@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Developmental AI — Skill Brain</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3;
+    --dim: #8b949e; --skill: #58a6ff; --skill-hi: #a5d6ff; --concept: #3fb950;
+    --ghost: #6e7681; --fire: #f0883e; --milestone: #d29922;
+    --dormant: #a371f7;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text);
+         font: 13px/1.5 -apple-system, "Segoe UI", sans-serif;
+         overflow: hidden; height: 100vh; display: flex; }
+  #graph { flex: 1; position: relative; }
+  canvas { display: block; }
+  #side { width: 340px; background: var(--panel);
+          border-left: 1px solid var(--line); display: flex;
+          flex-direction: column; }
+  #hdr { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  #hdr h1 { font-size: 15px; }
+  #hdr .meta { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  #status-dot { display: inline-block; width: 8px; height: 8px;
+                border-radius: 50%; background: #f85149; margin-right: 5px; }
+  #status-dot.live { background: var(--concept); }
+  #feed { border-bottom: 1px solid var(--line); max-height: 34%;
+          overflow-y: auto; padding: 8px 14px; }
+  #feed h2, #note h2 { font-size: 11px; text-transform: uppercase;
+        letter-spacing: .08em; color: var(--dim); margin-bottom: 6px; }
+  .fire-ev { padding: 3px 0; font-size: 12px; border-bottom:
+             1px dotted #21262d; }
+  .fire-ev .env { color: var(--dim); }
+  .fire-ev .sk { color: var(--fire); font-weight: 600; }
+  .fire-ev.running .sk { animation: pulse 1s infinite alternate; }
+  .fire-ev .out { float: right; color: var(--dim); }
+  .fire-ev .out.achieved { color: var(--concept); }
+  #note { flex: 1; overflow-y: auto; padding: 10px 14px; }
+  #note .md h1 { font-size: 16px; margin: 8px 0 4px; }
+  #note .md h2 { font-size: 12px; margin: 10px 0 4px; color: var(--text);
+                 text-transform: none; letter-spacing: 0; }
+  #note .md li { margin-left: 18px; }
+  #note .md .wl { color: var(--skill); cursor: pointer; }
+  #note .md img { max-width: 100%; image-rendering: pixelated;
+                  border: 1px solid var(--line); border-radius: 4px;
+                  margin: 6px 0; }
+  #note .md pre { background: #0d1117; padding: 6px; border-radius: 4px;
+                  font-size: 10px; overflow-x: auto; margin: 6px 0;
+                  white-space: pre-wrap; color: var(--dim); }
+  #legend { position: absolute; left: 12px; bottom: 12px;
+            background: rgba(22,27,34,.9); border: 1px solid var(--line);
+            border-radius: 6px; padding: 8px 12px; font-size: 11px;
+            color: var(--dim); }
+  .lg { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .lg .ln { width: 16px; height: 0; border-top: 2px solid; }
+  @keyframes pulse { from { opacity: .55; } to { opacity: 1; } }
+</style>
+</head>
+<body>
+<div id="graph">
+  <canvas id="cv"></canvas>
+  <div id="legend">
+    <div class="lg"><span class="dot" style="background:var(--skill)"></span>
+      skill (size = competence)</div>
+    <div class="lg"><span class="dot" style="background:var(--milestone)"></span>
+      milestone reached</div>
+    <div class="lg"><span class="dot" style="background:var(--concept)"></span>
+      concept (grounded)</div>
+    <div class="lg"><span class="dot" style="border:1.5px dashed var(--ghost);
+      background:none"></span> unresolved (no skill achieves it)</div>
+    <div class="lg"><span class="dot" style="border:1.5px solid var(--dormant);
+      background:none;opacity:.6"></span> dormant (in long-term memory)</div>
+    <div class="lg"><span class="dot" style="background:var(--fire)"></span>
+      firing now</div>
+    <div class="lg"><span class="ln" style="border-color:#8b949e"></span>
+      precedence (observed)</div>
+    <div class="lg"><span class="ln" style="border-color:var(--concept)"></span>
+      achieves / causal</div>
+  </div>
+</div>
+<div id="side">
+  <div id="hdr">
+    <h1><span id="status-dot"></span>Skill Brain</h1>
+    <div class="meta" id="meta">waiting for brain_state.json…</div>
+  </div>
+  <div id="feed"><h2>Pathways — live firing</h2><div id="feed-list">
+    <span style="color:var(--dim)">no skill invocations yet</span>
+  </div></div>
+  <div id="note"><h2>Note</h2>
+    <div class="md" id="note-md" style="color:var(--dim)">
+      Click a node to read its note. Skills are documents: what they do,
+      when they apply, what they achieve, where they came from.
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+let W, H, nodes = [], edges = [], byId = new Map(), state = null;
+let dragging = null, hover = null, selected = null;
+let view = { x: 0, y: 0, k: 1 };
+// alpha cooling: the layout settles (clickable) but keeps a faint pulse of
+// life; re-heats when data changes or a node is dragged.
+let alpha = 1.0;
+const ALPHA_FLOOR = 0.015;
+const css = n => getComputedStyle(document.documentElement)
+  .getPropertyValue(n).trim();
+
+function resize() {
+  W = cv.width = cv.parentElement.clientWidth * devicePixelRatio;
+  H = cv.height = cv.parentElement.clientHeight * devicePixelRatio;
+  cv.style.width = cv.parentElement.clientWidth + "px";
+  cv.style.height = cv.parentElement.clientHeight + "px";
+}
+addEventListener("resize", resize); resize();
+
+// ---- data ----
+async function poll() {
+  try {
+    const r = await fetch("brain_state.json?t=" + Date.now());
+    if (!r.ok) throw 0;
+    merge(await r.json());
+    document.getElementById("status-dot").classList.add("live");
+  } catch (e) {
+    document.getElementById("status-dot").classList.remove("live");
+  }
+  setTimeout(poll, 1500);
+}
+function merge(s) {
+  state = s;
+  const grew = s.nodes.length !== nodes.length;
+  if (grew) {
+    alpha = Math.max(alpha, 0.5);
+    settleBurst = 240;   // pre-settle synchronously (see loop) so the
+                         // graph lands laid-out even in a throttled tab
+  }
+  const seen = new Set();
+  for (const n of s.nodes) {
+    seen.add(n.id);
+    let ex = byId.get(n.id);
+    if (!ex) {
+      ex = { x: (Math.random() - .5) * 400, y: (Math.random() - .5) * 400,
+             vx: 0, vy: 0 };
+      byId.set(n.id, ex);
+      nodes.push(ex);
+    }
+    Object.assign(ex, n);
+  }
+  nodes = nodes.filter(n => seen.has(n.id));
+  byId = new Map(nodes.map(n => [n.id, n]));
+  edges = s.edges.filter(e => byId.has(e.source) &&
+                              byId.has(e.target));
+  const active = new Set(Object.values(s.active || {}).filter(Boolean));
+  for (const n of nodes) n.firing = active.has(n.id);
+  const ws = s.working_set || {};
+  const wsTxt = (ws.total_known)
+    ? ` · working set ${ws.active_goals}▪ / ${ws.dormant_goals}◦ ` +
+      `(${ws.total_known} known)`
+    : "";
+  document.getElementById("meta").textContent =
+    `ep ${s.meta.episode} · step ${s.meta.timestep.toLocaleString()} · ` +
+    `${s.meta.n_skills} skills${wsTxt} · ` +
+    `${new Date(s.meta.written_at * 1000).toLocaleTimeString()}`;
+  renderFeed(s);
+  if (selected) renderNote(byId.get(selected.id) || null);
+}
+function renderFeed(s) {
+  const list = document.getElementById("feed-list");
+  const evs = (s.firing || []).slice().reverse().slice(0, 30);
+  if (!evs.length) return;
+  list.innerHTML = evs.map(ev => {
+    const n = byId.get(ev.skill_id);
+    const label = n ? n.label : ev.skill_id;
+    const running = ev.outcome === "running";
+    const dur = ev.t_end != null ? (ev.t_end - ev.t_start) + " steps" : "…";
+    return `<div class="fire-ev ${running ? "running" : ""}">
+      <span class="env">env${ev.env}</span> →
+      <span class="sk">${esc(label)}</span>
+      <span class="out ${ev.outcome}">${ev.outcome} · ${dur}</span></div>`;
+  }).join("");
+}
+// ---- force layout ----
+let _lastT = performance.now();
+function tick() {
+  // TIME-based cooling: rAF throttles hard in background tabs, so a
+  // per-frame decay never settles unless the tab is watched. Decay by
+  // wall-clock instead (0.99^60 per second), and cap dt so a long throttle
+  // gap doesn't slingshot the physics.
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - _lastT) / 1000);
+  _lastT = now;
+  alpha = Math.max(ALPHA_FLOOR, alpha * Math.pow(0.99, dt * 60));
+  const N = nodes.length;
+  for (let i = 0; i < N; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < N; j++) {
+      const b = nodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d2 = dx * dx + dy * dy + 0.01, d = Math.sqrt(d2);
+      const rep = 2600 / d2 * alpha;
+      dx /= d; dy /= d;
+      a.vx -= dx * rep; a.vy -= dy * rep;
+      b.vx += dx * rep; b.vy += dy * rep;
+    }
+    a.vx -= a.x * 0.0012 * alpha; a.vy -= a.y * 0.0012 * alpha;
+  }
+  for (const e of edges) {
+    const a = byId.get(e.source), b = byId.get(e.target);
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+    const want = e.kind === "achieves" ? 90 : 130;
+    const f = (d - want) * 0.004 * alpha;
+    dx /= d; dy /= d;
+    a.vx += dx * f * d * 0.02; a.vy += dy * f * d * 0.02;
+    b.vx -= dx * f * d * 0.02; b.vy -= dy * f * d * 0.02;
+  }
+  for (const n of nodes) {
+    if (n === dragging) { n.vx = n.vy = 0; continue; }
+    n.x += (n.vx *= 0.82); n.y += (n.vy *= 0.82);
+  }
+}
+// ---- draw ----
+function nodeR(n) {
+  if (n.kind === "skill") return 7 + 11 * (n.competence || 0);
+  if (n.kind === "dormant_goal") return 5 + 6 * (n.competence || 0);
+  return n.kind === "ghost" ? 6 : 7;
+}
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.setTransform(devicePixelRatio * view.k, 0, 0,
+                   devicePixelRatio * view.k,
+                   W / 2 + view.x * devicePixelRatio,
+                   H / 2 + view.y * devicePixelRatio);
+  const t = performance.now() / 1000;
+  for (const e of edges) {
+    const a = byId.get(e.source), b = byId.get(e.target);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    if (e.kind === "precedence") {
+      ctx.strokeStyle = "rgba(139,148,158,.45)";
+      ctx.lineWidth = 1 + (e.weight || 0.5);
+    } else if (e.kind === "prerequisite") {
+      ctx.strokeStyle = "rgba(139,148,158,.7)"; ctx.lineWidth = 1.4;
+    } else {
+      ctx.strokeStyle = "rgba(63,185,80,.55)"; ctx.lineWidth = 1.4;
+    }
+    ctx.stroke();
+    // arrowhead
+    const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+    const ux = dx / d, uy = dy / d, r = nodeR(b) + 3;
+    const px = b.x - ux * r, py = b.y - uy * r;
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(px - ux * 6 - uy * 3.4, py - uy * 6 + ux * 3.4);
+    ctx.lineTo(px - ux * 6 + uy * 3.4, py - uy * 6 - ux * 3.4);
+    ctx.fillStyle = ctx.strokeStyle; ctx.fill();
+  }
+  for (const n of nodes) {
+    const r = nodeR(n);
+    if (n.firing) {
+      const glow = 6 + 4 * Math.sin(t * 5);
+      ctx.beginPath(); ctx.arc(n.x, n.y, r + glow, 0, 7);
+      ctx.fillStyle = "rgba(240,136,62,.25)"; ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7);
+    if (n.kind === "ghost") {
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = css("--ghost"); ctx.lineWidth = 1.5;
+      ctx.stroke(); ctx.setLineDash([]);
+    } else if (n.kind === "dormant_goal") {
+      // consolidated to long-term memory: faded, hollow ring — present but
+      // not resident in the working set until a cue recalls it.
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = css("--bg"); ctx.fill();
+      ctx.strokeStyle = css("--dormant"); ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (n.kind === "concept") {
+      ctx.fillStyle = css("--concept"); ctx.fill();
+    } else {
+      ctx.fillStyle = n.firing ? css("--fire")
+        : n.milestone ? css("--milestone")
+        : (n === hover || n === selected) ? css("--skill-hi")
+        : css("--skill");
+      ctx.fill();
+    }
+    if (n === selected) {
+      ctx.beginPath(); ctx.arc(n.x, n.y, r + 3, 0, 7);
+      ctx.strokeStyle = css("--text"); ctx.lineWidth = 1.2; ctx.stroke();
+    }
+    ctx.fillStyle = (n === hover || n === selected || n.firing)
+      ? css("--text") : css("--dim");
+    ctx.font = `${n.kind === "skill" ? 11 : 10}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.fillText(n.label, n.x, n.y + r + 12);
+  }
+}
+let settleBurst = 0;
+function loop() {
+  if (settleBurst > 0) {           // burst-settle after topology changes
+    const n = Math.min(settleBurst, 60);
+    for (let i = 0; i < n; i++) tick();
+    settleBurst -= n;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+// rAF is throttled to 0fps in unfocused panes — keep the simulation
+// breathing on an interval (background-clamped to ~1Hz, which is fine).
+setInterval(tick, 50);
+// ---- interaction ----
+function toWorld(ev) {
+  const rect = cv.getBoundingClientRect();
+  return {
+    x: (ev.clientX - rect.left - rect.width / 2 - view.x) / view.k,
+    y: (ev.clientY - rect.top - rect.height / 2 - view.y) / view.k,
+  };
+}
+function pick(p) {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (Math.hypot(n.x - p.x, n.y - p.y) < nodeR(n) + 4) return n;
+  }
+  return null;
+}
+let panning = null;
+cv.addEventListener("mousedown", ev => {
+  const p = toWorld(ev), n = pick(p);
+  if (n) { dragging = n; alpha = Math.max(alpha, 0.3); }
+  else panning = { x: ev.clientX - view.x, y: ev.clientY - view.y };
+});
+addEventListener("mousemove", ev => {
+  const p = toWorld(ev);
+  if (dragging) { dragging.x = p.x; dragging.y = p.y; }
+  else if (panning) {
+    view.x = ev.clientX - panning.x; view.y = ev.clientY - panning.y;
+  } else {
+    hover = pick(p);
+    cv.style.cursor = hover ? "pointer" : "default";
+  }
+});
+addEventListener("mouseup", ev => {
+  if (dragging && hover === dragging) { selected = dragging;
+    renderNote(dragging); }
+  else if (!panning && !dragging) { selected = null; }
+  dragging = null; panning = null;
+});
+cv.addEventListener("click", ev => {
+  const n = pick(toWorld(ev));
+  if (n) { selected = n; renderNote(n); }
+});
+cv.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  view.k = Math.min(3, Math.max(.25,
+    view.k * (ev.deltaY < 0 ? 1.1 : 0.9)));
+}, { passive: false });
+// ---- note rendering (tiny markdown subset) ----
+function esc(s) { return String(s).replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function renderNote(n) {
+  const el = document.getElementById("note-md");
+  if (!n) { el.innerHTML = "<em>node gone</em>"; return; }
+  if (n.kind !== "skill") {
+    const desc = n.kind === "ghost"
+      ? "Unresolved: the agent's knowledge references this, but no " +
+        "skill achieves it yet. This is a visible gap — a goal."
+      : n.kind === "dormant_goal"
+        ? `Dormant in long-term memory (competence ${n.competence}, used ` +
+          `${n.usage}×). Paged out of the bounded working set when idle; a ` +
+          `matching perceptual cue recalls it back into an active slot.`
+        : "Grounded concept — earned through real events.";
+    el.innerHTML = `<h1>${esc(n.label)}</h1>` +
+      `<p style="color:var(--dim)">${desc}</p>`;
+    return;
+  }
+  let md = n.note_md || `# ${n.label}\n(no note yet)`;
+  md = md.replace(/^---\n[\s\S]*?\n---\n?/, m =>
+    "```" + m.replace(/```/g, "") + "```\n");
+  let html = esc(md)
+    .replace(/```([\s\S]*?)```/g, (m, b) => `<pre>${b}</pre>`)
+    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
+    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
+    .replace(/^\- (.*)$/gm, "<li>$1</li>")
+    .replace(/!\[.*?\]\((.*?)\)/g,
+      (m, src) => `<img src="notes/${esc(n.id)}/${esc(src)}">`)
+    .replace(/\[\[(.*?)\]\]/g,
+      (m, t) => `<span class="wl" data-wl="${esc(t)}">${esc(t)}</span>`);
+  el.innerHTML = html;
+  el.querySelectorAll(".wl").forEach(w => w.onclick = () => {
+    const t = w.dataset.wl;
+    const target = nodes.find(x => x.id === t || x.label === t ||
+                                   x.id === "concept:" + t);
+    if (target) { selected = target; renderNote(target); }
+  });
+}
+poll(); loop();
+</script>
+</body>
+</html>

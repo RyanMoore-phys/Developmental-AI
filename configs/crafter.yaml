@@ -1,0 +1,205 @@
+# ============================================================
+# Developmental AI Framework — CRAFTER configuration
+# ============================================================
+# Crafter (Hafner): open-ended 2D survival, 64x64x3 PIXEL obs,
+# Discrete(17) actions, +1 per first-time achievement (22 total)
+# plus a small health-delta term. The crafting tech tree is a
+# family of discoverable laws — the richer world the developmental
+# stack was built for (NEXT_OBJECTIVES.md #1).
+#
+# NOTE: configs do NOT merge with default.yaml — this file is
+# self-complete. Pixel-specific choices are commented inline.
+# ============================================================
+
+# --- Environment ---
+environment:
+  name: "CrafterReward-v1"           # "CrafterNoReward-v1" = curiosity-only variant
+  max_episode_steps: 10000           # Crafter's own length cap (long episodes!)
+  # An episode with >=1 achievement scores ~1.0 (+/- small health drift);
+  # health-only episodes hover near 0. So success = "unlocked something".
+  success_reward_threshold: 0.9
+  mastery_reward_floor: 0.0          # died with nothing
+  mastery_reward_target: 8.0         # 8 distinct achievements = a strong episode
+  render_mode: null
+  pixel_obs: true                    # THE switch: CNN encoder/decoder + native-pixel wrappers
+  image_size: 64                     # matches Crafter's native render exactly
+  grayscale: false
+
+# --- RSSM World Model (DreamerV3-style) ---
+world_model:
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 512
+  encoder_hidden: 256                # CNN feature width (CNNEncoder output dim)
+  decoder_hidden: 256
+  learning_rate: 0.0003
+  batch_size: 16                     # 16 seqs x 32 steps of 12288-d obs per WM step
+  sequence_length: 32                # longer than DoorKey's 15 — Crafter dynamics are slower
+  train_iters: 8
+  # 20k transitions x 12288-d float32 ~= 1.0 GB — fits the pod (251 GB) and
+  # the Mac (40 GB). Raising this needs the uint8-storage optimization first
+  # (see NEXT_OBJECTIVES; the buffer stores flat float32 today).
+  buffer_capacity: 20000
+  imagination_horizon: 15
+  # Action-conditioning package (July 2026 audit H1) — keep ON everywhere.
+  film_conditioning: true
+  inverse_dynamics: true
+  inverse_dynamics_scale: 1.0
+  causal_align: true
+
+parallel_envs:
+  enabled: false
+  num_envs: 4
+
+prioritized_replay:
+  enabled: true
+  alpha: 0.6
+  beta: 0.4
+  epsilon: 0.01
+
+async_replay:
+  enabled: true
+
+# --- ICM Curiosity Engine ---
+# V1 NOTE: the ICM feature encoder is an MLP over the flat 12288-d pixel
+# vector (~3.1M params in its first layer). Functional but weak on pixels —
+# the CNN-feature ICM upgrade is the known follow-up (NEXT_OBJECTIVES).
+curiosity:
+  feature_dim: 256
+  hidden_dim: 256
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+  novelty_window: 1000
+
+knowledge_graph:
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password: "password"
+  embedding_dim: 64
+  embedding_model: "TransE"
+  embedding_epochs: 100
+  min_confidence: 0.7
+  max_facts_per_step: 10
+  use_in_memory_fallback: true
+  force_in_memory: true              # no Neo4j on pixel runs
+
+# Symbolic layer OFF for Crafter v1: the broadcast channels and per-dimension
+# fact extraction are MiniGrid-specific (and are pixel-gated in the loop
+# anyway). Crafter symbols will come from achievements/inventory via the
+# rulebook — a designed follow-up, not a retrofit.
+symbolic:
+  enabled: false
+
+skill_bank:
+  storage_dir: "./skill_bank_crafter"
+  mastery_threshold: 0.8
+  mastery_window: 50
+  min_episodes_before_save: 20
+  max_skills_loaded: 5
+  similarity_threshold: 0.5
+
+# --- Policy ---
+policy:
+  algorithm: "PPO"
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.3
+  intrinsic_reward_weight: 0.7
+  reward_decay_rate: 0.000005
+
+llm:
+  enabled: false
+  model: "llama3.1:8b"
+  env_description: "Crafter: an open-ended 2D survival world. Collect resources, craft tools, survive, and unlock achievements."
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+  async_mode: true
+  reward_shaping:
+    enabled: false
+    weight: 0.2
+    min_weight: 0.0
+    decay: 0.000005
+    clip: 1.0
+    interval: 25
+
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+
+# --- Dream Training: AUGMENT mode (H2-validated) ---
+# Dreaming is ON in augment mode: the dream actor trains in imagination and
+# distills into PPO behind the H2 trust gate. Crafter's sparse-ish rewards
+# are exactly where imagination should pay (the rung-4 5x5 negative showed
+# it can't help where real experience is already cheap).
+dream_training:
+  enabled: true
+  control: false                     # augment mode — PPO stays in control
+  warmup_episodes: 30
+  activate_after_episodes: 30
+  imagination_horizon: 15
+  batch_size: 16
+  n_dream_batches: 1
+  dream_curiosity: false
+  hidden_dim: 400
+  actor_lr: 0.00003
+  critic_lr: 0.00003
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+  # WM-trust gating (July 2026 audit H2 — collapse fix). Non-negotiable.
+  trust_gate: true
+  trust_kl_max: 6.0
+  trust_ema_beta: 0.1
+
+# --- Developmental Stage Controller ---
+# Crafter episodes are LONG (hundreds to thousands of steps), so episode-count
+# guards are set lower than DoorKey's and the step backstop higher.
+developmental_stages:
+  window: 20
+  patience: 5
+  min_episodes: 20
+  flat_slope_threshold: 0.001
+  skill_rate_threshold: 0.02
+  spike_factor: 2.5
+  reentry_bump: 0.2
+  trust_level: 0.0
+  force_exploit_timestep: 400000
+
+hub:
+  enabled: false
+  repo_id: ""
+  private: true
+  push_on_mastery: false
+  token: null
+
+distributed:
+  enabled: false
+  num_workers: 4
+  num_cpus_per_worker: 1
+  num_gpus_per_worker: 0
+  shared_skill_bank: true
+  ray_address: null
+
+# --- Developmental Loop ---
+loop:
+  total_timesteps: 1000000           # the standard Crafter budget (CLI overrides)
+  checkpoint_interval: 50000
+  eval_interval: 25000
+  eval_episodes: 5
+  curriculum_enabled: false
+  difficulty_increase_threshold: 0.8
+  difficulty_check_interval: 50
+  log_dir: "./logs"
+  tensorboard: true
+  verbose: 1

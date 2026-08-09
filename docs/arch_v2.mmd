@@ -1,0 +1,51 @@
+%%{init: {"theme":"dark","themeVariables":{"fontSize":"15px"}}}%%
+flowchart TD
+  ENV["Environments — Gymnasium<br/>MiniGrid DoorKey · RuleRegime · NoisyTV · SeqGoal<br/>classic-control · <b>MuJoCo continuous</b><br/><i>obs out, actions in</i>"]:::perc
+  CUR["Curiosity engine — custom ICM<br/>novelty OR <b>learning-progress</b><br/><i>→ intrinsic reward</i>"]:::cur
+  MIX["Reward mixer<br/><b>adaptive gating</b>: intrinsic weight down<br/>as extrinsic reward becomes findable"]:::cur
+  POL["PPO policy — StandaloneActorCritic<br/><b>knowledge-conditioned</b> actor-critic"]:::act
+  RSSM["World model — RSSM (DreamerV3-style)<br/>posterior = abduction · prior = imagine<br/><b>twohot reward head</b> · <b>goal-prioritized replay</b><br/>continue head · PER · causal-align<br/><i>⚠ weakly action-conditioned — the standing limiter</i>"]:::wm
+  DREAM["Dream actor-critic (latent space)<br/>trains in imagination, <b>distilled</b> into real policy<br/>value-gated · annealed · sharpened<br/><b>now knowledge-conditioned</b> (capstone fix)"]:::wm
+  STAGE["Developmental stage controller<br/>EXPLORE to EXPLOIT to IMAGINE<br/><i>from WM-error plateau + skill rate</i>"]:::goal
+  SELF["Self-model — CompetencePredictor<br/>calibrated P(success) + learning-progress<br/><i>what to practice · notices forgetting<br/>causally load-bearing (Rung 5)</i>"]:::goal
+  KG["Knowledge graph + PyKEEN embeddings<br/>facts · rules"]:::wm
+  BCAST["Affordance / regime broadcast<br/><b>conditions the policy</b> (Global Workspace)<br/>load-bearing under hidden structure (Rung 6)"]:::wm
+  GATE{"task-appropriateness gate<br/><b>auto-disable on continuous</b><br/>action spaces (Hopper ablation)"}:::gate
+  SKILL["Skill bank (local)<br/>mint on mastery · warm-start transfer · dedup<br/><i>warm-start route decisive (Rung 1 revisit)</i>"]:::skill
+  COMP["CompositeSkillExecutor — <b>NEW</b><br/>chains banked skills via state-aware<br/>subgoal switch · zero-training composition (Rung 2)"]:::skill
+  XDOM["Cross-domain transfer — <b>NEW</b> (Rung 7)<br/>domain encoder → shared <b>abstract core</b> → action adapter<br/>supervised representation alignment ✅<br/><i>autonomous correspondence discovery — open</i>"]:::skill
+  LLM["Local LLM — Ollama llama3.1:8b<br/>async goal generation + potential-based shaping<br/>stage-gated · offline · cadence ×4<br/><b>stabilizes the whole organism</b> (0/3 vs 1/3 collapse)"]:::goal
+  PT["PyTorch (CPU) — tensor foundation"]:::found
+
+  ENV -->|observations| CUR
+  ENV -->|observations| POL
+  CUR --> MIX --> POL
+  POL -->|actions| ENV
+  ENV -->|transitions| RSSM
+  RSSM -->|prediction error| CUR
+  RSSM -->|imagined rollouts| DREAM
+  DREAM -->|policy distillation| POL
+  RSSM --> STAGE --> MIX
+  STAGE --> DREAM
+  POL --> SELF --> STAGE
+  SELF --> SKILL
+  RSSM -->|symbolic facts| KG --> BCAST --> GATE
+  GATE -->|"discrete envs: broadcast feature"| POL
+  GATE -.->|"continuous envs: OFF"| ENV
+  BCAST -->|knowledge feature| DREAM
+  SKILL -->|warm-start| POL
+  SKILL -->|banked primitives| COMP -->|composed actions| ENV
+  SKILL --> XDOM -->|aligned encoder + frozen core| POL
+  LLM -->|goals + shaping| MIX
+  PT -.-> RSSM
+  PT -.-> POL
+  PT -.-> DREAM
+
+  classDef perc  fill:#1f5e51,stroke:#3da08a,color:#eafff8;
+  classDef cur   fill:#7a4d12,stroke:#d39b3a,color:#fff3df;
+  classDef goal  fill:#3b3a8c,stroke:#7b78e6,color:#eceaff;
+  classDef act   fill:#7a2f23,stroke:#d97a63,color:#ffe9e3;
+  classDef wm    fill:#2a2f6b,stroke:#6f78d6,color:#e6e9ff;
+  classDef skill fill:#2f5e1f,stroke:#7ad36b,color:#eaffe3;
+  classDef found fill:#3a3a3a,stroke:#888,color:#ddd;
+  classDef gate  fill:#5e1f4a,stroke:#d36ba8,color:#ffe3f3;

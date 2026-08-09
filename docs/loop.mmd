@@ -1,0 +1,31 @@
+%%{init: {"theme":"dark","themeVariables":{"fontSize":"15px"}}}%%
+flowchart TD
+  PERCEIVE["Perceive<br/>egocentric observation"]:::perc
+  CURI["Curiosity engine<br/>novelty / <b>learning-progress</b><br/>then intrinsic reward"]:::cur
+  GOAL["Set goal<br/>autotelic / LLM goal +<br/><b>self-model</b> picks what to practice"]:::goal
+  GATE["Reward mixer — adaptive gating<br/>intrinsic down as task reward becomes findable"]:::cur
+  STAGE["Stage controller<br/>EXPLORE to EXPLOIT"]:::goal
+  ACT["Explore & act<br/>PPO policy (knowledge-conditioned)"]:::act
+  WMOD["World model (RSSM)<br/>internal map: recon + reward + continue"]:::goal
+  OBS["Observe result"]:::perc
+  PE["Prediction error<br/>surprise signal"]:::err
+  DREAMSTEP["Dream<br/>imagine rollouts then dream actor then<br/>distill into policy (augment)"]:::goal
+  WMUP["Update world model"]:::goal
+  SELFUP["Update self-model<br/>competence (calibrated) + learning-progress"]:::goal
+  SKILLADD["Skill added / warm-start<br/>capability grows · transfers across envs"]:::skill
+  PERCEIVE --> CURI --> GOAL --> GATE --> STAGE --> ACT
+  ACT --> OBS --> PE
+  ACT --> WMOD --> OBS
+  PE -->|refine| WMUP --> DREAMSTEP --> SKILLADD
+  PE -->|drives anneal| GATE
+  PE --> SELFUP --> GOAL
+  DREAMSTEP -->|distilled policy| ACT
+  SKILLADD -->|open-ended, keep growing| PERCEIVE
+  STAGE -.->|EXPLORE — curiosity leads| CURI
+  STAGE -.->|EXPLOIT — task leads| ACT
+  classDef perc  fill:#1f5e51,stroke:#3da08a,color:#eafff8;
+  classDef cur   fill:#7a4d12,stroke:#d39b3a,color:#fff3df;
+  classDef goal  fill:#3b3a8c,stroke:#7b78e6,color:#eceaff;
+  classDef act   fill:#7a2f23,stroke:#d97a63,color:#ffe9e3;
+  classDef err   fill:#7a2330,stroke:#d96379,color:#ffe3e9;
+  classDef skill fill:#2f5e1f,stroke:#7ad36b,color:#eaffe3;

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Visualize what your AI is dreaming.
+#
+# Usage:
+#   ./dream                                          # train 2000 steps, full report
+#   ./dream --train 5000                             # train longer first
+#   ./dream --checkpoint logs/checkpoints            # from saved checkpoint
+#   ./dream --quick --show                           # one interactive plot
+#   ./dream --config configs/lunar_lander.yaml       # different env
+#   ./dream --horizon 50 --n-cloud 16                # longer dreams, more parallel
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/venv/bin/python3" -u -m developmental_ai.scripts.visualize_dreams "$@"

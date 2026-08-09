@@ -1,0 +1,287 @@
+# ============================================================
+# Developmental AI Framework — Default Configuration
+# ============================================================
+# This file controls all hyperparameters for the framework.
+# Override individual values by passing a custom YAML file
+# or by setting them programmatically.
+# ============================================================
+
+# --- Environment ---
+environment:
+  name: "MiniGrid-DoorKey-5x5-v0"     # Gymnasium environment ID
+  max_episode_steps: 250             # DoorKey-5x5 internal limit (env truncates here)
+  # --- Success / mastery reward calibration (per-env) ---
+  # success_reward_threshold: an episode counts as a "success" when its
+  #   extrinsic reward exceeds this (default 0.0 => reward > 0, original
+  #   CartPole behavior). Negative-reward envs override it (e.g. Acrobot -150).
+  success_reward_threshold: 0.0
+  # mastery_reward_floor / mastery_reward_target: the env-relative band used to
+  #   normalize mastery COMPETENCE = clip((reward-floor)/(target-floor),0,1).
+  #   Defaults 0 / 475 reproduce CartPole exactly (competence = reward/475).
+  #   Negative-reward envs MUST shift these (e.g. Acrobot floor=-500 target=-100)
+  #   or competence stays pinned at 0 and no skills can ever be minted.
+  mastery_reward_floor: 0.0          # random/worst-case return (DoorKey: 0 = never solved)
+  mastery_reward_target: 0.9         # "excellent" return (DoorKey solve reward ~0.9)
+  render_mode: null                  # Set to "human" for visual debugging
+  pixel_obs: false                   # Use pixel observations (CNN encoder)
+  image_size: 64                     # Pixel observation resolution (square)
+  grayscale: false                   # Convert pixels to grayscale
+
+# --- RSSM World Model (DreamerV3-style) ---
+world_model:
+  # Latent state dimensions
+  stochastic_size: 32                # Number of categorical distributions
+  stochastic_classes: 32             # Classes per categorical distribution
+  deterministic_size: 512            # GRU hidden state size
+  # Network sizes
+  encoder_hidden: 256                # Encoder MLP hidden layer size
+  decoder_hidden: 256                # Decoder MLP hidden layer size
+  # Training
+  learning_rate: 0.0003              # Adam optimizer LR
+  batch_size: 32                     # Sequences per training batch
+  sequence_length: 15                # Steps per sequence (shorter = more diverse batches)
+  train_iters: 8                     # Gradient steps per episode (more = better dynamics)
+  # Replay buffer
+  buffer_capacity: 100000            # Max transitions stored
+  # Imagination for planning
+  imagination_horizon: 15            # How many steps to imagine forward
+  # --- Action-conditioning package (July 2026 audit, CODE_AUDIT_2026-07.md §A) ---
+  # NOTE: these keys were previously missing from this file, and configs do
+  # NOT merge with default.yaml — so FiLM and inverse dynamics were silently
+  # OFF in every DoorKey experiment despite default.yaml enabling them.
+  film_conditioning: true            # Action modulates z multiplicatively (no 150:1 dilution)
+  inverse_dynamics: true             # Auxiliary action-prediction loss on consecutive latents
+  inverse_dynamics_scale: 1.0        # Weight of inverse loss in total WM loss
+  causal_align: true                 # state_t built from a_{t-1} (the action that CAUSED o_t)
+
+# --- Parallel Environments (vectorized lockstep collection) ---
+# When enabled, `num_envs` copies of the environment are stepped together and
+# the neural ops (dream actor, ICM, RSSM observe) are batched across them.
+# Each env gets its own independent replay stream so RSSM sequences stay
+# temporally contiguous. Only activates AFTER dream-training warmup (when the
+# PPO policy is dormant and the dream actor drives action selection), so the
+# single-stream PPO/GAE path is never affected.
+# Leave DISABLED until you've validated the single-env path — this is the
+# newest / least-battle-tested feature.
+parallel_envs:
+  enabled: false                     # Master switch for vectorized collection
+  num_envs: 4                        # Number of env copies stepped in lockstep
+
+# --- Prioritized Experience Replay (PER) ---
+# Samples world-model training sequences in proportion to their recent
+# reconstruction/prediction error (priority^alpha), with importance-sampling
+# weights (beta) to correct the bias. When disabled the buffer falls back to
+# uniform sampling and is numerically identical to the original sampler.
+prioritized_replay:
+  enabled: true                      # Use error-weighted sampling
+  alpha: 0.6                         # Priority exponent (0 = uniform, 1 = full)
+  beta: 0.4                          # Importance-sampling correction strength
+  epsilon: 0.01                      # Added to every priority so none hit zero
+
+# --- Asynchronous Experience Replay ---
+# A background worker thread prefetches/builds the next training batches while
+# the main thread runs gradient steps, overlapping CPU sampling with compute.
+# Only prefetches during the training phase (collection and training are
+# sequential in the loop, so no concurrent writes). When disabled, sampling is
+# synchronous (original behavior).
+async_replay:
+  enabled: true                      # Prefetch batches on a background thread
+
+# --- ICM Curiosity Engine ---
+curiosity:
+  # Architecture
+  feature_dim: 256                   # Shared feature encoding dimension
+  hidden_dim: 256                    # Forward/inverse model hidden size
+  # Loss weighting
+  forward_loss_weight: 0.8           # How much to weight forward model loss
+  inverse_loss_weight: 0.2           # How much to weight inverse model loss
+  # Reward scaling
+  curiosity_reward_scale: 1.0        # Multiplier for intrinsic reward
+  curiosity_reward_clip: 5.0         # Max intrinsic reward per step
+  # Training
+  learning_rate: 0.0001
+  # Novelty tracking
+  novelty_window: 1000               # Window for tracking novelty decay
+
+# --- Knowledge Graph ---
+knowledge_graph:
+  # Neo4j connection (requires running Neo4j instance)
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password: "password"
+  # PyKEEN embedding settings
+  embedding_dim: 64                  # KG entity/relation embedding size
+  embedding_model: "TransE"          # Options: TransE, RotatE, ComplEx, DistMult
+  embedding_epochs: 100              # Training epochs for KG embeddings
+  # Fact extraction
+  min_confidence: 0.7                # Minimum confidence to store a fact
+  max_facts_per_step: 10             # Limit fact extraction per timestep
+  # Fallback: use in-memory graph if Neo4j unavailable
+  use_in_memory_fallback: true
+  force_in_memory: false             # Set true to skip Neo4j even if available
+
+# --- Symbolic Conditioning (Path A: make the symbolic layer load-bearing) ---
+# When enabled, the graph-level knowledge vector (GNN over the KG) is fed to the
+# policy as a DETACHED input feature through a learned KnowledgeConditioner gate.
+# The gate is trained by the policy loss, so the symbolic layer can actually shape
+# behavior instead of only feeding a self-referential fact extractor. The GNN keeps
+# training on graph structure. Set enabled=false for the obs-only ablation baseline
+# (knowledge_dim collapses to 0 → policy sees raw observations only). This flag is
+# the falsifiable switch behind the symbolic-on vs symbolic-off comparison.
+symbolic:
+  enabled: true                      # false = obs-only baseline (knowledge_dim=0)
+
+# --- Skill Bank ---
+skill_bank:
+  storage_dir: "./skill_bank_doorkey"  # Dedicated DoorKey bank (canonical skill_bank_data untouched)
+  # Mastery detection
+  mastery_threshold: 0.8             # Success rate to consider skill "mastered"
+  mastery_window: 50                 # Episodes to evaluate mastery over
+  min_episodes_before_save: 20       # Minimum episodes before checking mastery
+  # Skill retrieval
+  max_skills_loaded: 5               # Max prior skills loaded for new goals
+  similarity_threshold: 0.5          # Min similarity for skill retrieval
+
+# --- Policy (Stable-Baselines3) ---
+policy:
+  algorithm: "PPO"                   # Options: PPO, SAC, A2C
+  learning_rate: 0.0003
+  n_steps: 2048                      # Steps per policy update
+  batch_size: 64
+  n_epochs: 10                       # PPO epochs per update
+  gamma: 0.99                        # Discount factor
+  gae_lambda: 0.95                   # GAE lambda
+  clip_range: 0.2                    # PPO clipping
+  # Reward mixing
+  extrinsic_reward_weight: 0.3       # Weight for environment reward
+  intrinsic_reward_weight: 0.7       # Weight for curiosity reward (sum = 1.0)
+  reward_decay_rate: 0.000005        # Per-TIMESTEP curiosity->task anneal. 0.7->0.1
+                                     # (floor) over ~120k steps, leaving headroom at
+                                     # high-task for the policy to converge. Natural
+                                     # drift, not a fixed ratio.
+
+# --- LLM Integration (local via Ollama — no API key needed) ---
+llm:
+  enabled: false                       # Gate run: LLM OFF for speed + to isolate "can it learn DoorKey?"
+  model: "llama3.1:8b"                 # Local model for perception/reasoning
+  env_description: "A MiniGrid gridworld: pick up the key, open the door, reach the green goal."
+  perception_interval: 50              # Episodes between LLM fact extraction
+  goal_interval: 25                    # Episodes between LLM goal generation
+  reasoning_interval: 100              # Episodes between LLM knowledge analysis
+  async_mode: true                     # Run Ollama calls off the training loop
+                                       # (submit on one episode, consume the
+                                       # result later) so slow LLM responses
+                                       # never block gradient steps. Set false
+                                       # for the original blocking behavior.
+  # Path B slice: LLM goal-progress potential-based reward shaping.
+  # The LLM scores how close the trajectory came to the current goal (progress
+  # p in [0,1], async, every `interval` episodes). That score is consumed as a
+  # difference-form potential F = weight * (Phi_now - Phi_prev), applied ONCE per
+  # episode to the last stored transition. Difference-form telescopes, so it cannot
+  # be farmed by stalling and preserves the optimal policy (Ng et al. 1999). The
+  # weight anneals toward min_weight on the same per-timestep clock as curiosity, so
+  # LLM guidance fades as the policy converges — natural drift, never a fixed ratio.
+  reward_shaping:
+    enabled: false                     # Gate run: no Path B shaping (pure curiosity+task)
+    weight: 0.2                        # w0: initial shaping weight (annealed down)
+    min_weight: 0.0                    # floor the weight anneals toward
+    decay: 0.000005                    # per-TIMESTEP anneal (same clock as curiosity)
+    clip: 1.0                          # clamp |F| per episode for stability
+    interval: 25                       # episodes between LLM progress-scoring calls
+
+# --- Skill Composition ---
+skill_composition:
+  enabled: true
+  min_mastery: 0.7                     # Minimum mastery to consider for composition
+  max_compositions_per_cycle: 3        # Max new compositions per mastery event
+
+# --- Dream Training (DreamerV3-style imagination-based policy learning) ---
+dream_training:
+  enabled: false                         # Disabled: dream-only control starved the world model of
+                                         # balanced trajectories (agent never exceeded 131 steps).
+                                         # Keeping the on-policy PPO learner in control so it learns
+                                         # CartPole directly. World model still trains for KG/symbolic.
+                                         # Re-enable for harder envs once the world model is debugged.
+  warmup_episodes: 50                    # Episodes before switching to dream policy
+  imagination_horizon: 15                # Steps to imagine forward per trajectory
+  batch_size: 16                         # Trajectories per dream training batch
+  n_dream_batches: 1                     # Dream batches per world model update
+  dream_curiosity: false                 # Add ICM curiosity to imagined rewards
+  hidden_dim: 400                        # Dream actor/critic hidden layer size
+  actor_lr: 0.00003                      # Dream actor learning rate
+  critic_lr: 0.00003                     # Dream critic learning rate
+  gamma: 0.997                           # Discount factor for imagined returns
+  lambda_: 0.95                          # Lambda for lambda-return computation
+  entropy_scale: 0.0003                  # Entropy bonus for exploration
+  target_ema: 0.98                       # EMA decay for slow target critic
+  # --- WM-trust gating (July 2026 audit H2 — capstone collapse fix) ---
+  # Distill only at states where the WM's own surprise (posterior-vs-prior KL)
+  # is low, and scale the global pull by an EMA of that trust fraction, so on
+  # envs the WM doesn't understand the pull fades regardless of solve rate.
+  trust_gate: true
+  trust_kl_max: 6.0                      # nats; ~2x the free-nats budget (32 x 0.1 x 2)
+  trust_ema_beta: 0.1                    # EMA rate for the global trust scale
+
+# --- Developmental Stage Controller (closed-loop curiosity->task handoff) ---
+# Replaces the open-loop wall-clock reward anneal + config dream latch with an
+# ENDOGENOUS stage machine driven by the agent's own learning signals:
+#   - World-model prediction-error (learning progress) is the SPINE — it drives
+#     transitions in BOTH directions (a leading indicator: novelty spikes error
+#     immediately).
+#   - Skill-acquisition rate is a FORWARD-ONLY confirm (EXPLORE->EXPLOIT needs
+#     both a flat WM-error slope AND a flat skill rate). It is deliberately NOT
+#     used for re-entry, because applying skills != acquiring them, so the rate
+#     stays flat even when there's genuinely new material to learn.
+# Stages: EXPLORE (curiosity-heavy, PPO drives, anneal held) <-> EXPLOIT
+# (task-heavy, anneal runs, re-anchored to the transition). IMAGINE (Stage 2,
+# dream-control) is trust-gated and only reachable when dream_training.enabled
+# AND trust_level > 0 — dormant on cheap/dense envs like CartPole.
+developmental_stages:
+  window: 30                  # Episodes of history for slope / skill-rate
+  patience: 5                 # Consecutive confirming checks before a transition (hysteresis)
+  min_episodes: 50            # Guard: no forward transition before this many episodes
+  flat_slope_threshold: 0.001 # |WM-error slope| below this counts as "plateaued"
+  skill_rate_threshold: 0.02  # New-skills-per-episode below this counts as "flat"
+  spike_factor: 2.5           # Re-entry: WM error > spike_factor x baseline => back to EXPLORE.
+                              # 2.5 ignores benign competence-induced WM-error drift (a real run
+                              # spiked to ~1.7x baseline as longer episodes opened new states) while
+                              # still catching a genuine novel-dynamics surprise (typically >3x).
+  reentry_bump: 0.2           # On EXPLOIT->EXPLORE re-entry, nudge intrinsic UP by this much (capped
+                              # at the initial high value) instead of a full reset to 0.7 — so a brief
+                              # WM-error blip can't erase the whole curiosity->task anneal schedule.
+  trust_level: 0.0            # Stage-2 gate: WM-error level deemed "trustworthy" (<=0 disables IMAGINE)
+  force_exploit_timestep: 120000  # Hard backstop: force EXPLORE->EXPLOIT if no plateau by here
+                                  # (safety net so a never-plateauing run can't stay curious forever;
+                                  # scale this with total run length). null = no backstop.
+
+# --- Hugging Face Hub (Skill Sharing) ---
+hub:
+  enabled: false                       # Set true to auto-push mastered skills
+  repo_id: ""                          # e.g. "username/my-developmental-skills"
+  private: true                        # Keep repo private by default
+  push_on_mastery: false               # Auto-push each newly mastered skill
+  token: null                          # HF token (uses cached huggingface-cli login if null)
+
+# --- Distributed Training (Ray) ---
+distributed:
+  enabled: false                       # Set true to use Ray multi-worker
+  num_workers: 4                       # Parallel environment workers
+  num_cpus_per_worker: 1
+  num_gpus_per_worker: 0               # Fractional GPU sharing: 0.25 = 4 workers per GPU
+  shared_skill_bank: true              # Workers share discovered skills
+  ray_address: null                    # null = local, "auto" = existing cluster
+
+# --- Developmental Loop ---
+loop:
+  total_timesteps: 60000             # Gate run length (CLI --timesteps overrides)
+  checkpoint_interval: 10000         # Steps between checkpoints
+  eval_interval: 5000                # Steps between evaluations
+  eval_episodes: 10                  # Episodes per evaluation
+  # Curriculum (fixed for DoorKey: difficulty handled via separate env sizes, not in-place)
+  curriculum_enabled: false
+  difficulty_increase_threshold: 0.8 # Performance level to increase difficulty
+  difficulty_check_interval: 50      # Episodes between difficulty checks
+  # Logging
+  log_dir: "./logs"
+  tensorboard: true
+  verbose: 1                         # 0=silent, 1=info, 2=debug

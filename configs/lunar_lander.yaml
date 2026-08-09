@@ -1,0 +1,103 @@
+# ============================================================
+# Developmental AI — LunarLander Configuration
+# ============================================================
+# A good stepping stone from CartPole: 8D continuous observations,
+# 4 discrete actions, sparse reward. Tests curiosity-driven exploration
+# and skill composition in a more challenging setting.
+#
+# Usage: DevelopmentalAI(config_path="configs/lunar_lander.yaml")
+# ============================================================
+
+environment:
+  name: "LunarLander-v3"
+  max_episode_steps: 1000
+  render_mode: null
+  pixel_obs: false
+
+world_model:
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 512
+  encoder_hidden: 256
+  decoder_hidden: 256
+  learning_rate: 0.0001
+  batch_size: 16
+  sequence_length: 50
+  buffer_capacity: 200000
+  imagination_horizon: 15
+
+curiosity:
+  feature_dim: 256
+  hidden_dim: 256
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+
+knowledge_graph:
+  embedding_dim: 64
+  embedding_model: "TransE"
+  embedding_epochs: 100
+  min_confidence: 0.7
+  use_in_memory_fallback: true
+
+skill_bank:
+  storage_dir: "./skill_bank_data/lunar_lander"
+  mastery_threshold: 0.7
+  mastery_window: 50
+  min_episodes_before_save: 30
+
+policy:
+  algorithm: "PPO"
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.4
+  intrinsic_reward_weight: 0.6
+
+llm:
+  enabled: true
+  model: "llama3.1:8b"
+  env_description: >
+    LunarLander-v3: A lunar lander must land softly between two flags.
+    Observations are position (x,y), velocity (vx,vy), angle, angular
+    velocity, and two leg contact booleans. Actions are noop, fire left
+    engine, fire main engine, fire right engine. Reward for landing
+    between flags, penalty for crashing or using fuel.
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+
+dream_training:
+  enabled: true
+  warmup_episodes: 75
+  imagination_horizon: 15
+  batch_size: 16
+  n_dream_batches: 2
+  dream_curiosity: false
+  hidden_dim: 400
+  actor_lr: 0.00003
+  critic_lr: 0.00003
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+
+loop:
+  total_timesteps: 500000
+  checkpoint_interval: 25000
+  eval_interval: 10000
+  eval_episodes: 10
+  curriculum_enabled: true
+  difficulty_increase_threshold: 0.7
+  difficulty_check_interval: 50
+  log_dir: "./logs/lunar_lander"
+  tensorboard: true
+  verbose: 1

@@ -1,0 +1,105 @@
+# ============================================================
+# Developmental AI — Pixel CartPole Configuration
+# ============================================================
+# CartPole with pixel observations — tests the CNN encoder/decoder
+# path end-to-end. Same simple task, but the agent must learn from
+# raw 64x64 RGB images instead of 4D state vectors.
+#
+# Usage: DevelopmentalAI(config_path="configs/pixel_cartpole.yaml")
+# ============================================================
+
+environment:
+  name: "CartPole-v1"
+  max_episode_steps: 500
+  render_mode: null                    # Overridden to rgb_array by pixel_obs
+  pixel_obs: true
+  image_size: 64
+  grayscale: false
+
+world_model:
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 512
+  encoder_hidden: 256
+  decoder_hidden: 256
+  learning_rate: 0.0001
+  batch_size: 16
+  sequence_length: 50
+  buffer_capacity: 100000
+  imagination_horizon: 15
+
+curiosity:
+  feature_dim: 256
+  hidden_dim: 256
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+
+knowledge_graph:
+  embedding_dim: 64
+  embedding_model: "TransE"
+  embedding_epochs: 100
+  min_confidence: 0.7
+  use_in_memory_fallback: true
+
+skill_bank:
+  storage_dir: "./skill_bank_data/pixel_cartpole"
+  mastery_threshold: 0.8
+  mastery_window: 50
+  min_episodes_before_save: 20
+
+policy:
+  algorithm: "PPO"
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.3
+  intrinsic_reward_weight: 0.7
+
+llm:
+  enabled: true
+  model: "llama3.1:8b"
+  env_description: >
+    CartPole-v1 with pixel observations: A pole is attached to a cart
+    on a frictionless track. The agent sees 64x64 RGB images and must
+    keep the pole balanced by pushing the cart left or right. This tests
+    visual perception — the agent must learn to extract relevant features
+    (cart position, pole angle) from raw pixels.
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+
+dream_training:
+  enabled: true
+  warmup_episodes: 75
+  imagination_horizon: 15
+  batch_size: 8
+  n_dream_batches: 1
+  dream_curiosity: false
+  hidden_dim: 400
+  actor_lr: 0.00003
+  critic_lr: 0.00003
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+
+loop:
+  total_timesteps: 200000
+  checkpoint_interval: 10000
+  eval_interval: 5000
+  eval_episodes: 10
+  curriculum_enabled: true
+  difficulty_increase_threshold: 0.8
+  difficulty_check_interval: 50
+  log_dir: "./logs/pixel_cartpole"
+  tensorboard: true
+  verbose: 1

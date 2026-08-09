@@ -1,0 +1,183 @@
+environment:
+  name: MineRLTreechop-v0
+  max_episode_steps: null
+  success_reward_threshold: 0.9
+  mastery_reward_floor: 0.0
+  mastery_reward_target: 8.0
+  render_mode: null
+  pixel_obs: true
+  image_size: 128
+  grayscale: false
+  # Each macro held 2 game ticks (camera scaled so net turn is unchanged):
+  # 2x game-time per policy step, and "chop" actually holds attack.
+  action_repeat: 2
+world_model:
+  # DreamerV3-XL-class core: 200.6M params (verified by construction), vs
+  # 12.5M in minecraft_parallel.yaml. CNN front-end is fixed-width; the
+  # scale lives in the GRU/dense core, same as DreamerV3. LR lowered for
+  # the big model (3e-4 is calibrated for the 12M net).
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 5120
+  encoder_hidden: 1536
+  decoder_hidden: 1536
+  learning_rate: 0.0001
+  batch_size: 16
+  sequence_length: 16
+  # WM trains once per EPISODE; Minecraft episodes are 4000 policy steps
+  # (~10 wall-min), so 4 iters (MiniGrid-calibrated) starved the WM: the
+  # 320k crash-run got ~160 gradient steps in 6.5h. The GPU sat at 3% —
+  # spend it on replay ratio (DreamerV3's actual lever).
+  train_iters: 128
+  buffer_capacity: 40000
+  imagination_horizon: 15
+  film_conditioning: true
+  inverse_dynamics: true
+  inverse_dynamics_scale: 1.0
+  causal_align: true
+parallel_envs:
+  enabled: true
+  num_envs: 8
+prioritized_replay:
+  enabled: true
+  alpha: 0.6
+  beta: 0.4
+  epsilon: 0.01
+async_replay:
+  enabled: true
+curiosity:
+  feature_dim: 512
+  hidden_dim: 512
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+  novelty_window: 1000
+knowledge_graph:
+  neo4j_uri: bolt://localhost:7687
+  neo4j_user: neo4j
+  neo4j_password: password
+  embedding_dim: 64
+  embedding_model: TransE
+  embedding_epochs: 100
+  min_confidence: 0.7
+  max_facts_per_step: 10
+  use_in_memory_fallback: true
+  force_in_memory: true
+symbolic:
+  enabled: true
+  knowledge_source: goal
+skill_bank:
+  storage_dir: ./skill_bank_minecraft
+  mastery_threshold: 0.8
+  mastery_window: 50
+  min_episodes_before_save: 20
+  max_skills_loaded: 5
+  similarity_threshold: 0.5
+policy:
+  algorithm: PPO
+  learning_rate: 0.0003
+  n_steps: 1024
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.3
+  intrinsic_reward_weight: 0.7
+  reward_decay_rate: 5.0e-06
+llm:
+  enabled: false
+  model: llama3.1:8b
+  env_description: 'Minecraft: find trees and chop wood.'
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+  async_mode: true
+  reward_shaping:
+    enabled: false
+    weight: 0.2
+    min_weight: 0.0
+    decay: 5.0e-06
+    clip: 1.0
+    interval: 25
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+dream_training:
+  enabled: true
+  control: true
+  warmup_episodes: 2
+  activate_after_episodes: 2
+  imagination_horizon: 15
+  batch_size: 16
+  n_dream_batches: 1
+  # Treechop extrinsic is near-zero early; without curiosity in the dream
+  # rewards the dream actor would optimize an all-zero signal.
+  dream_curiosity: true
+  hidden_dim: 1024
+  actor_lr: 3.0e-05
+  critic_lr: 3.0e-05
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+  trust_gate: true
+  trust_kl_max: 6.0
+  trust_ema_beta: 0.1
+developmental_stages:
+  window: 6
+  patience: 2
+  min_episodes: 2
+  flat_slope_threshold: 0.001
+  skill_rate_threshold: 0.02
+  spike_factor: 2.5
+  reentry_bump: 0.2
+  trust_level: 0.05
+  # Thresholds are in ADAPTER steps. With 60-tick chop macros an episode
+  # (8000 ticks) is ~600-1500 steps instead of 4000 — thresholds rescaled
+  # accordingly (run 2's gate fired genuinely at ep 12; keep that timing).
+  force_exploit_timestep: 4000
+  # Backstop: if the trust gate hasn't fired by here (~ep 12-15), force
+  # dream-control so the 8-env parallel fan-out engages regardless.
+  force_imagine_timestep: 12000
+hub:
+  enabled: false
+  repo_id: ''
+  private: true
+  push_on_mastery: false
+  token: null
+distributed:
+  enabled: false
+  num_workers: 4
+  num_cpus_per_worker: 1
+  num_gpus_per_worker: 0
+  shared_skill_bank: true
+  ray_address: null
+loop:
+  total_timesteps: 400000
+  checkpoint_interval: 25000
+  eval_interval: 1000000
+  eval_episodes: 1
+  curriculum_enabled: false
+  difficulty_increase_threshold: 0.8
+  difficulty_check_interval: 50
+  log_dir: ./logs
+  tensorboard: true
+  verbose: 1
+goals:
+  mode: discovered
+  max_slots: 16
+  mint_skills: true
+  spike_threshold: 0.9
+  match_cosine: 0.8
+  seed: 0
+video:
+  enabled: true
+  out_dir: podlogs/mc_videos
+  head: 3
+  every: 25
+  upscale: 4
+  fps: 12

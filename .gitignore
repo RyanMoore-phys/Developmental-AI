@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Developmental AI — what does NOT belong in version control.
+#
+# Context (2026-08-01): the repo directory is 7.8 GB, of which the actual
+# source is 4.3 MB. `git add` was once run before this file existed, staging
+# 10,000 files (9,393 of them under venv/) and leaving 2.39 GB of loose
+# objects in .git. NOTE: a .gitignore never retroactively unstages anything —
+# the index has to be cleared and re-added for this file to take effect.
+# ---------------------------------------------------------------------------
+
+# ---- environments / build artifacts ----
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+
+# ---- LEARNED WEIGHTS -------------------------------------------------------
+# Regenerable, and enormous: a single flat-arch skill's policy.pt is ~115 MB
+# (three near-duplicate 49250-wide input layers). The pod bank alone is 3.4 GB
+# of files that are 0.82-0.995 cosine-identical to each other. Git is the
+# wrong tool; GitHub LFS gives 1 GB free, which one skill would nearly fill.
+pod_repository/data/
+skill_bank_data/
+skill_bank_mc_curiosity/
+skill_bank*/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+brain_backup*/
+
+# ---- run outputs ----
+logs/
+podlogs/
+pod_results/
+experiments/results/
+runs/
+outputs/
+*.log
+
+# ...but KEEP the small result summaries: these are the experimental record,
+# and they are the reason to have the code under version control at all.
+!experiments/results/**/*.json
+!experiments/results/**/*.md
+
+# ---- media (heavy, regenerable) ----
+*.mp4
+*.gif
+*.avi
+# ...except the documentation figures, which are small and explanatory.
+!docs/*.png
+!assets/*.png
+
+# ---- local state that should never be shared ----
+*.env
+.env
+secrets.*
+*.pem
+id_rsa*
+skybot_ed25519*
+broadcaster_state.json
+registry.json

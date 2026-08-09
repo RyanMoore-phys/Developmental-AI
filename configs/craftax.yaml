@@ -1,0 +1,196 @@
+# ============================================================
+# Developmental AI Framework — CRAFTAX configuration
+# ============================================================
+# Craftax (Matthews et al. 2024): a JAX EXPANSION of Crafter —
+# 9 dungeon floors, 60+ achievements, 43 actions. The deeper
+# next-stage world for cumulative learning + law induction.
+#
+# We use the SYMBOLIC variant: obs is a flat (8268,) factored
+# state vector [0,1] (tiles + inventory + mobs + status), routed
+# through the MLP world-model path (pixel_obs=false). This suits
+# the structured/law-induction goal and avoids the pixel variant's
+# non-square 130x110 frame. See environments/craftax_env.py.
+#
+# NOTE: configs do NOT merge with default.yaml — self-complete.
+# ============================================================
+
+# --- Environment ---
+environment:
+  name: "Craftax-Symbolic-v1"        # JAX Craftax (full, not Classic)
+  max_episode_steps: null            # Craftax has its own episode length
+  # Craftax reward = +1 per first-time achievement (60+) + small terms.
+  # Early agents unlock a handful; a strong run unlocks many more.
+  success_reward_threshold: 0.9
+  mastery_reward_floor: 0.0
+  mastery_reward_target: 10.0        # 10 distinct achievements = a strong episode
+  render_mode: null
+  pixel_obs: false                   # SYMBOLIC obs -> MLP encoder (not CNN)
+  image_size: 64
+  grayscale: false
+
+# --- RSSM World Model (DreamerV3-style) ---
+world_model:
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 512
+  encoder_hidden: 256                # MLP encoder over the 8268-d obs
+  decoder_hidden: 256
+  learning_rate: 0.0003
+  batch_size: 16
+  sequence_length: 32                # Craftax dynamics unfold over many steps
+  train_iters: 8
+  # 20k transitions x 8268-d float32 ~= 0.66 GB — comfortable on the pod.
+  buffer_capacity: 20000
+  imagination_horizon: 15
+  film_conditioning: true            # action-conditioning package (H1)
+  inverse_dynamics: true
+  inverse_dynamics_scale: 1.0
+  causal_align: true
+
+parallel_envs:
+  enabled: false
+  num_envs: 4
+
+prioritized_replay:
+  enabled: true
+  alpha: 0.6
+  beta: 0.4
+  epsilon: 0.01
+
+async_replay:
+  enabled: true
+
+# --- ICM Curiosity Engine ---
+# The FeatureEncoder MLP over 8268-d obs is ~2.1M params in its first layer —
+# fine for a structured vector (unlike the pixel case, this IS a sensible MLP).
+curiosity:
+  feature_dim: 256
+  hidden_dim: 256
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+  novelty_window: 1000
+
+knowledge_graph:
+  neo4j_uri: "bolt://localhost:7687"
+  neo4j_user: "neo4j"
+  neo4j_password: "password"
+  embedding_dim: 64
+  embedding_model: "TransE"
+  embedding_epochs: 100
+  min_confidence: 0.7
+  max_facts_per_step: 10
+  use_in_memory_fallback: true
+  force_in_memory: true
+
+# Symbolic layer OFF for the first Craftax run: the 8268-d factored obs is
+# above the per-dimension symbolic gate (obs_dim > 2000), so the per-obs-dim
+# fact extractor / symbolic decoder are auto-skipped anyway. A Craftax-aware
+# symbolic channel (achievements/inventory via the rulebook) is a designed
+# follow-up, not a per-dimension retrofit.
+symbolic:
+  enabled: false
+
+skill_bank:
+  storage_dir: "./skill_bank_craftax"
+  mastery_threshold: 0.8
+  mastery_window: 50
+  min_episodes_before_save: 20
+  max_skills_loaded: 5
+  similarity_threshold: 0.5
+
+# --- Policy ---
+policy:
+  algorithm: "PPO"
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.3
+  intrinsic_reward_weight: 0.7
+  reward_decay_rate: 0.000005
+
+llm:
+  enabled: false
+  model: "llama3.1:8b"
+  env_description: "Craftax: a deep open-ended survival world with dungeons, crafting, and 60+ achievements."
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+  async_mode: true
+  reward_shaping:
+    enabled: false
+    weight: 0.2
+    min_weight: 0.0
+    decay: 0.000005
+    clip: 1.0
+    interval: 25
+
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+
+# --- Dream Training: AUGMENT mode (H2-validated) ---
+dream_training:
+  enabled: true
+  control: false
+  warmup_episodes: 30
+  activate_after_episodes: 30
+  imagination_horizon: 15
+  batch_size: 16
+  n_dream_batches: 1
+  dream_curiosity: false
+  hidden_dim: 400
+  actor_lr: 0.00003
+  critic_lr: 0.00003
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+  trust_gate: true
+  trust_kl_max: 6.0
+  trust_ema_beta: 0.1
+
+developmental_stages:
+  window: 20
+  patience: 5
+  min_episodes: 20
+  flat_slope_threshold: 0.001
+  skill_rate_threshold: 0.02
+  spike_factor: 2.5
+  reentry_bump: 0.2
+  trust_level: 0.0
+  force_exploit_timestep: 400000
+
+hub:
+  enabled: false
+  repo_id: ""
+  private: true
+  push_on_mastery: false
+  token: null
+
+distributed:
+  enabled: false
+  num_workers: 4
+  num_cpus_per_worker: 1
+  num_gpus_per_worker: 0
+  shared_skill_bank: true
+  ray_address: null
+
+loop:
+  total_timesteps: 1000000
+  checkpoint_interval: 50000
+  eval_interval: 25000
+  eval_episodes: 5
+  curriculum_enabled: false
+  difficulty_increase_threshold: 0.8
+  difficulty_check_interval: 50
+  log_dir: "./logs"
+  tensorboard: true
+  verbose: 1

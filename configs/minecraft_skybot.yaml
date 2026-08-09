@@ -1,0 +1,1149 @@
+environment:
+  name: MineRLTreechop-v0
+  max_episode_steps: null
+  success_reward_threshold: 0.9
+  mastery_reward_floor: 0.0
+  mastery_reward_target: 8.0
+  render_mode: null
+  pixel_obs: true
+  image_size: 128
+  # RENDER 3x THE AGENT'S OBS (ported from lifelong 2026-08-01). The agent
+  # still SEES 128px (block-mean downsampled -> obs_dim unchanged), but the
+  # game renders NATIVELY at 384 and llava gets THAT frame via render().
+  # llava:7b's vision tower is CLIP ViT-L/14-336, so a 128px frame was being
+  # UPSCALED to 336 — blurry enough that it could not tell a zombie from a
+  # skeleton. 384 lands just above native and is near-lossless.
+  render_size: 384
+  grayscale: false
+  action_repeat: 2
+  # SKYBOT: the primary lifelong stream (env 0) joins the user's Paper
+  # server through the pod-local socat->tailscale bridge. Scouts stay in
+  # local generated worlds (scope: primary). "all" would put every
+  # stream on the server.
+  remote_server: "127.0.0.1:25565"
+  remote_server_scope: primary
+  # ACTION THROTTLE (seconds of sleep per remote step; 0 = off).
+  # Off is normally correct: against a real server the client is tick-synced
+  # to the server's 20 TPS, so the agent already runs at wall-clock speed and
+  # cannot out-pace a human player. Raise this ONLY if the server's
+  # anti-cheat/anti-spam objects (rapid camera slew reads as erratic to some
+  # plugins). 0.05 roughly halves the command rate. Applied after the step,
+  # so it paces commands without distorting what the agent observes, and it
+  # is remote-only — the local scout keeps running at full speed.
+  remote_step_delay_s: 0.0
+  # ---- NO START TOOL (2026-08-02) --------------------------------------
+  # null = spawn EMPTY-HANDED. Previously an iron axe was granted via
+  # SimpleInventoryAgentStart, and on the external server it was RE-GRANTED
+  # on every rejoin — so each auto-rejoin handed the tool back and the
+  # "barehanded" test never actually ran.
+  #
+  # It also made the two streams disagree: with an axe a log is ~8 ticks,
+  # barehanded it is ~80. The scout kept its axe while the primary lost and
+  # regained one, so the world model was being taught two different break
+  # dynamics for the same block — and max_option_steps: 40 (= 80 ticks) is
+  # sized for the barehanded case.
+  #
+  # With this null, no SimpleInventoryAgentStart handler is added at all, so
+  # there is nothing to re-grant. Anything the agent ends up holding, it
+  # obtained itself.
+  # ---- AXE RESTORED, DELIBERATELY AND TEMPORARILY (2026-08-04) ---------
+  # null (spawn empty-handed) was set 2026-08-02 to make the barehanded test
+  # honest. MEASURED cost of that purity: ~5000 blocks broken over days and
+  # ZERO logs — and, the part that matters, the agent has never ONCE
+  # experienced a log break. Every reward mechanism built since reinforces an
+  # event that has never occurred; you cannot learn to chop from data that
+  # contains no chops.
+  #
+  # THE BINDING CONSTRAINT IS SWING LENGTH, not aim or guidance:
+  #     swings ending with no break: 400  (median 4t, >=8t: 93)
+  #     barehanded oak log: ~60 ticks
+  # The median swing is 15x too short, so even perfect VLM guidance onto a
+  # trunk could not fell it. An iron axe takes a log to ~8 ticks, which 23%
+  # of swings already reach — the first log goes from effectively impossible
+  # to near-certain within a segment or two.
+  #
+  # THIS IS NOT SCRIPTING THE BEHAVIOUR. The agent must still find a tree,
+  # aim at the trunk rather than the leaves, and hold the swing. It only
+  # lowers the bar from "sustain 60 ticks" (never once observed) to "sustain
+  # 8" (observed ~93 times per segment).
+  #
+  # REMOVE IT once a real break_oak_log skill has minted from genuine log
+  # breaks. That is the honest barehanded test, run in an order where it can
+  # succeed rather than as a precondition for ever starting.
+  # NOTE: on the external server the grant is re-applied on every rejoin.
+  # REVERTED TO null (2026-08-04). SimpleInventoryAgentStart is a SERVER-side
+  # handler in the mission XML, and a foreign Paper server ignores it — the
+  # same reason the frozen-daytime and world-generator handlers are ignored.
+  # We cannot hand SkyBot a tool from this side; only the server operator can
+  # (console/RCON `give`). Worse, setting it non-null is actively HARMFUL
+  # here: the local scout DOES honour the grant, so env 1 would swing an axe
+  # while env 0 (the server) stayed barehanded, teaching the SHARED world
+  # model two different break dynamics for the same block — the exact
+  # inconsistency the 2026-08-02 note warned about.
+  #
+  # The analysis behind wanting one still stands, and is for the operator:
+  #     swings ending with no break: 400  (median 4t, >=8t: 93)
+  #     barehanded oak log ~60 ticks | iron axe ~8 ticks
+  # The median swing is 15x too short to fell a log, so no guidance or
+  # shaping fix can produce a chop until either a tool is granted server-side
+  # or swings get dramatically longer.
+  start_tool: null
+  # ---- PHASE-SCOPED ACTION SPACE (2026-08-02) --------------------------
+  # Primitive macro indices the policy may not select right now. Indices are
+  # never renumbered (the macro table is append-only and stored skills index
+  # actions by position) — the action is simply not offered.
+  #
+  # 10 = `inventory`. MEASURED on the live server: with it selectable the
+  # agent spent 80% of every segment inside the menu, where 5 of its 12
+  # actions do nothing at all and the camera actions move a CURSOR instead
+  # of its head. Its pitch stayed clamped at -90 (straight up), so it could
+  # not look down to reach anything, and the only exit is a two-step
+  # release-then-press on an action it chose <4% of the time. gui-dwell was
+  # rising (52% -> 80%), not falling.
+  #
+  # This declares no meaning and hands over no skill. It is the same scoping
+  # the macro table already applied when it took inventory+use "over
+  # hotbar.1-9 to keep the exploration burden small". RE-ENABLE (set to [])
+  # when crafting is the actual objective — the button is a phase-2
+  # capability and the current phase is chopping.
+  # 6 RE-ENABLED (2026-08-02). Disabling attack+walk was a MISTAKE and the
+  # measurement says so: it was 51% of all actions, and removing it did not
+  # push the agent onto the stationary attack (5) — it pushed it onto plain
+  # walking (40%), so it simply stopped attacking at all and `persistence`
+  # went to exactly 0.0000/step. Removing the capability was the blunt fix.
+  #
+  # The right fix was already in place: the swing counter now RESETS on a
+  # real retarget (position/look change), so attack+walk accumulates no
+  # persistence potential while stationary attack does. The agent is taught
+  # the difference by the gradient instead of having the action taken away.
+  disable_macros: [10]
+  # ---- LOG ECONOMICS (2026-08-03) --------------------------------------
+  # MEASURED cause of "breaks everything except trees": the first-break tiers
+  # re-arm every goal_horizon, so four trivial block types can be re-harvested
+  # indefinitely for ~0.75/horizon needing no aim and no sustained effort,
+  # while a log paid 5.0 once for ~60 consecutive ticks on one specific
+  # target. Reliable-and-easy beat large-and-hard, and PPO correctly
+  # converged on clearing ground vegetation (2484 blocks, 0 logs).
+  #
+  # Pay for the EFFORT, per attack tick invested, logs only:
+  #     grass   0.15 over  ~1 tick  = 0.150 /tick
+  #     leaves  0.30 over  ~7 ticks = 0.043 /tick
+  #     dirt    0.15 over ~20 ticks = 0.008 /tick
+  #     stone   1.00 over ~40 ticks = 0.025 /tick
+  #     LOG     0.50/tick + 20.0/60 = 0.833 /tick   <- 5.5x the best other
+  # A felled log is then ~50 total (30 effort + 20 completion) against 0.15
+  # for grass, so the first log is worth more than every trivial break the
+  # agent has ever made combined.
+  #
+  # RETROACTIVE, necessarily: nothing in the observation says "I am mining a
+  # log right now" — only the completed break names the block. GAE propagates
+  # it back over the swing, which is the same gradient, but it is paid at
+  # completion, not during.
+  log_tick_reward: 0.5
+  log_break_reward: 20.0
+  # HARD CAP on ticks paid. `attack_run` has been observed at 13538 on a swing
+  # that never landed; uncapped, one mis-attributed streak would pay ~6800 and
+  # wreck the run. 120 = 2x a barehanded log, so real chops are never clipped.
+  log_tick_cap: 120
+  # ---- FAMILIARITY DECAY ON BREAKS (2026-08-06) ------------------------
+  # MEASURED: 85% of 2231 breaks were dirt. The first-break tier re-arms
+  # every goal horizon, so the ground underfoot is an inexhaustible 0.15
+  # income needing no aim and no sustained effort — every capability built
+  # for chopping got pointed at the floor instead.
+  # The payout for a block TYPE now decays with how often that type has
+  # already been felled: tier / (1 + n_type / scale). At scale 25:
+  #     dirt   n=1899 -> x0.013  (0.15 -> 0.002, effectively nothing)
+  #     leaves n=71   -> x0.26
+  #     LOG    n=0    -> x1.00   (full 20.0 + 0.5/tick effort, untouched)
+  # It declares NOTHING about dirt. It is novelty-of-achievement, the same
+  # 1/(1+n) shape the curiosity terms already use: stop paying for what has
+  # been thoroughly mastered, leave what has never been managed worth most.
+  break_decay_scale: 25.0
+  # LIFELONG BREAK MEMORY (2026-08-08): breaks_by_type persists here across
+  # restarts, so "mastered" survives a redeploy — every restart used to
+  # re-open the dirt tier at full worth and reset the familiarity decay.
+  # Primary stream only (scouts explore local throwaway worlds).
+  break_memory_path: podlogs/breaks_by_type.json
+world_model:
+  stochastic_size: 32
+  stochastic_classes: 32
+  deterministic_size: 512
+  encoder_hidden: 256
+  decoder_hidden: 256
+  learning_rate: 0.0003
+  batch_size: 16
+  sequence_length: 16
+  train_iters: 128
+  buffer_capacity: 240000
+  # (removed 2026-08-01: world_model.imagination_horizon had NO reader — the
+  # only consulted key is dream_training.imagination_horizon. Two identical
+  # values, one of which did nothing.)
+  film_conditioning: true
+  inverse_dynamics: true
+  inverse_dynamics_scale: 1.0
+  causal_align: true
+parallel_envs:
+  enabled: true
+  reset_timeout_s: 300
+  step_timeout_s: 120
+  num_envs: 2
+prioritized_replay:
+  enabled: true
+  alpha: 0.6
+  beta: 0.4
+  epsilon: 0.01
+async_replay:
+  enabled: true
+curiosity:
+  # EXTERNAL CURIOSITY (ported from lifelong 2026-08-01 — skybot had NO
+  # coverage_weight at all, so it defaulted to 0.0 and territory novelty was
+  # silently OFF). Count-based novelty over discretised world cells: new
+  # ground pays ~1, revisits decay as 1/sqrt(visits). This is what keeps the
+  # WORLD able to surprise a lifelong agent after prediction-error curiosity
+  # has mastered the current view. Intrinsic channel only, never a replay label.
+  # 0.15 -> 0.45 (2026-08-02). MEASURED on the live server: territory was
+  # emitting correctly but contributed only +0.0123/step — 6% of a
+  # +0.1905/step intrinsic drive — while `cells seen` sat at 2. The agent had
+  # collapsed onto spinning (turnL 56%), which is the cheapest novelty
+  # available once the inventory was closed off: rotating repaints the whole
+  # frame for one action, whereas walking must cross ~8-16 steps before a new
+  # cell pays. Coverage was not broken, it was OUT-COMPETED.
+  #
+  # This raises the payout for TRANSLATION without penalising rotation — no
+  # term says turning is bad. New ground now pays 0.45/step against a ~0.19
+  # total drive, so a walking policy roughly triples its income while a
+  # parked one still decays as 1/sqrt(visits) (0.45/sqrt(1000) = 0.014).
+  # Revert to 0.15 if the agent starts sprinting past trees instead of
+  # engaging them — territory is a means to find things, not the goal.
+  # ---- #1/#3 PERSISTENCE (potential-based, 2026-08-02) ----------------
+  # Holding attack is the LOWEST-novelty action available, so ICM paid most
+  # for turning/walking and least for the one behaviour that breaks blocks.
+  # Phi = min(1, attack_run / persistence_ticks); F = gamma*Phi' - Phi.
+  # Provably policy-preserving (Ng): a swing-then-abandon cycle telescopes to
+  # ~0, so there is no income in starting swings. What it adds is a per-step
+  # gradient for CONTINUING one — the signal a stochastic policy needs to
+  # hold an action for the ~8 consecutive macros a barehanded break costs.
+  # Set to 0.0 to disable. Intrinsic channel only, never a replay label.
+  # 0.30 -> 1.00 (2026-08-02). MEASURED: at 0.30 the per-step gradient was
+  # ~+0.0074 against a total intrinsic drive of +0.2565 — under 3%, far too
+  # quiet to compete with novelty. At 1.00 it is ~10% of the drive, and the
+  # full potential (1.0 at a completed break) sits sensibly below the +5.0 a
+  # log actually pays, so shaping never dwarfs the real task signal.
+  persistence_weight: 1.00
+  persistence_ticks: 80        # a barehanded log; dirt/grass are shorter
+  # ---- #7 APPROACH TO REACH (potential-based) -------------------------
+  # The stall fix zeroed approach/align/aim because they were RAW per-step
+  # income a parked agent farmed. This restores the missing half in
+  # telescoping form: a potential on P(breakable_in_reach), so closing pays,
+  # standing still pays exactly 0, and backing off charges it back.
+  reach_weight: 0.25
+  # MEASURED over a full run: Reach sense 0.01-0.03 while the agent broke
+  # 4931 blocks. `breakable_in_reach` is VLM-taught and llava cannot judge
+  # reach from a still frame, so the head learned to answer "no" and the
+  # approach-to-reach potential above was inert. "evidence" reads ground
+  # truth instead — a completed break proves something was within range.
+  # Retrospective, and honest about it: it says "I recently could touch
+  # something", not "I can right now". "head" restores the old behaviour.
+  reach_source: evidence
+  # 0.45 -> 0.10 (2026-08-02). Coverage counts (x, z) CELLS, so it pays for
+  # DISTANCE TRAVELLED and nothing else — and the cheapest way to maximise
+  # that is to walk in a straight line staring at the floor, which is exactly
+  # what the agent converged on (walk 40%, pitch pinned at +90, nothing seen).
+  # Kept small: territory is still worth something as an anti-parking term,
+  # but it should not be the reason to explore.
+  # 0.10 -> 0.30 (2026-08-08): "kept small" was calibrated when junk income
+  # (dirt grinding, sky/ground novelty farms) competed with walking. With
+  # all of those defunded the bot idled at 5 territory cells in 9h — the
+  # walk pressure must now be the dominant IDLE drive, because trunks only
+  # enter the fovea if the body moves. Still count-based (1/sqrt revisits),
+  # still unfarmable by pacing one cell.
+  coverage_weight: 0.30
+  # ---- NOVELTY OF EXPERIENCE (2026-08-02) ------------------------------
+  # What exploring SHOULD pay for: seeing things it has not seen. Same
+  # count-based form as coverage (new ~1, revisits decay as 1/sqrt(n)) but
+  # keyed on a hash of the agent's OWN world-model latent — so "a new thing"
+  # is defined by what its perception can already tell apart, not by a rule.
+  #
+  # Why count-based rather than raw prediction error: ICM never saturates on
+  # a rotation, so spinning farms it forever. Counting DOES saturate —
+  # turning on the spot cycles the same handful of views and their payout
+  # decays, while walking somewhere genuinely different keeps producing
+  # unseen ones. That asymmetry is what makes it exploration rather than
+  # fidgeting, and it is why this replaces most of the coverage weight.
+  # 0.45 -> 0.15. The visual hash keys on raw latent geometry, so a change
+  # of lighting or angle read as "new" even when nothing new was there. It is
+  # kept as a small floor for things the symbolic layer cannot yet name,
+  # while symbol_weight below carries the real exploration drive.
+  novelty_weight: 0.15
+  novelty_bits: 14        # 16384 buckets: coarse enough that views recur
+  # SKY DISCOUNT (2026-08-07): clouds drift even under frozen time, so a
+  # sky-filled gaze mints fresh view buckets forever. MEASURED: view-novelty
+  # was the largest itemised intrinsic term (+0.022/step) while the agent
+  # dwelt at the -90 sky clamp (43,900 gaze hits) parked in a self-dug pit.
+  # Scales view-novelty by (1 - fovea P(sky)), trust-gated, floored at 0.15
+  # so a first sky glance still pays — the FARM dies, not the sight.
+  novelty_sky_discount: true
+  # FROZEN HASH ENCODER (2026-08-07): the live shared encoder keeps training,
+  # so the bucket map drifts and old sights slowly re-key as "new" — novelty
+  # that replenishes without the world changing. Hash through a snapshot
+  # refreshed at this cadence instead. 0 = live (old behaviour).
+  novelty_encoder_refresh: 50000
+  # MASTERY HABITUATION (2026-08-08): the extrinsic break tier already
+  # decays with familiarity, and it worked (dirt pays ~0 extrinsically) —
+  # what kept the dirt farm alive was INTRINSIC income: every break makes a
+  # big frame change, so ICM/novelty re-paid the 300th dirt like the 1st
+  # (measured: 272+134 dirt across two runs, 0 logs). On a step where a
+  # block breaks, the whole step intrinsic is scaled by the LEAST-familiar
+  # type that broke: 1/(1+n/50), floored at 0.1. A novel block keeps full
+  # surprise; sights and movement are never touched. Also extends the sky
+  # view-novelty discount to fovea views dominated by mastered materials
+  # (a fresh dirt hole is a genuinely new view — digging manufactures
+  # novelty — so mastered-material views pay less). 0 = off.
+  break_habituation_scale: 50
+  # ---- SYMBOLIC NOVELTY (2026-08-02) -----------------------------------
+  # Exploration should pay for seeing things the agent can NAME as new, not
+  # for covering ground or for pixels changing:
+  #     sees new thing -> a symbol becomes grounded -> reward
+  #     sees more of an already-known symbol       -> less reward
+  #
+  # new_symbol_bonus fires ONCE, the first time a predicate crosses the
+  # symbolizer's trust gate (enough VLM labels AND enough reliability against
+  # real events) — acquiring a concept is a one-time event and can never be
+  # farmed. symbol_weight is count-based over the SET of currently-true
+  # predicates, decaying as 1/sqrt(n): staring at the ground yields one
+  # unchanging signature and decays to nothing within seconds.
+  #
+  # Nothing here says which symbols matter. The vocabulary is whatever the
+  # VLM taught and the world confirmed.
+  symbol_weight: 0.40
+  new_symbol_bonus: 2.00
+  # ---- SEEING AND AIMING, ONE DRIVE (2026-08-02) -----------------------
+  # symbol_weight above scores the SET of currently-true predicates. It is
+  # POSITION-BLIND: a tree at the edge of frame and a tree dead-centre pay
+  # exactly the same, and it decays as 1/sqrt(n) per distinct set — measured
+  # live at +0.0082/step with 48 distinct scenes, i.e. effectively zero. So
+  # NOTHING in the intrinsic channel rewarded turning toward a symbol, and
+  # the agent sat with pitch clamped at +90 while the drive that was supposed
+  # to pull it back paid the same either way.
+  #
+  # This is a POTENTIAL on centring the least-familiar thing the agent can
+  # currently name: Phi = P(something centred) x 1/sqrt(1 + times seen).
+  # Ng-telescoping, so a look-away/look-back cycle nets ~0 and fidgeting
+  # earns nothing; what it adds is the per-step GRADIENT that "turn toward
+  # it" never had. Nothing here says which symbols matter — the pull follows
+  # whatever has been named least, and fades as it becomes familiar.
+  # 0.5 matches seek_weight, the analogous orientation potential. Lower it if
+  # the agent starts sweeping its view instead of engaging what it finds.
+  symbol_center_weight: 0.5
+  # ---- GAZE COVERAGE (2026-08-02) --------------------------------------
+  # coverage_weight above counts the (x,z) CELLS the agent has stood in.
+  # NOTHING counted where it LOOKS — and pitch is clamped to [-90,+90], so
+  # once the agent drifted to +90 `lookDOWN` became a free no-op: the world
+  # does not change, so it costs zero prediction error and zero curiosity,
+  # while `lookUP` was the only action that moved. Measured over 100k+ steps:
+  # pitch pinned at +90 with lookDOWN chosen ~2x more often than lookUP —
+  # steady downward pressure into a wall that costs nothing to push against.
+  # No shaping term could fix that, because the agent was not being paid to
+  # look anywhere in particular; it simply was not being CHARGED for staring.
+  #
+  # Same count-based form as territory: a well-dwelt pitch bucket pays ~0, an
+  # unvisited one pays ~the weight, decaying 1/sqrt(n). PITCH ONLY — yaw is
+  # cyclic and spinning is this project's known cheap-novelty failure mode
+  # (turnL 56% once ate a whole run). ~12 buckets, so it saturates fast: it
+  # unsticks the clamp and then gets out of the way.
+  gaze_weight: 0.25
+  gaze_bucket_deg: 15.0
+  mode: learning_progress
+  lp_history: 30
+  lp_min_samples: 4
+  lp_pixel_pool: 4
+  # ---- STANDING STILL MUST PAY ZERO (2026-08-02) -----------------------
+  # MEASURED with the new reward census, on a stationary agent:
+  #     ICM/LP base  +0.1321/step  = 95% of the entire +0.1393 drive
+  #     LP internals running_std=1.42e-05  raw_pred_err=2.64e-03
+  # The LP pool's real spread had collapsed to 1.4e-05 — correct, the view IS
+  # mastered — but the normalizer divides by max(std, 1e-3), so residual
+  # jitter that squeaked past the RELATIVE significance gate was re-inflated
+  # ~100x into +0.13/step. Doing nothing was the best-paid behaviour
+  # available, and no shaping term (gaze, centring, coverage, all ~0.03
+  # combined) could outbid it.
+  # This requires an error drop to ALSO clear 5% of the bucket's outstanding
+  # error before it counts as learning. Unit-free and bucket-local like the
+  # existing gate. Real progress clears it easily; jitter on a mastered
+  # bucket does not — so a static view pays exactly 0 and curiosity has to be
+  # EARNED by finding something genuinely unpredicted.
+  # Raise if the agent still parks; lower if it starts ignoring real learning.
+  # ---- ACTION-CONDITIONAL CURIOSITY (2026-08-04) ------------------------
+  # MEASURED: the policy converged deterministically on `noop` — 80% of all
+  # actions, entropy 0.00 — while still collecting +0.2951/step. Doing
+  # nothing paid nearly as well as acting, so a converged policy picked it.
+  #
+  # Curiosity is forward-model prediction ERROR, and on a live server the
+  # world moves without the agent: day/night, mobs, other players, foliage.
+  # The env requests frozen time, but that is a SERVER-side handler and a
+  # foreign Paper server ignores it (confirmed — POV frames from one run show
+  # both daylight and night). Ambient change therefore paid an income for
+  # merely existing.
+  #
+  # The gate asks how much of each transition the agent's OWN action explains:
+  #     gate = relu(err_null - err_a) / (err_null + eps)   in [0,1]
+  # A no-op compares the forward model against ITSELF, so the gate is EXACTLY
+  # 0 — doing nothing can no longer earn anything, by construction rather
+  # than by tuning.
+  #
+  # SCOPE: this gates REWARD, never perception. The world model and ICM still
+  # train on every frame, so learning to predict mobs, weather and other
+  # players is untouched — that remains a goal, it just stops being PAID for.
+  action_conditional: true
+  null_action: 0        # macro 0 = noop in TREECHOP_MACROS
+  lp_abs_frac: 0.05
+  lp_proto_thresh: 0.025
+  lp_max_protos: 512
+  exploration_decay_rate: 0.02
+  feature_dim: 256
+  hidden_dim: 256
+  forward_loss_weight: 0.8
+  inverse_loss_weight: 0.2
+  curiosity_reward_scale: 1.0
+  curiosity_reward_clip: 5.0
+  learning_rate: 0.0001
+  novelty_window: 1000
+knowledge_graph:
+  neo4j_uri: bolt://localhost:7687
+  neo4j_user: neo4j
+  neo4j_password: password
+  embedding_dim: 64
+  embedding_model: TransE
+  embedding_epochs: 100
+  min_confidence: 0.7
+  max_facts_per_step: 10
+  use_in_memory_fallback: true
+  force_in_memory: true
+symbolic:
+  enabled: true
+  knowledge_source: goal
+symbolic_grounding:
+  enabled: true
+  # llava:7b -> qwen2.5vl:7b (2026-08-06). MEASURED on real 128px SkyBot
+  # frames: llava answered tree_visible=true on EVERY patch including
+  # canopy-only sky crops, and hallucinated freely on single-material patches
+  # ("a dog", "YOUR INVESTMENT"). The saturated tree_visible that froze the
+  # magnet's every gradient was the TEACHER's blindness, not the head's.
+  # qwen2.5vl:7b scored 8/8 on the same battery at the same warm latency
+  # (~1.17s vs ~1.1s). Pulled on the pod 2026-08-06 (4.7GB, fits beside the
+  # rest in 16GB VRAM).
+  model: qwen2.5vl:7b
+  # FOVEA channel (2026-08-06): alternate labelling of the CENTER CROP of the
+  # view ("what is under my crosshair?") training a separate small head. Even
+  # a good VLM cannot judge "is X under the crosshair" from a full frame — but
+  # presence-in-a-patch it answers reliably, and the crop converts the spatial
+  # question into a presence question (that is what a fovea is). Gives the
+  # magnet the per-step, pose-dependent centring gradient every potential was
+  # missing. Full-frame cadence halves (each channel labels every ~2x
+  # interval); the anneal absorbs it.
+  fovea: true
+  fovea_frac: 0.4
+  # FOVEA CADENCE (2026-08-08): fixed, NOT annealed. The anneal is driven by
+  # full-frame agreement, which says nothing about the fovea's much harder
+  # trunk-under-gaze discrimination — inherited annealing had the fovea down
+  # to one label per ~908 steps (284 labels in 11h). One qwen call is ~1.2s;
+  # at 60 the two channels together stay far under the worker's capacity.
+  fovea_interval: 60
+  # NEGATIVE EVIDENCE (2026-08-07): this many held-attack ticks with NO
+  # completed break docks the claimed affordance predicates
+  # (breakable_in_reach / object_centered / object_adjacent) — the verifier
+  # was structurally blind to false positives before this (a stuck-true
+  # predicate drifted to reliability 1.0 unopposed; llava's tree_visible
+  # did exactly that for weeks). 90 ticks > the ~60 a barehanded log needs,
+  # so a genuine slow break can never be scored as a miss. 0 = off.
+  neg_evidence_ticks: 90
+  interval: 60
+  max_interval: 600
+  anneal_agreement: 0.9
+  hidden_dim: 256
+  lr: 0.001
+  fact_threshold: 0.7
+  min_labels: 5
+  reliability_floor: 0.35
+skill_bank:
+  storage_dir: ./skill_bank_mc_curiosity
+  mastery_threshold: 0.8
+  mastery_window: 50
+  min_episodes_before_save: 20
+  # SKILL RETRIEVAL (given a python reader 2026-08-01 — both keys shipped in
+  # every config from the start and NOTHING read them; the warm-start path
+  # hardcoded 3 / 0.7 instead). max_skills_loaded = how many prior skills a
+  # new goal ranks as warm-start candidates. similarity_threshold = the floor
+  # a candidate must clear to seed the live policy, on the NORMALIZED [0,1]
+  # relevance scale ((cos+1)/2, then scaled by competence) — 0.5 is
+  # "orthogonal", 1.0 is "identical context". NOTE: 0.5 is LOOSER than the
+  # 0.7 that was hardcoded here; raise it to 0.7 to keep the old bar.
+  max_skills_loaded: 5
+  similarity_threshold: 0.5
+policy:
+  # ---- ONE VENTRAL STREAM (2026-08-01) ----------------------------------
+  # arch: wm  =>  the policy's perception IS world_model.encoder, shared by
+  # reference and read detached. Until now this run was arch:flat (the
+  # default — there was no `arch` key at all), which gave the agent TWO
+  # independent visual systems:
+  #   * the world model's CNN encoder, trained by reconstruction + KL on
+  #     every frame of all 4 streams — a dense, constant learning signal;
+  #   * the policy's own (256, 49250) pixel layer, trained only by PPO
+  #     gradients. MEASURED on a stored skill: 86% of its weights were still
+  #     inside their initialization bound and the knowledge columns sat at
+  #     1.009x init. The policy was acting on a near-random projection of the
+  #     screen while a trained representation of the same pixels sat unused.
+  # The dream actor already consumed world-model latents; the waking policy
+  # now does too. Side effects, all wanted: minted skills drop from ~116 MB
+  # to a few MB (no more three near-duplicate 49250-wide layers), and the
+  # conditioner gates 256 features instead of 49250 raw pixels.
+  # PPO CANNOT train the shared encoder (excluded from the optimizer AND
+  # detached in _encode) — perception is shaped by prediction, never reward.
+  # enc_dim is not set here on purpose: for arch:wm it is DERIVED from
+  # world_model.encoder_hidden, so the two can never drift apart.
+  arch: wm
+  algorithm: PPO
+  learning_rate: 0.0003
+  n_steps: 1024
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  extrinsic_reward_weight: 0.3
+  intrinsic_reward_weight: 0.7
+  reward_decay_rate: 5.0e-06
+  # ---- CURIOSITY MUST BE ABLE TO REACH ZERO (2026-08-02) ---------------
+  # This was never passed through, so it sat at its 0.1 default: the anneal
+  # drove curiosity down to 0.1 and then stopped, leaving a permanent drive
+  # to fidget even on a world the agent had exhausted — which is why it ends
+  # up sitting and staring. 0.0 lets it genuinely fall to nothing, so an
+  # agent with nothing left to learn is not paid to keep twitching, and the
+  # task signal is all that remains.
+  min_intrinsic: 0.0
+  # ---- THE TASK SIGNAL MUST BE VISIBLE (2026-08-02) --------------------
+  # RewardMixer has had a return-normalizing guard since 2026-07-27 and it
+  # was never wired: `return_ratio_cap` defaulted to 0.0, which DISABLES it,
+  # and no config set it. So the fix for the measured failure existed in
+  # source and ran in no run.
+  #
+  # The failure it fixes: the WEIGHTS say 0.7 intrinsic / 0.3 extrinsic, but
+  # the RETURNS were 1922:1 curiosity (weighted intrinsic return 9179.4 vs
+  # weighted extrinsic 4.78). Curiosity fires EVERY step at ~0.2; the task
+  # fires when a block breaks. Shifting a weight cannot matter at that ratio
+  # — PPO optimises curiosity and never sees the task, which is exactly the
+  # "reward does not work" symptom.
+  #
+  # 3.0 keeps curiosity DOMINANT (it is the exploration engine) while leaving
+  # the task signal an order of magnitude above invisible. The guard only
+  # ever SHRINKS intrinsic, never amplifies it, and it is inert until some
+  # extrinsic reward has actually been seen — so a task-free warmup is
+  # unaffected. min_intrinsic_scale bounds the correction so a very sparse
+  # task can damp curiosity but never delete it.
+  return_ratio_cap: 3.0
+  return_ema_alpha: 1.0e-4    # slow: the extrinsic stream is sparse and a
+                              # fast EMA would collapse between spikes
+  min_intrinsic_scale: 0.1    # floor on the damping (never zero curiosity)
+  # ---- REAL MINIBATCHING (2026-08-02) ----------------------------------
+  # `batch_size: 64` above has NEVER been read: the PPO update ran n_epochs
+  # FULL-batch passes, so a 1024-step rollout bought 10 gradient steps where
+  # standard PPO takes 10 x 16 = 160. Learning was ~16x slower than this file
+  # claimed. Deliberately a SEPARATE key: batch_size is set in all eleven
+  # configs, and adopting it would silently change MiniGrid/Crafter/Craftax
+  # learning dynamics and invalidate their recorded results.
+  # ---- REVERTED TO 0 (2026-08-02, same day it was enabled) -------------
+  # Enabling this took PPO from 10 to ~160 gradient steps per 1024-step
+  # rollout. Within three segments the (newly restored) entropy readout went
+  # 0.06 -> 0.00 -> 0.00 nats against a 2.48 maximum: the policy collapsed to
+  # a deterministic one, reward fell 0.45 -> 0.22 -> 0.15, and blocks-broken
+  # froze. 16x more sharpening per segment at entropy_coef 0.01 is the
+  # obvious cause, and the pre-change action histogram was visibly flatter
+  # (attack 30/use 25/atk+walk 20/jump 18 vs turnL 47 + entropy 0).
+  #
+  # NOT PROVEN — entropy was not recorded before the diagnostic was restored
+  # in the same wave, so this cannot be attributed with certainty. Setting it
+  # back to 0 is BOTH the rollback and the single-variable experiment: if
+  # entropy recovers, minibatching caused it.
+  #
+  # To re-enable, raise policy.entropy_coef FIRST (0.01 -> ~0.03-0.05) and
+  # watch "Policy: entropy" for three segments before trusting it. The
+  # underlying finding stands — policy.batch_size has never been read and
+  # 10 full-batch passes is very little learning per rollout.
+  minibatch_size: 0
+  # Exposed (2026-08-02) — previously pinned at the constructor default with
+  # no way to reach it, on a run whose failure mode is the action
+  # distribution collapsing onto three macros.
+  # 0.01 -> 0.03 (2026-08-02). MEASURED, once the entropy readout was finally
+  # recorded in the lifelong path: entropy falls monotonically across
+  # segments even with minibatching OFF —
+  #     93% -> 37% -> 27% -> 13% of the 2.48-nat maximum.
+  # Below ~50% the run stops sampling its own alternatives, and every shaping
+  # term added this session then becomes unreachable in principle: the gaze
+  # gradient now pays ~4x MORE for looking up than for staying pinned
+  # (0.017 vs 0.0045/step) and the agent still does not take it, because at
+  # 13% entropy it is effectively executing a fixed policy.
+  # This is the knob that governs how hard PPO is allowed to sharpen. 0.03 is
+  # a deliberate, modest step — NOT derived — chosen to slow the collapse
+  # without pinning the policy at permanent randomness. Watch
+  # "Policy: entropy" for three segments: it should settle ABOVE 50% rather
+  # than continuing to fall. Raise toward 0.05 if it keeps sliding; drop back
+  # if the agent stops committing to anything.
+  entropy_coef: 0.03
+  # ---- THE MISSING TRUST REGION (2026-08-05) ---------------------------
+  # PPO's clip_range bounds the SURROGATE OBJECTIVE, not how far the policy
+  # actually moves. Running n_epochs passes over one batch lets it walk
+  # arbitrarily far from the policy that collected the data. This codebase
+  # had NO KL check at all — no target_kl, no approx_kl, no early break —
+  # which every reference PPO (SB3, CleanRL, Spinning Up) has.
+  #
+  # MEASURED on every restart: entropy 90% -> 0.00 within one or two
+  # segments, max_prob EXACTLY 1.000 (one-hot softmax), obs_spread collapsing
+  # to 0.026 as the frozen policy stopped generating varied experience.
+  # Independent of entropy_coef (0.01 AND 0.03) and of minibatching (on AND
+  # off) — because neither of those bounds policy movement. Two rounds of
+  # tuning them failed for that reason.
+  #
+  # 0.02 is the standard value. Epochs now stop as soon as the update has
+  # spent its movement budget, so n_epochs: 10 becomes a CEILING rather than
+  # a mandate. Watch "PPO trust region" — it should stop early most segments.
+  # TESTED AND LEFT OFF (2026-08-05). Adding it was the obvious "standard
+  # PPO" fix and it MADE THINGS WORSE in the only test where movement was
+  # large enough to trip it: over 6 updates on a deliberately skewed reward,
+  #     target_kl OFF : entropy 99% -> 56%,  max_prob 0.22 -> 0.76
+  #     target_kl 0.02: entropy 99% -> 18%,  max_prob 0.30 -> 0.97
+  # The check runs AFTER an epoch completes, so it always overshoots the
+  # budget rather than enforcing it, and the shortened epoch count leaves the
+  # critic less well fit — larger advantage errors, bigger policy moves.
+  # The machinery and the approx_kl readout stay (both are useful); only the
+  # enable is withdrawn. Do not re-enable without evidence on the live run.
+  target_kl: 0.0
+  # ---- HARD EXPLORATION FLOOR (2026-08-05) -----------------------------
+  # Bounds the SPREAD of the action logits (rescaled, so their ORDER and
+  # therefore learning are untouched), capping the best/worst probability
+  # ratio at e^5. The policy may become confident; it cannot become certain.
+  #
+  # WHY A HARD BOUND AND NOT entropy_coef. Measured on the softmax itself:
+  #     max_prob 0.174 -> |d(entropy)/d(logits)| 2.88e-01
+  #     max_prob 0.920 -> 4.41e-01
+  #     max_prob 1.000 -> 9.54e-07      <- five orders of magnitude gone
+  # The entropy bonus can PREVENT saturation but can never REVERSE it, and
+  # every entropy_coef tried this session (0.01, 0.03) was applied to a policy
+  # already sitting at max_prob = 1.000 where it has no leverage whatsoever.
+  # That single fact explains why all of those attempts failed.
+  #
+  # VERIFIED over 30 updates on a deliberately skewed reward:
+  #     OFF : max_prob 0.987, entropy  5.0% of max, picked-best 98%
+  #     5.0 : max_prob 0.953, entropy 14.5% of max, picked-best 96%
+  # ~3x the exploration retained for 2 points of task performance.
+  # Raise if the agent still freezes; lower if it will not commit to anything.
+  logit_range: 5.0
+  value_coef: 0.5
+llm:
+  enabled: false
+  model: llama3.1:8b
+  env_description: 'Minecraft: find trees and chop wood.'
+  # Curiosity-ranked vision magnet (redesigned July 2026): no second VLM. It
+  # reads the grounding head's per-object presence probs + the primary stream's
+  # own learning progress (intrinsic[0]), keeps a contrastive per-category
+  # LP-EMA, and steers toward whatever it is most CURIOUS about — fading as
+  # curiosity quenches and re-arming on a novel object. Condition-based, not a
+  # clock, so it is correct in a never-ending lifelong stream.
+  vision:
+    enabled: true
+    weight: 0.6                  # peak shaping weight at full curiosity
+    min_weight: 0.0
+    # 0.20 -> 0.35 (ported from lifelong 2026-08-01). With the raw geometry
+    # terms zeroed above, the floor pull no longer scales a farmable income —
+    # it only scales the telescoping potentials, so it can be raised to
+    # actually bootstrap first contact without paying an agent to park.
+    cold_start_weight: 0.35
+    # target set: which interactables the magnet may steer toward. null ->
+    # DEFAULT_TARGETS (tree/stone/water/animal). Backgrounds are excluded so an
+    # always-on-screen predicate can't win by co-occurrence.
+    target_categories: null
+    # attribution EMAs
+    ema_beta: 0.01               # per-category / global LP EMA rate
+    # 0.005 -> 0.0 (ported from lifelong). A leak means an out-of-view
+    # category's learning-progress estimate decays toward zero, which
+    # re-arms its cold-start floor on a timer rather than on evidence —
+    # exactly the "guard becomes a latch" shape this project keeps hitting.
+    ema_leak: 0.0
+    # ---- THE MAGNET COULD NEVER RANK ANYTHING (2026-08-06) -------------
+    # _score() was cat_lp[c] - global_lp, but cat_lp is EMA'd with the same
+    # beta and the same lp as global_lp on every step c is present. For a
+    # category present on EVERY step the two series are identical by
+    # construction and the score is exactly 0, permanently. tree_visible is
+    # exactly that: the head reports it present essentially always (it read
+    # present while the agent stood in unrenderable void 65 blocks down).
+    # MEASURED: 144 of 144 segments pinned at the cold-start floor w=0.3500,
+    # cold_spent[tree]=144827, curiosity-ranked branch never fired once.
+    # Comparing against the mean of the OTHER live targets lets an
+    # always-present category still be ranked.
+    contrast_vs_peers: true
+    # ---- PHI FROM MEASURED CONTACT (2026-08-06) -------------------------
+    # object_centered / object_adjacent are VLM-taught, and llava cannot tell
+    # from a still frame whether something sits under the crosshair. The head
+    # agreed with it 96% of the time and faithfully learned "nothing is ever
+    # centred": Centring Phi 0.003 and Reach 2.0% for an entire run. The
+    # label carries no spatial information, so no amount of training fixes it.
+    # phi is now built from a COMPLETED BREAK — ground truth that something
+    # was both centred and within range — the same substitution already made
+    # for the reach sense.
+    phi_from_evidence: true
+    # trust gate (mirrors the symbolizer's perceptual_facts gate)
+    present_threshold: 0.6
+    reliability_floor: 0.35
+    min_labels: 5
+    # retarget hysteresis
+    retarget_margin: 0.20
+    min_dwell: 25
+    absent_tolerance: 3          # tolerate brief head-sigmoid flicker (MF-2)
+    # fade
+    eps_abs: 1.0e-3              # absolute LP floor for hard ON/OFF
+    scale_decay: 0.999           # running curiosity-scale decay
+    # ZERO-REWARD-STALL FIX (ported from minecraft_lifelong.yaml 2026-08-01;
+    # the fix was made there on 2026-07-25 and adversarially verified, but
+    # skybot still carried the OLD farmable values and would have reproduced
+    # the 19-hour zero-reward stall).
+    # These four are RAW PER-STEP income (x weight, unbudgeted, NOT potentials).
+    # With the cold-start budget unlatched they are farmable: standing at a
+    # trunk holding attack paid ~0.14/step (~143/segment) against +5.0 for
+    # actually felling a log — a 16:1 incentive to park. Zeroed so only the
+    # TELESCOPING potential terms survive: a parked agent earns exactly 0,
+    # while approaching still pays.
+    instinct_bonus: 0.0
+    approach_pull: 0.0
+    align_bonus: 0.0
+    aim_bonus: 0.0
+    # GOAL-SEEKING / FRONTIER drive (July 2026): the pulls above are inert once
+    # NO tree is on screen, and lifelong mode never resets the world to re-place
+    # the fleet among trees — so after the spawn cluster is harvested the primary
+    # strands off-tree at ~0 reward. seek_weight is a POTENTIAL on tree
+    # visibility (rewards actions that bring a trunk into frame; telescopes to 0
+    # over look-away/look-back so it can't be farmed). seek_forward_nudge is a
+    # small BUDGETED forward reward that unsticks the agent from parking on stone
+    # while no tree is visible; the budget refills the instant a tree is seen.
+    # Both feed shaped_extrinsic and ride the reward mixer's natural anneal — the
+    # intrinsic/extrinsic ratio is never hard-fixed.
+    seek_weight: 0.5
+    seek_categories:
+    - tree_visible
+    # GAZE RIGHTING (2026-08-06): levelness factor on the seek potential.
+    # MEASURED: pitch pinned at the sky clamp 47.7% of a segment (mean -76deg)
+    # — a pose from which no terrestrial goal can ever be foveated — and
+    # nothing paid for coming back to the horizon. Humans get this from
+    # vestibular righting. Telescoping (a bounded state function of measured
+    # pitch), scaled by goal visibility, so it cannot become a stare-at-the-
+    # horizon income.
+    seek_pitch_level: true
+    # 0.02 -> 0.05 (2026-08-08, alongside coverage 0.1->0.3): with every
+    # farm defunded, search must be the best thing to do while no tree is
+    # in sight. Still budgeted + pure-forward-only, so it cannot become a
+    # parked income; budget refills on sighting and trickles via regen.
+    seek_forward_nudge: 0.05
+    seek_nudge_budget: 200
+    # NUDGE REGEN (2026-08-07): the budget refilled ONLY on a goal sighting,
+    # so a bot that burned it without ever finding a tree lost its search
+    # drive PERMANENTLY (measured: nudge_left=0 for 10h+, parked in a
+    # self-dug pit at 20 cells explored). One nudge trickles back per this
+    # many steps — search can starve but never die. 0 = off.
+    # 500 -> 250 (2026-08-08): doubled sustain rate alongside the nudge
+    # raise — search is now the intended idle behaviour.
+    seek_nudge_regen: 250
+    # STALE-LP DISCOUNT (2026-08-07): with ema_leak=0 an absent category's
+    # LP freezes; measured 10h fossils (water/zombie/sheep ~0.4 vs global
+    # 0.03) would grab the target on their first re-sighting with zero fresh
+    # evidence. On re-appearance the stored EMA decays toward the current
+    # global with this time constant in absent-steps; recently-absent keeps
+    # its standing, long-absent re-earns. 0 = off.
+    lp_stale_tau: 20000
+    # cold-start floor budget (audit): steps of floor-pull each category gets
+    # to bootstrap its first interaction; after that an un-engaged category's
+    # floor drops to 0 (static stone can no longer pay a standing park income
+    # forever). Contrastive (genuine-curiosity) engagement is unaffected.
+    # 4000 -> 100000000 (ported from lifelong). The BUDGET LATCH was the
+    # measured cause of the 19-hour zero-reward run: the floor pull expired
+    # after 4000 steps, and with it the only drive that brought a trunk into
+    # frame. Effectively unlatched now that the farmable raw terms are 0 —
+    # what remains is potential-only, so an unbounded budget cannot be farmed.
+    cold_start_budget: 100000000
+    pitch_actions:
+    - 7
+    - 8
+    chop_actions:
+    - 5
+    - 6
+    - 12                       # HOLD attack (2026-08-05)
+    forward_actions:
+    - 1
+    - 2
+    - 6
+    turn_left_actions:
+    - 3
+    turn_right_actions:
+    - 4
+  perception_interval: 50
+  goal_interval: 25
+  reasoning_interval: 100
+  async_mode: true
+  reward_shaping:
+    enabled: false
+    weight: 0.2
+    min_weight: 0.0
+    decay: 5.0e-06
+    clip: 1.0
+    interval: 25
+skills_as_options:
+  enabled: true
+  # FOVEA CONTACT GATE (2026-08-07): break_*log* options are only OFFERED
+  # when the trunk is under the gaze (fovea P(tree) >= 0.35) or contact is
+  # measured — so the option's 80-tick budget starts at the work, not during
+  # the walk. MEASURED motivation: 61 break_spruce_log invocations, 0
+  # successes. Fail-open everywhere (ungated sense / non-log skill -> no
+  # veto); vetoes counted in the Gate state log line.
+  fovea_precondition: true
+  # INERT IN LIFELONG MODE. developmental_loop reads
+  # `lifelong.active_skills` and IGNORES k_slots whenever lifelong.enabled
+  # is true, so editing this line alone changes nothing. Kept only so the
+  # two stay visibly in agreement; the real knob is lifelong.active_skills.
+  k_slots: 24           # = lifelong.active_skills (which overrides this)
+  # WIDENED 25 -> 40 (2026-08-01), matching minecraft_lifelong.yaml, which
+  # made this change on 2026-07-25 after measuring it; skybot never got it.
+  # MEASURED: the agent chops BAREHANDED, and a log needs ~60 ticks. At 25
+  # option-steps x action_repeat 2 the chop held attack for only 50 and timed
+  # out a few ticks short EVERY time. 40 x 2 = 80 ticks clears it with margin.
+  # This is the budget the scripted chop_trunk macro needs to ever complete.
+  # Known cost: longer invocations coarsen SMDP credit assignment (~25 PPO
+  # rows per 1024-step segment instead of ~41), so do NOT raise it further
+  # without reason — the target is ticks-to-break plus margin, not "big".
+  max_option_steps: 40
+  terminate_on_spike: true
+  scouts_use_options: true
+  gate_by_preconditions: true
+  # skill-invokes-skill depth (ported from lifelong). Absent = 1 = the legacy
+  # flat behaviour, which would have made the nested-option machinery inert.
+  max_skill_depth: 2
+  # LET GOAL-DIRECTED OPTIONS DRIVE MORE: the old 0.6 gates locked out every
+  # early low-competence skill, so the policy never invoked an option (0 firings
+  # over the whole run). Loosened so learned skills are actually offered and
+  # exercised — the option value/competence still governs WHEN the policy picks
+  # them; this only widens eligibility.
+  precondition_min_match: 0.4
+  competence_floor: 0.25
+  # NO SCRIPTED OPTIONS (ported from lifelong 2026-08-01; the decision was
+  # made there on measured evidence and skybot never received it).
+  #
+  # Meaning and skill must be EARNED from experience, never declared. Felling
+  # a tree is not a fixed macro.
+  #
+  # IT WAS ALSO ACTIVELY HARMFUL. Measured over 32 segments / ~110k steps with
+  # the scripted `chop_trunk` this file used to contain:
+  #   * 2366 invocations = 96% of ALL option activity, on every stream at once
+  #   * ZERO logs broken, the entire run (69 dirt, 66 spruce_leaves, 0 logs)
+  #   * attack held for 10726 consecutive game ticks with nothing breaking
+  #   * 21+ consecutive segments of 0.00 extrinsic reward
+  # Root cause: its preconditions were tree_visible + object_centered +
+  # object_adjacent, but `precondition_min_match: 0.4` above means TWO OF
+  # THREE suffice — so it fired with object_adjacent FALSE and held attack at
+  # a trunk it could not reach. A fixed macro cannot notice it is hitting
+  # nothing; a policy can.
+  #
+  # The original justification ("the emergent policy presses attack a step at
+  # a time and moves on") does not survive the data either: the agent has
+  # already produced runs of 10-21 consecutive attack macros 69 times — that
+  # is what a 20-42 tick dirt break IS. The sustained-attack barrier this
+  # existed to vault is lower than the height the agent already clears.
+  #
+  # tests/_no_scripted_skills_smoke.py FAILS if this list is ever non-empty.
+  scripted_options: []
+  # ---- SKILLS AS MEMORIES (2026-08-01) ----------------------------------
+  # A skill used to mint ONCE, at its first unlock (when the policy could
+  # barely do it), and then stay frozen for the whole run — a recording, not
+  # a memory. With practice on, an invocation that produces the skill's OWN
+  # grounded effect trains that skill toward the actions it just took.
+  #   * self-imitation only — failures change no weights (see skill_practice)
+  #   * KL trust region — bounded drift per invocation, so the meta-policy's
+  #     value for "invoke slot k" can never go stale by more than kl_max
+  #   * consolidation — proven skills (high strength) move progressively less
+  #   * decay — unrehearsed skills weaken and are reported stale for
+  #     re-derivation from current competence
+  practice:
+    enabled: true
+    lr: 1.0e-4              # small: a skill should drift, not lurch
+    kl_max: 0.02            # max action-distribution change per invocation
+    min_steps: 4            # too short an invocation is not evidence
+    epochs: 1
+    strength_up: 0.10       # ~10 clean successes to fully consolidate
+    strength_down: 0.02     # a failure costs confidence, not weights
+    decay_per_segment: 0.01 # forgetting: ~100 unused segments to go stale
+    stale_below: 0.15
+    max_traj: 256
+  cache:
+    max_resident: 8
+    dtype: fp32
+  mine_cooccurrence: true
+# ---- LIVE VIEWER (2026-08-02) ------------------------------------------
+# MJPEG stream of the agent's own frame with the live action, extrinsic and
+# intrinsic reward overlaid. The server has existed for months and was never
+# enabled here; it was also only ever fed from the episodic loop path, so it
+# would have shown a black screen even if switched on. Both fixed.
+# Watch it with:
+#   ssh -N -L 8000:localhost:8000 -i ~/.ssh/skybot_ed25519 root@<pod>
+#   then open http://localhost:8000
+viewer:
+  enabled: true
+  port: 8000
+brain_viewer:
+  enabled: true
+  out_dir: podlogs/brain
+  interval: 400
+  ghost_frontier: true
+skill_composition:
+  enabled: true
+  min_mastery: 0.7
+  max_compositions_per_cycle: 3
+dream_training:
+  enabled: true
+  # ---- AUGMENT, NOT CONTROL (2026-08-01) --------------------------------
+  # control: true made this ENTIRE block dead in a lifelong run. Two
+  # independent gates closed it:
+  #   1. dream_training_active = (not lifelong) and control and stage==IMAGINE
+  #      -> lifelong.enabled: true forces this False, forever.
+  #   2. dream_augment = enabled and NOT control -> control:true forces this
+  #      False, so the distill path never ran either.
+  # control: false selects AUGMENT mode, which lifelong DOES support (the
+  # dream_augment_active check carries no lifelong guard): PPO stays in
+  # control of real actions and the PPO path is byte-for-byte unchanged,
+  # while the dream actor trains in imagination and is distilled into the
+  # real policy. That is the sample-efficiency lever this run wants — the
+  # bottleneck is the Minecraft client at ~10 steps/s, not GPU.
+  control: false
+  warmup_episodes: 2
+  # NOW LIVE (it gates dream_augment_active). Kept explicit rather than
+  # relying on its silent fallback to warmup_episodes.
+  activate_after_episodes: 2
+  # 15 -> 30. At action_repeat 2 a 15-step dream is only 30 GAME TICKS, and a
+  # barehanded log break is ~60 — the rollout structurally could not contain
+  # a completed break, so the dream critic could never propagate value back
+  # from one. 30 steps = 60 ticks covers it. COST: compounding WM error over
+  # longer rollouts; if dream_distill_trust_frac is low, walk this back first.
+  imagination_horizon: 30
+  batch_size: 16
+  # 1 -> 4. One batch of 16 sequences per 1024-step segment was a rounding
+  # error of extra learning. Dream batches cost GPU, not environment
+  # interaction, and the env is the bottleneck — so this is close to free.
+  n_dream_batches: 4
+  # Verified safe: _add_dream_curiosity calls the ICM with update_state=False
+  # and never writes to replay or the WM reward head, so it does NOT cross the
+  # self-hallucinated-reward boundary. BUT it makes the dream teacher prefer
+  # states the ICM found surprising IN IMAGINATION, which on a weak WM is the
+  # same set as "hallucinated". Turn this OFF FIRST if distillation hurts.
+  dream_curiosity: true
+  hidden_dim: 400
+  actor_lr: 3.0e-05
+  critic_lr: 3.0e-05
+  gamma: 0.997
+  lambda_: 0.95
+  entropy_scale: 0.0003
+  target_ema: 0.98
+  # ---- DISTILL STRENGTH (were defaults; made explicit so they are tunable) --
+  distill_weight: 1.0            # base dream->real pull
+  distill_lr: 1.0e-4             # optimizer LR for the distill step
+  teacher_temp: 0.5              # <1 sharpens toward the dream's PREFERRED action
+  value_gate: true               # distill only where dream critic > real critic
+  natural_anneal: true           # fade the pull by (1 - solve_ema)
+  # ---- THE ANNEAL'S DEFINITION OF "SOLVED" (defect fix 2026-08-01) --------
+  # WAS the 0.1 default, which is calibrated for EPISODIC tasks where episode
+  # reward means task completion. In lifelong, episode_metrics is a 1024-step
+  # SEGMENT and episode_reward is the primary stream's raw extrinsic SUM —
+  # so a single incidental dirt break (+0.15) or leaf (+0.3) marked the whole
+  # segment "solved". With solve_ema_beta 0.05 the EMA saturates toward 1.0
+  # within ~60 segments and eff_w = w * (1 - solve_ema) collapses to ~0: the
+  # distillation would have annealed ITSELF OFF because the agent broke some
+  # dirt, not because it learned anything. 5.0 = one log, i.e. real progress.
+  solve_threshold: 5.0
+  solve_ema_beta: 0.05
+  # ---- WM-TRUST GATE — do not tune blind ---------------------------------
+  # This is what stands between the policy and the documented collapse mode
+  # (weak WM -> hallucinating teacher -> full-strength pull -> more failure).
+  # The distill step RETURNS dream_distill_trust_frac / _gate_frac /
+  # _eff_weight — READ THOSE before changing trust_kl_max. trust_frac ~0 means
+  # the WM never earns trust (inert but safe) -> raise it. trust_frac ~1 while
+  # the WM is visibly bad -> lower it. 6.0 nats summed over 32 categorical
+  # groups is tight for pixel Minecraft; expect a low fraction at first.
+  trust_gate: true
+  trust_kl_max: 6.0
+  trust_ema_beta: 0.1
+  # ---- SLEEP CONSOLIDATION FOR SKILLS (2026-08-01) -----------------------
+  # Waking practice only fires when a skill is invoked AND produces its own
+  # grounded effect — rare at ~10 env steps/s. Here each bound skill is
+  # rolled forward through the WORLD MODEL using its own actor, and trained
+  # toward its ELITE imagined rollouts. Same self-imitation, same KL trust
+  # region, same consolidation curve as waking practice; only the evidence
+  # is dreamed, and it is discounted (lr_scale) and gated on WM trust
+  # accordingly. min_trust is the important safety line: below it a rollout
+  # is confabulation, and consolidating on it teaches the skill to be good
+  # at a hallucination. Raise min_trust if dream_distill_trust_frac is high
+  # while real competence is not improving.
+  consolidate_skills:
+    enabled: true
+    min_trust: 0.2        # WM trust EMA floor — below this, nothing dreams
+    rollouts: 8           # imagined trajectories per skill per rehearsal
+    horizon: 12           # imagination depth (WM error compounds past this)
+    elite_frac: 0.25      # top fraction of rollouts that teach
+    slots_per_segment: 3  # round-robin, so every skill gets sleep
+    lr_scale: 0.5         # dreamed evidence is weaker than real evidence
+developmental_stages:
+  window: 6
+  min_episodes: 2
+  flat_slope_threshold: 0.001
+  skill_rate_threshold: 0.02
+  spike_factor: 2.5
+  reentry_bump: 0.2
+  trust_level: 0.012
+  patience: 4
+  # total_timesteps counts ALL streams, so thresholds here are num_envs x the
+  # primary stream's steps. 200000 fired EXPLOIT at only 50k primary steps
+  # (audit); 800000 was then chosen as "= 200k primary steps" on the
+  # assumption of 4 streams.
+  # CORRECTED 2026-08-02: parallel_envs.num_envs is 2, not 4, so the counter
+  # advances +2 per loop step and 800000 was actually 400k primary steps —
+  # double the intended point, and since the mixer is gated=True that also
+  # doubled how long the curiosity->task anneal stayed frozen (min_intrinsic
+  # 0.0 does nothing until start_anneal fires). 400000 = 200k primary steps,
+  # which is what was meant. Keep this = 2 x the intended primary-step count
+  # whenever num_envs changes.
+  force_exploit_timestep: 400000
+  force_imagine_timestep: 1500000
+hub:
+  enabled: false
+  repo_id: ''
+  private: true
+  push_on_mastery: false
+  token: null
+distributed:
+  enabled: false
+  num_workers: 4
+  num_cpus_per_worker: 1
+  num_gpus_per_worker: 0
+  shared_skill_bank: true
+  ray_address: null
+loop:
+  total_timesteps: 4000000
+  checkpoint_interval: 25000
+  eval_interval: 1000000
+  eval_episodes: 1
+  curriculum_enabled: false
+  difficulty_increase_threshold: 0.8
+  difficulty_check_interval: 50
+  log_dir: ./logs
+  # ---- SELECTIVE RESUME (2026-08-03) -----------------------------------
+  # load_checkpoint() has existed for months and NOTHING in the launch path
+  # ever called it, so every restart threw away the world model, policy,
+  # curiosity, dream actor and glue layer and relearned from scratch — while
+  # the skill bank persisted. The system retained SKILLS better than
+  # LEARNING. That is why entropy started ~90% after every deploy and the
+  # reward curve 0.02 -> 0.14 -> 0.38 -> 0.53 was re-run from zero each time.
+  #
+  # PERCEPTION ONLY, ON PURPOSE. These four are trained by PREDICTION, not by
+  # reward, so none of them carries a policy pathology forward. The world
+  # model is also the expensive one (55 MB, every frame of every stream) and
+  # under arch="wm" the policy READS its encoder — so a fresh policy resumes
+  # onto a trained visual system and only relearns its action mapping.
+  #
+  # `policy` and `dream_actor` are deliberately ABSENT and are refused by
+  # name if added: they encode a policy converged under the reward economics
+  # we just changed, and would resume at ~0 entropy with no way to explore
+  # out of a now-wrong optimum. Revisit once entropy is understood.
+  #
+  # STILL NOT PERSISTED ANYWHERE (separate problem, not fixed here): the
+  # count-based familiarity state — _visits, _nov_counts, _gaze_counts,
+  # _symbol_counts, _bucket_err, _protos. They are plain dicts, absent from
+  # every state_dict, so "what have I already seen" resets on every launch
+  # and the agent still collects a novelty windfall each restart.
+  resume_components:
+    - world_model
+    - symbolic_decoder
+    - glue_layer
+    - knowledge_graph
+  tensorboard: true
+  verbose: 1
+imagination_curiosity:
+  # CURIOSITY THAT DOES NOT DIE (ported from lifelong 2026-08-01 — this block
+  # was entirely ABSENT from skybot, so the subsystem was off).
+  # Learning-progress curiosity is a DERIVATIVE of prediction error, so it
+  # necessarily dies once a stationary world is mastered — and skybot runs on
+  # a persistent server where that happens. This adds two world-model-sourced
+  # drives that take over as external curiosity fades: DISAGREEMENT between
+  # imagined rollouts (never dies — there is always something the model is
+  # unsure of) plus a small DECAYING daydream term. Intrinsic channel ONLY,
+  # so it can never become a replay reward LABEL and train the world model's
+  # reward head on the agent's own daydreams.
+  enabled: true
+  every: 50                      # steps between imagination probes (cost)
+  rollouts: 8                    # K imagined futures
+  horizon: 10                    # H latent steps each
+  disagreement_weight: 0.30      # the durable, never-dying term
+  imagined_reward_weight: 0.10   # the small daydream term...
+  imagined_reward_halflife: 300000   # ...which decays over a life
+  lp_reference: 0.05             # global_lp at which boredom = 0
+  max_bonus: 0.5                 # hard cap on the total intrinsic add
+goals:
+  # REPEATABILITY GATE (ported from lifelong 2026-08-01 — absent here, so one
+  # reward spike could mint a skill). A spike must RECUR before it becomes a
+  # goal/skill; without it the bank fills with junk goals (48/48 ungrounded
+  # slots, 0/51 mastered, was the measured outcome). Enforced by
+  # tests/_repeatability_gate_smoke.py.
+  mint_min_repeats: 3
+  mint_window_eps: 12
+  mode: discovered
+  max_slots: 48        # widened working goal set (single-knob = lifelong.active_goals)
+  mint_skills: true
+  spike_threshold: 0.9
+  match_cosine: 0.8
+  seed: 0
+video:
+  enabled: true
+  out_dir: podlogs/mc_videos
+  head: 3
+  every: 25
+  upscale: 6
+  fps: 12
+lifelong:
+  enabled: true
+  forever: false
+  stop_file: podlogs/STOP
+  segment_steps: 1024
+  active_skills: 24
+  active_goals: 48
+  state_decay: 1.0
+  reset_on_death_only: true
+  segment_len: 1024
+  wm_train_every: 250
+  goal_horizon: 8000
+  # Working-set <-> long-term paging (unbounded goals). With this ON a full
+  # goals.max_slots registry no longer refuses new discoveries: the stalest
+  # low-value slot is paged OUT to an on-disk store (evict-on-disuse) and a
+  # re-encountered behaviour is RECALLED (recall-on-cue). Total knowledge grows
+  # unbounded on disk while the network only ever sees the bounded working set.
+  # Skill payloads are NEVER wiped on a page-out (skill_bank_data is retained).
+  paging:
+    enabled: true
+    min_idle_episodes: 8      # goal-horizon windows a slot must be idle to evict
+    recall_threshold: 0.8     # cosine cue-match to page a dormant behaviour in
+
+# ---- Acting-while-learning: WM consolidation on a background thread ----
+# (the bot never freezes at wm_train_every; PPO stays synchronous)
+async_wm:
+  enabled: true
+
+# ---- Goal-level prospection: imagine-before-committing at goal selection ----
+# At each goal horizon the frontier's top-M candidates are rolled through the
+# world model under their counterfactual goal broadcasts; imagined discounted
+# return blends 50/50 with the retrospective frontier score.
+prospection:
+  enabled: true
+  weight: 0.5
+  top_m: 4
+  rollouts: 16
+  horizon: 15

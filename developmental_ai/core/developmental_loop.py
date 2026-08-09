@@ -1,0 +1,7819 @@
+"""
+Developmental AI Loop — Core Orchestrator
+============================================
+This is the MAIN LOOP that ties all components together into a unified
+developmental learning system. It implements the core cycle from the
+architecture diagram:
+
+  Environment → Curiosity Engine → Set Own Goal → Explore & Act →
+  Observe Result → Prediction Error → Update World Model → Add Skill →
+  (repeat, no endpoint)
+
+Key difference from standard RL training loops:
+  - There is NO fixed task or reward function
+  - The agent sets its OWN goals based on curiosity
+  - Learning never "finishes" — skills compound indefinitely
+  - The knowledge graph accumulates symbolic facts alongside neural learning
+  - Skills are detected, saved, and reused automatically
+
+Data flow between components (per step):
+  1. Gymnasium sends raw observations to ICM + Policy
+  2. ICM computes curiosity/intrinsic reward from prediction error
+  3. Policy selects action using blended (intrinsic + extrinsic) reward
+  4. World model (RSSM) encodes experience into latent space
+  5. Fact extractor converts observations to symbolic facts → Knowledge Graph
+  6. PyKEEN trains graph embeddings → feeds structured knowledge back to RSSM
+  7. Skill Bank detects mastery and saves/retrieves learned policies
+
+This module is the "orchestra conductor" — it doesn't implement any
+algorithms itself, but coordinates all the components in the right order.
+
+NOTE: The "glue layer" (Section 3.2 in the reference doc) that deeply
+connects DreamerV3's latent space to the skill bank is intentionally
+left as a placeholder interface. The user will implement this custom
+component later. What we build here is the orchestration framework
+that the glue layer plugs into.
+"""
+
+import torch
+import numpy as np
+import gymnasium as gym
+import yaml
+import json
+import os
+import time
+import random
+import logging
+from typing import Dict, Optional, Any, List, Tuple
+from collections import deque
+
+# Framework components
+from developmental_ai.world_model.rssm import WorldModel, symexp
+from developmental_ai.world_model.replay_buffer import (
+    ReplayBuffer,
+    MultiStreamReplayBuffer,
+)
+from developmental_ai.curiosity.icm import IntrinsicCuriosityModule
+from developmental_ai.curiosity.learning_progress import LearningProgressCuriosity
+from developmental_ai.knowledge_graph.knowledge_graph import (
+    InMemoryKnowledgeGraph,
+    Neo4jKnowledgeGraph,
+    create_knowledge_graph,
+    FactExtractor,
+    SymbolicFact,
+)
+from developmental_ai.knowledge_graph.graph_embeddings import (
+    KGEmbeddingTrainer,
+    KnowledgeGraphGNN,
+    SymbolicNeuralGate,
+)
+from developmental_ai.skill_bank.skill_bank import (
+    SkillBank,
+    MasteryDetector,
+    SkillComposer,
+    CompositeSkillExecutor,
+)
+from developmental_ai.policy.actor_critic import (
+    StandaloneActorCritic,
+    RewardMixer,
+    DreamActorCritic,
+)
+from developmental_ai.environments.wrappers import (
+    make_env,
+    get_env_labels,
+    DevelopmentalEnvWrapper,
+)
+from developmental_ai.core.episodic_memory import EpisodicWorkingMemory
+from developmental_ai.core.affordance_broadcast import AffordanceBroadcast
+from developmental_ai.core.rule_regime_broadcast import RuleRegimeBroadcast
+from developmental_ai.world_model.symbolic_decoder import SymbolicDecoderManager
+from developmental_ai.core.glue_layer import (
+    GlueLayer,
+    DevelopmentalStageController,
+)
+from developmental_ai.llm.llm_module import LLMModule
+
+logger = logging.getLogger(__name__)
+
+
+# Confidence for EARNED-MEANING facts. These four paths had NEVER executed —
+# both sensors that trigger them were dead — so a missing confidence field
+# (3-tuple into a 4-tuple unpack) crashed the run the moment they first fired.
+# The values encode measured-vs-inferred: the damage/death EVENT is ground
+# truth but WHICH creature caused it is a VLM identification and can be wrong;
+# the tool facts are measured on both halves (inventory-derived hand + a real
+# block break), so they are trusted more.
+_CREATURE_FACT_CONF = 0.7
+_TOOL_FACT_CONF = 0.9
+
+
+def _to_fact(triple, source: str, timestep: int = 0) -> "SymbolicFact":
+    """(subject, relation, object, confidence) -> SymbolicFact.
+
+    `timestep` must be threaded in: SymbolicFact.timestamp defaults to 0, so
+    without it every symbolizer fact is stamped 0 and the max(timestamp)
+    update inside add_fact is a permanent no-op. FactExtractor already passes
+    a real timestep; this makes the symbolizer channel consistent with it.
+    """
+    subj, rel, obj, conf = triple
+    return SymbolicFact(subject=subj, relation=rel, obj=obj,
+                        confidence=float(conf), source=source,
+                        timestamp=int(timestep))
+
+
+class _NullSymbolicDecoder:
+    """No-op symbolic decoder for PIXEL envs (July 2026, Crafter).
+
+    The real SymbolicDecoderManager allocates one classification head per
+    observation DIMENSION and extracts per-dimension facts — sensible for a
+    151-d symbolic grid vector, meaningless (and ~16M params + a per-step
+    softmax over 12k heads) for raw pixels. This stub satisfies every call
+    site: update_discretizer/extract_facts/train_step no-op, stats carries
+    the keys the episode printout reads, avg_confidence=0 keeps the glue's
+    uncertainty term inert, and decoder=None (the checkpoint writer guards).
+    """
+
+    decoder = None
+    avg_confidence = 0.0
+    stats = {"symbolic_decoder_confidence": 0.0}
+
+    def update_discretizer(self, obs) -> None:
+        pass
+
+    def extract_facts(self, latent, timestep: int = 0) -> list:
+        return []
+
+    def train_step(self, latent_states=None, raw_observations=None, **kw) -> dict:
+        return {}
+
+
+class DevelopmentalAI:
+    """
+    The complete developmental AI agent.
+
+    This class creates and coordinates all components:
+      - Environment (Gymnasium)
+      - World Model (RSSM)
+      - Curiosity Engine (ICM)
+      - Knowledge Graph (in-memory or Neo4j)
+      - Graph Embeddings (PyKEEN)
+      - Skill Bank
+      - Policy (actor-critic)
+      - Reward Mixer
+
+    Usage:
+        agent = DevelopmentalAI(config_path="configs/default.yaml")
+        agent.run(total_timesteps=100000)  # Or run indefinitely
+
+    The agent can be stopped and resumed — the knowledge graph and
+    skill bank persist to disk, and the world model can be checkpointed.
+    """
+
+    def __init__(self, config: Optional[Dict] = None, config_path: Optional[str] = None):
+        """
+        Initialize all components of the developmental AI agent.
+
+        Args:
+            config: Configuration dictionary (overrides config_path)
+            config_path: Path to YAML configuration file
+        """
+        # Load configuration
+        if config is not None:
+            self.config = config
+        elif config_path is not None:
+            with open(config_path, "r") as f:
+                self.config = yaml.safe_load(f)
+        else:
+            # Use sensible defaults
+            self.config = self._default_config()
+
+        # ---- Deterministic seeding (optional) ----
+        # When `seed` is set in the config, fix every RNG that affects training so
+        # that two runs differing ONLY in a single config flag (e.g. the symbolic
+        # ablation: symbolic.enabled on vs off) start from identical weights and
+        # follow the same environment stream. Without this, run-to-run RNG noise
+        # could masquerade as a treatment effect. Default None preserves the prior
+        # non-deterministic behavior. The env's RNG is seeded once on the first
+        # reset (see `_seeded_reset`); subsequent resets advance deterministically.
+        self.seed = self.config.get("seed", None)
+        self._env_seeded = False
+        if self.seed is not None:
+            self.seed = int(self.seed)
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
+            # Single-threaded BLAS removes a major source of float nondeterminism
+            # on CPU; harmless if already set by the launch environment.
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except Exception:
+                pass
+            logger.info(f"Deterministic seed set: {self.seed}")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
+
+        # ---- Create environment ----
+        env_cfg = self.config.get("environment", {})
+        self.env_name = env_cfg.get("name", "CartPole-v1")
+        self.pixel_obs = env_cfg.get("pixel_obs", False)
+        # Determine lifelong EARLY: env[0] (self.env) is built next and must
+        # carry the flag (in lifelong mode the world must never truncate).
+        # The full LifelongController + parallel-requirement check comes later.
+        self._lifelong = bool(
+            self.config.get("lifelong", {}).get("enabled", False))
+        self.image_size = env_cfg.get("image_size", 64)
+        self.image_channels = 1 if env_cfg.get("grayscale", False) else 3
+        # Live viewer: when enabled, force rgb_array rendering so env.render()
+        # yields frames to stream. Config-gated, default off (existing runs
+        # unchanged). See developmental_ai/core/viewer_server.py.
+        viewer_cfg = self.config.get("viewer", {})
+        self._viewer_enabled = bool(viewer_cfg.get("enabled", False))
+        _render_mode = "rgb_array" if self._viewer_enabled else env_cfg.get("render_mode")
+        self.env, self.curriculum = make_env(
+            env_name=self.env_name,
+            normalize=True,
+            curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
+            render_mode=_render_mode,
+            max_episode_steps=env_cfg.get("max_episode_steps"),
+            pixel_obs=self.pixel_obs,
+            image_size=self.image_size,
+            grayscale=env_cfg.get("grayscale", False),
+            agent_view_size=env_cfg.get("agent_view_size"),
+            action_repeat=env_cfg.get("action_repeat", 1),
+            render_size=env_cfg.get("render_size", 0),
+            lifelong=self._lifelong,
+            remote_server=env_cfg.get("remote_server"),
+            remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
+            # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
+            # the swing that fells a log, so the PROCESS of chopping out-earns
+            # any other block per tick — not just the completion event.
+            # 0.0 = off = byte-identical for every other config. BOTH call
+            # sites get it: the scouts feed the same shared world model, so
+            # different reward rules per stream would teach it two economies.
+            log_tick_reward=env_cfg.get("log_tick_reward", 0.0),
+            log_tick_cap=env_cfg.get("log_tick_cap", 120),
+            log_break_reward=env_cfg.get("log_break_reward", 5.0),
+            break_decay_scale=env_cfg.get("break_decay_scale", 0.0),
+            # lifelong break-mastery memory (2026-08-08): survives restarts
+            break_memory_path=env_cfg.get("break_memory_path", None),
+            start_tool=env_cfg.get("start_tool", "__default__"),
+        )
+
+        # ---- Live viewer server (optional) ----
+        self.viewer = None
+        if self._viewer_enabled:
+            try:
+                from developmental_ai.core.viewer_server import ViewerServer
+                self.viewer = ViewerServer(port=int(viewer_cfg.get("port", 8000)))
+                self.viewer.start()
+                logger.info(
+                    f"Live viewer streaming on port {viewer_cfg.get('port', 8000)} "
+                    f"(SSH-tunnel it, then open http://localhost:{viewer_cfg.get('port', 8000)})"
+                )
+            except Exception as e:
+                logger.warning(f"Live viewer disabled (init failed): {e}")
+                self.viewer = None
+
+        # Get environment dimensions
+        self.obs_dim = self.env.obs_dim
+        # PROPRIOCEPTION SOURCE: the env decides whether the agent has a body
+        # sense and how wide it is. Duck-typed on purpose — any env exposing
+        # PROPRIO_DIM + emitting info["proprio"] gets one for free, and any
+        # env that does not yields 0 and the unchanged pixels-only policy.
+        # Unwrapped so a wrapper chain cannot hide it.
+        _e = self.env
+        for _ in range(6):
+            if hasattr(_e, "PROPRIO_DIM"):
+                break
+            _e = getattr(_e, "env", None) or getattr(_e, "unwrapped", None)
+            if _e is None:
+                break
+        self._proprio_source = _e if hasattr(_e, "PROPRIO_DIM") else None
+        # last-seen self-state per env; act() consumes this (it runs before
+        # the step, so there is no "this step" proprio yet)
+        self._proprio_per_env = None
+        if self._proprio_source is not None:
+            logger.info("proprioception: %d dims from %s (%s)",
+                        int(self._proprio_source.PROPRIO_DIM),
+                        type(self._proprio_source).__name__,
+                        ", ".join(self._proprio_source.PROPRIO_KEYS))
+        self.action_dim = self.env.action_dim
+        self.is_discrete = self.env.is_discrete
+
+        # Per-DIMENSION symbolic machinery (the symbolic decoder builds one
+        # classification head per obs dim; the fact extractor bins per obs
+        # dim) only makes sense for LOW-dim structured observations. Skip it
+        # for pixels (12288-d) AND high-dim structured vectors like
+        # Craftax-Symbolic (8268-d) — otherwise it is ~thousands of heads of
+        # per-element nonsense and a large silent per-step tax. Low-dim
+        # symbolic envs (MiniGrid 151-d, CartPole 4-d) are unaffected.
+        self._skip_perdim_symbolic = self.pixel_obs or self.obs_dim > 2000
+
+        # Get human-readable labels for this environment
+        self.obs_labels, self.action_labels = get_env_labels(self.env_name)
+
+        logger.info(
+            f"Environment: {self.env_name} | "
+            f"obs_dim={self.obs_dim}, action_dim={self.action_dim}, "
+            f"discrete={self.is_discrete}"
+        )
+
+        # ---- Create World Model (RSSM) ----
+        wm_cfg = self.config.get("world_model", {})
+        self.world_model = WorldModel(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            stochastic_size=wm_cfg.get("stochastic_size", 32),
+            stochastic_classes=wm_cfg.get("stochastic_classes", 32),
+            deterministic_size=wm_cfg.get("deterministic_size", 512),
+            hidden_dim=wm_cfg.get("encoder_hidden", 256),
+            learning_rate=wm_cfg.get("learning_rate", 1e-4),
+            pixel_obs=self.pixel_obs,
+            image_channels=self.image_channels,
+            image_size=self.image_size,
+            film_conditioning=bool(wm_cfg.get("film_conditioning", False)),
+            inverse_dynamics=bool(wm_cfg.get("inverse_dynamics", False)),
+            inverse_dynamics_scale=float(wm_cfg.get("inverse_dynamics_scale", 1.0)),
+            discrete_actions=self.is_discrete,
+        ).to(self.device)
+        # Causal action alignment (ON by default since the July 2026 audit —
+        # CODE_AUDIT_2026-07.md §A). When on, the WM learns true
+        # action->next-state dynamics (state_t built from the action that
+        # CAUSED o_t), fixing the off-by-one that made the prior predict the
+        # next obs from the NEXT action (policy-correlation leak).
+        self.world_model.action_shift = bool(wm_cfg.get("causal_align", True))
+
+        # ---- Parallel environments (opt-in, OFF by default) ----
+        # When enabled, multiple env copies are stepped in lockstep and the
+        # neural ops are batched across them, while the replay buffer keeps one
+        # independent stream per env. The single-env path is preserved exactly.
+        par_cfg = self.config.get("parallel_envs", {})
+        self._use_parallel_envs = par_cfg.get("enabled", False)
+        self._num_envs = max(1, int(par_cfg.get("num_envs", 1)))
+        if self._num_envs <= 1:
+            self._use_parallel_envs = False
+        self._parallel_envs: List[Any] = []
+        self._parallel_curricula: List[Any] = []
+
+        # Replay buffer for world model training
+        per_cfg = self.config.get("prioritized_replay", {})
+        # uint8 obs storage (step 8): pixel obs are [0,1] -> quantize x255 for
+        # a 4x RAM cut; vector envs keep float32 (obs may be negative).
+        _obs_uint8 = bool(self.pixel_obs and wm_cfg.get("obs_uint8", True))
+
+        # ---- Lifelong / continuous-stream mode (default OFF) ----
+        from developmental_ai.core.lifelong import LifelongController
+        self._ll_ctrl = LifelongController(self.config.get("lifelong", {}))
+        assert self._lifelong == self._ll_ctrl.enabled  # set early, re-affirmed
+        if self._lifelong and not self._use_parallel_envs:
+            raise ValueError(
+                "lifelong.enabled requires parallel_envs.enabled with "
+                "num_envs>1; the single-env path is not covered by the "
+                "continuous loop.")
+        self._ll = None                 # the LifelongState, built at stream start
+        self._stream_started = False
+        self._stream_obs = None
+        self._last_wm_metrics = None
+
+        if self._use_parallel_envs:
+            self.replay_buffer = MultiStreamReplayBuffer(
+                num_streams=self._num_envs,
+                capacity=wm_cfg.get("buffer_capacity", 100000),
+                obs_dim=self.obs_dim,
+                action_dim=self.action_dim,
+                per_alpha=per_cfg.get("alpha", 0.6),
+                per_beta=per_cfg.get("beta", 0.4),
+                per_epsilon=per_cfg.get("epsilon", 1e-2),
+                obs_uint8=_obs_uint8,
+            )
+        else:
+            self.replay_buffer = ReplayBuffer(
+                capacity=wm_cfg.get("buffer_capacity", 100000),
+                obs_dim=self.obs_dim,
+                action_dim=self.action_dim,
+                per_alpha=per_cfg.get("alpha", 0.6),
+                per_beta=per_cfg.get("beta", 0.4),
+                per_epsilon=per_cfg.get("epsilon", 1e-2),
+                obs_uint8=_obs_uint8,
+            )
+        # Prioritized + asynchronous replay are opt-in. When both are off, the
+        # buffer behaves exactly like the original uniform/synchronous sampler.
+        self._use_per = per_cfg.get("enabled", False)
+        self._use_async_replay = self.config.get("async_replay", {}).get(
+            "enabled", False
+        )
+        self._bg_sampler = None  # lazily created BackgroundSampler
+        # ---- Async world-model trainer ("retrospective consolidation") ----
+        # Acting-while-learning: the WM's 128-iter gradient block runs on a
+        # background thread so the primary stream never freezes at the
+        # wm_train_every cadence (on a real multiplayer server the world keeps
+        # ticking — a 20-50s inline block leaves the bot statue-still and
+        # historically got it kicked). One-slot ticket queue, skip-if-busy:
+        # tickets never backlog; a skipped tick reposts at the next cadence
+        # point on fresher data. PPO stays synchronous (on-policy). Params are
+        # guarded by _wm_param_lock at per-gradient-step granularity against
+        # the main thread's per-step observe forwards, checkpoint saves, and
+        # prospection rollouts. Default OFF: existing configs byte-identical.
+        import queue as _queue
+        import threading as _threading
+        self._use_async_wm = self.config.get("async_wm", {}).get(
+            "enabled", False)
+        self._wm_trainer_thread = None
+        self._wm_ticket = _queue.Queue(maxsize=1)
+        self._wm_trainer_stop = _threading.Event()
+        self._wm_busy = _threading.Event()
+        self._wm_param_lock = _threading.RLock()
+        self._wm_metrics_box = None  # trainer publishes by atomic ref-swap
+        self._wm_metrics_fresh = False  # consume-once gate for run()'s users
+        # replay-ratio instrumentation (equal-learning verdict): count cadence
+        # points reached vs training blocks actually EXECUTED. skip_ratio =
+        # 1 - executed/cadence; near 0 => async trains on ~every datum sync
+        # would, i.e. equal effective replay ratio.
+        self._wm_cadence_hits = 0
+        self._wm_blocks_run = 0
+        # ---- Goal-level prospection config (hook wired at broadcaster) ----
+        self._prospection_cfg = dict(self.config.get("prospection", {}))
+        # ---- Imagination curiosity (the drive that does not die) ----
+        # LP curiosity is a DERIVATIVE of prediction error, so it necessarily
+        # dies once a stationary world is mastered. These world-model-sourced
+        # drives take over as external curiosity fades (boredom gate), and go
+        # into the INTRINSIC channel ONLY so they can never become a replay
+        # reward LABEL — the WM reward head must never learn from the agent's
+        # own daydreams (that loop is how an agent learns to hallucinate its
+        # own reward). See curiosity/imagination_curiosity.py.
+        from developmental_ai.curiosity.imagination_curiosity import (
+            ImaginationCuriosity)
+        # territory-coverage weight (external curiosity; intrinsic channel)
+        # #1/#3 persistence shaping (potential-based; see the note at its
+        # application site). ticks = what a barehanded break actually costs.
+        _cur_cfg = self.config.get("curiosity", {})
+        self._persist_weight = float(_cur_cfg.get("persistence_weight", 0.0))
+        self._persist_ticks = float(_cur_cfg.get("persistence_ticks", 80.0))
+        self._persist_phi = 0.0
+        # #7 approach-to-reach potential (telescoping; see its use site)
+        self._reach_weight = float(_cur_cfg.get("reach_weight", 0.0))
+        # ---- PERCEPTUAL NOVELTY (see _perceptual_cell) --------------------
+        # Count-based novelty over WHAT IS SEEN rather than WHERE THE BODY IS.
+        self._novelty_weight = float(_cur_cfg.get("novelty_weight", 0.0))
+        self._nov_bits = int(_cur_cfg.get("novelty_bits", 14))
+        self._nov_counts: Dict[int, int] = {}
+        self._nov_proj = None
+        # SKY DISCOUNT (2026-08-07): clouds drift even under frozen time, so
+        # a sky-filled gaze mints fresh view buckets forever — measured as
+        # the largest itemised intrinsic term (+0.022/step) while the agent
+        # dwelt at the -90 pitch clamp. Scale view-novelty by how little of
+        # the FOVEA is sky (trust-gated; 1.0 when the fovea is ungated, so
+        # the term is inert until the sense has earned labels). Floor keeps a
+        # first-ever sky glance worth something — it is the FARM that dies,
+        # not the sight.
+        self._nov_sky_discount = bool(_cur_cfg.get(
+            "novelty_sky_discount", False))
+        # FROZEN HASH ENCODER (2026-08-07): _view_key hashed through the LIVE
+        # shared encoder, which keeps training — so the bucket map itself
+        # drifts and OLD sights slowly re-key as "new" (novelty that
+        # replenishes without the world changing). Hash through a frozen
+        # snapshot refreshed every N steps instead: stable buckets between
+        # refreshes, representation still allowed to improve at refresh.
+        # 0 = live encoder (old behaviour).
+        self._nov_enc_refresh = int(_cur_cfg.get(
+            "novelty_encoder_refresh", 0))
+        self._nov_enc = None
+        self._nov_enc_stamp = -1
+        # MASTERY HABITUATION (2026-08-08, see _habituation_factor): scale
+        # of the familiarity decay applied to the step intrinsic when a
+        # well-mastered block type breaks. 0 = off.
+        self._habituation_scale = float(_cur_cfg.get(
+            "break_habituation_scale", 0.0))
+        self._habit_prev: Dict[str, int] = {}
+        # ---- SYMBOLIC NOVELTY (see _symbol_novelty) ----------------------
+        self._symbol_weight = float(_cur_cfg.get("symbol_weight", 0.0))
+        self._new_symbol_bonus = float(_cur_cfg.get("new_symbol_bonus", 0.0))
+        # ---- SEEING AND AIMING ARE ONE DRIVE (2026-08-02) ----------------
+        # The symbol reward scores the SET of predicates currently above the
+        # trust threshold, decaying as 1/sqrt(n) per distinct set. It is
+        # POSITION-BLIND — a tree at the edge of frame and a tree dead-centre
+        # pay identically — and it had decayed to ~0.01/step. So nothing in
+        # the intrinsic channel rewarded TURNING TOWARD a symbol, and the
+        # agent sat with its pitch clamped at +90 while the drive that was
+        # supposed to pull it back paid the same either way.
+        # This adds a POTENTIAL on centring the least-familiar thing the
+        # agent can currently name. 0.0 = off (every other config).
+        self._symbol_center_weight = float(
+            _cur_cfg.get("symbol_center_weight", 0.0))
+        # ---- GAZE COVERAGE (2026-08-02) ----------------------------------
+        # Territory coverage counts the (x,z) CELLS the agent has stood in, so
+        # standing still decays to ~0 and new ground pays. Nothing did the
+        # same for WHERE IT LOOKS — and pitch is CLAMPED to [-90,+90], so an
+        # agent that drifts to +90 finds that `lookDOWN` is a perfectly free
+        # no-op (the world does not change, which also means zero prediction
+        # error and zero curiosity cost) while `lookUP` is the only action
+        # that moves. Measured: pitch pinned at +90 for 100k+ steps with
+        # lookDOWN chosen ~2x more often than lookUP, so the net pressure was
+        # downward into a wall that costs nothing to push against.
+        # Same count-based form as territory: a pitch bucket seen often pays
+        # ~0, an unvisited one pays ~1, decaying 1/sqrt(n).
+        # PITCH ONLY, DELIBERATELY. Yaw is cyclic and unbounded, and spinning
+        # is this project's known cheap-novelty failure mode (turnL 56% once
+        # ate a whole run). Pitch spans ~12 buckets and SATURATES quickly, so
+        # the term does its job and then gets out of the way.
+        # "head" = the VLM-taught predicate (historic default); "evidence" =
+        # ground truth from real break events. See _reach_sense for why the
+        # head fails on this task.
+        self._reach_source = str(_cur_cfg.get("reach_source", "head"))
+        # INITIALISED HERE (fix 2026-08-04). This is assigned inside the
+        # segment loop, but the FELT-REACH block reads it EARLIER in the same
+        # loop body — so on the very first iteration it did not exist yet and
+        # every launch died with AttributeError before completing one segment.
+        # Three identical crashes in a row; the supervisor's deterministic-
+        # fault guard correctly refused to keep restarting. Owning it at
+        # construction removes the ordering dependency entirely rather than
+        # guarding each read.
+        self._last_world_info: Dict[str, Any] = {}
+        self._gaze_weight = float(_cur_cfg.get("gaze_weight", 0.0))
+        self._gaze_bucket_deg = float(_cur_cfg.get("gaze_bucket_deg", 15.0))
+        self._gaze_counts: Dict[int, int] = {}
+        self._known_symbols: set = set()
+        self._symbol_counts: Dict[tuple, int] = {}
+        self._reach_phi = 0.0
+        self._coverage_weight = float(
+            self.config.get("curiosity", {}).get("coverage_weight", 0.0))
+        self._deaths_seen = 0
+        _imag = dict(self.config.get("imagination_curiosity", {}))
+        self.imagination_curiosity = ImaginationCuriosity(
+            enabled=_imag.get("enabled", False),
+            every=_imag.get("every", 50),
+            rollouts=_imag.get("rollouts", 8),
+            horizon=_imag.get("horizon", 10),
+            disagreement_weight=_imag.get("disagreement_weight", 0.30),
+            imagined_reward_weight=_imag.get("imagined_reward_weight", 0.10),
+            imagined_reward_halflife=_imag.get(
+                "imagined_reward_halflife", 300_000),
+            lp_reference=_imag.get("lp_reference", 0.05),
+            max_bonus=_imag.get("max_bonus", 0.5),
+        )
+        # Goal-prioritized replay: fraction of each WM/dream batch drawn from
+        # windows that contain a nonzero reward, so the world model sees the rare
+        # goal transition far more often (attacks the WM-accuracy bottleneck on
+        # sparse-reward tasks). 0.0 = off (original behaviour).
+        self._goal_replay_fraction = float(
+            wm_cfg.get("goal_replay_fraction", 0.0))
+
+        # ---- Create Curiosity Engine ----
+        # mode: "novelty" (default; ICM raw prediction error) or
+        #       "learning_progress" (reward the REDUCTION of prediction error per
+        #       state bucket — ignores the unlearnable "noisy TV"). Same forward
+        #       model + training either way; only the reward shape differs. This
+        #       is the Rung-3 (autotelic) lever. Default keeps prior runs unchanged.
+        cur_cfg = self.config.get("curiosity", {})
+        self.curiosity_mode = cur_cfg.get("mode", "novelty")
+        _cur_kwargs = dict(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            feature_dim=cur_cfg.get("feature_dim", 256),
+            hidden_dim=cur_cfg.get("hidden_dim", 256),
+            forward_loss_weight=cur_cfg.get("forward_loss_weight", 0.8),
+            inverse_loss_weight=cur_cfg.get("inverse_loss_weight", 0.2),
+            reward_scale=cur_cfg.get("curiosity_reward_scale", 1.0),
+            reward_clip=cur_cfg.get("curiosity_reward_clip", 5.0),
+            learning_rate=cur_cfg.get("learning_rate", 1e-4),
+            # was silently ignored (audit): the YAML knob controlling the
+            # normalization-pool length never reached the constructor.
+            novelty_window=cur_cfg.get("novelty_window", 1000),
+            discrete_actions=self.is_discrete,
+            # CNN feature encoder on pixel envs (step 8; MLP-on-pixels had no
+            # spatial prior and ~3.1M params in its first layer).
+            pixel_obs=bool(self.pixel_obs and cur_cfg.get("cnn_encoder", True)),
+            image_channels=self.image_channels,
+            image_size=self.image_size,
+        )
+        if self.curiosity_mode == "learning_progress":
+            self.curiosity = LearningProgressCuriosity(
+                **_cur_kwargs,
+                lp_history=cur_cfg.get("lp_history", 30),
+                lp_min_samples=cur_cfg.get("lp_min_samples", 4),
+                lp_bucket_round=cur_cfg.get("lp_bucket_round", 1),
+                lp_pixel_pool=cur_cfg.get("lp_pixel_pool", 4),
+                lp_proto_thresh=cur_cfg.get("lp_proto_thresh", 0.025),
+                lp_max_protos=cur_cfg.get("lp_max_protos", 512),
+                # ABSOLUTE PROGRESS FLOOR: a mastered world must pay 0. See
+                # LearningProgressCuriosity.__init__ for the measurement that
+                # forced this (base term paid 95% of the drive for standing
+                # still). 0.0 = off = byte-identical for every other config.
+                lp_abs_frac=cur_cfg.get("lp_abs_frac", 0.0),
+                # ACTION-CONDITIONAL: pay only for surprise the agent's own
+                # action accounts for. False = off = byte-identical.
+                action_conditional=cur_cfg.get("action_conditional", False),
+                null_action=cur_cfg.get("null_action", 0),
+            ).to(self.device)
+            if cur_cfg.get("action_conditional", False):
+                logger.info(
+                    "ACTION-CONDITIONAL CURIOSITY ACTIVE: intrinsic is scaled "
+                    "by how much of each transition the agent's OWN action "
+                    "accounts for (null action=%d). Ambient change — day/night, "
+                    "mobs, other players — no longer pays, and a no-op earns "
+                    "EXACTLY zero by construction.",
+                    int(cur_cfg.get("null_action", 0)))
+            if float(cur_cfg.get("lp_abs_frac", 0.0)) > 0.0:
+                logger.info(
+                    "LP ABSOLUTE PROGRESS FLOOR ACTIVE: an error drop must "
+                    "also exceed %.1f%% of the bucket's outstanding error to "
+                    "count as learning — a mastered view now pays exactly 0",
+                    100.0 * float(cur_cfg["lp_abs_frac"]))
+        else:
+            self.curiosity = IntrinsicCuriosityModule(**_cur_kwargs).to(self.device)
+
+        # ---- VLM symbolic grounding ("knows how" -> "knows why") ----
+        # Turns pixels into PREDICATES so the dormant symbolic stack (KG,
+        # rule induction) has input. The VLM teaches a head that predicts
+        # symbols from the agent's own latent, then steps back.
+        sg_cfg = self.config.get("symbolic_grounding", {}) or {}
+        self.symbolizer = None
+        self._neg_evidence_ticks = 0
+        self._symbol_clock = 0
+        self._prev_mine: Dict[str, int] = {}
+        self._symbolizer_retractions = 0
+        # slot -> RSSM latent captured at the unlock moment. Becomes the
+        # skill's context_embedding at mint: "what the world looked like
+        # when this was first achieved" — the real when-does-this-apply
+        # signal (the old one-hot said nothing).
+        self._unlock_context: Dict[int, np.ndarray] = {}
+        # slot -> POV frame at the unlock moment (discovery.png provenance
+        # + the image the VLM names the skill from)
+        self._unlock_frame: Dict[int, Any] = {}
+        # GROUNDED SKILL NAMING (July 2026, replaces VLM hallucination):
+        # per-env running block-break high-water, and the newest block each
+        # env broke THIS step. A discovered achievement's grounded identity
+        # is the block whose break caused its reward spike -> name it after
+        # that block ("break_oak_log"), not the VLM's optimistic guess
+        # ("craft_wooden_planks" / "fish_blue_water").
+        self._mine_by_env: Dict[int, Dict[str, int]] = {}
+        self._new_break_by_env: Dict[int, str] = {}
+        self._unlock_block: Dict[int, str] = {}
+        if sg_cfg.get("enabled", False) and self.pixel_obs:
+            from developmental_ai.llm.vlm_symbolizer import VLMSymbolizer
+            self.symbolizer = VLMSymbolizer(
+                model=sg_cfg.get("model", "llava:7b"),
+                interval=sg_cfg.get("interval", 60),
+                max_interval=sg_cfg.get("max_interval", 600),
+                latent_dim=self.world_model.rssm.latent_dim,
+                hidden_dim=sg_cfg.get("hidden_dim", 256),
+                lr=sg_cfg.get("lr", 1e-3),
+                fact_threshold=sg_cfg.get("fact_threshold", 0.7),
+                min_labels=sg_cfg.get("min_labels", 5),
+                reliability_floor=sg_cfg.get("reliability_floor", 0.35),
+                anneal_agreement=sg_cfg.get("anneal_agreement", 0.9),
+                device=self.device,
+                fovea=sg_cfg.get("fovea", False),
+                fovea_frac=sg_cfg.get("fovea_frac", 0.4),
+                fovea_interval=sg_cfg.get("fovea_interval", None))
+            # Which actions count as "attacking" for the causal claim
+            # ("attack_held" breaks X). Defaults to the vision scaffold's
+            # chop actions, but is settable independently: causal grounding
+            # must not silently die if the scaffold is turned off.
+            _chop = sg_cfg.get("chop_actions")
+            if _chop is None:
+                _chop = (self.config.get("llm", {}) or {}).get(
+                    "vision", {}).get("chop_actions", [])
+            self._chop_action_set = frozenset(int(a) for a in (_chop or []))
+            if not self._chop_action_set:
+                logger.warning(
+                    "symbolic_grounding: no chop_actions configured — break "
+                    "events will mint properties but no causal facts")
+            # NEGATIVE EVIDENCE gate: attack ticks with no break before the
+            # claimed affordance predicates are docked. 0 = off.
+            self._neg_evidence_ticks = int(sg_cfg.get(
+                "neg_evidence_ticks", 0))
+            self._neg_evt_scored = False
+            logger.info("VLM symbolic grounding active (interval=%d, "
+                        "chop_actions=%s, neg_evidence_ticks=%d)",
+                        sg_cfg.get("interval", 60),
+                        sorted(self._chop_action_set),
+                        self._neg_evidence_ticks)
+
+        # ---- Brain-state emitter (live skill-graph telemetry) ----
+        # Writes brain_state.json for viewer/brain_viewer.html: the skill
+        # graph (earned edges only) + the live firing feed. The user's
+        # window into the agent's memory system.
+        bv_cfg = self.config.get("brain_viewer", {}) or {}
+        self.brain_emitter = None
+        self._brain_clock = 0
+        # NOTE: the emitter is CONSTRUCTED later (after skill_bank +
+        # broadcaster + option_executor exist) — see the block after the
+        # policy/mixer setup. It references those organs, so it cannot be
+        # built here.
+
+        # Configurable curiosity-vs-skill-count damper (both modes; icm.py note).
+        self.curiosity.exploration_decay_rate = cur_cfg.get(
+            "exploration_decay_rate", 0.1)
+
+        # ---- Create Knowledge Graph (Neo4j if available, else in-memory) ----
+        kg_cfg = self.config.get("knowledge_graph", {})
+        self.knowledge_graph = create_knowledge_graph(kg_cfg)
+        self.fact_extractor = FactExtractor(
+            obs_labels=self.obs_labels,
+            min_confidence=kg_cfg.get("min_confidence", 0.7),
+        )
+
+        # Graph embeddings (PyKEEN)
+        self.kg_embedder = KGEmbeddingTrainer(
+            embedding_dim=kg_cfg.get("embedding_dim", 64),
+            model_name=kg_cfg.get("embedding_model", "TransE"),
+            num_epochs=kg_cfg.get("embedding_epochs", 100),
+        )
+
+        # ---- Create Symbolic Decoder (Approach 2: latent → discrete categories) ----
+        # This is the trained neural bridge between the RSSM's latent space
+        # and the symbolic knowledge graph. Instead of decoding to continuous
+        # observations and then discretizing (lossy), it learns sharp category
+        # boundaries directly in latent space.
+        sd_cfg = self.config.get("symbolic_decoder", {})
+        # Pixel gate (July 2026, Crafter integration): the symbolic decoder
+        # builds a per-OBS-DIMENSION head bank and mints per-dimension facts.
+        # On a 64x64x3 pixel env that is ~12288 heads (~16M params) extracting
+        # "facts" about individual pixels — semantically meaningless and a
+        # large silent per-step tax. Pixel envs get a no-op stub; symbols for
+        # such envs come from higher-level channels (achievements, rulebook).
+        if self._skip_perdim_symbolic:
+            self.symbolic_decoder = _NullSymbolicDecoder()
+        else:
+            self.symbolic_decoder = SymbolicDecoderManager(
+                latent_dim=self.world_model.rssm.latent_dim,
+                obs_dim=self.obs_dim,
+                num_categories=sd_cfg.get("num_categories", 5),
+                hidden_dim=sd_cfg.get("hidden_dim", 128),
+                learning_rate=sd_cfg.get("learning_rate", 1e-4),
+                confidence_threshold=sd_cfg.get("confidence_threshold", 0.6),
+                obs_labels=self.obs_labels,
+                device=self.device,
+            )
+
+        # ---- Create Glue Layer (neural-symbolic bridge) ----
+        # Orchestrates: KnowledgeIntegrator (GNN+Gate), GoalGenerator,
+        # AdvancedMasteryDetector, AdvancedCurriculumManager, SkillSelector
+        glue_cfg = self.config.get("glue", {})
+        self.glue = GlueLayer(
+            latent_dim=self.world_model.rssm.latent_dim,
+            obs_dim=self.obs_dim,
+            embedding_dim=kg_cfg.get("embedding_dim", 64),
+            gnn_hidden_dim=glue_cfg.get("gnn_hidden_dim", 128),
+            gnn_output_dim=glue_cfg.get("gnn_output_dim", 64),
+            goal_embedding_dim=glue_cfg.get("goal_embedding_dim", 16),
+            max_difficulty=10,
+            device=self.device,
+            # Env-relative mastery competence band. Defaults (475/0) keep
+            # CartPole behavior identical; negative-reward envs override these
+            # (e.g. Acrobot: target=-100, floor=-500) so a strong negative
+            # return still reads as high competence and can mint skills.
+            reward_target=self.config.get("environment", {}).get(
+                "mastery_reward_target", 475.0
+            ),
+            reward_floor=self.config.get("environment", {}).get(
+                "mastery_reward_floor", 0.0
+            ),
+        )
+
+        # ---- Create Skill Bank ----
+        sb_cfg = self.config.get("skill_bank", {})
+        self.skill_bank = SkillBank(
+            storage_dir=sb_cfg.get("storage_dir", "./skill_bank_data"),
+            min_practice_episodes=sb_cfg.get("min_practice_episodes", 3),
+            policy_versions_kept=sb_cfg.get("policy_versions_kept", 5),
+            mastery_milestone=sb_cfg.get("mastery_threshold", 0.8),
+            # retrieval policy — how many prior skills a new goal may
+            # consider, and how relevant one must be to seed the live policy.
+            # Both keys shipped in every config with no reader at all; the
+            # warm-start below hardcoded 3 / 0.7 instead.
+            max_skills_loaded=sb_cfg.get("max_skills_loaded", 5),
+            similarity_threshold=sb_cfg.get("similarity_threshold", 0.5),
+        )
+        self.mastery_detector = MasteryDetector(
+            mastery_threshold=sb_cfg.get("mastery_threshold", 0.8),
+            mastery_window=sb_cfg.get("mastery_window", 50),
+            min_episodes=sb_cfg.get("min_episodes_before_save", 20),
+        )
+
+        # ---- Symbolic feature-conditioning (Path A) ----
+        # When enabled, the KG knowledge vector is fed into the policy as a
+        # gated input feature (the gate is trained by the policy loss), so the
+        # symbolic layer can actually shape behavior instead of only feeding a
+        # self-referential fact-extractor. Set symbolic.enabled=false to run the
+        # obs-only baseline (the other arm of the load-bearing ablation).
+        sym_cfg = self.config.get("symbolic", {})
+        self.symbolic_enabled = sym_cfg.get("enabled", True)
+        # Auto-disable the symbolic/KG layer on CONTINUOUS action spaces. It was
+        # built for discrete gridworlds; on continuous actions it only produces
+        # vacuous `action_continuous` facts and feeds the policy a noisy knowledge
+        # vector — a 5-seed Hopper ablation showed it *significantly hurts* return
+        # (curiosity-only 957 vs full-organism 706, p<0.01). Set
+        # `symbolic.force_on_continuous: true` to override (e.g. to reproduce that
+        # ablation). Discrete envs are unaffected.
+        if (self.symbolic_enabled and not self.is_discrete
+                and not sym_cfg.get("force_on_continuous", False)):
+            logger.info(
+                "Continuous action space detected — auto-disabling the symbolic "
+                "layer (it taxes continuous control; set "
+                "symbolic.force_on_continuous=true to override)."
+            )
+            self.symbolic_enabled = False
+        # Rung 6 (Global-Workspace) lesion. When True the symbolic layer runs
+        # IDENTICALLY to the intact arm (KG builds, the knowledge vector is still
+        # computed, the policy keeps the same input shape + gate params) but the
+        # vector's CONTENT is severed to zeros before it reaches the policy. This
+        # isolates the broadcast *channel* from its *content*: if behaviour
+        # degrades vs intact, information genuinely flows KG -> action. Default
+        # False so every prior run is byte-for-byte unchanged.
+        self.symbolic_broadcast_lesion = bool(sym_cfg.get("broadcast_lesion", False))
+        # Lesion CONTENT mode (Rung-6 content-vs-presence controls). The plain
+        # "zero" lesion hands the policy an all-zeros vector — clean, but OOD
+        # under force-concat training (the policy never saw zeros), so a drop vs
+        # intact could be dismissed as the policy breaking on a never-seen input.
+        # The in-distribution controls remove that confound:
+        #   "none"     — intact (no lesion).
+        #   "zero"     — all-zeros (presence severed; may be OOD).
+        #   "scramble" — a VALID canonical phase vector for the WRONG phase
+        #                (in-distribution, wrong info) -> tests CONTENT use.
+        #   "constant" — a FIXED valid phase vector regardless of state
+        #                (in-distribution, no variation) -> tests need for VARIATION.
+        # Back-compat: if broadcast_lesion=True but no mode given, default "zero";
+        # if a mode in {zero,scramble,constant} is given, the lesion is active even
+        # without broadcast_lesion=True. verify_broadcast_live.py flips
+        # self.symbolic_broadcast_lesion directly with mode "none" -> treat as zero.
+        self.broadcast_lesion_mode = str(
+            sym_cfg.get("broadcast_lesion_mode",
+                        "zero" if self.symbolic_broadcast_lesion else "none")
+        ).lower()
+        if self.broadcast_lesion_mode in ("zero", "scramble", "constant", "noise"):
+            self.symbolic_broadcast_lesion = True
+        # Dedicated RNG for the scramble control so the wrong-phase draw is
+        # reproducible per seed and never perturbs the policy / env RNG streams.
+        self._lesion_rng = np.random.RandomState(
+            int(self.seed) if self.seed is not None else 0
+        )
+        # Which channel feeds the policy broadcast:
+        #   "kg"       — GNN mean-pool over the knowledge graph (original; a global
+        #                vector recomputed every 50 episodes -> constant within an
+        #                episode, which is why the gate never opened on DoorKey).
+        #   "episodic"  — within-episode working memory of last-seen key/door/goal
+        #                 locations (varies every step, carries info the partial
+        #                 observation lacks). Same gate / lesion / off plumbing.
+        #   "affordance"— compact symbolic TASK-PHASE / rule vector (the
+        #                 "locked-door => needs-key" affordance), encoding WHAT
+        #                 the task state is, not WHERE anything is. Grid-size /
+        #                 layout invariant, so it is the natural unit of CROSS-TASK
+        #                 TRANSFER: a phase signal learned on an easy env transfers
+        #                 to a harder one. (Rung 6 redesign — knowledge, not memory.)
+        #   "none"     — no broadcast channel (DEFAULT since the July 2026
+        #                audit, H5): the KG->GNN path was never trained (frozen
+        #                gate at sigmoid(-2), no optimizer over the GNN) and its
+        #                PyKEEN embeddings rotate arbitrarily every retrain, so
+        #                it injected cost + noise, not knowledge. Set "kg"
+        #                explicitly to reproduce the old behavior; the KG store,
+        #                fact extraction, and symbolic decoder are unaffected.
+        self.knowledge_source = sym_cfg.get("knowledge_source", "none")
+        # Unified broadcaster handle (episodic OR affordance); kept as
+        # self.broadcaster so the reset/update/feature hooks are source-agnostic.
+        self.broadcaster = None
+        if self.symbolic_enabled and self.knowledge_source == "episodic":
+            self.broadcaster = EpisodicWorkingMemory()
+            knowledge_dim = EpisodicWorkingMemory.DIM
+        elif self.symbolic_enabled and self.knowledge_source == "affordance":
+            self.broadcaster = AffordanceBroadcast()
+            knowledge_dim = AffordanceBroadcast.DIM
+        elif self.symbolic_enabled and self.knowledge_source == "rule_regime":
+            # Hidden-affordance-regime knowledge for the Rung-6 DECISIVE test
+            # (costly perceptual aliasing). Carries the active rule, which the
+            # observation provably lacks. See core/rule_regime_broadcast.py.
+            self.broadcaster = RuleRegimeBroadcast()
+            knowledge_dim = RuleRegimeBroadcast.DIM
+        elif self.symbolic_enabled and self.knowledge_source == "goal":
+            # Achievement GOAL channel (rich-env program, step 1): a REAL goal
+            # representation the policy consumes — target slot + achieved mask,
+            # IMGEP frontier targeting via the rung-5 CompetencePredictor.
+            # goals.mode: "given" (oracle achievements — privileged arm) or
+            # "discovered" (reward-spike + obs-delta clustering — earned arm).
+            # See core/achievement_goals.py.
+            from developmental_ai.core.achievement_goals import (
+                make_goal_broadcast)
+            _goals_cfg = dict(self.config.get("goals", {}))
+            # LIFELONG working-set width: active_goals is the single knob for
+            # the goal registry size (the resident set). It OVERRIDES
+            # goals.max_slots so raising one variable widens the organism (the
+            # 24/48 widening). Paging keeps TOTAL goals unbounded regardless.
+            if self._lifelong:
+                _goals_cfg["max_slots"] = int(self._ll_ctrl.active_goals)
+            self.broadcaster = make_goal_broadcast(_goals_cfg)
+            # GOAL-LEVEL PROSPECTION: before committing to a target at each
+            # goal horizon, imagine pursuing the frontier's top-M candidates
+            # from the current stream state and blend the imagined payoff into
+            # the selection (see AchievementGoalBroadcast._select_target).
+            if self._prospection_cfg.get("enabled", False):
+                self.broadcaster.prospection_hook = self._prospective_goal_score
+                self.broadcaster.prospection_weight = float(
+                    self._prospection_cfg.get("weight", 0.5))
+                self.broadcaster.prospection_top_m = int(
+                    self._prospection_cfg.get("top_m", 4))
+            # STABLE SKILL IDENTITY (July 2026): restore the slot registry,
+            # cluster signatures and competence self-model from the skill
+            # bank's directory. Without this every process relabelled
+            # discovered_N from 0 in spike order, so the same name meant
+            # different behaviours across runs — and skill upserts clobbered
+            # the wrong directories.
+            self._broadcaster_state_path = os.path.join(
+                self.skill_bank.storage_dir, "broadcaster_state.json")
+            # THE PROBE ANSWERS "does slot i already have a skill?" from the
+            # BANK, which is the only authority on it. Match by the stable
+            # `ach_<NN>_` index prefix, never by slot NAME: names drift as
+            # goals re-key (slot 0 is `discovered_0` today but its skill is
+            # `ach_00_break_birch_leaves`), and a name-keyed lookup silently
+            # answers "no skill" for every renamed slot.
+            def _slot_has_skill(idx: int, _name: str) -> bool:
+                pfx = f"ach_{int(idx):02d}_"
+                return any(sid.startswith(pfx)
+                           for sid in self.skill_bank.skills)
+            self.broadcaster.load_state(self._broadcaster_state_path,
+                                        minted_probe=_slot_has_skill)
+            # LIFELONG working-set paging (opt-in via lifelong.paging.enabled):
+            # attach an unbounded on-disk store so a FULL goal registry pages
+            # the stalest low-value slot OUT (evict-on-disuse) and recalls a
+            # re-encountered behaviour back IN (recall-on-cue) instead of
+            # refusing new discoveries at the max_slots cap. Without this the
+            # registry keeps its fixed-cap behaviour, byte-identical.
+            self._goal_ltm = None
+            self._page_events_total = {"out": 0, "in": 0}
+            _pcfg = (self.config.get("lifelong", {}).get("paging", {}) or {})
+            if (_pcfg.get("enabled", False)
+                    and hasattr(self.broadcaster, "attach_long_term_store")):
+                from developmental_ai.memory.long_term_store import (
+                    LongTermStore)
+                _cue_dim = int(getattr(self.broadcaster, "pool", 192))
+                self._goal_ltm = LongTermStore(
+                    os.path.join(self.skill_bank.storage_dir, "ltm_goals"),
+                    cue_dim=_cue_dim)
+                self.broadcaster.attach_long_term_store(
+                    self._goal_ltm,
+                    min_idle_episodes=int(_pcfg.get("min_idle_episodes", 8)),
+                    recall_threshold=float(
+                        _pcfg.get("recall_threshold", 0.8)))
+                logger.info(
+                    "Working-set paging ON: goal registry <-> ltm_goals "
+                    "(cue_dim=%d, min_idle=%d)", _cue_dim,
+                    int(_pcfg.get("min_idle_episodes", 8)))
+            knowledge_dim = self.broadcaster.DIM
+        elif self.symbolic_enabled and self.knowledge_source == "kg":
+            knowledge_dim = self.glue.knowledge_integrator.gnn_output_dim
+        else:
+            # "none" (default) or symbolic off: no policy broadcast channel.
+            knowledge_dim = 0
+        # Back-compat alias (older code paths reference self.episodic_memory).
+        self.episodic_memory = (
+            self.broadcaster
+            if isinstance(self.broadcaster, EpisodicWorkingMemory)
+            else None
+        )
+        # Broadcast gate mode: "learned" (default; the gate decides how much
+        # knowledge to admit) or "open" (force-concat; gate fixed fully open so
+        # the knowledge reaches the policy unattenuated). Force-concat is used by
+        # the cross-task transfer test so the source policy wires the broadcast in
+        # unconditionally and lesioning its content at transfer time genuinely
+        # bites. Default "learned" keeps prior ablations unchanged.
+        self.broadcast_gate_mode = sym_cfg.get("broadcast_gate", "learned")
+
+        # ---- Create Policy ----
+        pol_cfg = self.config.get("policy", {})
+        # SKILLS AS OPTIONS (July 2026, Layer 4): widen the discrete head by
+        # K invocation slots. self.action_dim stays P EVERYWHERE ELSE — the
+        # world model, curiosity, replay and dream actor only ever see
+        # executed primitives (transition-semantics invariant, E7).
+        opt_cfg = self.config.get("skills_as_options", {}) or {}
+        # LIFELONG: active_skills is the single knob for the resident skill
+        # (option) set — it OVERRIDES k_slots so the 24/48 widening is one
+        # variable. Paging keeps TOTAL skills unbounded on disk regardless.
+        _k_default = (int(self._ll_ctrl.active_skills) if self._lifelong
+                      else int(opt_cfg.get("k_slots", 8)))
+        _k_slots = _k_default if opt_cfg.get("enabled", False) else 0
+        if _k_slots and not (self._use_parallel_envs and self.is_discrete):
+            logger.warning("skills_as_options requires the parallel discrete "
+                           "path — disabled for this run")
+            _k_slots = 0
+        self.meta_action_dim = self.action_dim + _k_slots
+        # ---- policy arch (v3): conv trunk for pixel envs -------------------
+        # `arch: conv` shares one CNN across actor/critic/conditioner (~16x
+        # smaller skills, spatial prior). Guarded: conv REQUIRES flat-CHW
+        # pixel obs; anything else falls back to flat with a warning rather
+        # than crashing a run on a config copied between environments.
+        _arch = str(pol_cfg.get("arch", "flat"))
+        if _arch in ("conv", "wm"):
+            _side = int(round((self.obs_dim / 3) ** 0.5))
+            if 3 * _side * _side != int(self.obs_dim):
+                logger.warning("policy.arch=%s needs 3*s*s pixel obs "
+                               "(obs_dim=%d) — falling back to flat",
+                               _arch, self.obs_dim)
+                _arch = "flat"
+        # arch="wm" reads the WORLD MODEL's encoder, so its feature width is
+        # not a free parameter — it IS world_model.encoder_hidden. Deriving it
+        # here (instead of trusting policy.enc_dim) makes the two impossible
+        # to set inconsistently; attach_shared_encoder still verifies with a
+        # real forward pass.
+        _enc_dim = int(pol_cfg.get("enc_dim", 256))
+        if _arch == "wm":
+            _wm_hidden = int(self.config.get("world_model", {}).get(
+                "encoder_hidden", 256))
+            if _enc_dim != _wm_hidden:
+                logger.info(
+                    "policy.arch=wm: enc_dim %d -> %d (world_model."
+                    "encoder_hidden) — perception width is the world model's",
+                    _enc_dim, _wm_hidden)
+            _enc_dim = _wm_hidden
+            if not self.pixel_obs:
+                logger.warning("policy.arch=wm needs pixel obs — the world "
+                               "model encoder is a CNN. Falling back to flat.")
+                _arch = "flat"
+        self.policy = StandaloneActorCritic(
+            obs_dim=self.obs_dim,
+            action_dim=self.meta_action_dim,
+            hidden_dim=256,
+            continuous=not self.is_discrete,
+            learning_rate=pol_cfg.get("learning_rate", 3e-4),
+            gamma=pol_cfg.get("gamma", 0.99),
+            gae_lambda=pol_cfg.get("gae_lambda", 0.95),
+            clip_range=pol_cfg.get("clip_range", 0.2),
+            # ---- PPO KNOBS THAT HAD NO READER (2026-08-02) ---------------
+            # train_step did `n_epochs` FULL-batch passes and nothing else, so
+            # a 1024-step rollout bought ~10 gradient steps where standard PPO
+            # takes ~160. entropy_coef and value_coef were likewise pinned at
+            # their signature defaults and could not be tuned at all — on a run
+            # whose failure mode is action-distribution collapse.
+            #
+            # DELIBERATELY A NEW KEY, NOT `policy.batch_size`. batch_size is
+            # set in all eleven configs and has never been read, so honouring
+            # it now would silently switch MiniGrid, Crafter, Craftax and every
+            # control task to a different learning regime mid-project and
+            # invalidate their recorded results. `minibatch_size` is opt-in;
+            # absent -> 0 -> the full-batch path, unchanged. The stale
+            # batch_size key is reported at boot instead of quietly lying.
+            minibatch_size=int(pol_cfg.get("minibatch_size", 0) or 0),
+            # THE MISSING TRUST REGION — see StandaloneActorCritic.__init__.
+            # 0.0 = off = byte-identical for every config that omits it.
+            target_kl=float(pol_cfg.get("target_kl", 0.0) or 0.0),
+            # HARD exploration floor — see StandaloneActorCritic.__init__ for
+            # why a soft entropy bonus provably cannot do this job.
+            logit_range=float(pol_cfg.get("logit_range", 0.0) or 0.0),
+            entropy_coef=float(pol_cfg.get("entropy_coef", 0.01)),
+            value_coef=float(pol_cfg.get("value_coef", 0.5)),
+            knowledge_dim=knowledge_dim,
+            knowledge_gate_mode=self.broadcast_gate_mode,
+            device=self.device,
+            arch=_arch,
+            enc_dim=_enc_dim,
+            # PROPRIOCEPTION: width comes from the ENV, so an env with no
+            # body sense yields 0 and the policy is byte-identical to before.
+            # +1 for the loop-computed REACH sense (see _reach_sense). The
+            # env supplies the body; this one field is perceptual and needs
+            # the RSSM latent, which only the loop has.
+            proprio_dim=(int(getattr(
+                getattr(self, "_proprio_source", None), "PROPRIO_DIM", 0))
+                + (1 if getattr(self, "_proprio_source", None) is not None
+                   and self.symbolizer is not None else 0)),
+        )
+        # A CONFIG KEY THAT DOES NOTHING MUST SAY SO. `policy.batch_size` has
+        # been present and unread since the first config; silence made it look
+        # honoured. See minibatch_size above for why it is not simply adopted.
+        if pol_cfg.get("batch_size") and not pol_cfg.get("minibatch_size"):
+            logger.warning(
+                "policy.batch_size=%s is NOT read by the PPO update (it never "
+                "has been) — PPO runs %s full-batch passes per rollout. Set "
+                "policy.minibatch_size to enable real minibatching.",
+                pol_cfg.get("batch_size"), pol_cfg.get("n_epochs", 10))
+        if float(pol_cfg.get("logit_range", 0.0) or 0.0) > 0.0:
+            logger.info(
+                "LOGIT RANGE BOUNDED at %.1f: the action distribution can "
+                "become confident but never CERTAIN (max_prob is capped), so "
+                "the entropy gradient never vanishes and a collapsed policy "
+                "can always recover. Saturation is a one-way door: at "
+                "max_prob=1.000 the entropy gradient is 9.5e-07, five orders "
+                "of magnitude below healthy — no entropy_coef can reverse it.",
+                float(pol_cfg["logit_range"]))
+        if int(pol_cfg.get("minibatch_size", 0) or 0) > 0:
+            logger.info(
+                "PPO MINIBATCHING ACTIVE: minibatch=%d over %d-step rollouts "
+                "x %d epochs — ~%d gradient steps per update instead of %d",
+                int(pol_cfg["minibatch_size"]),
+                int(pol_cfg.get("n_steps", 2048)),
+                int(pol_cfg.get("n_epochs", 10)),
+                int(pol_cfg.get("n_epochs", 10)) * max(1, int(
+                    pol_cfg.get("n_steps", 2048))
+                    // int(pol_cfg["minibatch_size"])),
+                int(pol_cfg.get("n_epochs", 10)))
+
+        # ---- ONE VENTRAL STREAM (arch="wm") -------------------------------
+        # Hand the policy the world model's encoder. From here the agent has
+        # a SINGLE visual system: trained by prediction on every frame of
+        # every stream, read by the world model, the dream actor and now the
+        # waking policy alike. Before this, the policy carried its own 50 MB
+        # pixel layer trained only by PPO gradients — measured at 86% of
+        # weights still inside their init bound, i.e. it was acting on a
+        # near-random projection while a trained one sat unused next door.
+        if _arch == "wm":
+            self.policy.attach_shared_encoder(self.world_model.encoder)
+            logger.info(
+                "SHARED PERCEPTION: policy reads world_model.encoder "
+                "(%d features, detached — PPO cannot reshape it)", _enc_dim)
+        # STATE THE ARCH AT BOOT. Verifying "is the conv trunk actually live"
+        # otherwise means inferring it from the config plus the absence of a
+        # fallback warning, or waiting for a checkpoint to measure its size —
+        # both indirect, on a run that lasts weeks. One line, greppable.
+        _npar = sum(p.numel() for m in (self.policy.actor, self.policy.critic,
+                                        self.policy.encoder,
+                                        self.policy.conditioner)
+                    if m is not None for p in m.parameters())
+        logger.info("Policy arch=%s enc_dim=%s params=%.2fM (obs_dim=%d, "
+                    "head=%d)", self.policy.arch,
+                    # enc_dim is meaningful for the whole ENCODED family, not
+                    # just conv — printing "-" under arch=wm would report the
+                    # shared-perception width as absent, i.e. a diagnostic
+                    # that lies about the thing it exists to show.
+                    self.policy.enc_dim
+                    if self.policy.arch in ("conv", "wm") else "-",
+                    _npar / 1e6, self.obs_dim, self.meta_action_dim)
+
+        # PPO updates on accumulated rollouts (~n_steps), NOT one short episode.
+        # Per-episode training on ~9 samples gave a frozen, zero-gradient policy;
+        # batching across episodes restores stable gradients and real learning.
+        self.policy_update_steps = pol_cfg.get("n_steps", 2048)
+
+        if bv_cfg.get("enabled", False):
+            from developmental_ai.skill_bank.brain_state import (
+                BrainStateEmitter)
+            _bv_dir = bv_cfg.get("out_dir", "podlogs/brain")
+            os.makedirs(_bv_dir, exist_ok=True)
+            self.brain_emitter = BrainStateEmitter(
+                self.skill_bank,
+                broadcaster=self.broadcaster,
+                knowledge_graph=self.knowledge_graph,
+                symbolizer=self.symbolizer,
+                long_term_store=getattr(self, "_goal_ltm", None),
+                out_path=os.path.join(_bv_dir, "brain_state.json"))
+            self._brain_interval = int(bv_cfg.get("interval", 400))
+            # make the served directory self-contained: viewer page + a
+            # link to the skill notes (discovery.png in note panels)
+            try:
+                import shutil as _sh
+                _src = os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__)))),
+                    "viewer", "brain_viewer.html")
+                if os.path.exists(_src):
+                    _sh.copy(_src, os.path.join(_bv_dir,
+                                                "brain_viewer.html"))
+                _notes = os.path.join(_bv_dir, "notes")
+                if not os.path.exists(_notes):
+                    os.symlink(os.path.abspath(
+                        self.skill_bank.storage_dir), _notes)
+            except OSError:
+                pass
+            # Legacy skills predate notes: give them thin, honest notes so
+            # the brain's first render is not a field of anonymous nodes.
+            # Their real names/preconditions arrive at their next unlock.
+            try:
+                from developmental_ai.skill_bank.skill_notes import (
+                    backfill_notes, reground_names)
+                # strip stale VLM-hallucinated names from prior runs FIRST,
+                # so the brain shows honest names from the first render
+                reground_names(self.skill_bank)
+                backfill_notes(self.skill_bank, self.broadcaster,
+                               self.knowledge_graph)
+            except Exception as _e:
+                logger.warning("note backfill skipped: %s", _e)
+            logger.info("Brain viewer emitter active -> %s", _bv_dir)
+
+        # Options executor (None when disabled). Brain-emitter firing hooks
+        # are wired after the emitter exists (post-construction, below).
+        self.option_executor = None
+        if _k_slots:
+            from developmental_ai.policy.options import (
+                OptionExecutor, SkillOptionBank)
+            _n_envs = int(self.config.get("parallel_envs", {}).get(
+                "num_envs", 1))
+            _ob = SkillOptionBank(
+                self.skill_bank, self.obs_dim, self.action_dim, _k_slots,
+                self.device, opt_cfg.get("cache", {}))
+            # ---- SKILLS AS MEMORIES ---------------------------------------
+            # Off by default: with practice disabled a bound skill stays
+            # frozen for the run exactly as before, so every other config is
+            # unaffected. Enabled, an invocation that produces the skill's own
+            # grounded effect trains that skill toward what it just did, under
+            # a KL trust region, with consolidation slowing proven skills and
+            # decay weakening unrehearsed ones.
+            # PHASE-SCOPED ACTION SPACE: indices the policy may not pick.
+            _dis = [int(x) for x in
+                    (self.config.get("environment", {}).get(
+                        "disable_macros") or [])]
+            if _dis:
+                _ob.disabled_macros = set(_dis)
+                logger.info(
+                    "ACTION SPACE SCOPED: macros %s disabled for this phase "
+                    "(indices preserved; the actions are simply not offered)",
+                    sorted(_dis))
+            _pr_cfg = dict(opt_cfg.get("practice", {}) or {})
+            if _pr_cfg.get("enabled", False):
+                from developmental_ai.skill_bank.skill_practice import (
+                    SkillPractice)
+                _ob.practice = SkillPractice(
+                    enabled=True,
+                    lr=float(_pr_cfg.get("lr", 1e-4)),
+                    kl_max=float(_pr_cfg.get("kl_max", 0.02)),
+                    min_steps=int(_pr_cfg.get("min_steps", 4)),
+                    epochs=int(_pr_cfg.get("epochs", 1)),
+                    strength_up=float(_pr_cfg.get("strength_up", 0.10)),
+                    strength_down=float(_pr_cfg.get("strength_down", 0.02)),
+                    decay_per_segment=float(
+                        _pr_cfg.get("decay_per_segment", 0.01)),
+                    stale_below=float(_pr_cfg.get("stale_below", 0.15)),
+                    max_traj=int(_pr_cfg.get("max_traj", 256)),
+                    device=str(self.device))
+                logger.info(
+                    "SKILL PRACTICE ACTIVE: bound skills are no longer frozen "
+                    "(lr=%.1e, KL trust region %.3f, decay %.3f/segment)",
+                    _ob.practice.lr, _ob.practice.kl_max,
+                    _ob.practice.decay_per_segment)
+            # SCRIPTED bootstrap options (e.g. chop_trunk): reserved BEFORE
+            # skill binding so they hold a slot the policy can invoke to
+            # perform a behaviour the emergent policy can't stumble into.
+            for _spec in (opt_cfg.get("scripted_options") or []):
+                _ob.reserve_scripted(_spec)
+            self.option_executor = OptionExecutor(
+                _ob, _n_envs, dict(
+                    opt_cfg,
+                    spike_threshold=self.config.get("goals", {}).get(
+                        "spike_threshold", 0.9)),
+                gamma=pol_cfg.get("gamma", 0.99))
+            logger.info("Skills-as-options ACTIVE: head %d = %d primitives "
+                        "+ %d slots", self.meta_action_dim, self.action_dim,
+                        _k_slots)
+            # ---- FOVEA CONTACT GATE (2026-08-07, change 5) --------------
+            # break_*log* options only offer when the trunk is under the
+            # gaze or there is fresh contact evidence — so the option's
+            # 80-tick budget starts at the work, not during the walk
+            # (measured: 61 break_spruce_log invocations, 0 successes).
+            # Fail-open on every uncertainty: sense ungated -> no veto;
+            # non-log skill -> no veto. A veto can therefore never lock a
+            # skill out longer than the fovea itself stays empty.
+            if bool(opt_cfg.get("fovea_precondition", False)):
+                _min_lab = int(sg_cfg.get("min_labels", 5))
+
+                def _log_contact_gate(binding, _self=self,
+                                      _ml=_min_lab) -> bool:
+                    try:
+                        name = str(binding.get("name")
+                                   or binding.get("skill_id") or "")
+                        if "log" not in name:
+                            return True
+                        fcs = getattr(_self, "_last_fovea_counts",
+                                      None) or {}
+                        if fcs.get("tree_visible", 0) < _ml:
+                            return True     # sense not yet earned -> no veto
+                        if float(getattr(_self, "_reach_now", 0.0)) > 0.5:
+                            return True     # measured contact
+                        fps = getattr(_self, "_last_fovea_probs",
+                                      None) or {}
+                        return float(fps.get("tree_visible", 0.0)) >= 0.35
+                    except Exception:
+                        return True         # never let the gate kill an offer
+                self.option_executor.contact_gate = _log_contact_gate
+                logger.info("options: fovea contact gate ACTIVE for "
+                            "*log* skills (threshold 0.35, fail-open)")
+            if self.brain_emitter is not None:
+                # live "pathways of thought": option start/end events light
+                # nodes up in the brain viewer as they fire
+                self.option_executor.on_start = (
+                    self.brain_emitter.option_started)
+                self.option_executor.on_end = (
+                    lambda env, sid, t, outcome:
+                    self.brain_emitter.option_ended(env, sid, t, outcome))
+
+        # ---- Create Reward Mixer ----
+        # gated=True hands anneal control to the developmental stage controller:
+        # intrinsic weight is held high through EXPLORE and only begins its
+        # curiosity->task drift once the controller fires EXPLORE->EXPLOIT.
+        self.reward_mixer = RewardMixer(
+            intrinsic_weight=pol_cfg.get("intrinsic_reward_weight", 0.7),
+            extrinsic_weight=pol_cfg.get("extrinsic_reward_weight", 0.3),
+            decay_rate=pol_cfg.get("reward_decay_rate", 5e-6),
+            # FLOOR, previously un-passed and therefore stuck at its 0.1
+            # default: curiosity annealed down to 0.1 and stayed there
+            # forever. Setting it to 0 lets the drive genuinely reach zero on
+            # a world the agent has mastered, which is the point of an anneal.
+            min_intrinsic=pol_cfg.get("min_intrinsic", 0.1),
+            gated=True,
+            reentry_bump=self.config.get("developmental_stages", {}).get(
+                "reentry_bump", 0.2
+            ),
+            adaptive_gating=pol_cfg.get("adaptive_gating", False),
+            adaptive_rate=pol_cfg.get("adaptive_gating_rate", 5e-5),
+            # ---- RETURN NORMALIZATION, ACTUALLY WIRED (2026-08-02) --------
+            # RewardMixer has carried this guard since 2026-07-27 and NOTHING
+            # ever passed it, so `return_ratio_cap` sat at its 0.0 default and
+            # the damping branch inside mix() was unreachable — the fix existed
+            # in source and was inert in every run ever made.
+            #
+            # It exists because the WEIGHTS said 0.7/0.3 while the RETURNS were
+            # 1922:1 curiosity (measured on the stalled run: weighted intrinsic
+            # return 9179.4 vs weighted extrinsic 4.78). Annealing a weight
+            # cannot matter when one stream fires every step and the other
+            # fires four times in sixty segments — PPO optimises curiosity and
+            # never sees the task. That is what "reward does not work" IS.
+            #
+            # 0.0 still means OFF, which remains the default for every config
+            # that does not ask for it (tests/_stall_fixes_smoke.py pins that
+            # default, and the guard only ever SHRINKS intrinsic, never
+            # amplifies it, so it cannot detonate a task-free warmup).
+            return_ratio_cap=pol_cfg.get("return_ratio_cap", 0.0),
+            ret_ema_alpha=pol_cfg.get("return_ema_alpha", 1e-4),
+            min_intrinsic_scale=pol_cfg.get("min_intrinsic_scale", 0.1),
+        )
+        if float(pol_cfg.get("return_ratio_cap", 0.0)) > 0.0:
+            logger.info(
+                "REWARD RETURN NORMALIZATION ACTIVE: intrinsic is damped "
+                "whenever its return EMA exceeds %.1fx the extrinsic one "
+                "(floor %.2f, alpha %.0e) — the task signal can no longer be "
+                "buried by a dense per-step curiosity stream",
+                self.reward_mixer.target_ratio,
+                self.reward_mixer.min_intrinsic_scale,
+                self.reward_mixer._ret_ema_alpha)
+
+        # ---- Create Dream Actor-Critic (latent-space policy) ----
+        dream_cfg = self.config.get("dream_training", {})
+        self.dream_actor = DreamActorCritic(
+            latent_dim=self.world_model.rssm.latent_dim,
+            action_dim=self.action_dim,
+            hidden_dim=dream_cfg.get("hidden_dim", 400),
+            continuous=not self.is_discrete,
+            actor_lr=dream_cfg.get("actor_lr", 3e-5),
+            critic_lr=dream_cfg.get("critic_lr", 3e-5),
+            gamma=dream_cfg.get("gamma", 0.997),
+            lambda_=dream_cfg.get("lambda_", 0.95),
+            entropy_scale=dream_cfg.get("entropy_scale", 3e-4),
+            target_ema=dream_cfg.get("target_ema", 0.98),
+        ).to(self.device)
+        self.dream_training_active = False
+        self.dream_warmup = dream_cfg.get("warmup_episodes", 50)
+        self.dream_enabled = dream_cfg.get("enabled", True)
+        # ---- Imagination-AUGMENTED learning (Rung 4) ----
+        # dream_control True (default) = original dream-CONTROL (the dream actor
+        # drives real actions in the IMAGINE stage — the destabilizing path).
+        # dream_control False = AUGMENT mode: the dream actor trains in imagination
+        # and is DISTILLED into the real policy, but the REAL PPO policy stays in
+        # control and learns normally (dream_training_active is never set, so the
+        # PPO path is byte-for-byte unaffected). This is the proper sample-
+        # efficiency lever: extra learning from accurate dreams, no control handover.
+        self.dream_control = dream_cfg.get("control", True)
+        self.dream_augment = bool(self.dream_enabled) and not self.dream_control
+        self.dream_activate_after = dream_cfg.get("activate_after_episodes", self.dream_warmup)
+        self.dream_distill_weight = float(dream_cfg.get("distill_weight", 1.0))
+        self.dream_augment_active = False
+        self._distill_opt = (
+            torch.optim.Adam(self.policy.actor.parameters(),
+                             lr=dream_cfg.get("distill_lr", 1e-4))
+            if self.dream_augment else None
+        )
+        # ---- Distillation shaping (Rung 4 fix) ----
+        # The original distill pulled the real policy toward the dream actor at
+        # EVERY replay state, with a FIXED weight, via forward KL (mode-covering).
+        # That violated "anneal naturally — never fix the ratio": late in training
+        # PPO has already surpassed the dream actor, yet the fixed-weight pull kept
+        # re-injecting the dream's softness and dragged final AUC/frac_solved down
+        # (confirmed in both seeds even after the reward head was fixed). Three
+        # coordinated levers fix it — distill only good dreams, only while they help:
+        #   value_gate    : per-state mask — distill only where the dream critic
+        #                   values the state ABOVE the real critic (the dream sees a
+        #                   better path there); elsewhere PPO is already >= so no pull.
+        #   natural_anneal: scale the distill weight by (1 - solve_rate_EMA) so the
+        #                   dream's influence fades to zero as extrinsic reward
+        #                   becomes reliably findable — kills the late-training drag.
+        #   teacher_temp  : sharpen the teacher (<1) so the real policy adopts the
+        #                   dream's PREFERRED action, not its uncertainty.
+        self.dream_distill_value_gate = bool(dream_cfg.get("value_gate", True))
+        self.dream_distill_anneal = bool(dream_cfg.get("natural_anneal", True))
+        self.dream_distill_temp = float(dream_cfg.get("teacher_temp", 0.5))
+        self._dream_solve_ema = 0.0
+        self._dream_solve_beta = float(dream_cfg.get("solve_ema_beta", 0.05))
+        self._dream_solve_threshold = float(dream_cfg.get("solve_threshold", 0.1))
+        # ---- WM-trust gating (July 2026 audit, H2 — capstone collapse fix) ----
+        # The value gate alone compares INCOMMENSURABLE critics (dream critic:
+        # extrinsic-only WM-predicted symexp'd rewards; real critic: mixed
+        # intrinsic+extrinsic GAE), so on a weak-WM env it opens widest exactly
+        # where the teacher hallucinates; and the natural anneal is MAXIMAL when
+        # the policy fails — a positive feedback loop into collapse. Fix: only
+        # distill at states where the WM's own surprise (posterior-vs-prior KL)
+        # is low, and scale the global pull by an EMA of that trust fraction, so
+        # on envs the WM doesn't understand the pull fades no matter how badly
+        # the real policy is doing. Signal-driven — no fixed ratio.
+        self.dream_distill_trust_gate = bool(dream_cfg.get("trust_gate", True))
+        self.dream_distill_trust_kl_max = float(dream_cfg.get("trust_kl_max", 6.0))
+        self._wm_trust_ema = 0.0
+        self._wm_trust_beta = float(dream_cfg.get("trust_ema_beta", 0.1))
+
+        # ---- Developmental Stage Controller (closed-loop EXPLORE<->EXPLOIT) ----
+        # Drives the curiosity->task handoff (and the optional, trust-gated
+        # Stage-2 dream-control) from the agent's own learning signals — WM
+        # prediction-error plateau as the spine, skill-acquisition rate as a
+        # forward-only confirm. Replaces the old wall-clock anneal + episode-
+        # count dream latch. IMAGINE (dream-control) stays dormant unless dream
+        # training is enabled AND the world model earns trust.
+        stage_cfg = self.config.get("developmental_stages", {})
+        self.stage_controller = DevelopmentalStageController(
+            window=stage_cfg.get("window", 30),
+            patience=stage_cfg.get("patience", 5),
+            min_episodes=stage_cfg.get("min_episodes", 50),
+            flat_slope_threshold=stage_cfg.get("flat_slope_threshold", 1e-3),
+            skill_rate_threshold=stage_cfg.get("skill_rate_threshold", 0.02),
+            spike_factor=stage_cfg.get("spike_factor", 1.5),
+            trust_level=stage_cfg.get("trust_level", 0.0),
+            force_exploit_timestep=stage_cfg.get("force_exploit_timestep", None),
+            force_imagine_timestep=stage_cfg.get("force_imagine_timestep", None),
+            dream_enabled=self.dream_enabled,
+        )
+
+        # ---- Create LLM Module (optional — requires Ollama) ----
+        llm_cfg = self.config.get("llm", {})
+        shape_cfg = llm_cfg.get("reward_shaping", {}) or {}
+        if llm_cfg.get("enabled", True):
+            self.llm = LLMModule(
+                model=llm_cfg.get("model", "llama3.1:8b"),
+                env_description=llm_cfg.get(
+                    "env_description",
+                    f"Gymnasium {self.env_name} environment",
+                ),
+                obs_labels=self.obs_labels,
+                perception_interval=llm_cfg.get("perception_interval", 50),
+                goal_interval=llm_cfg.get("goal_interval", 25),
+                reasoning_interval=llm_cfg.get("reasoning_interval", 100),
+                shaping_interval=shape_cfg.get("interval", 25),
+                async_mode=llm_cfg.get("async_mode", True),
+                enabled=True,
+            )
+            if self.llm.is_available:
+                logger.info(
+                    "LLM module active — Ollama will assist with "
+                    "perception and goal generation "
+                    f"(async={self.llm.async_mode})"
+                )
+        else:
+            # enabled=False forces every sub-channel offline even if a local
+            # Ollama server is running, so no LLM calls fire and all should_*/
+            # submit_* short-circuit (poll_* -> None).
+            self.llm = LLMModule(enabled=False, async_mode=False)
+
+        # Most recent goal produced by the (async) LLM goal generator. The loop
+        # reuses it across episodes until a fresh one arrives, so a slow Ollama
+        # call never blocks goal selection.
+        self._pending_llm_goal: Optional[Dict[str, Any]] = None
+
+        # ---- LLM goal-progress reward shaping (Path B) ----
+        # The LLM scores how much each episode advanced the current goal; that
+        # progress estimate Phi is consumed as a POTENTIAL-BASED shaping term:
+        #   F = w * (Phi_now - Phi_prev)
+        # applied once per episode onto the last stored transition. Difference-
+        # form (no per-step constant) => telescopes to w*(Phi_final-Phi_initial),
+        # so it CANNOT be farmed by stalling and provably preserves the task's
+        # optimal policy. The weight w anneals toward zero on the same per-
+        # timestep clock as curiosity — a fading guide, never a fixed ratio.
+        self.llm_shaping_enabled = (
+            shape_cfg.get("enabled", True) and llm_cfg.get("enabled", True)
+        )
+        self.llm_shape_w0 = shape_cfg.get("weight", 0.2)
+        self.llm_shape_w = self.llm_shape_w0
+        self.llm_shape_min = shape_cfg.get("min_weight", 0.0)
+        self.llm_shape_decay = shape_cfg.get("decay", 5e-6)
+        self.llm_shape_clip = shape_cfg.get("clip", 1.0)
+        self.llm_potential = 0.0       # Phi: latest LLM goal-progress estimate
+        self.llm_potential_prev = 0.0  # Phi at last shaping application
+        self._recent_ep_rewards: deque = deque(maxlen=20)
+
+        # ---- Curiosity-ranked vision magnet (INSTINCT channel, redesigned
+        #      July 2026) ----
+        # No longer a second VLM. The magnet consumes (a) the GROUNDING HEAD's
+        # per-object presence probabilities (which the symbolizer already
+        # predicts from the agent's own RSSM latent each step) and (b) the
+        # primary stream's own learning-progress reward (intrinsic[0]), keeps a
+        # contrastive per-category LP-EMA, and steers the agent toward whatever
+        # it is currently most CURIOUS about — retargeting with hysteresis and
+        # setting its OWN weight so it FADES as curiosity quenches and RE-ARMS
+        # on a novel object. It never selects actions, and the env's raw reward
+        # stream — what spike-based goal discovery and all grading read — is
+        # never modified. Condition-based (curiosity magnitude), not a clock,
+        # so it is correct in a never-ending lifelong stream.
+        vis_cfg = llm_cfg.get("vision", {}) or {}
+        self.vision_scaffold = None
+        # Waking-step counter: retarget-hysteresis clock (min_dwell). Advances
+        # ONLY on serial waking steps (where the magnet actually runs), NOT
+        # during dream/parallel phases.
+        self._vision_clock = 0
+        if vis_cfg.get("enabled", False) and self.pixel_obs:
+            from developmental_ai.llm.vision_scaffold import VisionScaffold
+            self.vision_scaffold = VisionScaffold(
+                weight=vis_cfg.get("weight", 0.15),
+                min_weight=vis_cfg.get("min_weight", 0.0),
+                cold_start_weight=vis_cfg.get("cold_start_weight", 0.10),
+                cold_start_budget=vis_cfg.get("cold_start_budget", 4000),
+                focus_distractors=vis_cfg.get("focus_distractors", None),
+                target_categories=vis_cfg.get("target_categories", None),
+                ema_beta=vis_cfg.get("ema_beta", 0.01),
+                ema_leak=vis_cfg.get("ema_leak", 0.005),
+                present_threshold=vis_cfg.get("present_threshold", 0.6),
+                reliability_floor=vis_cfg.get("reliability_floor", 0.35),
+                min_labels=vis_cfg.get("min_labels", 5),
+                retarget_margin=vis_cfg.get("retarget_margin", 0.20),
+                min_dwell=vis_cfg.get("min_dwell", 25),
+                absent_tolerance=vis_cfg.get("absent_tolerance", 3),
+                eps_abs=vis_cfg.get("eps_abs", 1.0e-3),
+                scale_decay=vis_cfg.get("scale_decay", 0.999),
+                instinct_bonus=vis_cfg.get("instinct_bonus", 0.05),
+                approach_pull=vis_cfg.get("approach_pull", 0.0),
+                align_bonus=vis_cfg.get("align_bonus", 0.0),
+                aim_bonus=vis_cfg.get("aim_bonus", 0.0),
+                seek_weight=vis_cfg.get("seek_weight", 0.0),
+                seek_categories=vis_cfg.get("seek_categories", None),
+                seek_forward_nudge=vis_cfg.get("seek_forward_nudge", 0.0),
+                seek_nudge_budget=vis_cfg.get("seek_nudge_budget", 200),
+                seek_nudge_regen=vis_cfg.get("seek_nudge_regen", 0),
+                lp_stale_tau=vis_cfg.get("lp_stale_tau", 0.0),
+                chop_actions=vis_cfg.get("chop_actions", [5, 6]),
+                forward_actions=vis_cfg.get("forward_actions", [1, 2, 6]),
+                turn_left_actions=vis_cfg.get("turn_left_actions", [3]),
+                turn_right_actions=vis_cfg.get("turn_right_actions", [4]),
+                pitch_actions=vis_cfg.get("pitch_actions", [7, 8]),
+                contrast_vs_peers=vis_cfg.get("contrast_vs_peers", False),
+                phi_from_evidence=vis_cfg.get("phi_from_evidence", False),
+                seek_pitch_level=vis_cfg.get("seek_pitch_level", False),
+            )
+            logger.info(
+                "Curiosity-ranked vision magnet active: w0=%.3f targets=%s "
+                "(contrastive LP-EMA, condition-based fade)",
+                vis_cfg.get("weight", 0.15),
+                vis_cfg.get("target_categories") or "default-interactables")
+
+        # ---- Create Skill Composer ----
+        self.skill_composer = SkillComposer(
+            min_mastery=sb_cfg.get("mastery_threshold", 0.8),
+        )
+        self.composite_executor = CompositeSkillExecutor(self.skill_bank)
+
+        # ---- Training state ----
+        self.total_timesteps = 0
+        self.total_episodes = 0
+        self.episode_rewards = deque(maxlen=100)
+        self.training_metrics: Dict[str, deque] = {
+            "episode_reward": deque(maxlen=100),
+            "episode_length": deque(maxlen=100),
+            "intrinsic_reward": deque(maxlen=100),
+            "world_model_loss": deque(maxlen=100),
+            "curiosity_loss": deque(maxlen=100),
+            "policy_loss": deque(maxlen=100),
+            "kl_divergence": deque(maxlen=100),
+            "new_facts": deque(maxlen=100),
+            "symbolic_decoder_loss": deque(maxlen=100),
+            "symbolic_decoder_accuracy": deque(maxlen=100),
+            "symbolic_decoder_facts": deque(maxlen=100),
+            "glue_mastery_score": deque(maxlen=100),
+            "glue_kg_density": deque(maxlen=100),
+            "dream_actor_loss": deque(maxlen=100),
+            "dream_distill_loss": deque(maxlen=100),
+            "dream_distill_gate_frac": deque(maxlen=100),
+            "dream_distill_eff_weight": deque(maxlen=100),
+            "dream_critic_loss": deque(maxlen=100),
+            "dream_returns_mean": deque(maxlen=100),
+            "inverse_dynamics_loss": deque(maxlen=100),
+        }
+
+        # ---- SELECTIVE RESUME (2026-08-03) -------------------------------
+        # MEASURED: load_checkpoint() exists but NOTHING in the launch path
+        # calls it — not run_minecraft.py, not launch_skybot.sh. Its only
+        # callers are the demo/eval/transfer scripts. So every restart threw
+        # away the world model, policy, curiosity, dream actor and glue layer
+        # and relearned from scratch, while the skill bank (goals, minted
+        # skills) persisted. The system retained SKILLS better than LEARNING,
+        # which is why entropy started ~90% and the reward curve
+        # 0.02 -> 0.14 -> 0.38 -> 0.53 was re-run from zero after every deploy.
+        _rc = [str(x) for x in (self.config.get("loop", {}).get(
+            "resume_components") or [])]
+        if _rc:
+            self._resume_components(
+                self.config.get("loop", {}).get(
+                    "log_dir", "./logs") + "/checkpoints", _rc)
+
+    def _resume_components(self, checkpoint_dir: str, names) -> None:
+        """Restore ONLY the named components from a checkpoint.
+
+        DELIBERATELY NOT `load_checkpoint`. That one restores the policy and
+        dream actor too, and those are the ones that must NOT come back right
+        now: they encode a policy converged under a reward economics that has
+        since changed, and they resume at ~0 entropy with no way to explore
+        out of a now-wrong optimum. Discarding the policy each launch is
+        currently the only reason the run ever shows a healthy exploration
+        phase. This method makes that a CHOICE rather than an accident.
+
+        DIRECTIONAL, and the direction matters: keeping the world model while
+        resetting the policy is safe, because under arch="wm" the policy reads
+        world_model.encoder and simply relearns its action mapping on a better
+        perception. The reverse — a resumed policy on a fresh encoder — would
+        have its perception change underneath it, and is never valid here.
+
+        Every load is shape-guarded. `action_dim` moved 10 -> 12 historically,
+        and a stale checkpoint with the wrong head width must fail LOUD and
+        fall back to fresh weights, never load partially.
+        """
+        import os as _os
+        if not _os.path.isdir(checkpoint_dir):
+            logger.info("resume: no checkpoint dir at %s — starting fresh",
+                        checkpoint_dir)
+            return
+        # SHAPES MUST MATCH THE WRITER, not the attribute name. _save_checkpoint
+        # writes symbolic_decoder.pt from `self.symbolic_decoder.DECODER` (the
+        # inner module, which is None under the pixel gate) and glue_layer.pt
+        # as a TWO-KEY DICT {"gnn", "gate"} — loading either into the outer
+        # object would raise, or worse, silently no-op.
+        def _load_wm(m):
+            self.world_model.load_state_dict(m)
+
+        def _load_sd(m):
+            _dec = getattr(self.symbolic_decoder, "decoder", None)
+            if _dec is None:
+                raise RuntimeError(
+                    "symbolic_decoder.decoder is None (pixel gate / null "
+                    "decoder) — nothing to restore into")
+            _dec.load_state_dict(m)
+
+        def _load_glue(m):
+            _ki = self.glue.knowledge_integrator
+            if not isinstance(m, dict) or "gnn" not in m or "gate" not in m:
+                raise RuntimeError(
+                    f"glue_layer.pt is not the expected "
+                    f"{{'gnn','gate'}} dict (got {type(m).__name__})")
+            _ki.gnn.load_state_dict(m["gnn"])
+            _ki.gate.load_state_dict(m["gate"])
+
+        _loaders = {
+            "world_model": ("world_model.pt", _load_wm),
+            "symbolic_decoder": ("symbolic_decoder.pt", _load_sd),
+            "glue_layer": ("glue_layer.pt", _load_glue),
+        }
+        _ok, _skip = [], []
+        for _n in names:
+            if _n == "knowledge_graph":
+                _kp = _os.path.join(checkpoint_dir, "knowledge_graph.json")
+                if not _os.path.exists(_kp):
+                    _skip.append(f"{_n}(absent)"); continue
+                try:
+                    self.knowledge_graph.load(_kp)
+                    _ok.append(_n)
+                except Exception as _e:
+                    _skip.append(f"{_n}({type(_e).__name__})")
+                    logger.warning("resume: knowledge_graph FAILED (%s) — "
+                                   "continuing with an empty graph", _e)
+                continue
+            if _n in ("policy", "dream_actor", "curiosity"):
+                # refused by name, so it can never happen by a config typo
+                logger.warning(
+                    "resume: REFUSING '%s' — restoring a converged policy "
+                    "resumes its entropy collapse under a reward function "
+                    "that has since changed. Remove it from "
+                    "loop.resume_components.", _n)
+                _skip.append(f"{_n}(refused)")
+                continue
+            _spec = _loaders.get(_n)
+            if _spec is None:
+                _skip.append(f"{_n}(unknown)"); continue
+            _fn, _apply = _spec
+            _fp = _os.path.join(checkpoint_dir, _fn)
+            if not _os.path.exists(_fp):
+                _skip.append(f"{_n}(absent)"); continue
+            try:
+                _apply(torch.load(_fp, map_location=self.device))
+                _ok.append(_n)
+            except Exception as _e:
+                # LOUD, and fresh weights survive: load_state_dict raises
+                # before mutating on a shape mismatch, so the module is intact.
+                _skip.append(f"{_n}({type(_e).__name__})")
+                logger.warning(
+                    "resume: '%s' NOT restored (%s: %s) — this is usually a "
+                    "shape change (action_dim, enc_dim). Continuing with "
+                    "FRESH weights for it.", _n, type(_e).__name__, _e)
+        logger.info("RESUMED %s from %s%s", _ok or "nothing", checkpoint_dir,
+                    f" | skipped: {', '.join(_skip)}" if _skip else "")
+        if "world_model" in _ok:
+            logger.info(
+                "  perception carried over: the policy reads "
+                "world_model.encoder, so a fresh policy starts on a TRAINED "
+                "visual system and only relearns its action mapping")
+
+    def close(self) -> None:
+        """Clean up resources (Neo4j connections, LLM threads, etc.)."""
+        if hasattr(self.knowledge_graph, "close"):
+            self.knowledge_graph.close()
+        if hasattr(self, "llm") and self.llm is not None:
+            self.llm.close()
+        if getattr(self, "vision_scaffold", None) is not None:
+            self.vision_scaffold.close()
+        if getattr(self, "symbolizer", None) is not None:
+            self.symbolizer.close()
+        # Stop the async WM trainer FIRST (before the sampler it consumes and
+        # before env/CUDA teardown): a daemon thread killed at interpreter
+        # exit mid-optimizer-step segfaults, and closing the sampler first
+        # would strand a mid-block trainer in sampler.get() (review fix).
+        if getattr(self, "_wm_trainer_thread", None) is not None:
+            self._wm_trainer_stop.set()
+            self._wm_trainer_thread.join(timeout=90)
+            if self._wm_trainer_thread.is_alive():
+                logger.warning("async WM trainer did not stop within 90s")
+        if hasattr(self, "_bg_sampler") and self._bg_sampler is not None:
+            self._bg_sampler.close()
+        # Close any extra parallel envs (index 0 is self.env, closed below).
+        for e in getattr(self, "_parallel_envs", [])[1:]:
+            try:
+                e.close()
+            except Exception:
+                pass
+        self.env.close()
+
+    # -----------------------------------------------------------------------
+    # Main training loop
+    # -----------------------------------------------------------------------
+
+    def run(
+        self,
+        total_timesteps: Optional[int] = None,
+        log_interval: int = 10,
+        save_interval: Optional[int] = None,
+        verbose: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Run the developmental AI loop.
+
+        This is the core training loop that implements:
+          Environment → Curiosity → Goal → Explore → Observe →
+          Prediction Error → Update World Model → Add Skill → Repeat
+
+        Args:
+            total_timesteps: Max steps to run (None = run forever)
+            log_interval: Episodes between logging
+            save_interval: Timesteps between checkpoints
+            verbose: 0=silent, 1=info, 2=debug
+
+        Returns:
+            Training summary with metrics
+        """
+        if total_timesteps is None:
+            _cfg_budget = self.config.get("loop", {}).get(
+                "total_timesteps", 100000)
+            # forever-mode -> None (run until stop-file/SIGTERM); else the
+            # configured budget, exactly as before.
+            total_timesteps = self._ll_ctrl.budget(_cfg_budget)
+
+        # `loop.checkpoint_interval` had NO reader: run_minecraft.py calls
+        # run() without save_interval, so the config value was inert and the
+        # hardcoded 10000 default applied silently. An explicit argument still
+        # wins (harnesses that pass one keep their behaviour).
+        if save_interval is None:
+            save_interval = int(self.config.get("loop", {}).get(
+                "checkpoint_interval", 10000))
+        logger.info("checkpointing every %d timesteps", save_interval)
+
+        logger.info(f"Starting developmental loop for {total_timesteps} timesteps")
+        logger.info(f"Components: RSSM world model, ICM curiosity, "
+                     f"knowledge graph, skill bank, PPO policy")
+
+        start_time = time.time()
+
+        # Warm-start from prior skills happens exactly ONCE, even if run() is
+        # called repeatedly in blocks (e.g. the Rung-5 multi-task harness swaps
+        # self.env and re-enters run() each block). Repeatedly overwriting the
+        # live policy would clobber in-progress learning, so the latch persists
+        # across run() calls — only the first call seeds.
+        if not hasattr(self, "_warm_start_done"):
+            self._warm_start_done = False
+
+        # ---- Env-swap detection (July 2026 audit, H2) ----
+        # Block-driven harnesses (capstone, rung 5) swap self.env and re-enter
+        # run(). On a swap: (a) restart the dream-augment warmup so distillation
+        # doesn't fire immediately from a teacher trained on the PREVIOUS env's
+        # dynamics, and (b) flush the PPO rollout buffer so the first (and
+        # formative) update on the new env isn't contaminated with up to a full
+        # window of old-env transitions whose rewards and optimal actions differ.
+        if not hasattr(self, "_env_token"):
+            self._env_token = id(self.env)
+            self._episodes_this_env = self.total_episodes
+        elif self._env_token != id(self.env):
+            self._env_token = id(self.env)
+            self._episodes_this_env = 0
+            n_stale = len(self.policy.rollout_obs)
+            if n_stale:
+                for lst in (self.policy.rollout_obs,
+                            self.policy.rollout_actions,
+                            self.policy.rollout_rewards,
+                            self.policy.rollout_dones,
+                            self.policy.rollout_log_probs,
+                            self.policy.rollout_values,
+                            self.policy.rollout_knowledge,
+                            self.policy.rollout_taus,
+                            self.policy.rollout_masks):
+                    lst.clear()
+            logger.info(
+                "Env swap detected: dream-augment warmup restarted, "
+                "%d stale rollout transitions flushed.", n_stale)
+
+        # STOP-FILE APPLIES TO BUDGETED RUNS TOO (2026-07-25). It used to be
+        # consulted only on the `total_timesteps is None` (forever) branch,
+        # while `should_stop()` itself returned False unless `forever` was set
+        # — so for a budgeted run (`forever: false`, the mode actually used on
+        # the pod) touching `lifelong.stop_file` did NOTHING. The documented
+        # graceful-stop escape hatch silently no-op'd, leaving SIGKILL mid-write
+        # as the only way to end a run. Both halves are fixed: `should_stop()`
+        # now honours the stop-file whenever lifelong is enabled, and it is
+        # checked on BOTH branches here.
+        while (not self._ll_ctrl.should_stop()
+               and ((total_timesteps is None)
+                    or (self.total_timesteps < total_timesteps))):
+            # ---- Generate goal for this episode ----
+            # LLM goal generation is ASYNC: we poll for any goal that finished
+            # on the background thread, and periodically submit a new request.
+            # The (possibly slow) Ollama call never blocks this loop.
+            ready_goal = self.llm.poll_goal()
+            if ready_goal:
+                self._pending_llm_goal = ready_goal
+                logger.info(
+                    f"LLM goal: {ready_goal.get('description', '?')} "
+                    f"[{ready_goal.get('strategy', '?')}]"
+                )
+
+            if self.llm.should_generate_goal(self.total_episodes):
+                kg_stats = self.knowledge_graph.get_stats()
+                sk_stats = self.skill_bank.get_stats()
+                self.llm.submit_goal(
+                    knowledge_summary=(
+                        f"{kg_stats['num_facts']} facts, "
+                        f"{kg_stats['num_entities']} entities, "
+                        f"{kg_stats['num_action_rules']} rules"
+                    ),
+                    skill_summary=", ".join(sk_stats["skill_names"]) or "None",
+                    recent_performance=(
+                        f"Avg reward: "
+                        f"{np.mean(list(self.training_metrics['episode_reward'])) if self.training_metrics['episode_reward'] else 0:.2f}"
+                    ),
+                )
+
+            llm_goal = self._pending_llm_goal
+            goal = self.glue.generate_goal(
+                self.knowledge_graph,
+                self.symbolic_decoder,
+                skill_bank=self.skill_bank,
+                llm_subgoals=llm_goal.get("sub_goals") if llm_goal else None,
+                stage=self.stage_controller.stage,
+            )
+
+            # ---- Warm-start from prior skills (ONCE, at run start) ----
+            # Cumulative learning across runs: a relevant skill saved by a
+            # *previous* run seeds the PPO policy so practice compounds. We do
+            # this exactly once per run. Overwriting the live policy mid-run
+            # (the old per-episode behavior) repeatedly clobbered in-progress
+            # learning — the Q1 instability — so it is now latched.
+            if not self._warm_start_done:
+                self._warm_start_done = True
+                relevant_skills = self.glue.select_skills(
+                    goal, self.skill_bank, self.knowledge_graph,
+                    max_skills=self.skill_bank.max_skills_loaded,
+                )
+                # relevant_skills is sorted by relevance (desc). Take the best
+                # skill that is BOTH relevant enough AND shape-compatible with
+                # this env's policy network. A high-similarity match to a
+                # different-env skill (different obs/action dims) must NOT be
+                # loaded — load_state_dict would raise a shape mismatch and
+                # crash the run — so we skip it and try the next candidate.
+                #
+                # The cut is `skill_bank.similarity_threshold` (was a
+                # hardcoded 0.7). Scale is the normalized [0,1] relevance from
+                # SkillSelector, further scaled by competence — so it is the
+                # bar for "relevant AND competent enough to seed the policy",
+                # and how many candidates get this far is max_skills_loaded.
+                _sim_floor = float(self.skill_bank.similarity_threshold)
+                for best_skill, score in relevant_skills:
+                    if score <= _sim_floor:
+                        break  # sorted desc → nothing further qualifies
+
+                    dims_known = (
+                        best_skill.obs_dim is not None
+                        and best_skill.action_dim is not None
+                    )
+                    if dims_known and (
+                        best_skill.obs_dim != self.obs_dim
+                        or best_skill.action_dim != self.action_dim
+                    ):
+                        logger.info(
+                            f"Skipping warm-start from '{best_skill.name}' "
+                            f"(relevance={score:.2f}) — shape mismatch "
+                            f"(skill obs/act="
+                            f"{best_skill.obs_dim}/{best_skill.action_dim}, "
+                            f"env obs/act={self.obs_dim}/{self.action_dim})"
+                        )
+                        continue
+
+                    policy_state = self.skill_bank.load_skill_policy(
+                        best_skill.skill_id
+                    )
+                    if not policy_state:
+                        continue
+
+                    # SNAPSHOT-AND-RESTORE (2026-07-26). torch >=2.6 copies
+                    # every MATCHING parameter into the module BEFORE raising
+                    # on the first mismatched one — so the except-branch's
+                    # "keep the fresh policy" was a lie: the run continued on
+                    # a FRANKEN-policy (foreign trunk + fresh head + fresh
+                    # critic) while logging "training from scratch". The only
+                    # honest failure mode is all-or-nothing.
+                    import copy as _copy
+                    _fresh_sd = _copy.deepcopy(self.policy.get_state_dict())
+                    try:
+                        self.policy.load_state_dict(policy_state)
+                    except (RuntimeError, ValueError) as e:
+                        self.policy.load_state_dict(_fresh_sd)   # undo partial
+                        logger.info(
+                            f"Warm-start from '{best_skill.name}' failed "
+                            f"(incompatible policy: {e}); restored the fresh "
+                            f"policy — training from scratch, genuinely"
+                        )
+                        continue
+
+                    logger.info(
+                        f"Warm-started policy from skill "
+                        f"'{best_skill.name}' (relevance={score:.2f}) "
+                        f"— seeding this run from prior experience"
+                    )
+                    break
+
+            # ---- Run one episode ----
+            # Parallel collection only activates once dream training is active.
+            # Before that, the on-policy PPO learner is collecting real rollouts
+            # (whose GAE assumes a single temporal stream), so we keep the
+            # proven single-env path. After warmup the real policy is dormant
+            # and the rollout's only job is to feed the world model + buffer —
+            # which parallelizes safely across N envs.
+            # Parallel collection now runs in BOTH phases (July 2026 curiosity
+            # program): waking uses the REAL policy across N envs (15 "scout"
+            # streams feed the world model + curiosity + discovery; PPO learns
+            # on-policy from the primary stream only, so GAE stays single-
+            # stream-correct), dream uses the latent dream actor. This is what
+            # makes the fleet accelerate the CURIOSITY phase, not just dreams.
+            if self._lifelong:
+                episode_metrics = self._collect_segment()
+            elif self._use_parallel_envs:
+                episode_metrics = self._run_episode_parallel(
+                    use_dream_actor=self.dream_training_active)
+            else:
+                episode_metrics = self._run_episode()
+
+            # Track metrics
+            for key, value in episode_metrics.items():
+                if key in self.training_metrics:
+                    self.training_metrics[key].append(value)
+
+            self.total_episodes += 1
+            self._episodes_this_env += 1
+
+            # ---- Achievement-grounded skill minting (rich-env program,
+            # step 2) ---- One skill PER ACHIEVEMENT at its first unlock,
+            # instead of one-per-env at an unreachable 0.8 mastery bar (both
+            # 1M rich-env runs minted ZERO skills under the old rule). The
+            # context embedding is the CANONICAL goal vector for that slot,
+            # so future goal-conditioned retrieval matches by construction.
+            if (
+                self.broadcaster is not None
+                and hasattr(self.broadcaster, "pop_skill_mint_events")
+                and self.config.get("goals", {}).get("mint_skills", True)
+            ):
+                for slot, slot_name in self.broadcaster.pop_skill_mint_events():
+                    emb = self._unlock_context.get(slot)
+                    if emb is None:  # unlock predates latent pairing
+                        emb = np.zeros(self.broadcaster.DIM, dtype=np.float32)
+                        emb[slot] = 1.0
+                        emb[2 * self.broadcaster.max_slots] = 1.0
+                    comp = float(
+                        self.broadcaster.competence.predict_all()[slot])
+                    # GROUNDED naming — from the block that actually broke
+                    # at unlock, never the VLM (which hallucinated
+                    # "fish_blue_water" etc. from frames). Ground truth only.
+                    from developmental_ai.skill_bank import skill_notes
+                    _frame = self._unlock_frame.get(slot)
+                    _pre = self._preconditions_from_latent(slot)
+                    _name, _desc = self._grounded_skill_name(slot, _pre)
+                    # ---- FOSSIL GUARD (2026-07-27 stall assessment) -------
+                    # Refuse to mint a slot whose NAME encodes no grounded
+                    # effect (`discovered_N`, `break_air`). Those are evidence
+                    # that SOMETHING happened, not evidence of a capability;
+                    # minting them is what filled this bank with 48 slots and
+                    # 0 usable skills. scripts/retire_fossil_skills.py cleaned
+                    # them once, but nothing stopped them coming back — so the
+                    # guard belongs HERE, at the moment of creation, not in a
+                    # tool that runs afterwards.
+                    from developmental_ai.core.achievement_goals import (
+                        is_fossil_slot_name)
+                    if is_fossil_slot_name(slot_name) or \
+                            is_fossil_slot_name(_name):
+                        logger.info(
+                            "mint REFUSED for slot %d: fossil name "
+                            "(slot_name=%r, grounded=%r) — an unnamed effect "
+                            "is not a capability", slot, slot_name, _name)
+                        continue
+                    # ---- COMPOSITION METADATA (arch v3) -----------------
+                    # slot_map: what each option-slot row of the SAVED head
+                    # meant at this instant, by IDENTITY. Slots rebind, so a
+                    # frozen skill can only ever re-resolve children through
+                    # this map — a row whose skill has left the working set
+                    # goes dark instead of silently invoking a stranger.
+                    # parent_skills: skills observed RUNNING when this
+                    # slot's effect unlocked (earned provenance, additive).
+                    _slot_map, _parents = None, None
+                    if self.option_executor is not None:
+                        _slot_map = {
+                            str(_j): _sb["skill_id"]
+                            for _j, _sb in enumerate(
+                                self.option_executor.bank.slots)
+                            if _sb is not None
+                            and not _sb.get("scripted")}
+                        _parents = sorted({
+                            _co["skill_id"]
+                            for _co in self.option_executor.co_log
+                            if int(_co.get("unlocked_slot", -1)) == slot})
+                    _skill = self.skill_bank.save_skill(
+                        skill_id=f"ach_{slot:02d}_{slot_name}"[:64],
+                        name=_name,
+                        policy_state_dict=self.policy.get_state_dict(),
+                        description=_desc,
+                        success_rate=comp,
+                        total_episodes=self.total_episodes,
+                        avg_reward=float(
+                            episode_metrics.get("episode_reward", 0.0)),
+                        context_embedding=emb,
+                        preconditions=_pre or None,
+                        obs_dim=self.obs_dim,
+                        action_dim=self.action_dim,
+                        dedup=True,
+                        parent_skills=_parents or None,
+                        **self._arch_save_kwargs(),
+                    )
+                    self._write_skill_note(_skill, slot, _frame)
+                    if self.option_executor is not None:
+                        self.option_executor.bank.notify_minted(
+                            _skill.skill_id)
+                    logger.info(
+                        "Minted achievement skill '%s' -> '%s' (slot %d, "
+                        "ep %d)", slot_name, _name, slot,
+                        self.total_episodes)
+
+            # Persist slot identity + competence once per episode: a few-KB
+            # atomic write, and the thing that makes skills survive ANY stop
+            # (there is no signal handler on this path — durability comes
+            # from writing at every boundary, not from a graceful exit).
+            if (self.broadcaster is not None
+                    and hasattr(self.broadcaster, "save_state")):
+                self.broadcaster.save_state(self._broadcaster_state_path)
+            # Consolidate working-set paging: drain page events (bounds the
+            # queues on a multi-day run) + persist the long-term index.
+            self._drain_goal_paging()
+            if self.option_executor is not None:
+                # earned prerequisite edges from this episode's practice,
+                # then one registry flush for all invocation stats
+                _slot_to_sid = {
+                    i: f"ach_{i:02d}_{nm}"[:64]
+                    for i, nm in enumerate(
+                        getattr(self.broadcaster, "slot_names", []))}
+                self.skill_bank.mine_cooccurrences(
+                    list(self.option_executor.co_log), _slot_to_sid)
+                self.option_executor.co_log.clear()
+                # RE-DISTILL improved skills (audit critical): a skill mints
+                # ONCE at its first-ever unlock, when the policy could barely do
+                # it, and nothing ever captures the IMPROVED policy as competence
+                # grows. Re-save the current policy for any slot whose competence
+                # now clearly beats its stored skill (dedup -> challenger_wins
+                # keeps the strict improvement + archives the incumbent). Gated
+                # by a competence margin + minimum practice so it neither
+                # thrashes disk nor re-saves noise. Within-run BOUND slots stay
+                # frozen (refresh only fills empty slots), so meta-values stay
+                # stationary; the better weights are picked up at the next
+                # empty-slot bind or restart.
+                if (self.broadcaster is not None
+                        and hasattr(self.broadcaster, "competence")
+                        and self.config.get("goals", {}).get(
+                            "mint_skills", True)):
+                    _comp = self.broadcaster.competence.predict_all()
+                    _att = getattr(self.broadcaster, "_attempts", None)
+                    for _sl, _sid in _slot_to_sid.items():
+                        _sk = self.skill_bank.skills.get(_sid)
+                        if _sk is None or _sl >= len(_comp):
+                            continue
+                        _c = float(_comp[_sl])
+                        _at = (int(_att[_sl]) if _att is not None
+                               and _sl < len(_att) else 0)
+                        if (_c >= 0.3 and _at >= 10
+                                and _c > float(_sk.success_rate) + 0.15):
+                            self.skill_bank.save_skill(
+                                skill_id=_sid, name=_sk.name,
+                                policy_state_dict=self.policy.get_state_dict(),
+                                description=_sk.description, success_rate=_c,
+                                total_episodes=self.total_episodes,
+                                context_embedding=_sk.context_embedding,
+                                preconditions=_sk.preconditions or None,
+                                obs_dim=self.obs_dim,
+                                action_dim=self.action_dim, dedup=True,
+                                # arch metadata MUST travel with the weights:
+                                # omitting it wrote conv tensors under a
+                                # 'flat' registry row and the skill was then
+                                # permanently SlotRefused (review CRITICAL).
+                                **self._arch_save_kwargs())
+                            logger.info(
+                                "Re-distilled skill %s: success_rate %.2f -> "
+                                "%.2f (attempts=%d)", _sid,
+                                _sk.success_rate, _c, _at)
+                # ---- MEMORY MAINTENANCE (skills as memories) --------------
+                # Time passes: unrehearsed skills weaken. Practised ones have
+                # improved weights sitting in their slot bindings, so persist
+                # those to disk here — the same boundary every other durable
+                # write uses, since there is no signal handler on this path.
+                _pr = getattr(self.option_executor, "bank", None)
+                _pr = getattr(_pr, "practice", None) if _pr else None
+                if _pr is not None and _pr.enabled:
+                    _stale = _pr.decay()
+                    _n = self._persist_practised_skills()
+                    _st = _pr.stats()
+                    logger.info(
+                        "skill memory: %d practised (%d updates, %d "
+                        "trust-clipped, %d abstained) | mean strength %.2f "
+                        "drift %.4f | %d persisted | %d stale",
+                        _st["slots_practised"], _st["updates_total"],
+                        _st["clipped_total"], _st["abstained"],
+                        _st["mean_strength"], _st["mean_drift"], _n,
+                        len(_stale))
+                self.skill_bank.flush_if_dirty()
+                # BIND newly-minted (and re-distilled) skills into option slots.
+                # Without this the lifelong loop only ever binds at
+                # _start_stream, so every skill discovered DURING the run (a
+                # future break_oak_log included) stays queued in _pending_minted
+                # forever and is never invocable (audit critical). refresh_slots
+                # fills EMPTY slots only — bound slots stay frozen, preserving
+                # meta-value stationarity.
+                self.option_executor.bank.refresh_slots()
+
+            # UNRESOLVED LINKS -> ATTENTION. Concepts the grounded facts
+            # reference but no skill achieves are visible gaps; the slots
+            # that are stepping stones toward them get a frontier boost.
+            # Bias only — ghosts never become goal slots of their own (an
+            # unachievable slot would be targeted forever).
+            if (self.broadcaster is not None
+                    and self.config.get("brain_viewer", {}).get(
+                        "ghost_frontier", True)
+                    and hasattr(self.broadcaster, "set_frontier_bonus")):
+                try:
+                    from developmental_ai.skill_bank.brain_state import (
+                        compute_ghost_frontier)
+                    self.broadcaster.set_frontier_bonus(
+                        compute_ghost_frontier(
+                            self.skill_bank, self.knowledge_graph,
+                            self.broadcaster))
+                except Exception as _e:
+                    logger.warning("ghost frontier skipped: %s", _e)
+
+            if self.brain_emitter is not None:
+                self.brain_emitter.emit(self.total_episodes,
+                                        self.total_timesteps)
+
+            # ---- Periodic world model + symbolic decoder training ----
+            # Lifelong trains the WM on a STEP cadence inside _collect_segment
+            # and reuses those metrics here (no re-training); the episodic
+            # path trains once per episode, exactly as before.
+            if self._lifelong:
+                # consume-once (review fix): with the async trainer a block
+                # can outlast a segment; re-feeding the SAME reconstruction
+                # value would flatten the stage controller's error slope.
+                _wm_ready = (self._last_wm_metrics is not None
+                             and self._wm_metrics_fresh)
+            else:
+                _wm_ready = self.replay_buffer.is_ready
+            if _wm_ready:
+                wm_metrics = (self._last_wm_metrics if self._lifelong
+                              else self._train_world_model())
+                if self._lifelong:
+                    self._wm_metrics_fresh = False
+                self.training_metrics["world_model_loss"].append(
+                    wm_metrics.get("total", 0)
+                )
+                self.training_metrics["kl_divergence"].append(
+                    wm_metrics.get("kl", 0)
+                )
+                self.training_metrics["symbolic_decoder_loss"].append(
+                    wm_metrics.get("symbolic_decoder_loss", 0)
+                )
+                self.training_metrics["symbolic_decoder_accuracy"].append(
+                    wm_metrics.get("symbolic_decoder_accuracy", 0)
+                )
+                self.training_metrics["inverse_dynamics_loss"].append(
+                    wm_metrics.get("inverse", 0)
+                )
+                # Feed training signals to glue layer
+                self.glue.record_training_signals(
+                    kl_value=wm_metrics.get("kl"),
+                    prediction_error=wm_metrics.get("reconstruction"),
+                )
+
+                # ---- Developmental stage controller (closed-loop) ----
+                # WM reconstruction error (learning progress) is the spine;
+                # skill count feeds the forward-only confirm. The controller
+                # decides when curiosity has done its job and the agent should
+                # tip toward task reward — and, with dream enabled, when the
+                # world model is trustworthy enough for dream-control.
+                stage_info = self.stage_controller.update(
+                    prediction_error=wm_metrics.get("reconstruction"),
+                    skill_count=self.skill_bank.get_skill_count(),
+                    timestep=self.total_timesteps,
+                )
+                if stage_info["transitioned"]:
+                    self._on_stage_transition(stage_info)
+
+                # ---- Dream-based policy training (Stage 2 / IMAGINE only) ----
+                # Dream-control is active only in the trust-gated IMAGINE stage,
+                # which is unreachable unless dream training is enabled in config
+                # AND the world model earns trust. On cheap/dense envs (CartPole)
+                # it never engages, keeping PPO in control as intended.
+                # Dream-CONTROL only when explicitly enabled (default). In augment
+                # mode this stays False so the PPO control/learning path is intact.
+                self.dream_training_active = (
+                    (not self._lifelong) and self.dream_control and (
+                        self.stage_controller.stage
+                        == DevelopmentalStageController.IMAGINE))
+                if self.dream_training_active:
+                    try:
+                        dream_metrics = self._dream_train_policy()
+                        for k in (
+                            "dream_actor_loss",
+                            "dream_critic_loss",
+                            "dream_returns_mean",
+                        ):
+                            if k in dream_metrics:
+                                self.training_metrics[k].append(
+                                    dream_metrics[k]
+                                )
+                    except ValueError:
+                        pass  # Not enough data for dream training yet
+
+                # ---- Imagination-AUGMENTED learning (Rung 4) ----
+                # PPO stays in control; the dream actor trains in imagination and
+                # is distilled into the real policy => extra learning per real step.
+                # Warmup counts episodes on THIS env (audit H2): the global
+                # counter meant that after an env swap the condition was
+                # already true, so distillation fired from episode 1 on the
+                # new env from a stale dream actor and old-env replay.
+                self.dream_augment_active = (
+                    self.dream_augment
+                    and getattr(self, "_episodes_this_env", self.total_episodes)
+                    >= self.dream_activate_after
+                )
+                if self.dream_augment_active:
+                    try:
+                        dm = self._dream_train_policy()
+                        for k in ("dream_actor_loss", "dream_critic_loss",
+                                  "dream_returns_mean"):
+                            if k in dm:
+                                self.training_metrics[k].append(dm[k])
+                        dd = self._distill_dream_to_real()
+                        # SLEEP CONSOLIDATION for skills. Placed AFTER the
+                        # distill so `_wm_trust_ema` reflects this segment's
+                        # measured trust — consolidating on last segment's
+                        # trust estimate would let a WM that just went bad get
+                        # one more round of teaching in.
+                        _dc = self._dream_consolidate_skills()
+                        if _dc["slots"]:
+                            logger.info(
+                                "dream consolidation: %d skills rehearsed, "
+                                "%d updated (WM trust %.2f)",
+                                int(_dc["slots"]), int(_dc["updates"]),
+                                _dc["trust"])
+                        self.training_metrics["dream_distill_loss"].append(
+                            dd["dream_distill_loss"])
+                        self.training_metrics["dream_distill_gate_frac"].append(
+                            dd["dream_distill_gate_frac"])
+                        self.training_metrics["dream_distill_eff_weight"].append(
+                            dd["dream_distill_eff_weight"])
+                    except (ValueError, RuntimeError) as e:
+                        # Don't fail silently — a persistent error here means a
+                        # composition bug (e.g. distill input dim vs symbolic), not
+                        # a transient. Log the first occurrence so it can't hide.
+                        if not getattr(self, "_dream_augment_warned", False):
+                            self._dream_augment_warned = True
+                            logger.warning(
+                                "dream-augment step failed (%s): %r — dreaming is "
+                                "NOT training the policy this run.", type(e).__name__, e)
+
+            # ---- Record episode reward for glue mastery detector ----
+            self.glue.record_training_signals(
+                episode_reward=episode_metrics.get("episode_reward", 0)
+            )
+
+            # ---- Step hierarchical goal manager ----
+            goal_status = self.glue.step_goal(
+                episode_metrics.get("episode_reward", 0)
+            )
+            if goal_status.get("goal_completed"):
+                logger.info("Root goal completed — new goal next episode")
+            elif goal_status.get("replan_needed"):
+                logger.info("Sub-goal failed — replanning")
+
+            # ---- Check skill mastery (multi-signal via glue layer) ----
+            # Success is reward-relative so negative-reward envs (e.g. Acrobot,
+            # MountainCar) can still register success / mastery and mint skills.
+            # Threshold defaults to 0.0 (i.e. reward > 0), which preserves the
+            # original CartPole behavior EXACTLY. Set
+            # `environment.success_reward_threshold` per-env for negative-reward
+            # tasks (e.g. -150 for Acrobot = "reached the goal in < 150 steps").
+            success_threshold = self.config.get("environment", {}).get(
+                "success_reward_threshold", 0.0
+            )
+            episode_success = (
+                episode_metrics.get("episode_reward", 0) > success_threshold
+            )
+            self.mastery_detector.record_episode(
+                episode_metrics.get("episode_reward", 0),
+                episode_success,
+            )
+            is_mastered, mastery_signals = self.glue.detect_mastery(
+                self.knowledge_graph
+            )
+            self.training_metrics["glue_mastery_score"].append(
+                mastery_signals.get("combined_score", 0)
+            )
+            if is_mastered:
+                self._save_skill(mastery_signals.get("combined_score", 0.8))
+                self.glue.mastery_detector.reset()
+                self.mastery_detector.reset()
+
+                # ---- Check for skill composition after mastery ----
+                if self.skill_bank.get_skill_count() >= 2:
+                    pairs = self.skill_composer.find_composable_pairs(
+                        self.skill_bank, self.knowledge_graph
+                    )
+                    for skill_a, skill_b, score, comp_type in pairs:
+                        self.skill_composer.compose_skills(
+                            skill_a, skill_b, comp_type, self.skill_bank
+                        )
+
+            # ---- Update curriculum (multi-signal via glue layer) ----
+            if self.curriculum is not None:
+                self.curriculum.record_episode(
+                    episode_metrics.get("episode_reward", 0),
+                    episode_success,
+                )
+                recommended, curr_signals = self.glue.recommend_difficulty(
+                    self.skill_bank,
+                    self.knowledge_graph,
+                    self.curriculum.current_difficulty,
+                )
+                self.training_metrics["glue_kg_density"].append(
+                    curr_signals.get("kg_density", 0)
+                )
+                if recommended != self.curriculum.current_difficulty:
+                    self.curriculum.current_difficulty = recommended
+                    logger.info(
+                        f"Difficulty adjusted to {recommended} "
+                        f"(depth={curr_signals['skill_tree_depth']:.0f}, "
+                        f"density={curr_signals['kg_density']:.1f})"
+                    )
+
+            # ---- Periodic graph embedding + knowledge vector update ----
+            # Only when the "kg" channel is actually consumed (audit H5): the
+            # from-scratch PyKEEN retrain blocks the main loop and scales with
+            # the unboundedly growing fact set — pure waste when no consumer.
+            if self.knowledge_source == "kg" and self.total_episodes % 50 == 0:
+                self._update_graph_embeddings()
+                self.glue.update_knowledge(
+                    self.kg_embedder, self.knowledge_graph
+                )
+
+            # ---- LLM fact extraction (async submit + poll) ----
+            # Consume any result that finished on the background thread, then
+            # periodically submit a fresh snapshot. Polling every episode keeps
+            # results flowing without ever blocking the loop on Ollama.
+            self._llm_consume_facts()
+            if self.llm.should_extract_facts(self.total_episodes):
+                self._llm_submit_facts()
+
+            # ---- LLM knowledge analysis (async submit + poll) ----
+            self._llm_consume_analysis()
+            if self.llm.should_analyze(self.total_episodes):
+                self._llm_submit_analysis()
+
+            # ---- Decay curiosity over time (per-timestep, not per-episode) ----
+            # Advance the anneal by the number of timesteps just experienced so
+            # the high-curiosity -> high-task shift progresses on a consistent
+            # clock even as episodes lengthen.
+            # Adaptive gating: feed the per-episode extrinsic return so the anneal
+            # tracks how findable the task reward is (no-op unless enabled).
+            if getattr(self.reward_mixer, "adaptive_gating", False):
+                self.reward_mixer.observe_episode(
+                    episode_metrics.get("episode_reward", 0.0))
+            self.reward_mixer.decay(
+                steps=episode_metrics.get("episode_length", 1)
+            )
+            # Dream-distillation natural anneal: track how reliably the REAL policy
+            # is now solving so the dream's pull can fade as competence takes over
+            # (updated unconditionally in augment mode, independent of the mixer's
+            # adaptive-gating switch above).
+            if self.dream_augment:
+                _solved = (1.0 if episode_metrics.get("episode_reward", 0.0)
+                           > self._dream_solve_threshold else 0.0)
+                self._dream_solve_ema += self._dream_solve_beta * (
+                    _solved - self._dream_solve_ema)
+            # Anneal the LLM goal-progress shaping weight on the SAME per-timestep
+            # clock, so the LLM's guidance fades as the agent's own competence
+            # takes over — natural drift, not a fixed shaping ratio (Path B).
+            if self.llm_shaping_enabled:
+                self.llm_shape_w = max(
+                    self.llm_shape_min,
+                    self.llm_shape_w
+                    - self.llm_shape_decay * episode_metrics.get("episode_length", 1),
+                )
+            # Keyed to MASTERED skills, not raw registry size (audit fix): the
+            # persisted bank held 24 skills at boot — minted largely by trivial
+            # first-breaks in prior runs — which quenched curiosity 38% before
+            # this run learned anything. Competence should quench curiosity;
+            # a monotone counter should not impersonate competence.
+            self.curiosity.update_exploration_ratio(
+                self.skill_bank.get_stats().get("mastered_skills", 0)
+            )
+
+            # ---- Logging ----
+            if verbose >= 1 and self.total_episodes % log_interval == 0:
+                self._log_progress()
+
+            # ---- Checkpointing ----
+            # MONOTONE INTERVAL, not a modulo window (fix 2026-08-01, audit
+            # #31). The old condition was
+            #     total_timesteps % save_interval < env.episode_length + 1
+            # which assumed episode_length approximates how far the counter
+            # moved since the last check. In LIFELONG that assumption breaks
+            # completely: env 0's episode_length grows without bound (it
+            # resets only on 64-log success — crash restarts happen inside the
+            # adapter and never touch it), so once it exceeds save_interval
+            # the predicate is PERMANENTLY TRUE and a checkpoint fired after
+            # EVERY 1024-step segment: a full knowledge-graph JSON dump plus
+            # six torch.save calls, serially blocking the stream for the rest
+            # of a multi-day run. Comparing against the last checkpoint's step
+            # is correct in both modes and cannot be fooled by episode length.
+            if (self.total_timesteps
+                    - getattr(self, "_last_checkpoint_step", 0)
+                    >= save_interval):
+                self._last_checkpoint_step = self.total_timesteps
+                self._save_checkpoint()
+
+        elapsed = time.time() - start_time
+        return self._training_summary(elapsed)
+
+    # -----------------------------------------------------------------------
+    # Developmental stage transitions
+    # -----------------------------------------------------------------------
+
+    def _on_stage_transition(self, stage_info: Dict[str, Any]) -> None:
+        """React to a developmental stage change emitted by the controller.
+
+        The reward mixer is re-anchored here so the curiosity->task drift is
+        gated by the agent's learning state rather than a wall clock:
+          - EXPLORE->EXPLOIT: begin the anneal from the current (high) anchor.
+          - EXPLOIT->EXPLORE: re-ignite curiosity (reset intrinsic high, pause).
+          - *->IMAGINE: dream-control takes over action selection; the mixer
+            continues from its current annealed weights.
+        """
+        to_stage = stage_info["to"]
+        C = DevelopmentalStageController
+        if to_stage == C.EXPLOIT:
+            self.reward_mixer.start_anneal()
+        elif to_stage == C.EXPLORE:
+            self.reward_mixer.restore_exploration()
+
+        # The active goal's intent is tied to the regime it was born in
+        # (frontier goal in EXPLORE, consolidation goal in EXPLOIT). Reset it so
+        # the next generate_goal() builds a stage-appropriate root — otherwise a
+        # sticky goal whose threshold is unreachable in the new regime persists
+        # indefinitely and the stage-gating never engages.
+        self.glue.goal_manager.reset_active_goal()
+
+        logger.info(
+            f"[developmental stage] {stage_info['from']} -> {to_stage} "
+            f"| reason={stage_info['reason']} "
+            f"| WM-error level={stage_info['level']:.4f} "
+            f"slope={stage_info['slope']:.5f} "
+            f"skill_rate={stage_info['skill_rate']:.3f} "
+            f"| intrinsic={self.reward_mixer.weights['intrinsic']:.3f}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Single episode execution
+    # -----------------------------------------------------------------------
+
+    def _run_episode(self) -> Dict[str, float]:
+        """
+        Run one complete episode of the developmental loop.
+
+        This is where the core cycle happens:
+          1. Reset environment
+          2. For each step:
+             a. Policy selects action
+             b. Environment executes action
+             c. ICM computes curiosity reward
+             d. Fact extractor generates symbolic facts
+             e. Replay buffer stores transition
+             f. Policy stores experience for training
+          3. After episode: update policy, extract action rules
+        """
+        obs, info = self._seeded_reset()
+        # Rung 6 broadcast: clear the broadcaster and fold in the starting view so
+        # the first action is conditioned on what is visible at reset.
+        if self.broadcaster is not None:
+            self.broadcaster.reset()
+            self._broadcaster_update(self.env, 0)   # reset priming (no break)
+        # Clear the vision scaffold's per-episode belief (potential anchor +
+        # aimed window + any in-flight assessment) so guidance never leaks
+        # across the env reset. See VisionScaffold.reset().
+        if self.vision_scaffold is not None:
+            self.vision_scaffold.reset()
+        done = False
+        episode_reward = 0.0
+        episode_intrinsic = 0.0
+        episode_length = 0
+        new_facts_count = 0
+        symbolic_decoder_facts_count = 0
+        symbolizer_facts_count = 0
+
+        # RSSM state tracking — encode initial obs for dream policy
+        rssm_state = self.world_model.rssm.initial_state(1, self.device)
+        with torch.no_grad():
+            _init_obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            _init_encoded = self.world_model.encoder(_init_obs_t)
+            _zero_act = torch.zeros(1, self.action_dim, device=self.device)
+            rssm_state, _ = self.world_model.rssm.observe_step(
+                rssm_state, _zero_act, _init_encoded
+            )
+
+        # Feed initial observation to the symbolic decoder's discretizer
+        self.symbolic_decoder.update_discretizer(obs)
+
+        while not done:
+            # ---- 1. SELECT ACTION ----
+            # Snapshot the current KG knowledge feature (detached) so it can
+            # condition the policy AND be stored with the transition for the
+            # PPO update. None when symbolic conditioning is disabled.
+            kv_np = self._current_knowledge_feature()
+            if self.dream_training_active:
+                with torch.no_grad():
+                    _latent = self.world_model.rssm.get_latent(rssm_state)
+                action, policy_info = self.dream_actor.select_action(_latent)
+            else:
+                action, policy_info = self.policy.select_action(obs, knowledge=kv_np)
+
+            # ---- 2. EXECUTE IN ENVIRONMENT ----
+            next_obs, extrinsic_reward, terminated, truncated, step_info = self.env.step(action)
+            done = terminated or truncated
+
+            # Rung 6 broadcast: fold the post-step pose + partial view into the
+            # broadcaster so the NEXT action sees an up-to-date feature.
+            # GROUNDED-EFFECT dedup on the serial path too: pass WHAT broke so
+            # the same behaviour keys ONE slot (else viewpoint variation mints
+            # a fresh slot + skill each time — the break_*_leaves x8 bug), and
+            # pair fresh unlocks with the grounded block for stable skill names.
+            if self.broadcaster is not None:
+                _blk = self._grounded_break_for(step_info, 0)
+                _ub = len(getattr(self.broadcaster, "unlock_log", []))
+                self._broadcaster_update(self.env, 0, effect_key=_blk)
+                if hasattr(self.broadcaster, "unlock_log"):
+                    with torch.no_grad():
+                        _lat0 = self.world_model.rssm.get_latent(rssm_state)
+                    for _ev in self.broadcaster.unlock_log[_ub:]:
+                        _slot = int(_ev["slot"])
+                        self._unlock_context[_slot] = (
+                            _lat0[0].detach().cpu().numpy())
+                        if _blk:
+                            self._unlock_block[_slot] = _blk
+
+            # ---- 2b. shaping seed (magnet applied after LP is known) ----
+            # `shaped_extrinsic` feeds LEARNING (replay buffer -> WM reward
+            # head, and the PPO mix below); `extrinsic_reward` itself stays
+            # raw so episode metrics, spike-based goal discovery, and all
+            # grading remain uncontaminated.
+            shaped_extrinsic = extrinsic_reward
+
+            # ---- 3. COMPUTE CURIOSITY REWARD ----
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
+
+            # Encode action for ICM input: one-hot (discrete) or the raw action
+            # VECTOR (continuous). For continuous, `action` is already a (act_dim,)
+            # array, so wrap to (1, act_dim) — NOT [action] which would give 3-D.
+            if self.is_discrete:
+                action_tensor = torch.zeros(1, self.action_dim).to(self.device)
+                action_tensor[0, int(action)] = 1.0
+            else:
+                action_tensor = torch.FloatTensor(
+                    np.asarray(action, dtype=np.float32)
+                ).unsqueeze(0).to(self.device)
+
+            intrinsic_reward = self.curiosity.compute_intrinsic_reward(
+                obs_tensor, action_tensor, next_obs_tensor
+            ).item()
+
+            # ---- 3b. CURIOSITY-RANKED MAGNET (waking only) ----
+            # Runs after LP is known: the magnet reads intrinsic_reward (this
+            # step's learning progress) + the grounding head's per-object probs
+            # on the current belief, and steers toward the most-curious in-view
+            # object. Guidance only during waking control (dream runs on what
+            # was internalized).
+            if (self.vision_scaffold is not None
+                    and not self.dream_training_active):
+                _scaffold_r = self._magnet_step_shaping(
+                    action, intrinsic_reward,
+                    self.world_model.rssm.get_latent(rssm_state).detach())
+                if _scaffold_r:
+                    shaped_extrinsic = extrinsic_reward + _scaffold_r
+
+            # ---- 4. MIX REWARDS ----
+            mixed_reward = self.reward_mixer.mix(intrinsic_reward, shaped_extrinsic)
+
+            # ---- 5. EXTRACT SYMBOLIC FACTS (two sources) ----
+            # Source A: Direct observation discretization (existing FactExtractor).
+            # Pixel gate (July 2026, Crafter): the extractor bins per-dimension
+            # values — on 12288-d raw pixels it would mint thousands of
+            # per-pixel "facts" per step into an unboundedly growing KG.
+            new_facts = 0
+            if not self._skip_perdim_symbolic:
+                new_facts = self._extract_and_store_facts(
+                    obs, action, next_obs, extrinsic_reward
+                )
+            new_facts_count += new_facts
+
+            # Source B: Symbolic decoder on knowledge-augmented RSSM latent
+            # Step the RSSM forward to get the latent encoding of this transition
+            # ---- WM one-step PREDICTION (prior) for the live accuracy panel ----
+            # Imagine forward from the PRE-update state under the action taken,
+            # so this is a genuine forecast of next_obs (not a reconstruction
+            # that already saw it). Decoder targets are symlog(obs), so invert.
+            wm_pred_obs = None
+            if self.viewer is not None:
+                try:
+                    with torch.no_grad():
+                        _prior = self.world_model.rssm.imagine_step(
+                            rssm_state, action_tensor)
+                        _dec = self.world_model.decoder(
+                            self.world_model.rssm.get_latent(_prior))
+                        wm_pred_obs = (torch.sign(_dec)
+                                       * torch.expm1(torch.abs(_dec))
+                                       ).squeeze(0).cpu().numpy()
+                except Exception:
+                    wm_pred_obs = None
+
+            encoded_obs = self.world_model.encoder(next_obs_tensor)
+            rssm_state, _ = self.world_model.rssm.observe_step(
+                rssm_state, action_tensor, encoded_obs
+            )
+            latent = self.world_model.rssm.get_latent(rssm_state)
+
+            # ---- LIVE VIEWER (optional, best-effort, never breaks training) ----
+            if self.viewer is not None:
+                self._viewer_push(action, extrinsic_reward, intrinsic_reward,
+                                  rssm_state, latent, episode_length,
+                                  wm_pred_obs, next_obs)
+
+            # Augment latent with symbolic knowledge from GNN + gate
+            augmented_latent = self.glue.augment_latent(latent)
+
+            # Extract high-confidence symbolic facts from augmented latent
+            sd_facts = self.symbolic_decoder.extract_facts(
+                augmented_latent.squeeze(0), timestep=self.total_timesteps
+            )
+            for fact in sd_facts:
+                if self.knowledge_graph.add_fact(fact):
+                    symbolic_decoder_facts_count += 1
+
+            # Update the discretizer with the new observation
+            self.symbolic_decoder.update_discretizer(next_obs)
+
+            # Capture scene snapshot periodically for goal generation
+            # (gated: per-dimension scene graphs are meaningless on pixels /
+            # high-dim structured obs)
+            if episode_length % 50 == 0 and not self._skip_perdim_symbolic:
+                scene = self.fact_extractor.extract_scene_graph(
+                    next_obs, timestep=self.total_timesteps
+                )
+                self.knowledge_graph.save_scene_snapshot(scene)
+
+            # ---- 6. STORE EXPERIENCE ----
+            # Replay buffer (for world model training). Stores the SHAPED
+            # extrinsic so the WM reward head — and therefore the dream
+            # actor — inherits the (annealing) instinct signal.
+            self.replay_buffer.add(obs, action, shaped_extrinsic, done)
+
+            # Policy buffer (skipped during dream training)
+            if not self.dream_training_active:
+                self.policy.store_transition(
+                    obs, action, mixed_reward, done,
+                    policy_info["log_prob"], policy_info["value"],
+                    knowledge=kv_np,
+                )
+
+            # ---- 7. TRAIN CURIOSITY MODULE ----
+            icm_metrics = self.curiosity.train_step(
+                obs_tensor, action_tensor, next_obs_tensor
+            )
+
+            # Update tracking
+            episode_reward += extrinsic_reward
+            episode_intrinsic += intrinsic_reward
+            episode_length += 1
+            self.total_timesteps += 1
+
+            obs = next_obs
+
+        # ---- LLM GOAL-PROGRESS REWARD SHAPING (Path B) ----
+        # Applied here, before the PPO update, so the potential-based increment
+        # lands in this episode's last transition and is used by the very next
+        # train_step. Potential-based + annealed => guides without redefining
+        # the task and fades over training (never a fixed ratio).
+        self._apply_llm_goal_shaping(episode_reward, episode_length)
+
+        # ---- END OF EPISODE: TRAIN POLICY ----
+        # Only run a PPO update once enough transitions have accumulated across
+        # episodes (~n_steps). Episodes always end on done=True, so the buffer
+        # ends cleanly on an episode boundary and GAE bootstrapping stays valid.
+        # This replaces the old per-episode update on ~9 samples, which produced
+        # a frozen, zero-gradient policy (Policy loss ~0) that never learned.
+        if (
+            not self.dream_training_active
+            and self.policy.rollout_env_steps() >= self.policy_update_steps
+        ):
+            # policy.n_epochs, not a hardcoded 10 (fix 2026-08-02): the two
+            # other call sites read the config and this one did not, so the
+            # knob silently meant different things depending on which loop
+            # path a run took.
+            policy_metrics = self.policy.train_step(
+                n_epochs=int(self.config.get("policy", {}).get(
+                    "n_epochs", 10)))
+        else:
+            policy_metrics = {"policy_loss": 0.0, "value_loss": 0.0}
+
+        return {
+            "episode_reward": episode_reward,
+            "episode_length": episode_length,
+            "intrinsic_reward": episode_intrinsic / max(1, episode_length),
+            "policy_loss": policy_metrics.get("policy_loss", 0),
+            "curiosity_loss": icm_metrics.get("icm_total", 0),
+            "new_facts": new_facts_count,
+            "symbolic_decoder_facts": symbolic_decoder_facts_count,
+        }
+
+    # -----------------------------------------------------------------------
+    # Parallel episode execution (vectorized data collection)
+    # -----------------------------------------------------------------------
+
+    def _ensure_parallel_envs(self) -> None:
+        """Lazily create the extra env copies (env[0] is the primary self.env)."""
+        if self._parallel_envs:
+            return
+        # Persistent pool for concurrent env stepping/resets. Real-game envs
+        # (MineRL) block on Java with the GIL released, so threads genuinely
+        # parallelize; fast envs see only microseconds of overhead.
+        from concurrent.futures import ThreadPoolExecutor
+        self._env_pool = ThreadPoolExecutor(
+            max_workers=self._num_envs, thread_name_prefix="envstep")
+        self._parallel_envs = [self.env]
+        self._parallel_curricula = [self.curriculum]
+        env_cfg = self.config.get("environment", {})
+        for _ in range(self._num_envs - 1):
+            e, c = make_env(
+                env_name=self.env_name,
+                normalize=True,
+                curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
+                render_mode=None,
+                max_episode_steps=env_cfg.get("max_episode_steps"),
+                pixel_obs=self.pixel_obs,
+                image_size=self.image_size,
+                grayscale=env_cfg.get("grayscale", False),
+                agent_view_size=env_cfg.get("agent_view_size"),
+                action_repeat=env_cfg.get("action_repeat", 1),
+                render_size=env_cfg.get("render_size", 0),
+                lifelong=getattr(self, "_lifelong", False),
+                # remote_server_scope "primary" (default): only env 0 — the
+                # continuous lifelong stream — joins the external server; the
+                # scout envs explore local generated worlds. "all": every
+                # stream joins (N bots on the server).
+                remote_server=(env_cfg.get("remote_server")
+                               if env_cfg.get("remote_server_scope",
+                                              "primary") == "all" else None),
+            )
+            self._parallel_envs.append(e)
+            self._parallel_curricula.append(c)
+        logger.info(
+            f"Parallel collection active with {self._num_envs} environments"
+        )
+
+    def _make_one_env(self, idx: int = -1):
+        """Build one fresh env (used to replace a hung/dead parallel env).
+
+        idx is the parallel-env slot being replaced: slot 0 is the primary
+        lifelong stream, which must KEEP its remote_server binding across
+        crash-rebuilds (else the visitor silently respawns into a local
+        world). Scouts (idx != 0) follow remote_server_scope.
+        """
+        env_cfg = self.config.get("environment", {})
+        _scope = env_cfg.get("remote_server_scope", "primary")
+        _remote = env_cfg.get("remote_server") if (
+            idx == 0 or _scope == "all") else None
+        e, _c = make_env(
+            env_name=self.env_name, normalize=True,
+            curriculum=self.config.get("loop", {}).get(
+                "curriculum_enabled", True),
+            render_mode=None,
+            max_episode_steps=env_cfg.get("max_episode_steps"),
+            pixel_obs=self.pixel_obs, image_size=self.image_size,
+            grayscale=env_cfg.get("grayscale", False),
+            agent_view_size=env_cfg.get("agent_view_size"),
+            action_repeat=env_cfg.get("action_repeat", 1),
+            render_size=env_cfg.get("render_size", 0),
+            lifelong=self._lifelong,
+            remote_server=_remote,
+            remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
+            # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
+            # the swing that fells a log, so the PROCESS of chopping out-earns
+            # any other block per tick — not just the completion event.
+            # 0.0 = off = byte-identical for every other config. BOTH call
+            # sites get it: the scouts feed the same shared world model, so
+            # different reward rules per stream would teach it two economies.
+            log_tick_reward=env_cfg.get("log_tick_reward", 0.0),
+            log_tick_cap=env_cfg.get("log_tick_cap", 120),
+            log_break_reward=env_cfg.get("log_break_reward", 5.0),
+            break_decay_scale=env_cfg.get("break_decay_scale", 0.0),
+            # break-mastery memory is the PRIMARY stream's biography — scouts
+            # write nothing (concurrent writers would race the same file, and
+            # a scout's local-world grinding is not the visitor's history).
+            break_memory_path=(env_cfg.get("break_memory_path", None)
+                               if idx == 0 else None),
+            **({} if env_cfg.get("start_tool", "__default__") == "__default__"
+               else {"start_tool": env_cfg.get("start_tool")}))
+        return e
+
+    def _parallel_reset(self, envs):
+        """Reset all N envs concurrently with a PER-ENV TIMEOUT. A MineRL
+        client that hangs its reset (no exception, just a stuck socket) would
+        otherwise block the whole lockstep barrier forever (observed: a 16-env
+        run stalled with 0 episodes). On timeout we abandon the stuck client
+        (its worker thread leaks but is harmless) and rebuild that env in
+        place, so one bad client can't freeze the fleet.
+        """
+        from concurrent.futures import TimeoutError as _FTimeout
+        timeout = float(self.config.get("parallel_envs", {}).get(
+            "reset_timeout_s", 300))
+        def _bounded_rebuild(i):
+            # Rebuild env i and reset it THROUGH THE POOL with a timeout, so a
+            # rebuild that also hangs (the hung MineRL client won't die and the
+            # new one won't come up) can't re-block the barrier forever — the
+            # earlier bug that re-stalled the 8-env run. Give up to 2 tries,
+            # then zero-fill and carry on with a dead stream for this episode.
+            for _try in range(2):
+                try:
+                    envs[i] = self._make_one_env(i)
+                    rf = self._env_pool.submit(envs[i].reset)
+                    o = rf.result(timeout=timeout)[0]
+                    return np.asarray(o, dtype=np.float32)
+                except Exception as ex:
+                    logger.warning("env %d rebuild try %d failed (%s)",
+                                   i, _try + 1, ex)
+            logger.error("env %d rebuild exhausted; zero-filling stream", i)
+            return np.zeros(self.obs_dim, dtype=np.float32)
+
+        obs_list = [None] * len(envs)
+        futs = {i: self._env_pool.submit(e.reset) for i, e in enumerate(envs)}
+        for i, f in futs.items():
+            try:
+                obs_list[i] = np.asarray(f.result(timeout=timeout)[0],
+                                         dtype=np.float32)
+            except _FTimeout:
+                logger.warning("env %d reset exceeded %.0fs — rebuilding "
+                               "(abandoning the hung one)", i, timeout)
+                obs_list[i] = _bounded_rebuild(i)
+            except Exception as ex:
+                logger.warning("env %d reset error (%s) — rebuilding", i, ex)
+                obs_list[i] = _bounded_rebuild(i)
+        return obs_list
+
+    def _drain_goal_paging(self) -> None:
+        """Consume the broadcaster's working-set page events and persist the
+        long-term index. Draining bounds the event queues on a multi-day run;
+        the store's save keeps dormant knowledge across process restarts.
+
+        A page-OUT never wipes a skill: skill_bank_data lives in its own dirs
+        and is retained on disk. The freed goal slot simply stops being
+        offered; a later unlock on the reused slot re-mints its skill through
+        the normal mint path, and a RECALL rebinds the dormant behaviour. Full
+        skill/option rebinding on recall is deferred (P3c) — logged here so the
+        paging activity is never silent.
+        """
+        br = self.broadcaster
+        if br is None or not hasattr(br, "drain_page_events"):
+            return
+        po, pi = br.drain_page_events()
+        tot = getattr(self, "_page_events_total", None)
+        if tot is not None:
+            tot["out"] += len(po)
+            tot["in"] += len(pi)
+        for ev in po:
+            logger.info("goal slot %d PAGED OUT ('%s' -> %s); skill data kept",
+                        ev["slot"], ev["name"], ev["mem_id"])
+        for ev in pi:
+            logger.info("goal slot %d RECALLED ('%s' <- %s)",
+                        ev["slot"], ev["name"], ev["mem_id"])
+        ltm = getattr(self, "_goal_ltm", None)
+        if ltm is not None:
+            ltm.save()
+
+    def _grounded_break_for(self, step_info, env_idx: int = 0):
+        """Highest-tier newly-broken block from ONE step's achievements (the
+        grounded behaviour identity for effect-keyed dedup). Mirrors the
+        parallel-path _new_break_by_env extraction for the serial single-env
+        loop; updates the per-env mine high-water marks. log > solid > plant."""
+        if not isinstance(step_info, dict):
+            return None
+        ach = step_info.get("achievements", {}) or {}
+        hw = self._mine_by_env.setdefault(env_idx, {})
+        best, best_rank = None, -1
+        for k, v in ach.items():
+            if not k.startswith("mine_"):
+                continue
+            b = k[5:]
+            try:
+                c = int(v)
+            except (TypeError, ValueError):
+                continue
+            if c > hw.get(b, 0):
+                hw[b] = c
+                rank = (2 if "log" in b else
+                        0 if b in ("grass", "tall_grass", "fern", "vine",
+                                   "seagrass") else 1)
+                if rank > best_rank:
+                    best, best_rank = b, rank
+        return best
+
+    def _broadcaster_update(self, env, stream: int, effect_key=None) -> None:
+        """Feed one env into the broadcaster, tolerating both signatures.
+
+        The achievement broadcasters accept a `stream` index (per-stream
+        episode state); the rung-6 broadcasters (Episodic/Affordance/
+        RuleRegime) are single-stream `update(env)`. Only the achievement
+        family reaches the parallel path in practice, but stay signature-
+        agnostic so a mis-paired config degrades to primary-stream-only
+        rather than crashing.
+        """
+        # Detect the broadcaster's update() ARITY ONCE (achievement arms take
+        # (env, stream, effect_key); rung-6 arms take (env)) and dispatch
+        # directly, so a REAL TypeError from inside update() propagates instead
+        # of being masked as a signature mismatch — a masked TypeError would
+        # silently retry WITHOUT effect_key, downgrading grounded-effect dedup
+        # back to the noisy-signature clustering this change fixes.
+        mode = getattr(self, "_bc_update_mode", None)
+        if mode is None:
+            import inspect
+            try:
+                params = inspect.signature(self.broadcaster.update).parameters
+            except (TypeError, ValueError):
+                params = {}
+            mode = ("effect" if "effect_key" in params
+                    else "stream" if len(params) >= 2 else "env")
+            self._bc_update_mode = mode
+        if mode == "effect":
+            self.broadcaster.update(env, stream, effect_key=effect_key)
+        elif mode == "stream":
+            self.broadcaster.update(env, stream)
+        elif stream == 0:
+            self.broadcaster.update(env)
+
+    def _run_episode_parallel(self, use_dream_actor: bool = True
+                              ) -> Dict[str, float]:
+        """
+        Collect experience from N environments stepped in lockstep.
+
+        The PRIMARY env (index 0) defines the episode boundary returned to the
+        main loop; the other envs autoreset and keep filling their own replay
+        streams. ICM/RSSM ops are BATCHED across all N envs. Symbolic fact
+        extraction and knowledge-graph writes are primary-env only.
+
+        Two actor modes:
+          * use_dream_actor=True (IMAGINE phase): the latent-space dream actor
+            selects actions; the real PPO policy is dormant.
+          * use_dream_actor=False (WAKING/curiosity phase): the REAL PPO policy
+            selects actions per env. All N streams feed the world model +
+            curiosity + discovery, but ONLY the primary stream (0) feeds the
+            PPO rollout buffer + the vision scaffold shaping, so PPO's
+            on-policy GAE stays single-stream-correct. The other N-1 envs are
+            curiosity SCOUTS that widen world-model coverage and first-break
+            discovery without perturbing the policy update.
+        """
+        self._ensure_parallel_envs()
+        n = self._num_envs
+        envs = self._parallel_envs
+
+        # Keep every env at the primary env's curriculum difficulty.
+        if self.curriculum is not None:
+            for c in self._parallel_curricula:
+                if c is not None:
+                    c.current_difficulty = self.curriculum.current_difficulty
+
+        # Reset all envs CONCURRENTLY (July 2026, Minecraft-parallel fix):
+        # env.reset()/step() on real-game envs (MineRL) block on a Java
+        # subprocess for 70ms-90s with the GIL released, so serial resets
+        # would cost N x 90s at every episode boundary. Fast envs are
+        # unaffected (thread overhead is microseconds).
+        obs_list = self._parallel_reset(envs)
+        self.symbolic_decoder.update_discretizer(obs_list[0])
+
+        # Goal broadcaster (July 2026): the parallel path predates the goal
+        # channel — without these hooks, goal targeting / discovery / skill
+        # minting silently die in parallel mode. Primary-stream only (an
+        # accepted degradation: discovery sees 1/N of the experience).
+        if self.broadcaster is not None:
+            if hasattr(self.broadcaster, "set_num_streams"):
+                self.broadcaster.set_num_streams(len(envs))
+            self.broadcaster.reset()
+            for _i, e in enumerate(envs):
+                self._broadcaster_update(e, _i)
+        # Clear the vision scaffold's per-episode belief (waking parallel path
+        # shapes the primary stream, same as the single-env path).
+        if not use_dream_actor and self.vision_scaffold is not None:
+            self.vision_scaffold.reset()
+        if self.symbolizer is not None:
+            self._prev_mine.clear()   # counts restart at 0 in a fresh world
+        # per-env break high-water also restarts (new world every reset)
+        self._mine_by_env.clear()
+        self._new_break_by_env.clear()
+        if not use_dream_actor and self.option_executor is not None:
+            # close any dangling options (telemetry only) and bind newly
+            # minted skills into EMPTY slots — bound slots stay frozen.
+            self.option_executor.clear_all(self.total_timesteps)
+            self.option_executor.bank.refresh_slots()
+
+        # Batched RSSM state, initialised exactly like the single-env path.
+        rssm_state = self.world_model.rssm.initial_state(n, self.device)
+        with torch.no_grad():
+            obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
+            encoded = self.world_model.encoder(obs_t)
+            zero_act = torch.zeros(n, self.action_dim, device=self.device)
+            rssm_state, _ = self.world_model.rssm.observe_step(
+                rssm_state, zero_act, encoded
+            )
+
+        episode_reward = 0.0
+        episode_intrinsic = 0.0
+        episode_length = 0
+        new_facts_count = 0
+        symbolic_decoder_facts_count = 0
+        symbolizer_facts_count = 0
+        icm_metrics: Dict[str, float] = {}
+        primary_done = False
+
+        primary_kv = None       # knowledge feature stored with the PPO rollout
+        primary_pol = None      # PPO policy_info for the primary stream
+        while not primary_done:
+            obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
+
+            # ---- 1. SELECT ACTIONS ----
+            if use_dream_actor:
+                # Latent-space dream actor, batched across all N envs.
+                with torch.no_grad():
+                    latent = self.world_model.rssm.get_latent(rssm_state)
+                    dist = self.dream_actor.get_action_dist(latent)
+                    sampled = dist.sample()
+                    if self.is_discrete:
+                        action_idx = sampled.long().view(-1)
+                        action_tensor = torch.nn.functional.one_hot(
+                            action_idx, self.action_dim).float()
+                        env_actions = [int(a) for a in action_idx.cpu().numpy()]
+                    else:
+                        action_tensor = sampled.view(n, self.action_dim).float()
+                        env_actions = [a for a in action_tensor.cpu().numpy()]
+            else:
+                # WAKING: real PPO policy per env. Primary stream keeps its
+                # log_prob/value for the on-policy update; scouts just act.
+                primary_kv = self._current_knowledge_feature()
+                if self.option_executor is not None:
+                    # options path: executor resolves primitives per env,
+                    # opening/continuing skill invocations as sampled. Its
+                    # decision records replace primary_pol for storage;
+                    # keep primary_pol non-None so the dream-phase guard
+                    # below still distinguishes waking from dreaming.
+                    _preds = None
+                    if self.option_executor.gate_by_preconditions:
+                        # belief BEFORE this step's action == the state the
+                        # initiation set must be evaluated against
+                        with torch.no_grad():
+                            _preds = self._predicates_batch(
+                                self.world_model.rssm.get_latent(rssm_state))
+                    # live per-skill competence for the warmup gate:
+                    # broadcaster slot N -> skill ach_NN_.. -> competence[N]
+                    _comp = None
+                    if (self.option_executor.competence_floor > 0.0
+                            and self.broadcaster is not None
+                            and hasattr(self.broadcaster, "competence")):
+                        _cv = self.broadcaster.competence.predict_all()
+                        _nm = getattr(self.broadcaster, "slot_names", [])
+                        # Keyed by BOTH the reconstructed name AND the raw slot
+                        # index. A skill id freezes the slot name it was minted
+                        # under, so once a slot is re-keyed (grounded effect <->
+                        # discovered_N) only the index still matches; the bank's
+                        # gate falls back to it via options._slot_index_of.
+                        _comp = {f"ach_{i:02d}_{n}"[:64]: float(_cv[i])
+                                 for i, n in enumerate(_nm) if i < len(_cv)}
+                        _comp.update({i: float(_cv[i])
+                                      for i in range(len(_cv))})
+                    # SELF-STATE THE AGENT CURRENTLY FEELS. act() runs
+                    # BEFORE this step, so it must use the LAST observation's
+                    # proprio — reading this step's step_infos here referenced
+                    # it before assignment and crashed the episodic path on
+                    # its very first iteration.
+                    _props = getattr(self, "_proprio_per_env", None)
+                    env_actions = self.option_executor.act(
+                        obs_list, primary_kv, self.policy,
+                        self.total_timesteps, predicates_per_env=_preds,
+                        competence=_comp, proprio_per_env=_props)
+                    primary_pol = (self.option_executor._primary_primitive
+                                   or {"log_prob": 0.0, "value": 0.0})
+                else:
+                    env_actions = []
+                    for e_i in range(n):
+                        a, pinfo = self.policy.select_action(
+                            obs_list[e_i],
+                            knowledge=primary_kv if e_i == 0 else None)
+                        env_actions.append(int(a) if self.is_discrete else a)
+                        if e_i == 0:
+                            primary_pol = pinfo
+                if self.is_discrete:
+                    action_tensor = torch.zeros(n, self.action_dim,
+                                                device=self.device)
+                    action_tensor[range(n),
+                                  [int(a) for a in env_actions]] = 1.0
+                else:
+                    action_tensor = torch.from_numpy(
+                        np.stack(env_actions).astype(np.float32)
+                    ).to(self.device)
+
+            # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
+            from concurrent.futures import TimeoutError as _FTimeout
+            _step_to = float(self.config.get("parallel_envs", {}).get(
+                "step_timeout_s", 120))
+            futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
+                    for e_i in range(n)]
+            next_obs_list, rewards, dones = [], [], []
+            prim_info: Dict[str, Any] = {}
+            step_infos: List[Dict[str, Any]] = [None] * n
+            # keep the body sense fresh for the NEXT act() (see _props)
+            if self._proprio_source is not None:
+                self._proprio_per_env = [None] * n
+            for e_i, f in enumerate(futs):
+                try:
+                    nobs, rew, term, trunc, _inf = f.result(timeout=_step_to)
+                    if isinstance(_inf, dict):
+                        step_infos[e_i] = _inf
+                        if (self._proprio_per_env is not None
+                                and e_i < len(self._proprio_per_env)):
+                            _pp = (_inf or {}).get("proprio")
+                            # APPEND THE REACH SENSE (primary stream only —
+                            # the grounding head runs on stream 0's latent).
+                            # Scouts get a neutral 0.0, which is the same
+                            # convention a missing sensor uses everywhere
+                            # else; only stream 0 feeds PPO, so nothing
+                            # downstream reads a scout's value.
+                            if _pp is not None and self.symbolizer is not None:
+                                _rv = (float(getattr(self, "_reach_now", 0.0))
+                                       if e_i == 0 else 0.0)
+                                _pp = np.concatenate(
+                                    [np.asarray(_pp, dtype=np.float32),
+                                     np.array([_rv], dtype=np.float32)])
+                            self._proprio_per_env[e_i] = _pp
+                    if e_i == 0 and isinstance(_inf, dict):
+                        prim_info = _inf   # symbolizer reads mine_* from here
+                except (_FTimeout, Exception) as ex:
+                    # Hung/failed client: end its episode (done) so the next
+                    # boundary rebuilds it via _parallel_reset; carry the last
+                    # obs, zero reward. One straggler can't freeze the fleet.
+                    logger.warning("env %d step hung/failed (%s) — truncating",
+                                   e_i, ex)
+                    nobs = (obs_list[e_i]
+                            if obs_list[e_i] is not None
+                            else np.zeros(self.obs_dim, dtype=np.float32))
+                    rew, term, trunc = 0.0, False, True
+                next_obs_list.append(np.asarray(nobs, dtype=np.float32))
+                rewards.append(float(rew))
+                dones.append(bool(term or trunc))
+            # per-env newly-broken block this step (highest tier wins:
+            # log > solid > plant, mirroring the tiered break reward, so the
+            # naming picks the block that actually spiked the reward)
+            self._new_break_by_env = {}
+            for _e in range(n):
+                _inf = step_infos[_e]
+                if not isinstance(_inf, dict):
+                    continue
+                _ach = _inf.get("achievements", {}) or {}
+                _hw = self._mine_by_env.setdefault(_e, {})
+                _best, _best_rank = None, -1
+                for _k, _v in _ach.items():
+                    # CRAFTS ARE GROUNDED EFFECTS TOO (2026-07-26): a
+                    # craft_item increment is as real as a block break and
+                    # outranks everything — making something is the rarest,
+                    # most significant event in this world. The effect key
+                    # KEEPS its craft_ prefix (`craft_planks`), so it can
+                    # never collide with a block of the same name and the
+                    # goal slot is legibly a crafting goal.
+                    if _k.startswith("craft_"):
+                        _b, _rank_base = _k, 3
+                    elif _k.startswith("mine_"):
+                        _b, _rank_base = _k[5:], None
+                    else:
+                        continue
+                    try:
+                        _c = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if _c > _hw.get(_b, 0):
+                        _hw[_b] = _c
+                        # MASTERY GROUND TRUTH (task #39): every open option
+                        # frame on this env witnesses the effect key in the
+                        # SAME vocabulary skills are named in (break_X /
+                        # craft_Y) — at close, each frame is asked whether
+                        # its OWN key is among what it witnessed.
+                        if self.option_executor is not None:
+                            self.option_executor.note_effect(
+                                _e, _k if _k.startswith("craft_")
+                                else f"break_{_b}")
+                        _rank = (_rank_base if _rank_base is not None else
+                                 (2 if "log" in _b else
+                                  0 if _b in ("grass", "tall_grass", "fern",
+                                              "vine", "seagrass") else 1))
+                        if _rank > _best_rank:
+                            _best, _best_rank = _b, _rank
+                # LOG-PICKUP ATTRIBUTION GUARD (audit fix): the +1/log
+                # inventory reward has no mine_* counterpart (a pickup breaks
+                # nothing), so a pickup spike landing on the same step as an
+                # incidental leaf/grass break used to be grounded-keyed to the
+                # VEGETATION — minting exactly the foliage goals the tiered
+                # rewards were built to suppress, and blending leaf signatures
+                # into log-goal provenance. If the log count rose this step and
+                # no mine_*log break explains it, pass NO effect key (ungrounded
+                # signature clustering handles that spike correctly).
+                if not hasattr(self, "_loginv_by_env"):
+                    self._loginv_by_env = {}
+                try:
+                    _lg = int(_ach.get("log", 0))
+                except (TypeError, ValueError):
+                    _lg = 0
+                _lg_prev = self._loginv_by_env.get(_e)
+                self._loginv_by_env[_e] = _lg
+                if (_lg_prev is not None and _lg > _lg_prev
+                        and (_best is None or "log" not in _best)):
+                    # STABLE PICKUP KEY (2026-07-25) — was `_best = None`.
+                    # Refusing to mis-ground a pickup was right, but None
+                    # routed it into UNGROUNDED signature clustering, so every
+                    # novel viewpoint of picking up a log minted a fresh
+                    # `discovered_N` goal + skill. The core task reward was
+                    # the dominant junk producer (48/48 goal slots were
+                    # `discovered_N`). A stable canonical key collapses ALL
+                    # pickups into ONE grounded slot instead.
+                    _best = "log_pickup"
+                if _best is not None:
+                    self._new_break_by_env[_e] = _best
+
+            next_obs_t = torch.from_numpy(np.stack(next_obs_list)).to(self.device)
+
+            if not use_dream_actor and self.option_executor is not None:
+                # scout option terminations (raw reward; no credit records)
+                self.option_executor.observe_scouts(
+                    rewards, dones, self.total_timesteps)
+
+            # Goal broadcaster ingests ALL streams (July 2026 pivot, part 2).
+            # Discovery previously watched only the primary env, so 7/8 of
+            # the fleet's experience could never mint a goal slot — with
+            # first-discovery being THE bottleneck in Minecraft, that threw
+            # away 8x the odds of catching the first grounded event. Each
+            # wrapper keeps its own reward/obs history; the signature
+            # clustering in DiscoveredAchievementGoals dedups events found
+            # independently by different streams. Each env passes its STREAM
+            # INDEX: per-stream episode state keeps the self-model learning
+            # P(success in one episode) instead of P(any-of-N succeeds).
+            _unlocks_before = (len(self.broadcaster.unlock_log)
+                               if (self.broadcaster is not None and hasattr(
+                                   self.broadcaster, "unlock_log")) else 0)
+            if self.broadcaster is not None:
+                for _i, e in enumerate(envs):
+                    # grounded-effect dedup: pass WHAT broke on this stream so
+                    # the same behaviour keys one slot (kills break_*_leaves x8)
+                    self._broadcaster_update(
+                        e, _i, effect_key=self._new_break_by_env.get(_i))
+
+            # ---- 3. CURIOSITY (batched) ----
+            intrinsic = self.curiosity.compute_intrinsic_reward(
+                obs_t, action_tensor, next_obs_t
+            )
+            icm_metrics = self.curiosity.train_step(
+                obs_t, action_tensor, next_obs_t
+            )
+
+            # ---- 4. RSSM observe (batched) + primary-only symbolic facts ----
+            # _wm_param_lock (review fix): with the async trainer these
+            # forwards would otherwise read params MID-optimizer-step; the
+            # torn latents flow into the permanently carried lifelong state.
+            # Uncontended (sync mode) the RLock costs ~1us.
+            with self._wm_param_lock, torch.no_grad():
+                encoded_next = self.world_model.encoder(next_obs_t)
+                rssm_state, _ = self.world_model.rssm.observe_step(
+                    rssm_state, action_tensor, encoded_next
+                )
+                latent = self.world_model.rssm.get_latent(rssm_state)
+            # LIFELONG carry fix: observe_step RETURNS A NEW dict, so the local
+            # rssm_state diverges from self._ll.rssm_state (which otherwise stays
+            # the startup seed) — silently making the "continuous" cross-segment
+            # carry a no-op AND making death_reset zero the wrong (stale) tensor.
+            # Sync the LifelongState every step so the next segment resumes from
+            # the evolved state and death_reset/decay mutate the LIVE object.
+            # No-op off the lifelong path (self._ll is None).
+            if self._ll is not None:
+                self._ll.rssm_state = rssm_state
+
+            # pair fresh unlocks with the latent of the stream that earned
+            # them (context provenance for skill minting / the brain graph)
+            if (self.broadcaster is not None
+                    and hasattr(self.broadcaster, "unlock_log")):
+                for _ev in self.broadcaster.unlock_log[_unlocks_before:]:
+                    _st = int(_ev.get("stream", 0))
+                    if 0 <= _st < latent.shape[0]:
+                        self._unlock_context[int(_ev["slot"])] = (
+                            latent[_st].detach().cpu().numpy())
+                    try:  # provenance frame (adapters cache last POV: cheap)
+                        self._unlock_frame[int(_ev["slot"])] = (
+                            envs[_st].render())
+                    except Exception:
+                        pass
+                    # grounded name source: the block that broke on THIS
+                    # stream this step is what the reward spike (= the
+                    # unlock) was caused by
+                    if _st in self._new_break_by_env:
+                        self._unlock_block[int(_ev["slot"])] = (
+                            self._new_break_by_env[_st])
+                    # co-occurrence: unlock landed while (or just as) an
+                    # option ran on that stream -> earned evidence that the
+                    # SKILL causes the ACHIEVEMENT (fed to the prerequisite
+                    # miner at episode end; same-step closes included).
+                    if (not use_dream_actor
+                            and self.option_executor is not None):
+                        _rt = self.option_executor.runtimes[_st]
+                        _sid = (_rt.skill_id if _rt.active else
+                                self.option_executor
+                                .last_closed_this_step[_st])
+                        if _sid is not None:
+                            self.option_executor.record_cooccurrence(
+                                _sid, int(_ev["slot"]), _st,
+                                self.total_timesteps)
+
+            # Gate: per-dimension fact extraction is meaningless (and
+            # unboundedly expensive) on raw pixels / high-dim structured obs.
+            if not self._skip_perdim_symbolic:
+                new_facts_count += self._extract_and_store_facts(
+                    obs_list[0], env_actions[0], next_obs_list[0], rewards[0]
+                )
+            # sd heads + discretizer are trained on the async trainer thread;
+            # lock the reads/writes here (review fix — write-write race on the
+            # discretizer, torn sd-head reads)
+            with self._wm_param_lock:
+                with torch.no_grad():
+                    augmented_primary = self.glue.augment_latent(latent[0:1])
+                sd_facts = self.symbolic_decoder.extract_facts(
+                    augmented_primary.squeeze(0),
+                    timestep=self.total_timesteps
+                )
+                self.symbolic_decoder.update_discretizer(next_obs_list[0])
+            for fact in sd_facts:
+                if self.knowledge_graph.add_fact(fact):
+                    symbolic_decoder_facts_count += 1
+
+            if episode_length % 50 == 0 and not self._skip_perdim_symbolic:
+                scene = self.fact_extractor.extract_scene_graph(
+                    next_obs_list[0], timestep=self.total_timesteps
+                )
+                self.knowledge_graph.save_scene_snapshot(scene)
+
+            # ---- 5. STORE EXPERIENCE (one stream per env) ----
+            # Primary stream (0) gets vision-scaffold shaping folded into its
+            # extrinsic (waking only); scouts store the raw env reward. The
+            # WM reward head thus learns the true reward from 15 streams and
+            # the shaped one from the primary — matching the single-env path.
+            prim_extrinsic = rewards[0]
+            _frame = None
+            if not use_dream_actor and self.symbolizer is not None:
+                try:
+                    _frame = envs[0].render()   # symbolizer's VLM label frame
+                except Exception:
+                    _frame = None
+            # Curiosity-ranked magnet: reads the grounding head's per-object
+            # probs on the primary latent + this step's learning progress
+            # (intrinsic[0]) and steers toward the most-curious in-view object.
+            # FELT REACH, every step (cheap: one small MLP forward on a
+            # latent the loop already has). Computed here so the value is
+            # fresh for the NEXT act(), matching how proprio is refreshed.
+            if not use_dream_actor and self.symbolizer is not None:
+                self._reach_now = self._reach_sense(latent[0:1])
+            # MASTERY HABITUATION: a break of a long-mastered type damps this
+            # step's whole intrinsic (see _habituation_factor) — applied
+            # BEFORE the magnet so its LP attribution habituates too.
+            if not use_dream_actor:
+                _hab = self._habituation_factor(prim_info)
+                if _hab < 1.0:
+                    intrinsic[0] = intrinsic[0] * _hab
+            if not use_dream_actor and self.vision_scaffold is not None:
+                _sr = self._magnet_step_shaping(
+                    env_actions[0], float(intrinsic[0].item()), latent[0:1])
+                if _sr:
+                    prim_extrinsic = rewards[0] + _sr
+
+            # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
+            # The VLM names what the agent is looking at; a head learns to
+            # predict those names from the agent's OWN latent (borrowed ->
+            # owned). Perceptual facts are emitted only when a fresh label
+            # lands, so KG traffic anneals with the VLM itself. Causal facts
+            # come from real break events, never from the VLM's word.
+            if not use_dream_actor and self.symbolizer is not None:
+                _lat0 = latent[0:1].detach()
+                self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
+                _labels = self.symbolizer.collect()
+                # LAYER 3: route a VLM-PROPOSED category to the instinct. The
+                # proposal is attention only — it goes to the magnet's
+                # probation set, never to the head and never to the KG. If
+                # attending to it yields no learning progress it is evicted.
+                if (_labels and self.vision_scaffold is not None
+                        and _labels.get("__novel__")):
+                    try:
+                        self.vision_scaffold.propose_category(
+                            str(_labels["__novel__"]), self.total_timesteps)
+                    except Exception as _e:     # never kill a run over instinct
+                        logger.warning("category proposal failed: %s", _e)
+                if _labels is not None:
+                    for _sf in self.symbolizer.perceptual_facts(_lat0):
+                        # refresh=True: this channel may REVISE its own
+                        # confidence downward. Without it add_fact ratchets
+                        # to a high-water mark and a discredited predicate
+                        # keeps its most-confident moment forever.
+                        if self.knowledge_graph.add_fact(
+                                _to_fact(_sf, "vlm_grounded",
+                                         self.total_timesteps),
+                                refresh=True):
+                            symbolizer_facts_count += 1
+                # ground truth: which block types were newly broken this step
+                _ach = prim_info.get("achievements", {}) or {}
+                _chopping = (self.is_discrete
+                             and int(env_actions[0]) in self._chop_action_set)
+                _broke_now_p = []
+                for _k, _v in _ach.items():
+                    if not _k.startswith("mine_"):
+                        continue
+                    _btype = _k[5:]
+                    if int(_v) > int(self._prev_mine.get(_btype, 0)):
+                        self._prev_mine[_btype] = int(_v)
+                        _broke_now_p.append(_btype)
+                        for _cf in self.symbolizer.observe_event(
+                                "block_break", _btype,
+                                was_chopping=_chopping,
+                                now=self._symbol_clock):
+                            if self.knowledge_graph.add_fact(_to_fact(
+                                    _cf, "grounded_event",
+                                    self.total_timesteps)):
+                                symbolizer_facts_count += 1
+                # negative evidence — same contract as the lifelong body
+                # (see the comment there): a full break-worth of held attack
+                # with no break docks the claimed affordance predicates.
+                if self._neg_evidence_ticks > 0:
+                    _arun = float(prim_info.get("attack_run", 0.0) or 0.0)
+                    if _broke_now_p or _arun <= 0.0:
+                        self._neg_evt_scored = False
+                    elif (_arun >= self._neg_evidence_ticks
+                          and not getattr(self, "_neg_evt_scored", False)):
+                        self._neg_evt_scored = True
+                        self._neg_evt_total = getattr(
+                            self, "_neg_evt_total", 0) + \
+                            self.symbolizer.observe_negative_event(
+                                now=self._symbol_clock)
+                # ---- RETRACTION: the other half of the gates ----
+                # min_labels/reliability_floor only stop NEW facts. A
+                # predicate the world has discredited must also stop feeding
+                # its triple to the graph embedding. Placed after the break
+                # events above so a collapse caused by THIS step retracts
+                # immediately. stale_facts() is edge-triggered, so this is a
+                # 16-entry scan per step and at most one KG write per
+                # collapse; source-scoped, so it can only delete facts this
+                # channel minted.
+                for _stale in self.symbolizer.stale_facts():
+                    try:
+                        if self.knowledge_graph.remove_fact(
+                                *_stale, source="vlm_grounded"):
+                            self._symbolizer_retractions += 1
+                            logger.info(
+                                "Symbol grounding: retracted %s "
+                                "(reliability fell below floor)", _stale)
+                    except Exception as _e:   # never kill a multi-day run
+                        logger.warning(
+                            "KG retraction failed for %s: %s", _stale, _e)
+                self._symbol_clock += 1
+
+            if self.brain_emitter is not None:
+                self._brain_clock += 1
+                if self._brain_clock % self._brain_interval == 0:
+                    self.brain_emitter.emit(self.total_episodes,
+                                            self.total_timesteps)
+            for e_i in range(n):
+                self.replay_buffer.add(
+                    obs_list[e_i], env_actions[e_i],
+                    prim_extrinsic if e_i == 0 else rewards[e_i],
+                    dones[e_i], stream=e_i,
+                )
+
+            # Primary stream feeds the on-policy PPO rollout (waking only).
+            if not use_dream_actor and primary_pol is not None:
+                # ---- OCCLUSION SUPPRESSION MUST PRECEDE THE MIX ----------
+                # (fix 2026-08-02, found live on the server.) The gui_open
+                # zeroing sat ~40 lines BELOW this call — AFTER `mixed` was
+                # computed and AFTER the transition was stored — so it only
+                # ever changed the logged `episode_intrinsic` and NEVER
+                # reached the PPO reward. The guard was inert from the day it
+                # was written, in BOTH loop paths.
+                #
+                # Measured live: the inventory screen paid +0.0410/step vs
+                # +0.0196 for the world (2.09x), and the agent sat in the menu
+                # 89% of a segment with an unbroken 1491-step dwell —
+                # motionless, because inside a GUI it cannot move, look or
+                # swing. Curiosity was paying for the act of occluding the
+                # camera, which is exactly what the note below forbids.
+                #
+                # The menu stays fully available and crafting still earns its
+                # extrinsic tier; only payment for the occlusion is removed.
+                if bool((step_infos[0] or {}).get("gui_open")):
+                    intrinsic[0] = intrinsic[0] * 0.0
+                mixed = self.reward_mixer.mix(
+                    float(intrinsic[0].item()), prim_extrinsic)
+                # running "typical surprise" baseline — the denominator of
+                # mastery's WM-fidelity ratio. Updated EVERY primary step
+                # (not just during options), or the baseline would be biased
+                # toward exactly the moments options select for.
+                #
+                # THE RAW FORWARD-MODEL ERROR, not `intrinsic` (review HIGH,
+                # flagged independently by four reviewers). `intrinsic` is
+                # the SHAPED curiosity reward: mean-centred, clipped, and
+                # carrying learning-progress / imagination / coverage
+                # bonuses. Feeding that to "can the world model predict this
+                # skill" measured a different variable — a skill could look
+                # unpredictable purely because it was novel, or predictable
+                # because its LP had flattened. `last_pred_error` is the
+                # pre-normalization MSE the ICM already computes.
+                _err_now = float(getattr(self.curiosity, "last_pred_error",
+                                         float(intrinsic[0].item())))
+                # ---- OCCLUSION: NO WORLD CHANGE, NO WORLD CURIOSITY ------
+                # MEASURED (2026-07-27): the inventory screen paid the agent
+                # +0.18 -> +0.30 intrinsic per step against +0.09 for the
+                # world — a 2.0x -> 3.1x advantage that WIDENED over the run.
+                # The agent was not failing to learn; it was optimal under
+                # the signal it was given, and spent ~50% of every episode
+                # in a menu.
+                #
+                # This is a CATEGORY ERROR, not a preference. The ICM scores
+                # prediction error on the OBSERVATION. When a menu covers the
+                # screen the observation changes hugely while the WORLD does
+                # not change at all, so curiosity — which exists to reward
+                # learning about world dynamics — is paying for an overlay
+                # drawn over the world. It is the same argument already
+                # accepted for the attack counter: a swing into a menu never
+                # reached the world, so counting it was a measurement error.
+                # Applying it to actions but not to perception was
+                # inconsistent.
+                #
+                # NOT a rule about what the agent should want: the menu stays
+                # fully available, and CRAFTING in it still pays the +5.0
+                # extrinsic first-craft tier. What is removed is payment for
+                # the act of occluding the camera.
+                #
+                # (2026-08-02) The zeroing now happens BEFORE the mix, above.
+                # By the time control reaches here intrinsic[0] is already 0 on
+                # a GUI frame, so re-multiplying by 0.0 was a no-op left behind
+                # by that fix. Removed; the reasoning above is the load-bearing
+                # part and stays.
+                # ---- IS THE MENU A CURIOSITY FARM? (2026-07-27) ----------
+                # The agent spends ~50% of every episode in the inventory
+                # screen. I have been calling that "a learning result" with
+                # no evidence. It is a MEASURABLE question: split the
+                # intrinsic reward by whether the world was covered by a
+                # menu at the time. If menu frames pay MORE, the agent is
+                # behaving optimally under the signal it is given and the
+                # signal is what needs looking at -- not the behaviour.
+                try:
+                    _gui_now = bool((step_infos[0] or {}).get("gui_open"))
+                    # THE RAW forward-model surprise, NOT the post-
+                    # suppression intrinsic. Measuring the value we just
+                    # zeroed makes the readout tautological (`in-menu=0.0000`
+                    # by construction) and destroys the falsification test
+                    # this line exists to provide. What we want to know is
+                    # whether the menu WOULD still pay better — i.e. whether
+                    # the underlying category error is still there — which
+                    # only the pre-suppression error can answer.
+                    _iv = _err_now
+                    if not hasattr(self, "_gui_intr"):
+                        self._gui_intr = [0.0, 0, 0.0, 0]   # sum,n | sum,n
+                    if _gui_now:
+                        self._gui_intr[0] += _iv
+                        self._gui_intr[1] += 1
+                    else:
+                        self._gui_intr[2] += _iv
+                        self._gui_intr[3] += 1
+                except Exception:
+                    pass
+                self._wm_err_ema = (
+                    _err_now if not hasattr(self, "_wm_err_ema")
+                    else 0.999 * self._wm_err_ema + 0.001 * _err_now)
+                if self.option_executor is not None:
+                    _rt0 = self.option_executor.runtimes[0]
+                    if _rt0.active:
+                        # inside an option: accumulate; store ONE SMDP
+                        # decision when it closes
+                        _closed = self.option_executor.observe_primary(
+                            float(rewards[0]), bool(dones[0]), mixed,
+                            self.total_timesteps, wm_err=_err_now)
+                        if _closed is not None:
+                            self.policy.store_transition(
+                                _closed["obs"], _closed["meta_action"],
+                                _closed["reward"], dones[0],
+                                _closed["log_prob"], _closed["value"],
+                                knowledge=_closed["kv"],
+                                tau=_closed["tau"],
+                                action_mask=_closed["mask"],
+                                proprio=_closed.get("proprio"))
+                            self.skill_bank.record_invocation(
+                                _closed["skill_id"], _closed["outcome"],
+                                _closed["reward"])
+                            self._competence_from_option(_closed)
+                            # WM fidelity (task #39): this invocation's mean
+                            # surprise vs the agent's typical surprise. The
+                            # asked/success half is recorded by the executor
+                            # itself at every frame close (incl. scouts and
+                            # nested frames) — only the fidelity ratio needs
+                            # the loop's global baseline.
+                            _wem = _closed.get("wm_err_mean")
+                            if (_wem is not None
+                                    and getattr(self, "_wm_err_ema", 0) > 1e-9):
+                                self.skill_bank.record_wm_fidelity(
+                                    _closed["skill_id"],
+                                    float(_wem) / float(self._wm_err_ema))
+                    else:
+                        _pp = self.option_executor._primary_primitive
+                        if _pp is not None:
+                            self.policy.store_transition(
+                                obs_list[0], _pp["action"], mixed,
+                                dones[0], _pp["log_prob"], _pp["value"],
+                                knowledge=primary_kv, tau=1,
+                                action_mask=_pp["mask"],
+                                proprio=_pp.get("proprio"))
+                else:
+                    self.policy.store_transition(
+                        obs_list[0], env_actions[0], mixed, dones[0],
+                        primary_pol["log_prob"], primary_pol["value"],
+                        knowledge=primary_kv)
+
+            # ---- 6. ADVANCE / AUTORESET ----
+            primary_done = dones[0]
+            for e_i in range(n):
+                if dones[e_i]:
+                    if e_i == 0 or primary_done:
+                        # Primary done ends the episode; every env is then
+                        # concurrently re-reset at the next episode's start —
+                        # resetting non-primaries here too was a SERIAL,
+                        # REDUNDANT double reset (on MineRL, minutes per
+                        # episode boundary: fixed step limits make all envs
+                        # finish together). Just carry the obs; it's discarded.
+                        obs_list[e_i] = next_obs_list[e_i]
+                    else:
+                        o, _ = envs[e_i].reset()
+                        obs_list[e_i] = np.asarray(o, dtype=np.float32)
+                        # Reset that env's latent row to the initial state.
+                        rssm_state["h"][e_i] = 0.0
+                        rssm_state["z"][e_i] = 0.0
+                        # That stream just started a NEW episode: clear its
+                        # achieved mask so unlocks re-count and its baseline
+                        # re-establishes (else a mid-episode autoreset makes
+                        # the stream's row a union over several episodes).
+                        if (self.broadcaster is not None
+                                and hasattr(self.broadcaster, "clear_stream")):
+                            self.broadcaster.clear_stream(e_i)
+                        if (not use_dream_actor
+                                and self.option_executor is not None):
+                            self.option_executor.clear(
+                                e_i, self.total_timesteps)
+                else:
+                    obs_list[e_i] = next_obs_list[e_i]
+
+            episode_reward += rewards[0]
+            episode_intrinsic += float(intrinsic[0].item())
+            episode_length += 1
+            self.total_timesteps += n  # all N transitions are real experience
+
+        # On-policy PPO update from the primary stream's rollout (waking only;
+        # single-stream GAE, exactly as the serial path does at episode end).
+        policy_loss = 0.0
+        if (not use_dream_actor
+                and self.policy.rollout_env_steps()
+                >= self.policy_update_steps):
+            pm = self.policy.train_step(n_epochs=self.config.get(
+                "policy", {}).get("n_epochs", 10))
+            policy_loss = pm.get("policy_loss", 0.0)
+            # PPO already computes entropy; it was returned and then dropped,
+            # so "has the policy collapsed onto one action" was unanswerable
+            # from the logs — the exact question a turn-dominated action
+            # histogram raises.
+            if "entropy" in pm:
+                self.training_metrics.setdefault(
+                    "policy_entropy", deque(maxlen=100)).append(
+                        float(pm["entropy"]))
+
+        return {
+            "episode_reward": episode_reward,
+            "episode_length": episode_length,
+            "intrinsic_reward": episode_intrinsic / max(1, episode_length),
+            "policy_loss": policy_loss,
+            "curiosity_loss": icm_metrics.get("icm_total", 0),
+            "new_facts": new_facts_count,
+            "symbolic_decoder_facts": symbolic_decoder_facts_count,
+        }
+
+    def _start_stream(self) -> None:
+        """ONE-TIME continuous-stream setup: the ONLY place the full reset
+        block (env reset, RSSM init, broadcaster.reset, scaffold reset) runs
+        in lifelong mode. Copies _run_episode_parallel's reset block, then
+        seeds LifelongState + carries obs on self. The episodic function is
+        left untouched (duplication is the deliberate price of not editing a
+        live-critical path)."""
+        from developmental_ai.core.lifelong_state import LifelongState
+        use_dream_actor = False
+        self._ensure_parallel_envs()
+        n = self._num_envs
+        envs = self._parallel_envs
+
+        # Keep every env at the primary env's curriculum difficulty.
+        if self.curriculum is not None:
+            for c in self._parallel_curricula:
+                if c is not None:
+                    c.current_difficulty = self.curriculum.current_difficulty
+
+        # Reset all envs CONCURRENTLY (July 2026, Minecraft-parallel fix):
+        # env.reset()/step() on real-game envs (MineRL) block on a Java
+        # subprocess for 70ms-90s with the GIL released, so serial resets
+        # would cost N x 90s at every episode boundary. Fast envs are
+        # unaffected (thread overhead is microseconds).
+        obs_list = self._parallel_reset(envs)
+        self.symbolic_decoder.update_discretizer(obs_list[0])
+
+        # Goal broadcaster (July 2026): the parallel path predates the goal
+        # channel — without these hooks, goal targeting / discovery / skill
+        # minting silently die in parallel mode. Primary-stream only (an
+        # accepted degradation: discovery sees 1/N of the experience).
+        if self.broadcaster is not None:
+            if hasattr(self.broadcaster, "set_num_streams"):
+                self.broadcaster.set_num_streams(len(envs))
+            self.broadcaster.reset()
+            for _i, e in enumerate(envs):
+                self._broadcaster_update(e, _i)
+        # Clear the vision scaffold's per-episode belief (waking parallel path
+        # shapes the primary stream, same as the single-env path).
+        if not use_dream_actor and self.vision_scaffold is not None:
+            self.vision_scaffold.reset()
+        if self.symbolizer is not None:
+            self._prev_mine.clear()   # counts restart at 0 in a fresh world
+        # per-env break high-water also restarts (new world every reset)
+        self._mine_by_env.clear()
+        self._new_break_by_env.clear()
+        if not use_dream_actor and self.option_executor is not None:
+            # close any dangling options (telemetry only) and bind newly
+            # minted skills into EMPTY slots — bound slots stay frozen.
+            self.option_executor.clear_all(self.total_timesteps)
+            self.option_executor.bank.refresh_slots()
+
+        # Batched RSSM state, initialised exactly like the single-env path.
+        rssm_state = self.world_model.rssm.initial_state(n, self.device)
+        with torch.no_grad():
+            obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
+            encoded = self.world_model.encoder(obs_t)
+            zero_act = torch.zeros(n, self.action_dim, device=self.device)
+            rssm_state, _ = self.world_model.rssm.observe_step(
+                rssm_state, zero_act, encoded
+            )
+        self._ll = self._ll_ctrl.make_state(
+            rssm_state, broadcaster=self.broadcaster,
+            scaffold=self.vision_scaffold)
+        self._stream_obs = obs_list
+
+    def _collect_segment(self) -> Dict[str, float]:
+        """CONTINUOUS waking collection (lifelong mode). Steps the unbroken
+        world for `lifelong.segment_len` steps, carrying RSSM/mask/belief
+        across segments with a soft decay (self._ll.decay), hard-zeroing a
+        stream ONLY on a true terminal. Never calls env.reset except on death.
+        Duplicates _run_episode_parallel's step body verbatim except the two
+        marked transforms, so the episodic path stays byte-identical."""
+        ll = self.config.get("lifelong", {})
+        segment_len = int(ll.get("segment_len", self.policy_update_steps))
+        wm_train_every = int(ll.get("wm_train_every", 250))
+        goal_horizon = int(ll.get("goal_horizon", 8000))
+        n = self._num_envs
+        if not self._stream_started:
+            self._stream_started = True
+            self._start_stream()
+        envs = self._parallel_envs
+        rssm_state = self._ll.rssm_state          # carried; observe_step mutates
+        obs_list = self._stream_obs               # carried between segments
+        use_dream_actor = False
+
+        episode_reward = 0.0
+        episode_intrinsic = 0.0
+        episode_length = 0
+        new_facts_count = 0
+        symbolic_decoder_facts_count = 0
+        symbolizer_facts_count = 0
+        icm_metrics: Dict[str, float] = {}
+        primary_kv = None
+        primary_pol = None
+
+        for _seg_i in range(segment_len):
+            obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
+
+            # ---- 1. SELECT ACTIONS ----
+            if use_dream_actor:
+                # Latent-space dream actor, batched across all N envs.
+                with torch.no_grad():
+                    latent = self.world_model.rssm.get_latent(rssm_state)
+                    dist = self.dream_actor.get_action_dist(latent)
+                    sampled = dist.sample()
+                    if self.is_discrete:
+                        action_idx = sampled.long().view(-1)
+                        action_tensor = torch.nn.functional.one_hot(
+                            action_idx, self.action_dim).float()
+                        env_actions = [int(a) for a in action_idx.cpu().numpy()]
+                    else:
+                        action_tensor = sampled.view(n, self.action_dim).float()
+                        env_actions = [a for a in action_tensor.cpu().numpy()]
+            else:
+                # WAKING: real PPO policy per env. Primary stream keeps its
+                # log_prob/value for the on-policy update; scouts just act.
+                primary_kv = self._current_knowledge_feature()
+                if self.option_executor is not None:
+                    # options path: executor resolves primitives per env,
+                    # opening/continuing skill invocations as sampled. Its
+                    # decision records replace primary_pol for storage;
+                    # keep primary_pol non-None so the dream-phase guard
+                    # below still distinguishes waking from dreaming.
+                    _preds = None
+                    if self.option_executor.gate_by_preconditions:
+                        # belief BEFORE this step's action == the state the
+                        # initiation set must be evaluated against
+                        with torch.no_grad():
+                            _preds = self._predicates_batch(
+                                self.world_model.rssm.get_latent(rssm_state))
+                    # live per-skill competence for the warmup gate:
+                    # broadcaster slot N -> skill ach_NN_.. -> competence[N]
+                    _comp = None
+                    if (self.option_executor.competence_floor > 0.0
+                            and self.broadcaster is not None
+                            and hasattr(self.broadcaster, "competence")):
+                        _cv = self.broadcaster.competence.predict_all()
+                        _nm = getattr(self.broadcaster, "slot_names", [])
+                        # Keyed by BOTH the reconstructed name AND the raw slot
+                        # index. A skill id freezes the slot name it was minted
+                        # under, so once a slot is re-keyed (grounded effect <->
+                        # discovered_N) only the index still matches; the bank's
+                        # gate falls back to it via options._slot_index_of.
+                        _comp = {f"ach_{i:02d}_{n}"[:64]: float(_cv[i])
+                                 for i, n in enumerate(_nm) if i < len(_cv)}
+                        _comp.update({i: float(_cv[i])
+                                      for i in range(len(_cv))})
+                    # SELF-STATE THE AGENT CURRENTLY FEELS. act() runs
+                    # BEFORE this step, so it must use the LAST observation's
+                    # proprio — reading this step's step_infos here referenced
+                    # it before assignment and crashed the episodic path on
+                    # its very first iteration.
+                    _props = getattr(self, "_proprio_per_env", None)
+                    env_actions = self.option_executor.act(
+                        obs_list, primary_kv, self.policy,
+                        self.total_timesteps, predicates_per_env=_preds,
+                        competence=_comp, proprio_per_env=_props)
+                    primary_pol = (self.option_executor._primary_primitive
+                                   or {"log_prob": 0.0, "value": 0.0})
+                else:
+                    env_actions = []
+                    for e_i in range(n):
+                        a, pinfo = self.policy.select_action(
+                            obs_list[e_i],
+                            knowledge=primary_kv if e_i == 0 else None)
+                        env_actions.append(int(a) if self.is_discrete else a)
+                        if e_i == 0:
+                            primary_pol = pinfo
+                if self.is_discrete:
+                    action_tensor = torch.zeros(n, self.action_dim,
+                                                device=self.device)
+                    action_tensor[range(n),
+                                  [int(a) for a in env_actions]] = 1.0
+                else:
+                    action_tensor = torch.from_numpy(
+                        np.stack(env_actions).astype(np.float32)
+                    ).to(self.device)
+
+            # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
+            from concurrent.futures import TimeoutError as _FTimeout
+            _step_to = float(self.config.get("parallel_envs", {}).get(
+                "step_timeout_s", 120))
+            futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
+                    for e_i in range(n)]
+            next_obs_list, rewards, dones = [], [], []
+            terminateds, restarted = [], []   # LIFELONG: terminal vs restart
+            prim_info: Dict[str, Any] = {}
+            step_infos: List[Dict[str, Any]] = [None] * n
+            # keep the body sense fresh for the NEXT act() (see _props)
+            if self._proprio_source is not None:
+                self._proprio_per_env = [None] * n
+            for e_i, f in enumerate(futs):
+                _rst = False
+                try:
+                    nobs, rew, term, trunc, _inf = f.result(timeout=_step_to)
+                    if isinstance(_inf, dict):
+                        step_infos[e_i] = _inf
+                        if (self._proprio_per_env is not None
+                                and e_i < len(self._proprio_per_env)):
+                            self._proprio_per_env[e_i] = (
+                                (_inf or {}).get("proprio"))
+                    if e_i == 0 and isinstance(_inf, dict):
+                        prim_info = _inf   # symbolizer reads mine_* from here
+                except (_FTimeout, Exception) as ex:
+                    # Hung/failed client: the wrapper rebuilt its own world, so
+                    # this is a crash-RESTART (a true terminal), not a time
+                    # truncation. Carry last obs, zero reward.
+                    logger.warning("env %d step hung/failed (%s) — restart",
+                                   e_i, ex)
+                    nobs = (obs_list[e_i]
+                            if obs_list[e_i] is not None
+                            else np.zeros(self.obs_dim, dtype=np.float32))
+                    rew, term, trunc, _rst = 0.0, False, True, True
+                next_obs_list.append(np.asarray(nobs, dtype=np.float32))
+                rewards.append(float(rew))
+                terminateds.append(bool(term))
+                restarted.append(_rst)
+                # LIFELONG: the STORED done is the TERM-FLAG (real terminal or
+                # crash-restart). A plain 8000-tick time-TRUNCATION is NOT a
+                # boundary and must not sever the advantage trace, so it is
+                # deliberately excluded here.
+                dones.append(bool(term) or _rst)
+            # per-env newly-broken block this step (highest tier wins:
+            # log > solid > plant, mirroring the tiered break reward, so the
+            # naming picks the block that actually spiked the reward)
+            self._new_break_by_env = {}
+            for _e in range(n):
+                _inf = step_infos[_e]
+                if not isinstance(_inf, dict):
+                    continue
+                _ach = _inf.get("achievements", {}) or {}
+                _hw = self._mine_by_env.setdefault(_e, {})
+                _best, _best_rank = None, -1
+                for _k, _v in _ach.items():
+                    # CRAFTS ARE GROUNDED EFFECTS TOO (2026-07-26): a
+                    # craft_item increment is as real as a block break and
+                    # outranks everything — making something is the rarest,
+                    # most significant event in this world. The effect key
+                    # KEEPS its craft_ prefix (`craft_planks`), so it can
+                    # never collide with a block of the same name and the
+                    # goal slot is legibly a crafting goal.
+                    if _k.startswith("craft_"):
+                        _b, _rank_base = _k, 3
+                    elif _k.startswith("mine_"):
+                        _b, _rank_base = _k[5:], None
+                    else:
+                        continue
+                    try:
+                        _c = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if _c > _hw.get(_b, 0):
+                        _hw[_b] = _c
+                        # MASTERY GROUND TRUTH (task #39): every open option
+                        # frame on this env witnesses the effect key in the
+                        # SAME vocabulary skills are named in (break_X /
+                        # craft_Y) — at close, each frame is asked whether
+                        # its OWN key is among what it witnessed.
+                        if self.option_executor is not None:
+                            self.option_executor.note_effect(
+                                _e, _k if _k.startswith("craft_")
+                                else f"break_{_b}")
+                        _rank = (_rank_base if _rank_base is not None else
+                                 (2 if "log" in _b else
+                                  0 if _b in ("grass", "tall_grass", "fern",
+                                              "vine", "seagrass") else 1))
+                        if _rank > _best_rank:
+                            _best, _best_rank = _b, _rank
+                # LOG-PICKUP ATTRIBUTION GUARD (audit fix): the +1/log
+                # inventory reward has no mine_* counterpart (a pickup breaks
+                # nothing), so a pickup spike landing on the same step as an
+                # incidental leaf/grass break used to be grounded-keyed to the
+                # VEGETATION — minting exactly the foliage goals the tiered
+                # rewards were built to suppress, and blending leaf signatures
+                # into log-goal provenance. If the log count rose this step and
+                # no mine_*log break explains it, pass NO effect key (ungrounded
+                # signature clustering handles that spike correctly).
+                if not hasattr(self, "_loginv_by_env"):
+                    self._loginv_by_env = {}
+                try:
+                    _lg = int(_ach.get("log", 0))
+                except (TypeError, ValueError):
+                    _lg = 0
+                _lg_prev = self._loginv_by_env.get(_e)
+                self._loginv_by_env[_e] = _lg
+                if (_lg_prev is not None and _lg > _lg_prev
+                        and (_best is None or "log" not in _best)):
+                    # STABLE PICKUP KEY (2026-07-25) — was `_best = None`.
+                    # Refusing to mis-ground a pickup was right, but None
+                    # routed it into UNGROUNDED signature clustering, so every
+                    # novel viewpoint of picking up a log minted a fresh
+                    # `discovered_N` goal + skill. The core task reward was
+                    # the dominant junk producer (48/48 goal slots were
+                    # `discovered_N`). A stable canonical key collapses ALL
+                    # pickups into ONE grounded slot instead.
+                    _best = "log_pickup"
+                if _best is not None:
+                    self._new_break_by_env[_e] = _best
+
+            next_obs_t = torch.from_numpy(np.stack(next_obs_list)).to(self.device)
+
+            if not use_dream_actor and self.option_executor is not None:
+                # scout option terminations (raw reward; no credit records)
+                self.option_executor.observe_scouts(
+                    rewards, dones, self.total_timesteps)
+
+            # Goal broadcaster ingests ALL streams (July 2026 pivot, part 2).
+            # Discovery previously watched only the primary env, so 7/8 of
+            # the fleet's experience could never mint a goal slot — with
+            # first-discovery being THE bottleneck in Minecraft, that threw
+            # away 8x the odds of catching the first grounded event. Each
+            # wrapper keeps its own reward/obs history; the signature
+            # clustering in DiscoveredAchievementGoals dedups events found
+            # independently by different streams. Each env passes its STREAM
+            # INDEX: per-stream episode state keeps the self-model learning
+            # P(success in one episode) instead of P(any-of-N succeeds).
+            _unlocks_before = (len(self.broadcaster.unlock_log)
+                               if (self.broadcaster is not None and hasattr(
+                                   self.broadcaster, "unlock_log")) else 0)
+            if self.broadcaster is not None:
+                for _i, e in enumerate(envs):
+                    # grounded-effect dedup: pass WHAT broke on this stream so
+                    # the same behaviour keys one slot (kills break_*_leaves x8)
+                    self._broadcaster_update(
+                        e, _i, effect_key=self._new_break_by_env.get(_i))
+
+            # ---- 3. CURIOSITY (batched) ----
+            intrinsic = self.curiosity.compute_intrinsic_reward(
+                obs_t, action_tensor, next_obs_t
+            )
+
+            # EVERY STEP, UNCONDITIONALLY (fix 2026-08-03). This accumulator
+            # was first placed inside the imagination-curiosity block, which
+            # is gated by wants_step() with `every: 50` — so it sampled ~20
+            # of every 1024 steps, and not representatively. The census then
+            # reported base +0.0073/step against a "+0.0189 total drive"
+            # while the segment's ACTUAL mean intrinsic was +0.1958/step: a
+            # ~10x understatement that made the progress floor look far more
+            # effective than it was. A diagnostic that samples a hot loop
+            # conditionally is a diagnostic that lies.
+            self._cen_base = getattr(self, "_cen_base", 0.0) + float(
+                intrinsic[0].item())
+            self._cen_n = getattr(self, "_cen_n", 0) + 1
+            # SEGMENT MEAN (fix 2026-08-04). `last_action_attribution` is
+            # overwritten every step, so printing it directly showed whatever
+            # the FINAL step of the segment happened to be — a 2-sample
+            # reading from one timestep. It printed 0.000 and read as "the
+            # gate is dead", which is indistinguishable from "the last step
+            # was a no-op". Same sampling mistake as the census accumulator,
+            # made twice: a diagnostic that samples a hot loop unrepresenta-
+            # tively is worse than no diagnostic, because it looks like data.
+            _at = getattr(self.curiosity, "last_action_attribution", None)
+            if _at is not None:
+                self._attr_sum = getattr(self, "_attr_sum", 0.0) + float(_at)
+                self._attr_n = getattr(self, "_attr_n", 0) + 1
+                if float(_at) > 1e-6:
+                    self._attr_nz = getattr(self, "_attr_nz", 0) + 1
+            icm_metrics = self.curiosity.train_step(
+                obs_t, action_tensor, next_obs_t
+            )
+
+            # ---- 4. RSSM observe (batched) + primary-only symbolic facts ----
+            # _wm_param_lock (review fix): with the async trainer these
+            # forwards would otherwise read params MID-optimizer-step; the
+            # torn latents flow into the permanently carried lifelong state.
+            # Uncontended (sync mode) the RLock costs ~1us.
+            with self._wm_param_lock, torch.no_grad():
+                encoded_next = self.world_model.encoder(next_obs_t)
+                rssm_state, _ = self.world_model.rssm.observe_step(
+                    rssm_state, action_tensor, encoded_next
+                )
+                latent = self.world_model.rssm.get_latent(rssm_state)
+            # LIFELONG carry fix: observe_step RETURNS A NEW dict, so the local
+            # rssm_state diverges from self._ll.rssm_state (which otherwise stays
+            # the startup seed) — silently making the "continuous" cross-segment
+            # carry a no-op AND making death_reset zero the wrong (stale) tensor.
+            # Sync the LifelongState every step so the next segment resumes from
+            # the evolved state and death_reset/decay mutate the LIVE object.
+            # No-op off the lifelong path (self._ll is None).
+            if self._ll is not None:
+                self._ll.rssm_state = rssm_state
+
+            # ---- IMAGINATION CURIOSITY (primary stream, INTRINSIC only) ----
+            # Rolls the WM forward from the live latent: pays for reaching
+            # states the model is UNCERTAIN about (disagreement — never dies),
+            # plus a small DECAYING daydream bonus. Gated on boredom, so it
+            # contributes ~nothing while the environment is still teaching.
+            # Added to intrinsic[0] — NOT to prim_extrinsic — so it can never
+            # become a replay reward LABEL and train the WM reward head on the
+            # agent's own daydreams (that loop = self-hallucinated reward).
+            if (not use_dream_actor
+                    and self.imagination_curiosity.enabled
+                    and self.imagination_curiosity.wants_step(
+                        self.total_timesteps)
+                    and (self._last_wm_metrics or self._wm_metrics_box)):
+                _vs = (self.vision_scaffold.stats
+                       if self.vision_scaffold is not None else {})
+                _glp = float(_vs.get("global_lp", 0.0) or 0.0)
+                _kn = self.glue.knowledge_integrator.knowledge_vector
+                _P = self.action_dim
+
+                # the actor input is [obs, gated_knowledge]; feeding raw obs
+                # is a shape error (obs_dim vs obs_dim+DIM). Mirror the
+                # prospection path and augment with the CURRENT goal broadcast.
+                _ikv = self.policy._prep_knowledge(
+                    self._current_knowledge_feature())
+
+                def _imag_policy(_lat, _P=_P, _ikv=_ikv):
+                    _obs = self.world_model.decoder(_lat)
+                    _obs = (_obs.flatten(1) if self.pixel_obs
+                            else symexp(_obs))
+                    _k = (_ikv.expand(_obs.shape[0], -1)
+                          if _ikv is not None else None)
+                    # conv: the MLP stack consumes ENCODER FEATURES, not
+                    # raw pixels (review HIGH — these three imagination/
+                    # prospection/distill sites bypassed the trunk).
+                    _aug = self.policy._augment(
+                        self.policy._encode(_obs), _k, self._cur_proprio_t())
+                    _lg = self.policy.actor.action_head(
+                        self.policy.actor.shared(_aug))
+                    _a = torch.distributions.Categorical(
+                        logits=_lg[..., :_P]).sample()
+                    return torch.nn.functional.one_hot(_a, _P).float()
+
+                with self._wm_param_lock:
+                    _ib = self.imagination_curiosity.bonus(
+                        self.world_model, rssm_state, _imag_policy,
+                        self.total_timesteps, _glp,
+                        knowledge=_kn, symexp_fn=symexp)
+                # REWARD CENSUS (2026-08-02). The segment log itemised
+                # coverage, gaze, centring, symbols, novelty, reach and
+                # persistence — together ~2% of a +0.19/step drive. The other
+                # ~98% is the raw ICM/learning-progress term and it was NEVER
+                # printed, so "what is the agent paid for while standing
+                # still?" was unanswerable from the log. Captured here,
+                # BEFORE any shaping is added, so it is the base in isolation.
+                if _ib:
+                    intrinsic[0] = intrinsic[0] + _ib
+                    self._cen_imag = getattr(self, "_cen_imag", 0.0) + float(_ib)
+
+            # FELT REACH — computed HERE, in the lifelong loop. It was only
+            # ever computed in `_run_episode_parallel` (the episodic path),
+            # which this run never enters, so `_reach_now` stayed 0.0 and both
+            # the reach proprioception field and the approach-to-reach
+            # potential were silently inert the whole time.
+            if not use_dream_actor and self.symbolizer is not None:
+                self._reach_now = self._reach_sense(latent[0:1])
+                # PREFER MEASURED OVER PREDICTED (2026-08-04). The VLM-taught
+                # `breakable_in_reach` head sat at 0.01-0.03 for an entire run
+                # in which the agent broke 4931 blocks — llava cannot judge
+                # reach from a still frame, so the head learned to answer "no"
+                # and two shaping terms plus a proprioception field rode on it.
+                # The env now emits ground truth: a completed break PROVES
+                # something was within range. Use it when present; fall back
+                # to the head otherwise.
+                if self._reach_source == "evidence":
+                    _re = (getattr(self, "_last_world_info", None)
+                           or {}).get("reach_evidence")
+                    if _re is not None:
+                        self._reach_now = float(_re)
+                        self._reach_gate = "measured"
+                # SEGMENT AGGREGATE (fix 2026-08-04). `Reach sense` printed
+                # `_reach_now` — whatever the FINAL step of the segment
+                # happened to be. It read 0.00 in a segment containing 142
+                # breaks, which says nothing about whether the trace works.
+                # Third time this session I sampled a hot loop at one point
+                # and reasoned off it (after the reward census and the action
+                # attribution), so every such readout is now a mean.
+                _rv = float(self._reach_now)
+                self._reachval_sum = getattr(self, "_reachval_sum", 0.0) + _rv
+                self._reachval_n = getattr(self, "_reachval_n", 0) + 1
+                if _rv > 0.5:
+                    self._reachval_hi = getattr(self, "_reachval_hi", 0) + 1
+
+            # ---- SYMBOLIC NOVELTY: new THINGS, not new pixels ----------
+            # Pays for acquiring a symbol and for seeing combinations it has
+            # not seen, decaying as the vocabulary becomes familiar. Staring
+            # at the ground produces one unchanging signature, so it goes to
+            # ~0 within seconds rather than paying forever.
+            if (float(self._symbol_weight) > 0.0
+                    or float(self._new_symbol_bonus) > 0.0) \
+                    and not use_dream_actor:
+                _sb, _nk, _sig = self._symbol_novelty(latent[0:1])
+                if _sb:
+                    intrinsic[0] = intrinsic[0] + _sb
+                self._sym_sum = getattr(self, "_sym_sum", 0.0) + float(_sb)
+                self._sym_n = getattr(self, "_sym_n", 0) + 1
+                self._sym_known = _nk
+                # ---- C: pay for BRINGING it to the middle of the frame ----
+                # Potential-based (Ng): F = gamma*Phi(s") - Phi(s). Optimal
+                # policy unchanged; what it supplies is the per-step gradient
+                # that "turn toward the thing" never had. Intrinsic channel
+                # only, so it can never become a replay reward LABEL.
+                _scw = float(self._symbol_center_weight)
+                if _scw > 0.0:
+                    _phi_c = float(getattr(self, "_sym_center_phi", 0.0))
+                    _prev_c = float(getattr(self, "_sym_center_prev", 0.0))
+                    _gc = float(self.config.get("policy", {}).get(
+                        "gamma", 0.99))
+                    _fc = _scw * (_gc * _phi_c - _prev_c)
+                    self._sym_center_prev = _phi_c
+                    intrinsic[0] = intrinsic[0] + _fc
+                    self._symc_sum = getattr(self, "_symc_sum", 0.0) + _fc
+                    self._symc_abs = getattr(self, "_symc_abs", 0.0) + abs(_fc)
+                    self._symc_n = getattr(self, "_symc_n", 0) + 1
+
+            # ---- NOVELTY OF EXPERIENCE, NOT OF PLACE -------------------
+            # Same count-based form as territory coverage (new -> ~1, revisits
+            # decay as 1/sqrt(n)), but keyed on WHAT THE AGENT SEES instead of
+            # where its feet are. Walking in a straight line staring at the
+            # floor maximises distance and sees almost nothing, so it earns
+            # almost nothing here; turning to look at something it has not
+            # seen before earns, and keeps earning only while it is genuinely
+            # new. Intrinsic channel only -> never a replay reward label.
+            _nw = float(self._novelty_weight)
+            if _nw > 0.0 and not use_dream_actor:
+                # DETERMINISTIC KEY. The RSSM's z is a SAMPLED categorical
+                # (StraightThroughCategorical), redrawn every step — so an
+                # identical frame hashed to a DIFFERENT bucket each time and
+                # staring at unchanging ground still read as 369 "new views"
+                # per segment. Novelty keyed on a stochastic variable is
+                # novelty that can never be exhausted. The encoder output is
+                # a pure function of the frame, so the same sight is the same
+                # bucket and repetition genuinely decays.
+                # NEXT_obs, not obs (fix 2026-08-02). Keyed on `obs_list[0]`
+                # this paid for the view the agent was LEAVING, so the action
+                # that actually brought a new sight into frame was credited to
+                # the previous state and the term supplied almost no gradient
+                # toward seeking anything. Every other latent-derived term in
+                # this loop (`latent`, the reach sense, symbol novelty) is
+                # computed from next_obs; this one was the odd man out.
+                _pc = self._perceptual_cell(self._view_key(next_obs_list[0]))
+                if _pc >= 0:
+                    _n = self._nov_counts.get(_pc, 0)
+                    self._nov_counts[_pc] = _n + 1
+                    if len(self._nov_counts) > 200000:
+                        self._nov_counts.pop(next(iter(self._nov_counts)))
+                    _nv = _nw * (1.0 / ((1.0 + _n) ** 0.5))
+                    # BORING-VIEW DISCOUNT (see _boring_view_factor): sky
+                    # (drifting clouds mint buckets forever) and MASTERED
+                    # materials (a fresh dirt hole is a new view, and digging
+                    # manufactures them endlessly) pay reduced view-novelty,
+                    # in proportion to how much of the FOVEA they fill.
+                    if self._nov_sky_discount:
+                        _nv *= self._boring_view_factor()
+                    intrinsic[0] = intrinsic[0] + _nv
+                    self._nov_sum = getattr(self, "_nov_sum", 0.0) + _nv
+                    self._nov_n = getattr(self, "_nov_n", 0) + 1
+
+            # ---- EXTERNAL CURIOSITY: territory coverage (INTRINSIC only) ----
+            # Count-based novelty over discretised world cells, emitted by the
+            # env adapter from the newly-restored position stats. This is what
+            # keeps the WORLD able to surprise a lifelong agent: standing still
+            # pays ~0, new ground pays ~1, and revisiting decays as 1/sqrt(n).
+            # Also intrinsic-only => never a replay label.
+            _cw = float(self._coverage_weight)
+            if step_infos:
+                # keep the latest primary world-info for the segment log line
+                self._last_world_info = (step_infos[0] or {}).get("world") or {}
+                # ...and the FULL info: ticks-to-break lives at top level, not
+                # under "world", and reading the wrong dict would silently
+                # print nothing — which is how a measurement quietly becomes
+                # a non-measurement (this has happened repeatedly here).
+                self._last_env_info = step_infos[0] or {}
+
+            # ---- #7: NOTHING PAID FOR GETTING WITHIN REACH -------------
+            # The stall fix zeroed instinct/approach/align/aim because they
+            # were RAW PER-STEP INCOME and a parked agent farmed them
+            # (~0.14/step for standing at a trunk). That was correct, but it
+            # left `seek` paying only for GLIMPSING a target and nothing at
+            # all for CLOSING on one — so the agent was rewarded for looking
+            # at trees and never for reaching them.
+            #
+            # This restores the missing half in the telescoping form:
+            # a potential on the grounded probability that something is
+            # BREAKABLE IN REACH. Approaching pays; standing still pays
+            # exactly 0 (Phi stops changing); backing off charges back what
+            # approaching earned. Unfarmable by construction, unlike the term
+            # it replaces. Uses the same head+trust gate as the reach sense.
+            _rw = float(self._reach_weight)
+            if _rw > 0.0 and not use_dream_actor:
+                _rp = float(getattr(self, "_reach_now", 0.0))
+                _rprev = float(getattr(self, "_reach_phi", 0.0))
+                _g2 = float(self.config.get("policy", {}).get("gamma", 0.99))
+                _fr = _rw * (_g2 * _rp - _rprev)
+                self._reach_phi = _rp
+                intrinsic[0] = intrinsic[0] + _fr
+                self._reach_sum = getattr(self, "_reach_sum", 0.0) + _fr
+                self._reach_n = getattr(self, "_reach_n", 0) + 1
+
+            # ---- #1/#3: PERSISTENCE IS OTHERWISE INVISIBLE ------------
+            # ICM pays for prediction error, i.e. for the frame CHANGING.
+            # Holding attack on one block is the lowest-change action
+            # available (the crack overlay is a few pixels at 128px), while
+            # turning repaints everything. So the dominant drive paid MOST
+            # for the behaviours that prevent breaking and LEAST for the one
+            # that achieves it — and every earlier fix only moved which cheap
+            # novelty it farmed.
+            #
+            # POTENTIAL-BASED, so it cannot be farmed. With
+            #     Phi = min(1, attack_run / ticks_needed)
+            #     F   = gamma * Phi(s') - Phi(s)
+            # Ng's theorem says the optimal policy is UNCHANGED: any cycle of
+            # swing-then-stop telescopes to ~0, so there is no income in
+            # starting swings and abandoning them. What it does supply is a
+            # per-step GRADIENT for continuing one, which is exactly the
+            # signal a step-wise stochastic policy needs to hold an action
+            # for the ~8 consecutive macros a barehanded break requires.
+            # Intrinsic channel only -> never a replay reward label.
+            _pw = float(self._persist_weight)
+            if _pw > 0.0 and step_infos:
+                _ar = float((getattr(self, "_last_env_info", None) or {})
+                            .get("attack_run", 0.0))
+                _phi = min(1.0, _ar / max(1.0, float(self._persist_ticks)))
+                _phi_prev = float(getattr(self, "_persist_phi", 0.0))
+                _g = float(self.config.get("policy", {}).get("gamma", 0.99))
+                _f = _pw * (_g * _phi - _phi_prev)
+                self._persist_phi = _phi
+                intrinsic[0] = intrinsic[0] + _f
+                self._persist_sum = getattr(self, "_persist_sum", 0.0) + _f
+                self._persist_n = getattr(self, "_persist_n", 0) + 1
+
+            # ---- GAZE COVERAGE: novelty of VIEW DIRECTION ---------------
+            # Count-based over pitch buckets, so being pinned at a clamp is
+            # the single most-visited direction there is and pays ~nothing,
+            # while any direction it has not looked in pays. Declares nothing
+            # about WHAT to look at — only that an unexplored gaze direction
+            # is novel, exactly the principle already accepted for territory.
+            # Intrinsic channel only => never a replay reward label.
+            # ---- LIVE VIEWER (2026-08-02) -------------------------------
+            # _viewer_push was called ONLY from _run_episode, the serial
+            # episodic path. skybot runs _collect_segment, so the viewer has
+            # never received a single frame in the mode that matters — the
+            # THIRD subsystem found dead this way, after the gui_open guard
+            # and the entropy/magnet diagnostics. _viewer_push swallows every
+            # exception, so this cannot interrupt the run.
+            if self.viewer is not None and not use_dream_actor:
+                self._viewer_push(
+                    env_actions[0], float(rewards[0]),
+                    float(intrinsic[0].item()), rssm_state, latent[0:1],
+                    episode_length)
+
+            # WHERE IT LOOKED, ALL SEGMENT — not just on the last step. A
+            # single-step pitch cannot distinguish "pinned at the clamp" from
+            # "swept through and happened to end there".
+            _pv = (getattr(self, "_last_world_info", None) or {}).get("pitch")
+            if _pv is not None:
+                self._pitch_sum = getattr(self, "_pitch_sum", 0.0) + float(_pv)
+                self._pitch_n = getattr(self, "_pitch_n", 0) + 1
+                if abs(abs(float(_pv)) - 90.0) < 2.0:
+                    self._pitch_clamped = getattr(
+                        self, "_pitch_clamped", 0) + 1
+
+            if float(self._gaze_weight) > 0.0 and step_infos:
+                _gv = self._gaze_bonus(
+                    (self._last_world_info or {}).get("pitch"))
+                if _gv:
+                    intrinsic[0] = intrinsic[0] + _gv
+                    self._gaze_sum = getattr(self, "_gaze_sum", 0.0) + _gv
+                    self._gaze_n = getattr(self, "_gaze_n", 0) + 1
+
+            if _cw > 0.0 and step_infos:
+                _wi = self._last_world_info
+                _cov = float(_wi.get("coverage", 0.0) or 0.0)
+                if _cov > 0.0:
+                    intrinsic[0] = intrinsic[0] + _cw * _cov
+                # MEASURE THE TERRITORY DRIVE AT ITS POINT OF APPLICATION.
+                # Whether coverage actually competes with the cheap novelty
+                # of spinning was unanswerable: the value was applied and
+                # never reported, so "coverage pays 0 because it is broken"
+                # and "coverage pays 0 because the agent never walks" looked
+                # identical from outside.
+                self._cov_sum = getattr(self, "_cov_sum", 0.0) + _cw * _cov
+                self._cov_n = getattr(self, "_cov_n", 0) + 1
+                self._cov_cells = int(_wi.get("cells_seen", 0) or 0)
+                if _wi.get("died"):
+                    self._deaths_seen = getattr(self, "_deaths_seen", 0) + 1
+
+
+            # pair fresh unlocks with the latent of the stream that earned
+            # them (context provenance for skill minting / the brain graph)
+            if (self.broadcaster is not None
+                    and hasattr(self.broadcaster, "unlock_log")):
+                for _ev in self.broadcaster.unlock_log[_unlocks_before:]:
+                    _st = int(_ev.get("stream", 0))
+                    if 0 <= _st < latent.shape[0]:
+                        self._unlock_context[int(_ev["slot"])] = (
+                            latent[_st].detach().cpu().numpy())
+                    try:  # provenance frame (adapters cache last POV: cheap)
+                        self._unlock_frame[int(_ev["slot"])] = (
+                            envs[_st].render())
+                    except Exception:
+                        pass
+                    # grounded name source: the block that broke on THIS
+                    # stream this step is what the reward spike (= the
+                    # unlock) was caused by
+                    if _st in self._new_break_by_env:
+                        self._unlock_block[int(_ev["slot"])] = (
+                            self._new_break_by_env[_st])
+                    # co-occurrence: unlock landed while (or just as) an
+                    # option ran on that stream -> earned evidence that the
+                    # SKILL causes the ACHIEVEMENT (fed to the prerequisite
+                    # miner at episode end; same-step closes included).
+                    if (not use_dream_actor
+                            and self.option_executor is not None):
+                        _rt = self.option_executor.runtimes[_st]
+                        _sid = (_rt.skill_id if _rt.active else
+                                self.option_executor
+                                .last_closed_this_step[_st])
+                        if _sid is not None:
+                            self.option_executor.record_cooccurrence(
+                                _sid, int(_ev["slot"]), _st,
+                                self.total_timesteps)
+
+            # Gate: per-dimension fact extraction is meaningless (and
+            # unboundedly expensive) on raw pixels / high-dim structured obs.
+            if not self._skip_perdim_symbolic:
+                new_facts_count += self._extract_and_store_facts(
+                    obs_list[0], env_actions[0], next_obs_list[0], rewards[0]
+                )
+            # sd heads + discretizer are trained on the async trainer thread;
+            # lock the reads/writes here (review fix — write-write race on the
+            # discretizer, torn sd-head reads)
+            with self._wm_param_lock:
+                with torch.no_grad():
+                    augmented_primary = self.glue.augment_latent(latent[0:1])
+                sd_facts = self.symbolic_decoder.extract_facts(
+                    augmented_primary.squeeze(0),
+                    timestep=self.total_timesteps
+                )
+                self.symbolic_decoder.update_discretizer(next_obs_list[0])
+            for fact in sd_facts:
+                if self.knowledge_graph.add_fact(fact):
+                    symbolic_decoder_facts_count += 1
+
+            if episode_length % 50 == 0 and not self._skip_perdim_symbolic:
+                scene = self.fact_extractor.extract_scene_graph(
+                    next_obs_list[0], timestep=self.total_timesteps
+                )
+                self.knowledge_graph.save_scene_snapshot(scene)
+
+            # ---- 5. STORE EXPERIENCE (one stream per env) ----
+            # Primary stream (0) gets vision-scaffold shaping folded into its
+            # extrinsic (waking only); scouts store the raw env reward. The
+            # WM reward head thus learns the true reward from 15 streams and
+            # the shaped one from the primary — matching the single-env path.
+            prim_extrinsic = rewards[0]
+            _frame = None
+            if not use_dream_actor and self.symbolizer is not None:
+                try:
+                    _frame = envs[0].render()   # symbolizer's VLM label frame
+                except Exception:
+                    _frame = None
+            # MASTERY HABITUATION: a break of a long-mastered type damps this
+            # step's whole intrinsic (see _habituation_factor) — applied
+            # BEFORE the magnet so its LP attribution habituates too.
+            if not use_dream_actor:
+                _hab = self._habituation_factor(prim_info)
+                if _hab < 1.0:
+                    intrinsic[0] = intrinsic[0] * _hab
+            # Curiosity-ranked magnet: reads the grounding head's per-object
+            # probs on the primary latent + this step's learning progress
+            # (intrinsic[0]) and steers toward the most-curious in-view object.
+            if not use_dream_actor and self.vision_scaffold is not None:
+                _sr = self._magnet_step_shaping(
+                    env_actions[0], float(intrinsic[0].item()), latent[0:1])
+                if _sr:
+                    prim_extrinsic = rewards[0] + _sr
+
+            # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
+            # The VLM names what the agent is looking at; a head learns to
+            # predict those names from the agent's OWN latent (borrowed ->
+            # owned). Perceptual facts are emitted only when a fresh label
+            # lands, so KG traffic anneals with the VLM itself. Causal facts
+            # come from real break events, never from the VLM's word.
+            if not use_dream_actor and self.symbolizer is not None:
+                _lat0 = latent[0:1].detach()
+                self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
+                _labels = self.symbolizer.collect()
+                # LAYER 3: route a VLM-PROPOSED category to the instinct. The
+                # proposal is attention only — it goes to the magnet's
+                # probation set, never to the head and never to the KG. If
+                # attending to it yields no learning progress it is evicted.
+                if (_labels and self.vision_scaffold is not None
+                        and _labels.get("__novel__")):
+                    try:
+                        self.vision_scaffold.propose_category(
+                            str(_labels["__novel__"]), self.total_timesteps)
+                    except Exception as _e:     # never kill a run over instinct
+                        logger.warning("category proposal failed: %s", _e)
+                if _labels is not None:
+                    for _sf in self.symbolizer.perceptual_facts(_lat0):
+                        # refresh=True: this channel may REVISE its own
+                        # confidence downward. Without it add_fact ratchets
+                        # to a high-water mark and a discredited predicate
+                        # keeps its most-confident moment forever.
+                        if self.knowledge_graph.add_fact(
+                                _to_fact(_sf, "vlm_grounded",
+                                         self.total_timesteps),
+                                refresh=True):
+                            symbolizer_facts_count += 1
+                # ground truth: which block types were newly broken this step
+                _ach = prim_info.get("achievements", {}) or {}
+                _chopping = (self.is_discrete
+                             and int(env_actions[0]) in self._chop_action_set)
+                _broke_now = []
+                for _k, _v in _ach.items():
+                    if not _k.startswith("mine_"):
+                        continue
+                    _btype = _k[5:]
+                    if int(_v) > int(self._prev_mine.get(_btype, 0)):
+                        self._prev_mine[_btype] = int(_v)
+                        _broke_now.append(_btype)
+                        for _cf in self.symbolizer.observe_event(
+                                "block_break", _btype,
+                                was_chopping=_chopping,
+                                now=self._symbol_clock):
+                            if self.knowledge_graph.add_fact(_to_fact(
+                                    _cf, "grounded_event",
+                                    self.total_timesteps)):
+                                symbolizer_facts_count += 1
+                # ---- NEGATIVE EVIDENCE (2026-08-07): a full break-worth of
+                # held attack with NOTHING breaking contradicts the claimed
+                # affordance predicates. Edge-triggered once per streak; any
+                # break (or letting go) re-arms the exam. This closes the
+                # verifier's false-positive blind spot the module docstring
+                # documented (a stuck-true predicate used to drift to
+                # reliability 1.0 unopposed — llava's tree_visible did).
+                if self._neg_evidence_ticks > 0:
+                    _arun = float(prim_info.get("attack_run", 0.0) or 0.0)
+                    if _broke_now or _arun <= 0.0:
+                        self._neg_evt_scored = False
+                    elif (_arun >= self._neg_evidence_ticks
+                          and not getattr(self, "_neg_evt_scored", False)):
+                        self._neg_evt_scored = True
+                        self._neg_evt_total = getattr(
+                            self, "_neg_evt_total", 0) + \
+                            self.symbolizer.observe_negative_event(
+                                now=self._symbol_clock)
+                # ---- CREATURE MEANING, EARNED (2026-07-25) ----
+                # The VLM only ever supplies a NAME from pixels. What a
+                # creature MEANS is learned HERE, from what actually happens
+                # to the agent: a creature in view when health drops becomes
+                # causally linked to being hurt. Nothing declares "zombie =
+                # hostile" — a cow that never hurts the agent never earns the
+                # link; a creeper that does earns it fast. Uses the
+                # damage/death signal the restored life-stats provide.
+                _wi = (prim_info.get("world") or {})
+                _dmg = float(_wi.get("damage", 0.0) or 0.0)
+                if _dmg > 0.0 or _wi.get("died"):
+                    from developmental_ai.llm.vlm_symbolizer import (
+                        CREATURE_PREDICATES)
+                    _seen = set()
+                    try:
+                        for _pf in self.symbolizer.perceptual_facts(_lat0):
+                            _seen.add(str(_pf[2]))     # ("scene","contains",X)
+                    except Exception:
+                        pass
+                    for _cp in CREATURE_PREDICATES:
+                        _who = _cp.replace("_visible", "")
+                        if _who not in _seen:
+                            continue
+                        _rel = "killed" if _wi.get("died") else "hurt"
+                        if self.knowledge_graph.add_fact(_to_fact(
+                                (_who, _rel, "agent", _CREATURE_FACT_CONF), "grounded_event",
+                                self.total_timesteps), refresh=True):
+                            symbolizer_facts_count += 1
+                        logger.warning(
+                            "creature meaning learned: %s %s agent "
+                            "(damage=%.1f)", _who, _rel, _dmg)
+                # ---- TOOL MEANING, EARNED (2026-07-25) ----
+                # The agent SEES what it holds (holding_tool) and that the
+                # thing wears out (tool_worn). What a tool is FOR is learned
+                # HERE, from use:
+                #   * a block falls while a tool is in hand -> that tool
+                #     ENABLES that effect
+                #   * the durability value rises as it works -> it WEARS DOWN
+                #   * the tool leaves its hand entirely     -> it BREAKS
+                # Nothing declares "an axe chops wood". If the agent fells a
+                # log barehanded the axe earns no credit for it, and a tool
+                # that never wears never earns `wears_down`.
+                _tool = str(_wi.get("mainhand") or "")
+                if _tool and _tool not in ("none", "air"):
+                    for _bt in _broke_now:
+                        if True:
+                            if self.knowledge_graph.add_fact(_to_fact(
+                                    (_tool, "enables", f"break_{_bt}", _TOOL_FACT_CONF),
+                                    "grounded_event", self.total_timesteps),
+                                    refresh=True):
+                                symbolizer_facts_count += 1
+                            logger.warning(
+                                "tool meaning learned: %s enables break_%s",
+                                _tool, _bt)
+                    if _wi.get("tool_wore"):
+                        if self.knowledge_graph.add_fact(_to_fact(
+                                (_tool, "wears_down", "with_use", _TOOL_FACT_CONF),
+                                "grounded_event", self.total_timesteps),
+                                refresh=True):
+                            symbolizer_facts_count += 1
+                if _wi.get("tool_lost"):
+                    _lost = str(_wi["tool_lost"])
+                    if self.knowledge_graph.add_fact(_to_fact(
+                            (_lost, "breaks_from", "use", _TOOL_FACT_CONF),
+                            "grounded_event", self.total_timesteps),
+                            refresh=True):
+                        symbolizer_facts_count += 1
+                    logger.warning("tool meaning learned: %s BROKE from use",
+                                   _lost)
+
+                # ---- RETRACTION: the other half of the gates ----
+                # min_labels/reliability_floor only stop NEW facts. A
+                # predicate the world has discredited must also stop feeding
+                # its triple to the graph embedding. Placed after the break
+                # events above so a collapse caused by THIS step retracts
+                # immediately. stale_facts() is edge-triggered, so this is a
+                # 16-entry scan per step and at most one KG write per
+                # collapse; source-scoped, so it can only delete facts this
+                # channel minted.
+                for _stale in self.symbolizer.stale_facts():
+                    try:
+                        if self.knowledge_graph.remove_fact(
+                                *_stale, source="vlm_grounded"):
+                            self._symbolizer_retractions += 1
+                            logger.info(
+                                "Symbol grounding: retracted %s "
+                                "(reliability fell below floor)", _stale)
+                    except Exception as _e:   # never kill a multi-day run
+                        logger.warning(
+                            "KG retraction failed for %s: %s", _stale, _e)
+                self._symbol_clock += 1
+
+            if self.brain_emitter is not None:
+                self._brain_clock += 1
+                if self._brain_clock % self._brain_interval == 0:
+                    self.brain_emitter.emit(self.total_episodes,
+                                            self.total_timesteps)
+            for e_i in range(n):
+                self.replay_buffer.add(
+                    obs_list[e_i], env_actions[e_i],
+                    prim_extrinsic if e_i == 0 else rewards[e_i],
+                    dones[e_i], stream=e_i,
+                )
+
+            # Primary stream feeds the on-policy PPO rollout (waking only).
+            if not use_dream_actor and primary_pol is not None:
+                # ---- OCCLUSION SUPPRESSION MUST PRECEDE THE MIX ----------
+                # (fix 2026-08-02, found live on the server.) The gui_open
+                # zeroing sat ~40 lines BELOW this call — AFTER `mixed` was
+                # computed and AFTER the transition was stored — so it only
+                # ever changed the logged `episode_intrinsic` and NEVER
+                # reached the PPO reward. The guard was inert from the day it
+                # was written, in BOTH loop paths.
+                #
+                # Measured live: the inventory screen paid +0.0410/step vs
+                # +0.0196 for the world (2.09x), and the agent sat in the menu
+                # 89% of a segment with an unbroken 1491-step dwell —
+                # motionless, because inside a GUI it cannot move, look or
+                # swing. Curiosity was paying for the act of occluding the
+                # camera, which is exactly what the note below forbids.
+                #
+                # The menu stays fully available and crafting still earns its
+                # extrinsic tier; only payment for the occlusion is removed.
+                if bool((step_infos[0] or {}).get("gui_open")):
+                    intrinsic[0] = intrinsic[0] * 0.0
+                mixed = self.reward_mixer.mix(
+                    float(intrinsic[0].item()), prim_extrinsic)
+                # running "typical surprise" baseline — the denominator of
+                # mastery's WM-fidelity ratio. Updated EVERY primary step
+                # (not just during options), or the baseline would be biased
+                # toward exactly the moments options select for.
+                #
+                # THE RAW FORWARD-MODEL ERROR, not `intrinsic` (review HIGH,
+                # flagged independently by four reviewers). `intrinsic` is
+                # the SHAPED curiosity reward: mean-centred, clipped, and
+                # carrying learning-progress / imagination / coverage
+                # bonuses. Feeding that to "can the world model predict this
+                # skill" measured a different variable — a skill could look
+                # unpredictable purely because it was novel, or predictable
+                # because its LP had flattened. `last_pred_error` is the
+                # pre-normalization MSE the ICM already computes.
+                _err_now = float(getattr(self.curiosity, "last_pred_error",
+                                         float(intrinsic[0].item())))
+                # ---- OCCLUSION: NO WORLD CHANGE, NO WORLD CURIOSITY ------
+                # MEASURED (2026-07-27): the inventory screen paid the agent
+                # +0.18 -> +0.30 intrinsic per step against +0.09 for the
+                # world — a 2.0x -> 3.1x advantage that WIDENED over the run.
+                # The agent was not failing to learn; it was optimal under
+                # the signal it was given, and spent ~50% of every episode
+                # in a menu.
+                #
+                # This is a CATEGORY ERROR, not a preference. The ICM scores
+                # prediction error on the OBSERVATION. When a menu covers the
+                # screen the observation changes hugely while the WORLD does
+                # not change at all, so curiosity — which exists to reward
+                # learning about world dynamics — is paying for an overlay
+                # drawn over the world. It is the same argument already
+                # accepted for the attack counter: a swing into a menu never
+                # reached the world, so counting it was a measurement error.
+                # Applying it to actions but not to perception was
+                # inconsistent.
+                #
+                # NOT a rule about what the agent should want: the menu stays
+                # fully available, and CRAFTING in it still pays the +5.0
+                # extrinsic first-craft tier. What is removed is payment for
+                # the act of occluding the camera.
+                #
+                # (2026-08-02) The zeroing now happens BEFORE the mix, above.
+                # By the time control reaches here intrinsic[0] is already 0 on
+                # a GUI frame, so re-multiplying by 0.0 was a no-op left behind
+                # by that fix. Removed; the reasoning above is the load-bearing
+                # part and stays.
+                # ---- IS THE MENU A CURIOSITY FARM? (2026-07-27) ----------
+                # The agent spends ~50% of every episode in the inventory
+                # screen. I have been calling that "a learning result" with
+                # no evidence. It is a MEASURABLE question: split the
+                # intrinsic reward by whether the world was covered by a
+                # menu at the time. If menu frames pay MORE, the agent is
+                # behaving optimally under the signal it is given and the
+                # signal is what needs looking at -- not the behaviour.
+                try:
+                    _gui_now = bool((step_infos[0] or {}).get("gui_open"))
+                    # THE RAW forward-model surprise, NOT the post-
+                    # suppression intrinsic. Measuring the value we just
+                    # zeroed makes the readout tautological (`in-menu=0.0000`
+                    # by construction) and destroys the falsification test
+                    # this line exists to provide. What we want to know is
+                    # whether the menu WOULD still pay better — i.e. whether
+                    # the underlying category error is still there — which
+                    # only the pre-suppression error can answer.
+                    _iv = _err_now
+                    if not hasattr(self, "_gui_intr"):
+                        self._gui_intr = [0.0, 0, 0.0, 0]   # sum,n | sum,n
+                    if _gui_now:
+                        self._gui_intr[0] += _iv
+                        self._gui_intr[1] += 1
+                    else:
+                        self._gui_intr[2] += _iv
+                        self._gui_intr[3] += 1
+                except Exception:
+                    pass
+                self._wm_err_ema = (
+                    _err_now if not hasattr(self, "_wm_err_ema")
+                    else 0.999 * self._wm_err_ema + 0.001 * _err_now)
+                if self.option_executor is not None:
+                    _rt0 = self.option_executor.runtimes[0]
+                    if _rt0.active:
+                        # inside an option: accumulate; store ONE SMDP
+                        # decision when it closes
+                        _closed = self.option_executor.observe_primary(
+                            float(rewards[0]), bool(dones[0]), mixed,
+                            self.total_timesteps, wm_err=_err_now)
+                        if _closed is not None:
+                            self.policy.store_transition(
+                                _closed["obs"], _closed["meta_action"],
+                                _closed["reward"], dones[0],
+                                _closed["log_prob"], _closed["value"],
+                                knowledge=_closed["kv"],
+                                tau=_closed["tau"],
+                                action_mask=_closed["mask"],
+                                proprio=_closed.get("proprio"))
+                            self.skill_bank.record_invocation(
+                                _closed["skill_id"], _closed["outcome"],
+                                _closed["reward"])
+                            self._competence_from_option(_closed)
+                            # WM fidelity (task #39): this invocation's mean
+                            # surprise vs the agent's typical surprise. The
+                            # asked/success half is recorded by the executor
+                            # itself at every frame close (incl. scouts and
+                            # nested frames) — only the fidelity ratio needs
+                            # the loop's global baseline.
+                            _wem = _closed.get("wm_err_mean")
+                            if (_wem is not None
+                                    and getattr(self, "_wm_err_ema", 0) > 1e-9):
+                                self.skill_bank.record_wm_fidelity(
+                                    _closed["skill_id"],
+                                    float(_wem) / float(self._wm_err_ema))
+                    else:
+                        _pp = self.option_executor._primary_primitive
+                        if _pp is not None:
+                            self.policy.store_transition(
+                                obs_list[0], _pp["action"], mixed,
+                                dones[0], _pp["log_prob"], _pp["value"],
+                                knowledge=primary_kv, tau=1,
+                                action_mask=_pp["mask"],
+                                proprio=_pp.get("proprio"))
+                else:
+                    self.policy.store_transition(
+                        obs_list[0], env_actions[0], mixed, dones[0],
+                        primary_pol["log_prob"], primary_pol["value"],
+                        knowledge=primary_kv)
+
+            # ---- 6. ADVANCE (lifelong: DEATH-ONLY reset; no episode) ----
+            # A time-truncation carries on unbroken. Only a true terminal
+            # (64-log success) or a crash-restart zeroes that stream. NOTE: in
+            # lifelong the MineRL adapter emits NO time-truncation (TimeLimit is
+            # removed), so a truncated=True from a MineRL step is ALWAYS a
+            # crash-restart the adapter caught internally (it rebuilt the CLIENT
+            # but the mission only launches inside reset()) — that stream must be
+            # reset here or it wedges on a stale frame forever (audit critical).
+            _reset_to = float(self.config.get("parallel_envs", {}).get(
+                "reset_timeout_s", 300))
+            for e_i in range(n):
+                _crashed = bool(step_infos[e_i]) and step_infos[e_i].get(
+                    "env_restarted")
+                if dones[e_i] or _crashed:
+                    self._ll.death_reset(e_i)        # zero h/z row + mask row
+                    self._mine_by_env.pop(e_i, None)
+                    self._new_break_by_env.pop(e_i, None)
+                    if hasattr(self, "_loginv_by_env"):
+                        self._loginv_by_env.pop(e_i, None)
+                    # fresh world: mine_* counts restart at 0, so the primary's
+                    # symbolizer high-water must restart too — else no causal
+                    # block_break facts (and no tree_visible reliability hits)
+                    # until the new life re-exceeds the old life's totals
+                    # (audit fix; mirrors the episodic paths' clears).
+                    if e_i == 0 and self.symbolizer is not None:
+                        self._prev_mine.clear()
+                    if self.option_executor is not None:
+                        self.option_executor.clear(e_i, self.total_timesteps)
+                    if restarted[e_i] and not _crashed:
+                        # loop-level step TIMEOUT: the step future may still be
+                        # in flight, so a reset here could race it on the same
+                        # client — carry the last obs (rare; the adapter-caught
+                        # crash below is the near-certain path).
+                        obs_list[e_i] = next_obs_list[e_i]
+                    else:
+                        # 64-log SUCCESS or adapter-caught CRASH-REBUILD: the
+                        # client needs a fresh mission (launched in reset()).
+                        # BOUNDED so a hung reset cannot freeze the whole fleet.
+                        try:
+                            _rf = self._env_pool.submit(envs[e_i].reset)
+                            o = _rf.result(timeout=_reset_to)[0]
+                            obs_list[e_i] = np.asarray(o, dtype=np.float32)
+                        except Exception as _re:
+                            logger.warning(
+                                "env %d bounded reset failed (%s) — carrying "
+                                "obs; stream may lag one segment", e_i, _re)
+                            obs_list[e_i] = next_obs_list[e_i]
+                else:
+                    obs_list[e_i] = next_obs_list[e_i]  # (no truncation in LL)
+
+            episode_reward += rewards[0]
+            episode_intrinsic += float(intrinsic[0].item())
+            episode_length += 1
+            self.total_timesteps += n  # all N transitions are real experience
+
+            # ---- lifelong cadences (step-based, not episode-based) ----
+            self._ll.wm_steps += 1
+            if (self._ll.wm_steps >= wm_train_every
+                    and self.replay_buffer.is_ready):
+                self._ll.wm_steps = 0
+                if self._use_async_wm:
+                    # RETROSPECTIVE-ASYNC: consolidation runs on the trainer
+                    # thread while acting continues. Skip-if-busy; the
+                    # busy-check/put window can let AT MOST one extra ticket
+                    # slip through (trainer sets busy after get) — harmless:
+                    # one extra back-to-back block on fresh data.
+                    self._ensure_wm_trainer()
+                    self._wm_cadence_hits += 1
+                    if (not self._wm_busy.is_set()
+                            and self._wm_ticket.empty()):
+                        try:
+                            self._wm_ticket.put_nowait(1)
+                            self._wm_blocks_run += 1
+                        except Exception:
+                            pass
+                    if self._wm_metrics_box is not None:
+                        # consume-once: each finished block feeds run()'s
+                        # stage-controller/glue consumers exactly once
+                        # (review fix — stale-metrics slope flattening)
+                        self._last_wm_metrics = self._wm_metrics_box
+                        self._wm_metrics_box = None
+                        self._wm_metrics_fresh = True
+                else:
+                    self._last_wm_metrics = self._train_world_model()
+                    self._wm_metrics_fresh = True
+            self._ll.goal_steps += 1
+            if (self._ll.goal_steps >= goal_horizon
+                    and self.broadcaster is not None):
+                # goal-horizon: competence Bernoulli update + IMGEP retarget +
+                # mask hard-clear (the mask has been softly fading each segment)
+                self._ll.goal_steps = 0
+                self.broadcaster.reset()
+                _ls = getattr(self.broadcaster, "last_selection", None)
+                if _ls:
+                    print(f"  Prospection re-rank: {_ls}", flush=True)
+                    self.broadcaster.last_selection = None
+                if self._use_async_wm and self._wm_cadence_hits:
+                    _skip = 1.0 - self._wm_blocks_run / self._wm_cadence_hits
+                    print(f"  AsyncWM replay-ratio: {self._wm_blocks_run}"
+                          f"/{self._wm_cadence_hits} blocks run "
+                          f"(skip {_skip:.1%})", flush=True)
+                # Re-open the env-side first-break tiers on the SAME horizon
+                # (audit fix): without this the broadcaster re-armed goal masks
+                # that could never re-unlock (first-break rewards had become
+                # once-per-LIFETIME), driving non-log competence to zero.
+                for _e in envs:
+                    if hasattr(_e, "clear_break_marks"):
+                        _e.clear_break_marks()
+
+        self._stream_obs = obs_list
+        self._ll.decay()                          # per-segment soft leak
+
+        # PPO update: bootstrap with V(s_last) because the segment ends
+        # MID-trajectory (the rollout is not a terminated episode).
+        policy_loss = 0.0
+        if self.policy.rollout_env_steps() >= self.policy_update_steps:
+            last_v = self.policy.compute_last_value(
+                obs_list[0], knowledge=self._current_knowledge_feature())
+            pm = self.policy.train_step(
+                n_epochs=self.config.get("policy", {}).get("n_epochs", 10),
+                last_value=last_v)
+            policy_loss = pm.get("policy_loss", 0.0)
+            self._last_ppo = dict(pm)      # for the entropy forensics line
+            # COLLAPSE DETECTOR, in the path that actually runs (2026-08-02).
+            # PPO returns entropy and the episodic path recorded it; this one
+            # dropped it, so the "<-- COLLAPSED" warning could never fire for
+            # skybot. It went unseen while the action distribution walked from
+            # attack:11% to attack:70% over three segments.
+            if "entropy" in pm:
+                self.training_metrics.setdefault(
+                    "policy_entropy", deque(maxlen=100)).append(
+                        float(pm["entropy"]))
+
+        return {
+            "episode_reward": episode_reward,
+            "episode_length": episode_length,
+            "intrinsic_reward": episode_intrinsic / max(1, episode_length),
+            "policy_loss": policy_loss,
+            "curiosity_loss": icm_metrics.get("icm_total", 0),
+            "new_facts": new_facts_count,
+            "symbolic_decoder_facts": symbolic_decoder_facts_count,
+        }
+
+    # -----------------------------------------------------------------------
+    # Symbolic fact extraction
+    # -----------------------------------------------------------------------
+
+    def _extract_and_store_facts(
+        self,
+        obs: np.ndarray,
+        action: int,
+        next_obs: np.ndarray,
+        reward: float,
+    ) -> int:
+        """
+        Extract symbolic facts from a transition and store in knowledge graph.
+
+        Returns the number of NEW (novel) facts added.
+        """
+        # Extract transition facts (state changes + action rules)
+        facts, action_rule = self.fact_extractor.extract_transition_facts(
+            obs=obs,
+            action=action,
+            next_obs=next_obs,
+            reward=reward,
+            timestep=self.total_timesteps,
+            action_labels=self.action_labels,
+        )
+
+        # Store facts in knowledge graph
+        novel_count = 0
+        for fact in facts:
+            if self.knowledge_graph.add_fact(fact):
+                novel_count += 1
+
+        # Store action rule if discovered
+        if action_rule is not None:
+            self.knowledge_graph.add_action_rule(action_rule)
+
+        return novel_count
+
+    # -----------------------------------------------------------------------
+    # World model training
+    # -----------------------------------------------------------------------
+
+    def _train_world_model(self) -> Dict[str, float]:
+        """
+        Train the RSSM world model AND the symbolic decoder on replay buffer data.
+
+        Runs multiple gradient steps per call (train_iters) to give the world
+        model enough signal to learn dynamics. DreamerV3 typically does a 1:1
+        ratio of real steps to gradient steps; with our episodic training loop
+        we compensate by doing multiple batches per episode.
+
+        The symbolic decoder piggybacks on the last batch — we reuse
+        the latent states the RSSM just computed.
+        """
+        wm_cfg = self.config.get("world_model", {})
+        batch_size = wm_cfg.get("batch_size", 16)
+        seq_len = wm_cfg.get("sequence_length", 50)
+        train_iters = wm_cfg.get("train_iters", 4)
+        prioritized = self._use_per
+
+        def _do_train(batch: Dict[str, Any]) -> Dict[str, float]:
+            """Run one gradient step on a sampled batch, updating PER
+            priorities from the per-sequence reconstruction error when PER
+            is enabled.
+
+            _wm_param_lock at PER-GRADIENT-STEP granularity: with the async
+            trainer, the main thread's per-step observe forwards / prospection
+            rollouts / checkpoint saves wait at most ONE optimizer step, and
+            never see torn parameters mid-update. Uncontended (sync mode) the
+            RLock costs ~1us per iteration.
+            """
+            with self._wm_param_lock:
+                if prioritized:
+                    m, errs = self.world_model.train_step(
+                        observations=batch["observations"],
+                        actions=batch["actions"],
+                        rewards=batch["rewards"],
+                        continues=batch["continues"],
+                        importance_weights=batch["weights"],
+                        return_per_sample=True,
+                    )
+                    self.replay_buffer.update_priorities(
+                        batch["start_indices"], seq_len, errs
+                    )
+                    return m
+                return self.world_model.train_step(
+                    observations=batch["observations"],
+                    actions=batch["actions"],
+                    rewards=batch["rewards"],
+                    continues=batch["continues"],
+                )
+
+        try:
+            metrics = {}
+            batch = None
+
+            if self._use_async_replay:
+                # Prefetch all batches for this call on a background thread so
+                # sampling overlaps with the (CPU/GPU-bound) gradient steps.
+                sampler = self._get_bg_sampler(batch_size, seq_len, prioritized)
+                sampler.request(train_iters)
+                for _ in range(train_iters):
+                    batch = sampler.get()
+                    metrics = _do_train(batch)
+            else:
+                for _ in range(train_iters):
+                    batch = self.replay_buffer.sample_sequences(
+                        batch_size=batch_size,
+                        seq_len=seq_len,
+                        device=self.device,
+                        prioritized=prioritized,
+                        reward_fraction=self._goal_replay_fraction,
+                    )
+                    metrics = _do_train(batch)
+
+            # Train the symbolic decoder on the last batch (same lock: the
+            # sd heads are read on the main thread every step via the glue)
+            with self._wm_param_lock:
+                with torch.no_grad():
+                    states, _ = self.world_model.observe_sequence(
+                        batch["observations"], batch["actions"]
+                    )
+                    latent_states = torch.cat(
+                        [states["h"], states["z"]], dim=-1)
+
+                sd_metrics = self.symbolic_decoder.train_step(
+                    latent_states=latent_states,
+                    raw_observations=batch["observations"],
+                )
+            metrics.update(sd_metrics)
+
+            return metrics
+
+        except ValueError as e:
+            logger.debug(f"World model training skipped: {e}")
+            return {}
+
+    def _get_bg_sampler(self, batch_size: int, seq_len: int, prioritized: bool):
+        """Lazily create the background prefetch sampler (async replay).
+
+        batch_size/seq_len/prioritized come from config and are constant across
+        the run, so a single long-lived sampler is correct. It is shut down in
+        close().
+        """
+        if self._bg_sampler is None:
+            from developmental_ai.world_model.replay_buffer import BackgroundSampler
+
+            self._bg_sampler = BackgroundSampler(
+                buffer=self.replay_buffer,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=self.device,
+                prioritized=prioritized,
+                reward_fraction=self._goal_replay_fraction,
+            )
+        return self._bg_sampler
+
+    # -----------------------------------------------------------------------
+    # Async world-model trainer (retrospective consolidation off-thread)
+    # -----------------------------------------------------------------------
+    def _ensure_wm_trainer(self) -> None:
+        """Lazily start the background WM trainer (async_wm.enabled)."""
+        if self._wm_trainer_thread is not None:
+            return
+        import queue
+        import threading
+
+        def _loop() -> None:
+            while not self._wm_trainer_stop.is_set():
+                try:
+                    self._wm_ticket.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                self._wm_busy.set()
+                try:
+                    m = self._train_world_model()
+                    if m:
+                        # atomic ref-swap under the GIL; the main thread
+                        # copies the reference into _last_wm_metrics
+                        self._wm_metrics_box = m
+                except Exception:
+                    # a crashed consolidation must log loudly and keep the
+                    # trainer alive for the next ticket — never kill the run
+                    logger.exception("async WM trainer iteration failed")
+                finally:
+                    self._wm_busy.clear()
+
+        self._wm_trainer_thread = threading.Thread(
+            target=_loop, name="wm-trainer", daemon=True)
+        self._wm_trainer_thread.start()
+        logger.warning("async WM trainer started (acting-while-learning)")
+
+    # -----------------------------------------------------------------------
+    # Goal-level prospection (imagine-before-committing)
+    # -----------------------------------------------------------------------
+    def _dream_consolidate_skills(self) -> Dict[str, float]:
+        """SLEEP CONSOLIDATION — practise skills inside the world model.
+
+        Waking practice can only fire when a skill is actually invoked AND
+        produces its grounded effect. On a Minecraft client at ~10 steps/s
+        those events are rare, so most skills would consolidate at a crawl.
+        Here each bound skill is rolled forward THROUGH THE WORLD MODEL using
+        its own actor, the resulting imagined trajectories are ranked by
+        imagined return, and the skill is trained toward its ELITE rollouts —
+        the ones where its own behaviour led somewhere good.
+
+        This is deliberately the same mechanism as waking practice (same
+        self-imitation, same KL trust region, same consolidation curve), only
+        the evidence is dreamed. Three gates keep dreamed evidence honest:
+
+          * WM TRUST. Gated on `_wm_trust_ema`, the same signal the dream
+            distiller uses. A world model whose prior does not anticipate what
+            actually happens produces rollouts that are confabulation, and
+            training a skill on those is how an agent gets better at
+            hallucinations. Below the floor, nothing consolidates.
+          * DISCOUNTED EVIDENCE. `lr_scale` < 1: an imagined success is
+            weaker evidence than a real one and is weighted as such.
+          * ELITE SELECTION. Only the best fraction of rollouts teach. The
+            median rollout of a mediocre skill is not worth imitating.
+
+        Returns telemetry; never raises (a multi-day run must survive a bad
+        batch).
+        """
+        out = {"slots": 0.0, "updates": 0.0, "trust": 0.0}
+        ex = self.option_executor
+        if ex is None or self.world_model is None:
+            return out
+        pr = getattr(ex.bank, "practice", None)
+        if pr is None or not pr.enabled:
+            return out
+        cs = dict(self.config.get("dream_training", {}).get(
+            "consolidate_skills", {}) or {})
+        if not cs.get("enabled", False):
+            return out
+
+        trust = float(getattr(self, "_wm_trust_ema", 0.0))
+        out["trust"] = trust
+        min_trust = float(cs.get("min_trust", 0.2))
+        if trust < min_trust:
+            # Not a failure — the correct behaviour. Say so, because a silent
+            # no-op here is indistinguishable from the feature being broken.
+            self._dream_consolidate_skipped = getattr(
+                self, "_dream_consolidate_skipped", 0) + 1
+            return out
+
+        n_roll = int(cs.get("rollouts", 8))
+        horizon = int(cs.get("horizon", 12))
+        elite_frac = float(cs.get("elite_frac", 0.25))
+        per_seg = int(cs.get("slots_per_segment", 3))
+        lr_scale = float(cs.get("lr_scale", 0.5))
+        gamma = float(self.config.get("policy", {}).get("gamma", 0.99))
+
+        # round-robin so every skill gets sleep, not just the low-numbered
+        # ones — a fixed scan order would starve the tail of the bank forever
+        cand = [i for i, b in enumerate(ex.bank.slots)
+                if b is not None and not b.get("scripted")]
+        if not cand:
+            return out
+        start = int(getattr(self, "_consolidate_cursor", 0))
+        picks = [cand[(start + k) % len(cand)]
+                 for k in range(min(per_seg, len(cand)))]
+        self._consolidate_cursor = (start + len(picks)) % len(cand)
+
+        for slot in picks:
+            try:
+                info = self._consolidate_one_slot(
+                    slot, n_roll, horizon, elite_frac, gamma, lr_scale)
+            except Exception as e:
+                logger.warning("dream consolidation failed on slot %d: %s",
+                               slot, e)
+                continue
+            out["slots"] += 1.0
+            if info:
+                out["updates"] += 1.0
+        return out
+
+    def _consolidate_one_slot(self, slot: int, n_roll: int, horizon: int,
+                              elite_frac: float, gamma: float,
+                              lr_scale: float) -> Optional[Dict[str, float]]:
+        """Roll ONE skill through the world model and consolidate its elites."""
+        ex = self.option_executor
+        pr = ex.bank.practice
+        b = ex.bank.slots[slot]
+        actor = ex.bank.resident_actor(slot)
+        if actor is None or b is None:
+            return None
+
+        # start states: real replay states, so the skill dreams from places
+        # it could actually be — not from arbitrary latents
+        wm_cfg = self.config.get("world_model", {})
+        batch = self.replay_buffer.sample_sequences(
+            batch_size=n_roll, seq_len=wm_cfg.get("sequence_length", 16),
+            device=self.device,
+            reward_fraction=self._goal_replay_fraction)
+        with torch.no_grad():
+            states, _ = self.world_model.observe_sequence(
+                batch["observations"], batch["actions"])
+            t_idx = torch.randint(0, states["h"].shape[1], (n_roll,))
+            start = {"h": states["h"][torch.arange(n_roll), t_idx],
+                     "z": states["z"][torch.arange(n_roll), t_idx]}
+
+        P = int(self.action_dim)
+        kdim = int(b.get("kdim") or 0)
+        ctx = b.get("ctx")
+        ctx_t = (torch.as_tensor(ctx, dtype=torch.float32,
+                                 device=self.device).reshape(1, -1)
+                 if (ctx is not None and kdim > 0) else None)
+        _cond = ex.bank._materialize(slot)[1]
+        feat_log: List[torch.Tensor] = []
+        act_log: List[torch.Tensor] = []
+
+        def _skill_policy(latent):
+            # THE SKILL MUST SEE WHAT IT SEES WHEN AWAKE. Its actor consumes
+            # encoder features, so the imagined latent is decoded back to an
+            # observation and re-encoded through the SAME shared encoder —
+            # the identical path `_add_dream_curiosity` uses to score
+            # imagined frames with the ICM.
+            with torch.no_grad():
+                obs = self.world_model.decoder(latent)
+                obs = obs.flatten(1) if self.pixel_obs else symexp(obs)
+                feats = (self.policy._shared_encoder(obs)
+                         if getattr(self.policy, "_shared_encoder", None)
+                         is not None else obs)
+                feats = feats.reshape(obs.shape[0], -1)
+                if kdim > 0:
+                    tail = (_cond(feats, ctx_t.expand(feats.shape[0], -1))
+                            if (_cond is not None and ctx_t is not None)
+                            else torch.zeros(feats.shape[0], kdim,
+                                             device=feats.device))
+                    feats = torch.cat([feats, tail], dim=-1)
+                # DIMENSION RECONCILIATION (2026-08-07). The waking feature
+                # vector carries loop-appended senses (proprio/knowledge
+                # tail) this dream path does not rebuild, so an actor minted
+                # on the wider vector crashed here EVERY segment with a
+                # shape-mismatch ("8x354 vs 365x256") and those skills never
+                # slept once. Pad the missing tail with zeros — the same
+                # "absent sense reads neutral 0" convention every other
+                # missing sense uses — or truncate a stale-wider vector.
+                # Logged once per slot so a mismatch is visible, not fatal.
+                _want = int(actor.shared[0].in_features)
+                if feats.shape[-1] != _want:
+                    if slot not in getattr(self, "_consol_dim_warned", set()):
+                        self._consol_dim_warned = getattr(
+                            self, "_consol_dim_warned", set()) | {slot}
+                        logger.warning(
+                            "dream consolidation slot %d: feature dim %d != "
+                            "actor's %d — %s the difference (senses absent "
+                            "in dreams read 0)", slot, feats.shape[-1],
+                            _want, "zero-padding"
+                            if feats.shape[-1] < _want else "truncating")
+                    if feats.shape[-1] < _want:
+                        feats = torch.cat(
+                            [feats, torch.zeros(
+                                feats.shape[0], _want - feats.shape[-1],
+                                device=feats.device)], dim=-1)
+                    else:
+                        feats = feats[:, :_want]
+                logits = actor.action_head(actor.shared(feats))
+                # primitives only: a dreamed NESTED invocation cannot be
+                # executed inside the world model (there is no executor in
+                # there), so slot rows are masked off rather than sampled and
+                # silently reinterpreted as a primitive.
+                logits = logits[:, :P]
+                a = torch.distributions.Categorical(logits=logits).sample()
+            feat_log.append(feats.detach().cpu())
+            act_log.append(a.detach().cpu())
+            return torch.nn.functional.one_hot(a, P).float()
+
+        with self._wm_param_lock:
+            imagined = self.world_model.imagine_trajectory(
+                start, _skill_policy, horizon=horizon,
+                knowledge=None)
+        if not feat_log:
+            return None
+
+        # imagined discounted return per rollout
+        rew = symexp(imagined["rewards"]).reshape(n_roll, -1)
+        disc = torch.tensor([gamma ** t for t in range(rew.shape[1])],
+                            device=rew.device).reshape(1, -1)
+        ret = (rew * disc).sum(dim=1).cpu()
+
+        k = max(1, int(round(elite_frac * n_roll)))
+        elite = torch.topk(ret, k).indices.tolist()
+        # A skill whose elite rollouts are no better than its median ones has
+        # learned nothing from this dream — imitating them would just inject
+        # noise. Require the elites to actually stand out.
+        if float(ret.max() - ret.median()) <= 1e-6:
+            return None
+
+        traj: List[Tuple[torch.Tensor, int]] = []
+        for t, (f, a) in enumerate(zip(feat_log, act_log)):
+            for e in elite:
+                if e < f.shape[0]:
+                    traj.append((f[e].reshape(1, -1), int(a[e])))
+        return pr.consolidate(slot, actor, traj, lr_scale=lr_scale)
+
+    def _persist_practised_skills(self) -> int:
+        """Write practised skill weights back to disk.
+
+        A practised skill lives in its slot binding (so it survives LRU
+        eviction) but the bank on disk still holds the weights it was minted
+        with. Without this the improvement would not survive a restart — the
+        agent would re-learn the same skill every run and never accumulate,
+        which is exactly the "recording, not a memory" failure this feature
+        exists to fix.
+
+        Writes only slots whose `practised` counter moved since the last
+        flush, so a segment in which nothing was practised costs no I/O.
+        """
+        if self.option_executor is None:
+            return 0
+        bank = self.option_executor.bank
+        written = 0
+        for slot, b in enumerate(bank.slots):
+            if b is None or b.get("scripted"):
+                continue
+            n = int(b.get("practised", 0))
+            if n <= int(b.get("practised_flushed", 0)):
+                continue
+            sid = b.get("skill_id")
+            sk = self.skill_bank.skills.get(sid)
+            if sk is None:
+                continue
+            try:
+                sd = self.skill_bank.load_skill_policy(sid) or {}
+                # replace ONLY the actor: the critic/conditioner/encoder are
+                # untouched by practice, and the encoder in particular is the
+                # world model's — rewriting it from here would be a lie about
+                # what changed.
+                sd["actor"] = {k: v.to(torch.float32)
+                               for k, v in b["actor_sd"].items()}
+                self.skill_bank.save_skill(
+                    skill_id=sid, name=sk.name,
+                    policy_state_dict=sd,
+                    description=sk.description,
+                    success_rate=float(sk.success_rate),
+                    total_episodes=self.total_episodes,
+                    context_embedding=sk.context_embedding,
+                    preconditions=sk.preconditions or None,
+                    obs_dim=self.obs_dim, action_dim=self.action_dim,
+                    dedup=False, **self._arch_save_kwargs())
+                b["practised_flushed"] = n
+                written += 1
+            except Exception as e:      # never kill a multi-day run
+                logger.warning("persisting practised skill %s failed: %s",
+                               sid, e)
+        return written
+
+    def _arch_save_kwargs(self) -> Dict[str, Any]:
+        """Arch metadata that MUST accompany every saved policy.
+
+        ONE builder for every save_skill site (mint, re-distill, _save_skill).
+        The re-distill and _save_skill sites originally omitted these, so
+        conv weights were written under a `arch='flat'` registry row; `_bind`
+        sniffs the family from the state dict, routes to `_bind_conv`, reads
+        enc_dim=0 from the registry, and raises SlotRefused — permanently,
+        because `refused` was never cleared. A skill deleted itself from the
+        option bank precisely BY IMPROVING. Keep this the single source.
+        """
+        # "wm" is an ENCODED family exactly like "conv" — it stores an encoder
+        # and binds through _bind_conv — so it must carry enc_dim too. Omitting
+        # it reproduces the documented failure above verbatim: enc_dim=0 in the
+        # registry -> SlotRefused -> permanently un-invocable skill.
+        _pa = getattr(self.policy, "arch", "flat")
+        out: Dict[str, Any] = {
+            "arch": _pa,
+            "enc_dim": (int(getattr(self.policy, "enc_dim", 0))
+                        if _pa in ("conv", "wm") else 0),
+            "head_dim": int(getattr(self, "meta_action_dim",
+                                    self.action_dim)),
+        }
+        if self.option_executor is not None:
+            out["slot_map"] = {
+                str(_j): _sb["skill_id"]
+                for _j, _sb in enumerate(self.option_executor.bank.slots)
+                if _sb is not None and not _sb.get("scripted")} or None
+        return out
+
+
+    def _cur_proprio_t(self):
+        """The primary stream's LAST-SEEN self-state, as the policy wants it.
+
+        Imagination and prospection ask "what if I did X from here" — the
+        body they should reason with is the one the agent currently has, not
+        a blank. Returns None when the env has no body sense, in which case
+        _augment is a no-op for this channel.
+        """
+        try:
+            pp = (getattr(self, "_proprio_per_env", None) or [None])[0]
+            return self.policy._prep_proprio(pp)
+        except Exception:
+            return None
+
+    def _competence_from_option(self, closed: Dict[str, Any]) -> None:
+        """Feed an option's OUTCOME back into the competence gate.
+
+        THE GAP THIS CLOSES (measured 2026-07-25): competence was updated in
+        exactly two places, both goal-attempt boundaries in achievement_goals.
+        NOTHING in the option path ever touched it, so the gate was
+        structurally blind to whether an option WORKS. Live consequence: 96 of
+        96 completed options ended in `horizon` (full 80-tick budget, nothing
+        achieved), one useless skill took 86% of all invocations, and its
+        competence never moved — so it kept being offered forever, crowding
+        out the scripted chop (down to ~3% of the budget) which is the only
+        option that earns the +5.0 log tier.
+
+        `spike` = the option produced a real reward spike -> success.
+        Anything else (`horizon`, `episode_end`) -> failure. That is the same
+        Bernoulli signal the predictor already consumes for goals, so a skill
+        that never delivers self-gates within a few dozen invocations.
+
+        MUST be paired with the re-offer probation in OptionExecutor.act():
+        gating on failure ALONE would make this the 5th one-way latch in this
+        project — gated -> never offered -> never invoked -> no new outcomes ->
+        never reopens. See [competence probation] there.
+        """
+        bc = getattr(self, "broadcaster", None)
+        if bc is None or not hasattr(bc, "competence"):
+            return
+        try:
+            from developmental_ai.policy.options import _slot_index_of
+            slot = _slot_index_of(closed.get("skill_id", ""))
+            if slot < 0 or slot >= int(bc.competence.n_tasks):
+                return          # scripted/unslotted option: nothing to update
+            bc.competence.update(
+                slot, 1.0 if closed.get("outcome") == "spike" else 0.0)
+        except Exception as e:      # never kill a multi-day run over telemetry
+            logger.warning("competence-from-option update failed: %s", e)
+
+    def _prospective_goal_score(self, candidates) -> Dict[int, float]:
+        """Imagine pursuing each candidate goal from the CURRENT stream state.
+
+        For each candidate slot g: build the counterfactual goal-broadcast
+        vector for g, roll the REAL (goal-conditioned) waking policy through
+        the world model's imagination for K rollouts x H steps, and score by
+        the discounted, continue-weighted, symexp'd reward-head return. The
+        broadcaster blends these scores into its frontier selection — so what
+        the organism imagines directly changes what it commits to next.
+
+        Empty dict = "no opinion" (frontier-only fallback). Guards: never
+        mutates the live rssm_state (detach/clone), read-only WM (eval +
+        no_grad, mode restored), holds _wm_param_lock so the async trainer
+        can't shift dynamics mid-rollout, requires a trained WM.
+        """
+        try:
+            if (self._ll is None or getattr(self._ll, "rssm_state", None)
+                    is None or not candidates):
+                return {}
+            # truthiness, not identity (review fix): a skipped first training
+            # returns {} — that must NOT satisfy "WM has trained at least once"
+            if not self._last_wm_metrics and not self._wm_metrics_box:
+                return {}   # WM never trained -> imagining would hallucinate
+            import torch.nn.functional as F
+            b = self.broadcaster
+            cfg = self._prospection_cfg
+            K = int(cfg.get("rollouts", 16))
+            H = int(cfg.get("horizon", 15))
+            P = self.action_dim
+            gamma = float(cfg.get("gamma", 0.997))
+            disc = torch.pow(
+                torch.tensor(gamma, device=self.device),
+                torch.arange(H, device=self.device).float())
+            knowledge = self.glue.knowledge_integrator.knowledge_vector
+            if knowledge is not None:
+                knowledge = knowledge.unsqueeze(0).expand(K, -1)
+            was_training = self.world_model.training
+            scores: Dict[int, float] = {}
+            sems: Dict[int, float] = {}
+            with self._wm_param_lock:
+                self.world_model.eval()
+                try:
+                    with torch.no_grad():
+                        # snapshot the primary stream's live latent (row 0);
+                        # clone so decay()'s in-place mul can never touch it
+                        s0 = {k: self._ll.rssm_state[k][0:1].detach()
+                              .clone().repeat(K, 1) for k in ("h", "z")}
+                        comp = b.competence.predict_all()
+                        for g in candidates:
+                            g = int(g)
+                            f = np.zeros(b.DIM, dtype=np.float32)
+                            f[g] = 1.0
+                            f[b.max_slots:2 * b.max_slots] = b.achieved_union
+                            f[2 * b.max_slots] = 1.0
+                            f[2 * b.max_slots + 1] = float(comp[g])
+                            kv = self.policy._prep_knowledge(f)
+                            kvK = (kv.expand(K, -1)
+                                   if kv is not None else None)
+
+                            def policy_fn(latent, _kvK=kvK):
+                                obs_hat = self.world_model.decoder(latent)
+                                if self.pixel_obs:
+                                    obs_hat = obs_hat.flatten(1)
+                                else:
+                                    obs_hat = symexp(obs_hat)
+                                aug = self.policy._augment(
+                                    self.policy._encode(obs_hat), _kvK,
+                                    self._cur_proprio_t())
+                                feats = self.policy.actor.shared(aug)
+                                # options-aware: primitive slice only (the WM
+                                # was built P-wide; slot logits cancel)
+                                logits = self.policy.actor.action_head(
+                                    feats)[..., :P]
+                                a = torch.distributions.Categorical(
+                                    logits=logits).sample()
+                                return F.one_hot(a, P).float()
+
+                            imagined = self.world_model.imagine_trajectory(
+                                {k: v.clone() for k, v in s0.items()},
+                                policy_fn=policy_fn, horizon=H,
+                                knowledge=knowledge)
+                            ext = symexp(imagined["rewards"]).squeeze(-1)
+                            w = disc
+                            cont = imagined.get("continues")
+                            if cont is not None:
+                                # SHIFTED continue product (review fix):
+                                # r_t is weighted by survival THROUGH t-1
+                                # (r_t + gamma*c_t*future convention — c_t
+                                # gates the NEXT step, not its own reward)
+                                c = cont.squeeze(-1)
+                                c_shift = torch.cat(
+                                    [torch.ones_like(c[:, :1]), c[:, :-1]],
+                                    dim=1)
+                                w = disc * c_shift.cumprod(dim=-1)
+                            rets = (ext * w).sum(-1)          # (K,)
+                            scores[g] = float(rets.mean().item())
+                            sems[g] = float(
+                                (rets.std(unbiased=False)
+                                 / max(1.0, float(K) ** 0.5)).item())
+                finally:
+                    self.world_model.train(was_training)
+            # NOISE FLOOR (review fix): range-normalizing pure Monte-Carlo
+            # noise would make selection half-random. If the spread across
+            # candidates is within ~2 standard errors, prospection has no
+            # real opinion — return {} and let the frontier decide alone.
+            if scores:
+                vals = list(scores.values())
+                spread = max(vals) - min(vals)
+                noise = 2.0 * (sum(sems.values()) / max(1, len(sems)))
+                if spread < noise:
+                    print(f"  Prospection: no signal (spread {spread:.4f} < "
+                          f"noise {noise:.4f}) — frontier-only", flush=True)
+                    return {}
+            print(f"  Prospection scores (K={K},H={H}): "
+                  + ", ".join(f"slot{g}={v:+.3f}"
+                              for g, v in scores.items()), flush=True)
+            return scores
+        except Exception:
+            logger.exception("prospection scoring failed — frontier-only")
+            return {}
+
+    # -----------------------------------------------------------------------
+    # Symbolic feature-conditioning (Path A)
+    # -----------------------------------------------------------------------
+
+    def _seeded_reset(self):
+        """Reset the environment, seeding its RNG exactly once (on the first
+        reset) when a deterministic seed is configured. Gymnasium seeds the env
+        RNG when `seed=` is passed; later resets without a seed continue the same
+        deterministic stream, so episodes still vary but the whole run is
+        reproducible. With no configured seed this is a plain reset()."""
+        if self.seed is not None and not self._env_seeded:
+            self._env_seeded = True
+            try:
+                return self.env.reset(seed=self.seed)
+            except TypeError:
+                # Older wrapper signature without seed support — fall back.
+                return self.env.reset()
+        return self.env.reset()
+
+    def _current_knowledge_feature(self) -> Optional[np.ndarray]:
+        """Current KG knowledge vector as a detached numpy feature for policy
+        conditioning, or None when symbolic conditioning is off. Before the
+        first embedding update the vector is None -> return zeros so the policy
+        input keeps a fixed shape (the gate sees a null feature)."""
+        if not self.symbolic_enabled or self.policy.knowledge_dim == 0:
+            return None
+        if self.symbolic_broadcast_lesion:
+            # Rung 6 lesion: the channel (KG / episodic / affordance) is built and
+            # updated identically, but we hand the policy a content-destroyed
+            # feature instead of the real one. Same shape, same gate. The MODE
+            # selects HOW content is destroyed (presence vs content vs variation):
+            mode = getattr(self, "broadcast_lesion_mode", "zero")
+            if mode == "none":
+                # External toggle (e.g. verify_broadcast_live.py) with no mode set
+                # -> treat as the plain zero lesion.
+                mode = "zero"
+            if mode == "scramble" and hasattr(self.broadcaster, "scrambled_feature"):
+                # VALID-but-WRONG affordance vector (in-distribution, wrong info).
+                return self.broadcaster.scrambled_feature(self._lesion_rng).astype(np.float32)
+            if mode == "noise" and hasattr(self.broadcaster, "noise_feature"):
+                # RANDOM valid vector each step, uncorrelated with the true state
+                # (in-distribution, present + varies, but carries no information).
+                return self.broadcaster.noise_feature(self._lesion_rng).astype(np.float32)
+            if mode == "constant" and hasattr(self.broadcaster, "constant_feature"):
+                # FIXED valid affordance vector (in-distribution, no variation).
+                return self.broadcaster.constant_feature().astype(np.float32)
+            # "zero" (or fallback when the broadcaster lacks a control method):
+            # all-zeros — presence severed, clean control, possibly OOD.
+            return np.zeros(self.policy.knowledge_dim, dtype=np.float32)
+        if self.broadcaster is not None:
+            # Within-episode broadcast (episodic working memory or symbolic
+            # affordance/task-phase vector) — Rung 6 redesign.
+            return self.broadcaster.feature().astype(np.float32)
+        kv = self.glue.knowledge_integrator.knowledge_vector
+        if kv is None:
+            return np.zeros(self.policy.knowledge_dim, dtype=np.float32)
+        return kv.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
+    # -----------------------------------------------------------------------
+    # LLM goal-progress reward shaping (Path B)
+    # -----------------------------------------------------------------------
+
+    def _trajectory_summary(self, episode_reward: float, episode_length: int) -> str:
+        """Compact textual summary of recent performance for the LLM to judge
+        goal progress against. Kept short so the Ollama call stays cheap."""
+        recent = list(self._recent_ep_rewards)
+        avg = float(np.mean(recent)) if recent else episode_reward
+        best = float(np.max(recent)) if recent else episode_reward
+        trend = "improving" if len(recent) >= 2 and recent[-1] > recent[0] else "flat/declining"
+        return (
+            f"Latest episode return: {episode_reward:.1f} over {episode_length} steps.\n"
+            f"Recent (last {len(recent)} eps) avg return: {avg:.1f}, best: {best:.1f}.\n"
+            f"Trend: {trend}."
+        )
+
+    def _apply_llm_goal_shaping(
+        self, episode_reward: float, episode_length: int
+    ) -> None:
+        """Poll the async LLM goal-progress score, apply a potential-based
+        shaping increment onto the episode's last stored transition, and queue
+        the next scoring job. No-op when shaping is disabled or during dream
+        training (the dream actor trains on imagined rollouts, not this buffer)."""
+        if not self.llm_shaping_enabled or self.dream_training_active:
+            return
+
+        # Consume any finished progress score -> update potential Phi. EMA
+        # smooths LLM-to-LLM noise so the shaping doesn't jerk the reward around.
+        p = self.llm.poll_progress()
+        if p is not None:
+            self.llm_potential = 0.5 * self.llm_potential + 0.5 * float(p)
+
+        # Potential-based increment F = w * (Phi_now - Phi_prev) onto the last
+        # transition. Difference-form telescopes => can't be farmed; clipped and
+        # weight-annealed => bounded, fading guide.
+        if self.policy.rollout_rewards:
+            shaping = self.llm_shape_w * (self.llm_potential - self.llm_potential_prev)
+            shaping = float(np.clip(shaping, -self.llm_shape_clip, self.llm_shape_clip))
+            if shaping != 0.0:
+                self.policy.rollout_rewards[-1] += shaping
+            self.llm_potential_prev = self.llm_potential
+
+        # Queue the next async scoring job against the current goal.
+        self._recent_ep_rewards.append(episode_reward)
+        if self.llm.should_score_progress(self.total_episodes):
+            goal = self.glue.goal_manager.current_goal
+            summary = self._trajectory_summary(episode_reward, episode_length)
+            self.llm.submit_progress(
+                goal.get("description", "") if goal else "", summary
+            )
+
+    # -----------------------------------------------------------------------
+    # Graph embedding updates
+    # -----------------------------------------------------------------------
+
+    def _update_graph_embeddings(self) -> None:
+        """
+        Retrain knowledge graph embeddings on accumulated facts.
+
+        This periodically updates the PyKEEN embeddings so the world model
+        has access to the latest symbolic knowledge. The embeddings convert
+        symbolic facts into vectors the neural world model can process.
+        """
+        triples = self.knowledge_graph.get_triples_for_embedding()
+        if len(triples) >= 3:
+            result = self.kg_embedder.train(triples)
+            logger.debug(f"Updated graph embeddings: {result}")
+
+    # -----------------------------------------------------------------------
+    # Skill detection and saving
+    # -----------------------------------------------------------------------
+
+    def _save_skill(self, mastery_level: float) -> None:
+        """Save the current policy as a mastered skill."""
+        # Deterministic identity: one canonical skill per environment.
+        # Re-mastering the same env upserts (keeps the best policy +
+        # accumulates practice) instead of spawning near-duplicate skills.
+        skill_id = f"skill_{self.env_name}"
+        skill_name = f"Behavior in {self.env_name} (difficulty {self._get_difficulty()})"
+
+        # Get recent performance stats
+        recent_rewards = list(self.training_metrics["episode_reward"])
+        avg_reward = np.mean(recent_rewards) if recent_rewards else 0.0
+        success_rate = mastery_level
+
+        # Extract goal facts from knowledge graph
+        goal_facts = []
+        for fact in self.knowledge_graph.query(relation="received_reward"):
+            goal_facts.append({
+                "subject": fact.subject,
+                "relation": fact.relation,
+                "object": fact.obj,
+            })
+
+        # Context embedding = the goal the agent was pursuing when it mastered
+        # this behavior. Stored so a future run can RETRIEVE this skill by
+        # goal similarity (select_skills cosine) and warm-start from it —
+        # cumulative learning across runs. obs/action dims are recorded so the
+        # warm-start path can verify the saved policy is shape-compatible
+        # before loading it (a cross-env match must not be loaded blindly).
+        context_embedding = self.glue.goal_manager.current_embedding
+
+        self.skill_bank.save_skill(
+            skill_id=skill_id,
+            name=skill_name,
+            policy_state_dict=self.policy.get_state_dict(),
+            description=f"Mastered at difficulty {self._get_difficulty()} with {mastery_level:.2f} mastery",
+            success_rate=success_rate,
+            total_episodes=self.total_episodes,
+            avg_reward=avg_reward,
+            context_embedding=context_embedding,
+            goal_facts=goal_facts[:10],  # Keep it manageable
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            dedup=True,
+            **self._arch_save_kwargs(),
+        )
+
+        logger.info(
+            f"Skill saved: '{skill_name}' "
+            f"(mastery={mastery_level:.2f}, reward={avg_reward:.2f})"
+        )
+
+        # Auto-push to Hugging Face Hub if configured
+        hub_cfg = self.config.get("hub", {})
+        if hub_cfg.get("push_on_mastery") and hub_cfg.get("repo_id"):
+            try:
+                self.skill_bank.push_to_hub(
+                    repo_id=hub_cfg["repo_id"],
+                    skill_ids=[skill_id],
+                    token=hub_cfg.get("token"),
+                    private=hub_cfg.get("private", True),
+                )
+            except Exception as e:
+                logger.warning(f"Hub push failed: {e}")
+
+        # Reset mastery detector for next skill
+        self.mastery_detector.reset()
+
+    def _get_difficulty(self) -> int:
+        """Get current curriculum difficulty level."""
+        if self.curriculum is not None:
+            return self.curriculum.current_difficulty
+        return 0
+
+    # -----------------------------------------------------------------------
+    # Checkpointing
+    # -----------------------------------------------------------------------
+
+    def _viewer_push(self, action, ext_r, int_r, rssm_state, latent, ep_step,
+                     pred_obs=None, actual_obs=None):
+        """Stream the live env frame + world-model state to the viewer.
+
+        Best-effort and fully isolated: any failure is swallowed so the viewer
+        can never interrupt training.
+        """
+        try:
+            try:
+                env_rgb = self.env.render()
+            except Exception:
+                env_rgb = None
+            # World-model predicted reward for the current latent (a WM head).
+            try:
+                with torch.no_grad():
+                    pred_r = float(self.world_model.predict_reward(latent).item())
+                pred_r = f"{pred_r:+.3f}"
+            except Exception:
+                pred_r = "n/a"
+            act = action
+            if hasattr(action, "tolist"):
+                act = np.round(np.asarray(action), 2).tolist()
+            lines = [
+                ("stage", str(getattr(self.stage_controller, "stage", "-"))),
+                ("action", str(act)),
+                ("ext reward", f"{float(ext_r):+.3f}"),
+                ("int reward", f"{float(int_r):+.3f}"),
+                ("WM pred reward", pred_r),
+                ("curiosity wt", f"{self.reward_mixer.weights['intrinsic']:.3f}"),
+                ("episode step", str(ep_step)),
+                ("timestep", str(self.total_timesteps)),
+            ]
+            recon = None
+            if pred_obs is not None and actual_obs is not None:
+                a = np.asarray(actual_obs, dtype=np.float32).ravel()
+                p = np.asarray(pred_obs, dtype=np.float32).ravel()
+                n = min(a.size, p.size)
+                if n:
+                    err = float(np.mean(np.abs(a[:n] - p[:n])))
+                    recon = {"env_name": self.env_name, "real": a[:n].tolist(),
+                             "pred": p[:n].tolist(), "err": err}
+                    lines.append(("WM pred err", f"{err:.4f}"))
+            z = rssm_state["z"].detach().cpu().numpy().ravel()
+            self.viewer.push(
+                env_rgb, f"{self.env_name}", lines, z=z,
+                ret_hist=list(self.episode_rewards), recon=recon,
+            )
+        except Exception:
+            pass
+
+    def _save_checkpoint(self) -> None:
+        """Save all component states to disk.
+
+        Holds _wm_param_lock: with the async trainer, a state_dict() walk
+        mid-optimizer-step would persist TORN weights (mixed pre/post-update
+        tensors across modules) — poisoning the pod-restore path. Waiting one
+        gradient step (<1s) buys a coherent snapshot. No-op cost sync mode.
+        """
+        with self._wm_param_lock:
+            self._save_checkpoint_locked()
+
+    def _save_checkpoint_locked(self) -> None:
+        checkpoint_dir = os.path.join(
+            self.config.get("loop", {}).get("log_dir", "./logs"),
+            "checkpoints",
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Save knowledge graph
+        self.knowledge_graph.save(
+            os.path.join(checkpoint_dir, "knowledge_graph.json")
+        )
+
+        # Save world model
+        torch.save(
+            self.world_model.state_dict(),
+            os.path.join(checkpoint_dir, "world_model.pt"),
+        )
+
+        # Save curiosity module
+        torch.save(
+            self.curiosity.state_dict(),
+            os.path.join(checkpoint_dir, "curiosity.pt"),
+        )
+
+        # Save policy
+        torch.save(
+            self.policy.get_state_dict(),
+            os.path.join(checkpoint_dir, "policy.pt"),
+        )
+
+        # options: record the head layout so a resumed run can fail LOUD on
+        # an incompatible action head instead of loading silently wrong
+        if getattr(self, "option_executor", None) is not None:
+            try:
+                # .get("mtime"): scripted (bootstrap) slots have no policy
+                # file, hence no mtime — b["mtime"] raised KeyError and
+                # aborted the WHOLE options_state save (2026-07-23 pod run).
+                _slot_tbl = [
+                    None if b is None else {
+                        "skill_id": b["skill_id"],
+                        "mtime": b.get("mtime"),
+                        "scripted": bool(b.get("scripted", False))}
+                    for b in self.option_executor.bank.slots]
+                with open(os.path.join(checkpoint_dir,
+                                       "options_state.json"), "w") as _f:
+                    # int() coerces np.int64 (action_dim comes from gym
+                    # Discrete(n).n, which is np.int64 -> not JSON-serializable)
+                    json.dump({"meta_action_dim": int(self.meta_action_dim),
+                               "action_dim": int(self.action_dim),
+                               "slots": _slot_tbl}, _f)
+            except Exception as _e:
+                logger.warning("options_state save failed: %s", _e)
+
+        # Save symbolic decoder (absent on pixel envs — no-op stub)
+        if getattr(self.symbolic_decoder, "decoder", None) is not None:
+            torch.save(
+                self.symbolic_decoder.decoder.state_dict(),
+                os.path.join(checkpoint_dir, "symbolic_decoder.pt"),
+            )
+
+        # Save glue layer (GNN + gate)
+        torch.save(
+            {
+                "gnn": self.glue.knowledge_integrator.gnn.state_dict(),
+                "gate": self.glue.knowledge_integrator.gate.state_dict(),
+            },
+            os.path.join(checkpoint_dir, "glue_layer.pt"),
+        )
+
+        # Save dream actor-critic
+        torch.save(
+            self.dream_actor.state_dict(),
+            os.path.join(checkpoint_dir, "dream_actor.pt"),
+        )
+
+        logger.debug(f"Checkpoint saved to {checkpoint_dir}")
+
+    def load_checkpoint(self, checkpoint_dir: str) -> None:
+        """Load component states from a previous checkpoint."""
+        # Load knowledge graph
+        kg_path = os.path.join(checkpoint_dir, "knowledge_graph.json")
+        if os.path.exists(kg_path):
+            self.knowledge_graph.load(kg_path)
+
+        # Load world model
+        wm_path = os.path.join(checkpoint_dir, "world_model.pt")
+        if os.path.exists(wm_path):
+            self.world_model.load_state_dict(
+                torch.load(wm_path, map_location=self.device)
+            )
+
+        # Load curiosity module
+        cur_path = os.path.join(checkpoint_dir, "curiosity.pt")
+        if os.path.exists(cur_path):
+            self.curiosity.load_state_dict(
+                torch.load(cur_path, map_location=self.device)
+            )
+
+        # Load policy
+        pol_path = os.path.join(checkpoint_dir, "policy.pt")
+        if os.path.exists(pol_path):
+            self.policy.load_state_dict(
+                torch.load(pol_path, map_location="cpu")
+            )
+
+        # Load dream actor-critic
+        dream_path = os.path.join(checkpoint_dir, "dream_actor.pt")
+        if os.path.exists(dream_path):
+            self.dream_actor.load_state_dict(
+                torch.load(dream_path, map_location=self.device)
+            )
+
+        logger.info(f"Checkpoint loaded from {checkpoint_dir}")
+
+    # -----------------------------------------------------------------------
+    # LLM integration helpers
+    # -----------------------------------------------------------------------
+
+    def _llm_submit_facts(self) -> None:
+        """Snapshot recent experience and SUBMIT an async fact-extraction job.
+
+        All reading of mutating environment state (obs/action/reward history)
+        happens here on the main thread; only the Ollama call + parsing runs in
+        the background, so there is no data race on env state.
+        """
+        # Gate (July 2026): this method serializes EVERY observation dimension
+        # as a named feature. On a 12288-d pixel obs (or an 8268-d
+        # Craftax-Symbolic vector) that is a per-element dump of hundreds of
+        # thousands of entries per call — meaningless to an LLM and huge.
+        if self._skip_perdim_symbolic:
+            return
+        recent_obs = []
+        recent_actions = []
+        recent_rewards = []
+
+        for i, obs_arr in enumerate(self.env.obs_history[-20:]):
+            obs_dict = {}
+            for j, val in enumerate(obs_arr):
+                label = (
+                    self.obs_labels[j]
+                    if self.obs_labels and j < len(self.obs_labels)
+                    else f"dim_{j}"
+                )
+                obs_dict[label] = float(val)
+            recent_obs.append(obs_dict)
+
+            if i < len(self.env.action_history):
+                act = self.env.action_history[-(20 - i)] if len(self.env.action_history) >= (20 - i) else 0
+                act_name = (
+                    self.action_labels[act]
+                    if self.action_labels and isinstance(act, int) and act < len(self.action_labels)
+                    else str(act)
+                )
+                recent_actions.append(act_name)
+            else:
+                recent_actions.append("unknown")
+
+            if i < len(self.env.reward_history):
+                recent_rewards.append(
+                    self.env.reward_history[-(20 - i)]
+                    if len(self.env.reward_history) >= (20 - i)
+                    else 0.0
+                )
+            else:
+                recent_rewards.append(0.0)
+
+        min_len = min(len(recent_obs), len(recent_actions), len(recent_rewards))
+        self.llm.submit_facts(
+            recent_obs[:min_len],
+            recent_actions[:min_len],
+            recent_rewards[:min_len],
+        )
+
+    def _llm_consume_facts(self) -> None:
+        """Consume a finished fact-extraction result (KG writes stay on the
+        main thread) and add any novel facts to the knowledge graph."""
+        facts = self.llm.poll_facts()
+        if not facts:
+            return
+
+        from developmental_ai.knowledge_graph.knowledge_graph import (
+            SymbolicFact)   # hoisted out of the loop (2026-08-02): re-imported
+        #                     per fact AND shadowing the module-level name.
+        novel_count = 0
+        for fact_dict in facts:
+            if not isinstance(fact_dict, dict):
+                continue
+            fact = SymbolicFact(
+                subject=fact_dict.get("subject", "unknown"),
+                relation=fact_dict.get("relation", "related_to"),
+                obj=fact_dict.get("object", "unknown"),
+                confidence=float(fact_dict.get("confidence", 0.8)),
+                source="llm_perception",
+                timestamp=self.total_timesteps,
+            )
+            if self.knowledge_graph.add_fact(fact):
+                novel_count += 1
+
+        if novel_count > 0:
+            logger.info(f"LLM extracted {novel_count} novel facts")
+
+    def _llm_submit_analysis(self) -> None:
+        """Snapshot the knowledge graph and SUBMIT an async analysis job."""
+        facts = [
+            {"subject": f.subject, "relation": f.relation, "object": f.obj}
+            for f in self.knowledge_graph.facts.values()
+        ]
+        rules = [
+            {
+                "preconditions": r.preconditions,
+                "action": r.action,
+                "effects": r.effects,
+                "confidence": r.confidence,
+            }
+            for r in self.knowledge_graph.action_rules
+        ]
+        skills = [
+            {
+                "name": s.name,
+                "description": s.description,
+                "mastery_level": s.mastery_level,
+                "goal_facts": s.goal_facts,
+            }
+            for s in self.skill_bank.skills.values()
+        ]
+
+        self.llm.submit_analysis(facts, rules, skills)
+
+    def _llm_consume_analysis(self) -> None:
+        """Consume a finished knowledge-analysis result and log suggestions."""
+        analysis = self.llm.poll_analysis()
+        if analysis:
+            logger.info(
+                f"LLM analysis: {analysis.get('reasoning', 'N/A')}"
+            )
+
+            # Use LLM composition suggestions
+            for suggestion in analysis.get("composition_suggestions", []):
+                if isinstance(suggestion, dict):
+                    logger.info(
+                        f"LLM suggests composing: {suggestion}"
+                    )
+
+    # -----------------------------------------------------------------------
+    # Dream-based policy training
+    # -----------------------------------------------------------------------
+
+    def _dream_train_policy(self) -> Dict[str, float]:
+        """
+        Train dream actor-critic on imagined trajectories (DreamerV3-style).
+
+        1. Sample posterior states from replay buffer via world model
+        2. Imagine H-step trajectories using dream actor
+        3. Compute lambda-returns from predicted rewards
+        4. Train actor to maximize returns, critic to predict them
+        """
+        wm_cfg = self.config.get("world_model", {})
+        dream_cfg = self.config.get("dream_training", {})
+        batch_size = dream_cfg.get("batch_size", 16)
+        horizon = dream_cfg.get("imagination_horizon", 15)
+        n_batches = dream_cfg.get("n_dream_batches", 1)
+
+        metrics: Dict[str, float] = {}
+
+        for _ in range(n_batches):
+            # 1. Get posterior states as starting points for imagination.
+            #    Goal-prioritized so imagination roots near reward-relevant states
+            #    (the dream actor then actually experiences imagined goals).
+            batch = self.replay_buffer.sample_sequences(
+                batch_size=batch_size,
+                seq_len=wm_cfg.get("sequence_length", 50),
+                device=self.device,
+                reward_fraction=self._goal_replay_fraction,
+            )
+
+            with torch.no_grad():
+                states, _ = self.world_model.observe_sequence(
+                    batch["observations"], batch["actions"]
+                )
+                # Pick random timesteps along the sequences as starting points
+                seq_len = states["h"].shape[1]
+                t_idx = torch.randint(0, seq_len, (batch_size,))
+                starting_states = {
+                    "h": states["h"][torch.arange(batch_size), t_idx],
+                    "z": states["z"][torch.arange(batch_size), t_idx],
+                }
+
+            # 2. Imagine trajectories from these starting states
+            #    Pass knowledge vector so dreams respect symbolic facts
+            knowledge = self.glue.knowledge_integrator.knowledge_vector
+            if knowledge is not None:
+                knowledge = knowledge.unsqueeze(0).expand(batch_size, -1)
+
+            self.world_model.eval()
+            with torch.no_grad():
+                imagined = self.world_model.imagine_trajectory(
+                    starting_states,
+                    policy_fn=self.dream_actor.policy_fn,
+                    horizon=horizon,
+                    knowledge=knowledge,
+                )
+            self.world_model.train()
+
+            # 3. Convert predicted rewards from symlog to real scale
+            imagined["rewards"] = symexp(imagined["rewards"])
+
+            # 4. Optionally add curiosity bonus to imagined rewards
+            if dream_cfg.get("dream_curiosity", False):
+                imagined = self._add_dream_curiosity(imagined)
+
+            # 5. Train dream actor-critic on this batch
+            metrics = self.dream_actor.dream_training_step(imagined)
+
+        return metrics
+
+    def _distill_dream_to_real(self, batch_size: int = 32, seq_len: int = 10
+                               ) -> Dict[str, float]:
+        """Imagination-augmented learning: distill the imagination-trained dream
+        actor (latent-space) into the REAL obs-space policy — but ONLY from dreams
+        that are actually better, and with an influence that ANNEALS to zero as the
+        real policy masters the task (never a fixed ratio).
+
+        Per replay state we (a) take the dream actor's action distribution + value
+        (teacher) and the real actor's + value (student); (b) value-GATE: keep only
+        states where the dream critic values the state above the real critic (the
+        dream sees a better path there); (c) sharpen the teacher by ``teacher_temp``
+        (<1) so the student adopts the dream's preferred action rather than its
+        uncertainty; (d) scale the whole update by (1 - solve_rate_EMA) so the
+        dream's pull fades as extrinsic reward becomes reliably findable.
+
+        Composes with symbolic ON: the real actor is conditioned on the knowledge
+        vector, so we pass the agent's current knowledge feature (the same one
+        dream-training uses) to ``_augment`` for every replay state. With symbolic
+        off this is None and reduces to the obs-only path. (Previously hardcoded
+        None, which silently RuntimeError'd the whole distill whenever symbolic was
+        on — the dream-augment never actually trained the policy.)"""
+        data = self.replay_buffer.sample_sequences(batch_size, seq_len, device=self.device)
+        obs = data["observations"]                       # (B, L, obs_dim)
+        acts = data["actions"]                            # (B, L, A) one-hot
+        ld = self.world_model.rssm.latent_dim
+        with torch.no_grad():
+            states, infos = self.world_model.observe_sequence(obs, acts)
+            latent = self.world_model.rssm.get_latent(
+                {"h": states["h"], "z": states["z"]}).reshape(-1, ld)
+            teacher_logits = self.dream_actor.get_action_dist(latent).logits  # (N, A)
+            v_dream = self.dream_actor.critic_net(latent).reshape(-1)          # (N,)
+            # Per-state WM surprise: KL(posterior || prior) in nats. High KL =
+            # the WM's prior did not anticipate what actually happened there =
+            # its dream rollouts through that state are not to be trusted.
+            kl_ps = None
+            if self.dream_distill_trust_gate:
+                S = self.world_model.rssm.stochastic_size
+                C = self.world_model.rssm.stochastic_classes
+                lp_post = torch.log_softmax(
+                    infos["posterior_logits"].reshape(-1, S, C), dim=-1)
+                lp_prior = torch.log_softmax(
+                    infos["prior_logits"].reshape(-1, S, C), dim=-1)
+                kl_ps = (lp_post.exp() * (lp_post - lp_prior)).sum(-1).sum(-1)  # (N,)
+        obs_flat = obs.reshape(-1, self.obs_dim)
+        # Knowledge vector for the symbolic-conditioned actor — use the SAME source
+        # the live policy uses (_current_knowledge_feature; zeros if not yet
+        # computed). _prep_knowledge returns (1, kdim) or None (symbolic off), and
+        # we broadcast it to every replay state.
+        kv = self.policy._prep_knowledge(self._current_knowledge_feature())
+        if kv is not None:
+            kv = kv.to(obs_flat.device).expand(obs_flat.shape[0], -1)
+        # Detach: the distill updates the ACTOR weights given the current
+        # conditioning; it must not backprop into the conditioner (whose params
+        # _distill_opt does not own — that would corrupt PPO's gradients).
+        aug = self.policy._augment(
+            self.policy._encode(obs_flat), kv,
+            self._cur_proprio_t()).detach()
+        with torch.no_grad():
+            v_real = self.policy.critic(aug).reshape(-1)                       # (N,)
+        # (b) value gate: distill only where the dream expects to do strictly better
+        gate = ((v_dream > v_real).float() if self.dream_distill_value_gate
+                else torch.ones_like(v_dream))
+        # (b2) WM-trust gate (audit H2): additionally require low WM surprise at
+        # the state — the value gate alone opens on hallucinated dream value.
+        trust_frac = 1.0
+        if kl_ps is not None:
+            trust = (kl_ps <= self.dream_distill_trust_kl_max).float()
+            trust_frac = float(trust.mean().item())
+            self._wm_trust_ema += self._wm_trust_beta * (
+                trust_frac - self._wm_trust_ema)
+            gate = gate * trust
+        gate_frac = float(gate.mean().item())
+        # (c) sharpened teacher target (temperature < 1 -> preferred action, not softness)
+        T = max(1e-3, self.dream_distill_temp)
+        teacher_p = torch.softmax(teacher_logits / T, dim=-1).clamp_min(1e-8)
+        if getattr(self, "meta_action_dim", self.action_dim) \
+                > self.action_dim:
+            # OPTIONS: the student head is P+K wide but the dream teacher is
+            # P-way. log_softmax over the primitive SLICE is exactly the
+            # renormalized conditional over primitives (slot logits cancel),
+            # so distillation targets the right object and slot logits get
+            # ZERO distill gradient — invoke/don't-invoke stays PPO's call.
+            # Without this the (N,P)x(N,P+K) broadcast raises and the
+            # warn-once handler silently kills dream-augment for the run.
+            _feats = self.policy.actor.shared(aug)
+            _logits = self.policy.actor.action_head(_feats)
+            student_logp = torch.log_softmax(
+                _logits[..., :self.action_dim], dim=-1)
+        else:
+            student_logp = self.policy.actor(aug).clamp_min(1e-8).log()
+        # forward cross-entropy distill (== forward-KL student gradient), gated
+        per_state = -(teacher_p * student_logp).sum(-1)                        # (N,)
+        denom = gate.sum().clamp_min(1.0)
+        distill = (gate * per_state).sum() / denom
+        # (d) natural anneal: fade the pull as the real policy solves reliably
+        eff_w = self.dream_distill_weight
+        if self.dream_distill_anneal:
+            eff_w = eff_w * (1.0 - max(0.0, min(1.0, self._dream_solve_ema)))
+        # (e) trust-scaled anneal (audit H2): the (1 - solve_ema) anneal is
+        # MAXIMAL when the policy fails — on a weak-WM env that was a positive
+        # feedback loop into collapse (failing policy -> full-strength pull
+        # from a hallucinating teacher -> more failure). Scaling by the trust
+        # EMA fades the pull wherever the WM hasn't earned trust, regardless
+        # of how badly the real policy is doing.
+        if self.dream_distill_trust_gate:
+            eff_w = eff_w * max(0.0, min(1.0, self._wm_trust_ema))
+        self._distill_opt.zero_grad()
+        (eff_w * distill).backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), 10.0)
+        self._distill_opt.step()
+        return {"dream_distill_loss": float(distill.item()),
+                "dream_distill_gate_frac": gate_frac,
+                "dream_distill_trust_frac": float(trust_frac),
+                "dream_distill_eff_weight": float(eff_w)}
+
+    def _add_dream_curiosity(
+        self, imagined: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Add ICM curiosity bonus to imagined trajectory rewards."""
+        with torch.no_grad():
+            latents = imagined["latents"]
+            batch_size, horizon, _ = latents.shape
+
+            # Decode imagined latents to approximate observations for ICM
+            decoded = self.world_model.decoder(
+                latents.reshape(-1, latents.shape[-1])
+            ).reshape(batch_size, horizon, -1)
+
+            # Undo symlog for vector observations
+            if not self.pixel_obs:
+                decoded = symexp(decoded)
+
+            # Compute curiosity reward per imagined transition. READ-ONLY
+            # (update_state=False): imagined decoder reconstructions must not
+            # mint/evict prototypes, append to error histories, or move the
+            # running normalization — that would pollute the state the WAKING
+            # curiosity signal is computed from (decoded frames co-bucket with
+            # real scenes and carry systematically lower error).
+            curiosity_rewards = torch.zeros_like(imagined["rewards"])
+            for t in range(horizon - 1):
+                cr = self.curiosity.compute_intrinsic_reward(
+                    decoded[:, t],
+                    imagined["actions"][:, t],
+                    decoded[:, t + 1],
+                    update_state=False,
+                )
+                curiosity_rewards[:, t, 0] = cr
+
+            # Mix: extrinsic predicted reward + intrinsic curiosity
+            imagined["rewards"] = (
+                self.reward_mixer.weights["extrinsic"] * imagined["rewards"]
+                + self.reward_mixer.weights["intrinsic"] * curiosity_rewards
+            )
+
+        return imagined
+
+    # -----------------------------------------------------------------------
+    # Logging and metrics
+    # -----------------------------------------------------------------------
+
+    def _predicates_batch(self, latent) -> Optional[List[Dict[str, bool]]]:
+        """Grounded-predicate readout for EVERY env from the current belief.
+
+        Feeds initiation-set gating: a skill is only offered where its
+        recorded preconditions hold. Returns None when grounding has no
+        evidence yet (early run), which leaves every slot offered — gating
+        degrades to today's behaviour instead of silently disabling skills.
+        """
+        if self.symbolizer is None or latent is None:
+            return None
+        try:
+            from developmental_ai.llm.vlm_symbolizer import PREDICATES
+            grounded = [
+                (i, p) for i, p in enumerate(PREDICATES)
+                if (self.symbolizer.label_counts.get(p, 0)
+                    >= self.symbolizer.min_labels)]
+            if not grounded:
+                return None
+            probs = self.symbolizer.head.predict(
+                latent.to(self.symbolizer.device))
+            return [{p: bool(probs[r, i] > 0.5) for i, p in grounded}
+                    for r in range(probs.shape[0])]
+        except Exception:
+            return None
+
+    def _symbol_novelty(self, latent_row):
+        """Reward for seeing something the agent can NAME as new.
+
+        Returns (bonus, n_grounded, signature) or (0.0, 0, None).
+
+        THE LOOP THIS IMPLEMENTS
+            sees new thing -> a symbol becomes grounded -> reward
+            sees more of an already-known symbol       -> less reward
+
+        Two components, both count-based so they decay by construction:
+
+        1. NEW SYMBOL. The first time a predicate crosses the symbolizer's
+           trust gate (enough VLM labels AND enough reliability against real
+           events), the agent has genuinely acquired a concept it did not
+           have. That is paid ONCE, and can never be paid for that symbol
+           again — a symbol is only new the first time.
+
+        2. NEW COMBINATION. Distinct sets of currently-true predicates
+           ("tree+stone", "water alone", "nothing") are counted, and the
+           payout decays as 1/sqrt(n) like all the other novelty here. Staring
+           at the ground yields the SAME signature every step, so it decays to
+           nothing within seconds — which is the behaviour this replaces.
+
+        WHY SYMBOLS RATHER THAN PIXELS. The visual hash it supersedes keyed on
+        raw latent geometry, so a change of lighting or camera angle read as
+        "new" even though nothing new was there. A symbolic signature only
+        changes when the agent's own grounded vocabulary says the SCENE
+        changed. Nothing here declares which symbols matter; the vocabulary is
+        whatever the VLM taught and the world confirmed.
+        """
+        try:
+            if self.symbolizer is None or latent_row is None:
+                return 0.0, 0, None
+            probs, rel, labels = self._grounded_object_probs(latent_row)
+            if not probs:
+                return 0.0, 0, None
+            thr = float(self.symbolizer.fact_threshold)
+            minl = int(self.symbolizer.min_labels)
+            floor = float(self.symbolizer.reliability_floor)
+            bonus = 0.0
+            active = []
+            for k in sorted(probs):
+                grounded = ((labels or {}).get(k, 0) >= minl
+                            and (rel or {}).get(k, 0.0) >= floor)
+                if not grounded:
+                    continue
+                if k not in self._known_symbols:
+                    # a concept it did not have before: paid once, ever
+                    self._known_symbols.add(k)
+                    bonus += float(self._new_symbol_bonus)
+                    logger.info("NEW SYMBOL GROUNDED: %s (%d known)",
+                                k, len(self._known_symbols))
+                if probs[k] >= thr:
+                    active.append(k)
+            sig = tuple(active)
+            # ---- CENTRING POTENTIAL (2026-08-02) ------------------------
+            # Phi = P(something is under the crosshair) x how UNFAMILIAR the
+            # least-seen nameable thing in view is. Turning so that a rarely
+            # seen symbol is what the crosshair rests on raises Phi; turning
+            # away lowers it again, so the shaping telescopes to ~0 over any
+            # look-away/look-back cycle and cannot be farmed by fidgeting.
+            #
+            # It declares NOTHING about which symbols matter. The weight is
+            # the same 1/sqrt(n) familiarity decay the set term already uses,
+            # so what the agent is pulled toward is simply whatever it has
+            # named least often — and that pull fades as it becomes familiar.
+            #
+            # HONEST LIMITATION: the vocabulary has no PER-SYMBOL position
+            # predicate (`object_centered` means "something is centred", not
+            # "the tree is centred"), so this is a proxy: centre something
+            # WHILE an unfamiliar symbol is in view. Making it exact needs the
+            # symbolizer to emit position per category.
+            _AFFORD = ("object_centered", "object_adjacent",
+                       "object_left", "object_right")
+            _cen = float(probs.get("object_centered", 0.0))
+            _sc = getattr(self, "_symbol_sight_counts", None)
+            if _sc is None:
+                _sc = self._symbol_sight_counts = {}
+            _wn = 0.0
+            for _k in active:
+                if _k in _AFFORD:
+                    continue          # an affordance is not a thing
+                _c = _sc.get(_k, 0)
+                _sc[_k] = _c + 1
+                _wn = max(_wn, 1.0 / ((1.0 + _c) ** 0.5))
+            self._sym_center_phi = float(
+                max(0.0, min(1.0, max(0.0, min(1.0, _cen)) * _wn)))
+            n = self._symbol_counts.get(sig, 0)
+            self._symbol_counts[sig] = n + 1
+            bonus += float(self._symbol_weight) / ((1.0 + n) ** 0.5)
+            return bonus, len(self._known_symbols), sig
+        except Exception:
+            return 0.0, 0, None
+
+    def _gaze_bonus(self, pitch) -> float:
+        """Count-based novelty over VIEW DIRECTION (pitch buckets).
+
+        Territory coverage counts the (x,z) cells the agent has stood in;
+        nothing did the same for where it LOOKS. Pitch is clamped to
+        [-90,+90], so an agent that drifts to a clamp finds `lookDOWN` is a
+        free no-op — the world does not change, which means zero prediction
+        error and therefore zero curiosity cost — while `lookUP` is the only
+        action that moves it. Measured: pitch pinned at +90 for 100k+ steps
+        with lookDOWN chosen ~2x more than lookUP, i.e. steady downward
+        pressure into a wall that costs nothing to push against.
+
+        A well-dwelt direction pays ~0 and an unvisited one pays ~the weight,
+        decaying 1/sqrt(n) — so this cannot be farmed by sweeping: every
+        bucket the agent oscillates through has its own count, and they all
+        decay. Pitch spans ~12 buckets and SATURATES quickly, which is the
+        point: it unsticks a clamp and then gets out of the way.
+
+        Declares nothing about what is worth looking at. Returns 0.0 when the
+        env cannot supply pitch (a missing sense reads neutral, never fatal).
+        """
+        if pitch is None:
+            return 0.0
+        try:
+            bkt = int(round(float(pitch)
+                            / max(1.0, float(self._gaze_bucket_deg))))
+        except (TypeError, ValueError):
+            return 0.0
+        n = self._gaze_counts.get(bkt, 0)
+        self._gaze_counts[bkt] = n + 1
+        return float(self._gaze_weight) * (1.0 / ((1.0 + n) ** 0.5))
+
+    def _view_key(self, obs_row):
+        """A DETERMINISTIC vector for what is on screen right now.
+
+        Uses the shared world-model encoder, which is a pure function of the
+        frame. Deliberately NOT the RSSM latent: its stochastic half is
+        resampled every step, so hashing it made every repeat of the same
+        sight look new and turned count-based novelty back into an
+        inexhaustible farm — the exact failure it was meant to remove.
+        """
+        try:
+            t = torch.as_tensor(np.asarray(obs_row, dtype=np.float32),
+                                device=self.device).reshape(1, -1)
+            with torch.no_grad():
+                enc = getattr(self.policy, "_shared_encoder", None)
+                # FROZEN SNAPSHOT (see _nov_enc_refresh at init): the live
+                # encoder trains every step, so its bucket map drifts and old
+                # sights re-key as new. Hash through a periodic snapshot so
+                # repetition genuinely decays between refreshes.
+                if enc is not None and self._nov_enc_refresh > 0:
+                    if (self._nov_enc is None
+                            or self.total_timesteps - self._nov_enc_stamp
+                            >= self._nov_enc_refresh):
+                        import copy as _copy
+                        self._nov_enc = _copy.deepcopy(enc).eval()
+                        for _p in self._nov_enc.parameters():
+                            _p.requires_grad_(False)
+                        self._nov_enc_stamp = self.total_timesteps
+                    return self._nov_enc(t).reshape(1, -1)
+                if enc is not None:
+                    return enc(t).reshape(1, -1)
+                return self.policy._encode(t).reshape(1, -1)
+        except Exception:
+            return None
+
+    def _perceptual_cell(self, latent_row) -> int:
+        """A discrete id for WHAT THE AGENT IS CURRENTLY SEEING.
+
+        Locality-sensitive hash of the agent's own world-model latent: a
+        fixed random projection to `_nov_bits` sign bits. Similar views land
+        in the same bucket, genuinely different ones do not.
+
+        WHY NOT SPATIAL CELLS. Territory coverage counts (x, z) cells, so it
+        pays for DISTANCE TRAVELLED and nothing else — and the cheapest way
+        to maximise it is to walk in a straight line staring at the floor,
+        which is exactly what the agent converged on (walk 40%, pitch pinned
+        at +90). Novelty of PLACE is not novelty of EXPERIENCE.
+
+        WHY NOT RAW PREDICTION ERROR. ICM never saturates on a rotation, so
+        spinning farms it forever. A COUNT-based bonus does saturate: turning
+        on the spot cycles through the same handful of buckets and their
+        payout decays as 1/sqrt(n), while walking into genuinely new
+        surroundings keeps producing unseen ones. That asymmetry is the whole
+        point — it rewards seeing new THINGS, not covering ground.
+
+        The key is the agent's OWN representation, so what counts as "a new
+        thing" is defined by what its world model can already tell apart,
+        not by a rule we impose.
+        """
+        try:
+            v = latent_row.reshape(1, -1)
+            if getattr(self, "_nov_proj", None) is None:
+                g = torch.Generator(device="cpu").manual_seed(0)
+                self._nov_proj = torch.randn(
+                    v.shape[1], int(self._nov_bits), generator=g).to(v.device)
+            bits = (v.float() @ self._nov_proj > 0).reshape(-1)
+            out = 0
+            for i, b in enumerate(bits.tolist()):
+                if b:
+                    out |= (1 << i)
+            return int(out)
+        except Exception:
+            return -1
+
+    def _reach_sense(self, latent_row) -> float:
+        """CAN I TOUCH ANYTHING FROM HERE — the felt affordance, in [0,1].
+
+        WHY THIS AND NOT A DEPTH NUMBER. Handing the policy a distance
+        readout would be a rangefinder, not perception, and it is not what
+        humans use. People do not estimate metres before swinging; Minecraft
+        draws a wireframe outline around the block your crosshair is on ONCE
+        IT IS IN REACH, and players key off that affordance directly. This is
+        the same signal, read from the agent's own grounding head
+        (`breakable_in_reach`), which the VLM taught and which the symbolizer
+        scores against REAL break events — it is one of only four predicates
+        with genuine ground truth behind it.
+
+        WHY IT IS NEEDED. Swinging into air and swinging into a trunk are
+        currently identical as far as the policy's inputs are concerned: it
+        has no contact sense at all. That is why it can hold attack at a
+        canopy six blocks up indefinitely — nothing it can feel distinguishes
+        that from chopping. Depth ITSELF stays learnable from the pixels
+        (occlusion, texture gradient, fog, and above all motion parallax now
+        that it actually walks); this supplies the calibration signal that
+        makes those cues mean something, the way reaching and missing is what
+        teaches a child where their hand ends.
+
+        DELIBERATELY A SENSE, NOT A RULE. It says nothing about sky being bad
+        or trees being good, and it is not a reward — it enters
+        proprioception only, so it can shape what the agent does without
+        paying it to do anything. An absent or untrusted head reads 0.0,
+        which is the same neutral convention every other missing sense uses.
+        """
+        try:
+            if self.symbolizer is None or latent_row is None:
+                return 0.0
+            probs, rel, labels = self._grounded_object_probs(latent_row)
+            if not probs:
+                return 0.0
+            key = "breakable_in_reach"
+            if key not in probs:
+                self._reach_gate = "absent"
+                return 0.0
+            # Record WHY the sense reads what it reads. A gated-off sense and
+            # a genuinely-nothing-in-reach sense both print 0.00, and those
+            # demand opposite responses: one means the feature is inert, the
+            # other means the agent is aiming at nothing.
+            self._reach_raw = float(probs[key])
+            # Trust gate, mirroring the magnet and the symbolizer's own
+            # perceptual-fact gate: an ungrounded predicate reports nothing
+            # rather than noise the policy would learn to act on.
+            if (labels or {}).get(key, 0) < self.symbolizer.min_labels:
+                self._reach_gate = (
+                    f"gated:labels={(labels or {}).get(key, 0)}"
+                    f"<{self.symbolizer.min_labels}")
+                return 0.0
+            if (rel or {}).get(key, 0.0) < self.symbolizer.reliability_floor:
+                self._reach_gate = (
+                    f"gated:reliability={(rel or {}).get(key, 0.0):.2f}"
+                    f"<{self.symbolizer.reliability_floor}")
+                return 0.0
+            self._reach_gate = "live"
+            return float(max(0.0, min(1.0, probs[key])))
+        except Exception:
+            return 0.0
+
+    def _grounded_object_probs(self, latent_row):
+        """Per-object presence signal for the curiosity magnet, from the
+        grounding head on ONE env's RSSM latent (the primary stream).
+
+        Returns (object_probs, reliability, label_counts) — the head's float
+        P(predicate) for every predicate, plus the symbolizer's earned
+        reliability and label-count dicts (the magnet's own trust gate mirrors
+        perceptual_facts). Returns (None, None, None) when grounding has no
+        evidence yet, which leaves the magnet inert instead of steering on
+        noise.
+        """
+        if self.symbolizer is None or latent_row is None:
+            return None, None, None
+        try:
+            from developmental_ai.llm.vlm_symbolizer import PREDICATES
+            probs = self.symbolizer.head.predict(
+                latent_row.reshape(1, -1).to(self.symbolizer.device)
+            ).squeeze(0)
+            object_probs = {p: float(probs[i]) for i, p in enumerate(PREDICATES)}
+            return (object_probs, self.symbolizer.reliability,
+                    self.symbolizer.label_counts)
+        except Exception:
+            return None, None, None
+
+    def _fovea_kwargs(self, latent_row) -> Dict[str, Any]:
+        """Foveal probs + counts + measured pitch for the magnet, from the
+        symbolizer's fovea head. Empty dict when the channel is off, so the
+        magnet call sites can always `**` this without branching (and the
+        THREE duplicated loop bodies cannot drift apart — the hazard that
+        killed the gui_open guard, the magnet diagnostics and the viewer)."""
+        out: Dict[str, Any] = {}
+        try:
+            if (self.symbolizer is not None
+                    and getattr(self.symbolizer, "fovea_enabled", False)):
+                fp = self.symbolizer.fovea_probs(latent_row)
+                if fp is not None:
+                    out["fovea_probs"] = fp
+                    out["fovea_counts"] = dict(
+                        self.symbolizer.fovea_label_counts)
+                    # cached for other consumers this same step (the
+                    # sky-novelty discount reads it; one head forward, N uses)
+                    self._last_fovea_probs = fp
+                    self._last_fovea_counts = out["fovea_counts"]
+            _p = (getattr(self, "_last_world_info", None) or {}).get("pitch")
+            if _p is not None:
+                out["pitch"] = float(_p)
+        except Exception:
+            return {}
+        return out
+
+    # fovea material category -> the block types whose lifetime break counts
+    # measure how MASTERED that material is. The mapping is name plumbing
+    # only — mastery itself is measured (breaks_by_type), never declared.
+    _MASTERY_BLOCKS = {
+        "dirt_visible": ("dirt", "coarse_dirt", "podzol"),
+        "grass_visible": ("grass_block", "grass", "tall_grass", "fern"),
+        "stone_visible": ("stone", "cobblestone", "gravel", "andesite",
+                          "diorite", "granite"),
+        "leaves_visible": ("oak_leaves", "birch_leaves", "spruce_leaves",
+                           "jungle_leaves"),
+    }
+
+    def _boring_view_factor(self) -> float:
+        """View-novelty multiplier in [0.15, 1]: how much of the fovea is
+        filled by sky or by a MASTERED material (2026-08-08).
+
+        Sky: clouds drift even under frozen time, so sky views mint fresh
+        buckets forever. Mastered materials: digging manufactures genuinely
+        new views (every hole is one), so view-novelty was bankrolling the
+        dirt farm the extrinsic decay had already defunded. Both are the
+        same statement — a view dominated by something the agent has fully
+        habituated to is not worth orienting to. Trust-gated per category;
+        trees/water/animals are never discounted; floored so first glances
+        keep paying. The FARM dies, not the sight."""
+        boring = 0.0
+        # MEASURED PITCH FIRST (2026-08-08): the sky discount keyed only on
+        # the fovea head's sky reading, and the head's confidence sags
+        # exactly when the agent lives in the failure mode (staring at
+        # clouds all segment -> agreement 0.80 and falling -> discount never
+        # bites -> novelty re-funds the sky farm at 0.04/step from a dirt
+        # pillar at y=72). Above ~55 degrees of tilt the view is sky or the
+        # agent's own feet BY GEOMETRY — same prefer-measured-over-predicted
+        # rule as the reach sense. SYMMETRIC since the same day: with the up
+        # clamp defunded the bot swapped to the DOWN clamp (mean +76.7deg,
+        # 48.5% pinned, staring at mastered ground) — the goals of a
+        # terrestrial world live near the horizon in both directions.
+        _pv = (getattr(self, "_last_world_info", None) or {}).get("pitch")
+        if _pv is not None and abs(float(_pv)) > 55.0:
+            boring = max(0.0, min(1.0, (abs(float(_pv)) - 55.0) / 35.0))
+        fps = getattr(self, "_last_fovea_probs", None) or {}
+        fcs = getattr(self, "_last_fovea_counts", None) or {}
+        if not fps:
+            return max(0.15, 1.0 - boring)
+        ml = (getattr(self.symbolizer, "min_labels", 5)
+              if self.symbolizer is not None else 5)
+        if fcs.get("sky_visible", 0) >= ml:
+            boring = max(boring, max(0.0, min(1.0, float(
+                fps.get("sky_visible", 0.0)))))
+        if self._habituation_scale > 0.0:
+            bbt = ((getattr(self, "_last_env_info", None) or {})
+                   .get("breaks_by_type") or {})
+            for cat, blocks in self._MASTERY_BLOCKS.items():
+                if fcs.get(cat, 0) < ml:
+                    continue
+                n = max((int(bbt.get(b, 0)) for b in blocks), default=0)
+                mastery = 1.0 - 1.0 / (1.0 + n / self._habituation_scale)
+                boring = max(boring, max(0.0, min(1.0, float(
+                    fps.get(cat, 0.0)))) * mastery)
+        return max(0.15, 1.0 - boring)
+
+    def _habituation_factor(self, info) -> float:
+        """MASTERY HABITUATION (2026-08-08): familiarity multiplier for THIS
+        step's intrinsic reward, keyed on what just BROKE.
+
+        WHY. The extrinsic break tier already decays with familiarity
+        (break_decay_scale), and it worked — dirt pays ~nothing. What kept
+        the dirt farm alive was the INTRINSIC side: every break produces a
+        large frame change, so the ICM/novelty stack re-pays the orienting
+        response for the 300th dirt exactly as for the 1st. MEASURED: 272 +
+        134 dirt across two runs, 0 logs, agent grinding the ground at its
+        feet. Habituation is the human analogue — a stimulus repeated
+        without consequence stops triggering orientation. The step's whole
+        intrinsic is scaled by the LEAST-familiar type that broke (a novel
+        block in the same step keeps its full surprise), floored at 0.1 so
+        mastered breaks stay perceptible, 1.0 when nothing broke at all —
+        sights, movement and exploration are never touched.
+        """
+        if self._habituation_scale <= 0.0 or not isinstance(info, dict):
+            return 1.0
+        ach = info.get("achievements") or {}
+        broke = []
+        for k, v in ach.items():
+            k = str(k)
+            if not k.startswith("mine_"):
+                continue
+            try:
+                v = int(v)
+            except Exception:
+                continue
+            prev = self._habit_prev.get(k)
+            # first sighting of a counter is baseline, not a break (counters
+            # restart at 0 on every mission rebuild — see MineRL stat note)
+            if prev is not None and v > prev:
+                broke.append(k[5:])
+            self._habit_prev[k] = v
+        # PLACEMENTS habituate exactly like breaks (2026-08-08): with breaks
+        # defunded the bot pillar-built instead (use action 18%, 1 cell/hr) —
+        # placing the 200th dirt makes the same unearned frame-change income
+        # breaking it did. Same counters, same decay, least-familiar event
+        # still governs so a genuinely novel placement keeps its surprise.
+        placed = [str(t) for t in (info.get("placed_now") or [])]
+        if not broke and not placed:
+            return 1.0
+        facs = []
+        bbt = info.get("breaks_by_type") or {}
+        for b in broke:
+            facs.append(1.0 / (1.0 + float(bbt.get(b, 0))
+                               / self._habituation_scale))
+        pbt = info.get("places_by_type") or {}
+        for t in placed:
+            facs.append(1.0 / (1.0 + float(pbt.get(t, 0))
+                               / self._habituation_scale))
+        f = max(0.1, min(1.0, float(max(facs))))
+        if f < 1.0:
+            self._habit_hits = getattr(self, "_habit_hits", 0) + 1
+            self._habit_sum = getattr(self, "_habit_sum", 0.0) + f
+        return f
+
+    def _magnet_step_shaping(self, action, lp_scalar, latent_row) -> float:
+        """THE one magnet invocation, shared by all three loop bodies.
+
+        The serial, parallel-episodic and lifelong bodies each carried their
+        own copy of this block, and the copies kept drifting: the rotation-
+        pay split existed only in one body for a whole run, the episodic
+        copy silently dropped `reach_measured`, and the fovea kwargs had to
+        be added three times. Fifth documented instance of the duplicated-
+        body hazard (gui guard, viewer, magnet diagnostics, reach) — so the
+        block now lives here once. Callers keep their own dream-gating and
+        apply the returned shaping to their own extrinsic variable."""
+        if (self.vision_scaffold is None
+                or not self.vision_scaffold.wants_step(self._vision_clock)):
+            return 0.0
+        _op, _rel, _lab = self._grounded_object_probs(latent_row)
+        _sr = self.vision_scaffold.step_shaping(
+            action=int(action) if self.is_discrete else -1,
+            timestep=self._vision_clock,
+            lp_scalar=float(lp_scalar),
+            object_probs=_op, reliability=_rel, label_counts=_lab,
+            reach_measured=float(getattr(self, "_reach_now", 0.0)),
+            **self._fovea_kwargs(latent_row))
+        # rotation-pay split: seek is a potential on visibility and turning
+        # is what changes visibility — if look-away/look-back does not
+        # telescope to 0, spinning becomes a farm. Measured, not argued.
+        _a0 = int(action) if self.is_discrete else -1
+        if _a0 in (3, 4):
+            self._mag_turn = getattr(self, "_mag_turn", 0.0) + float(_sr or 0.0)
+            self._mag_turn_n = getattr(self, "_mag_turn_n", 0) + 1
+        else:
+            self._mag_other = getattr(self, "_mag_other", 0.0) + float(_sr or 0.0)
+            self._mag_other_n = getattr(self, "_mag_other_n", 0) + 1
+        self._vision_clock += 1
+        return float(_sr or 0.0)
+
+    def _grounded_skill_name(self, slot: int, preconditions: Dict[str, bool]
+                             ) -> Tuple[str, str]:
+        """A skill's name from GROUND TRUTH, not the VLM.
+
+        Priority: the block whose break caused this achievement's reward
+        spike ("break_oak_log"). Fallback: the dominant grounded scene
+        predicate the head asserts ("act_where_tree_visible"). Last resort:
+        a neutral slot name. Never a hallucinated action.
+        """
+        block = self._unlock_block.get(slot)
+        if block:
+            return (f"break_{block}",
+                    f"Breaks {block} (grounded; first unlocked at episode "
+                    f"{self.total_episodes}).")
+        true_preds = [k for k, v in (preconditions or {}).items() if v]
+        if true_preds:
+            # SPECIFICITY, NOT ALPHABET (2026-07-25). `sorted(...)[0]` picked
+            # the alphabetically-first asserted predicate, which across 23
+            # predicates is nearly always the same one — 14 skills became
+            # `act_where_breakable_in_reach` and 8 `act_where_dirt_visible`,
+            # splitting one behaviour's practice across many slots so
+            # competence never accumulated and NOTHING ever reached mastery
+            # (0 of 51). Rank by RARITY instead: the least-frequently-asserted
+            # predicate is the most informative thing about this behaviour.
+            # The slot suffix then guarantees uniqueness, so two genuinely
+            # different behaviours can never silently share an identity.
+            counts = {}
+            try:
+                counts = dict(getattr(self.symbolizer, "label_counts", {}) or {})
+            except Exception:
+                counts = {}
+            key = min(true_preds, key=lambda p: (counts.get(p, 0), p))
+            return (f"act_where_{key}_s{slot:02d}",
+                    f"Behaviour reliable when {key} (slot {slot}, episode "
+                    f"{self.total_episodes}).")
+        return (f"skill_slot_{slot:02d}",
+                f"Discovered behaviour (episode {self.total_episodes}).")
+
+    def _preconditions_from_latent(self, slot: int) -> Dict[str, bool]:
+        """Grounded-predicate readout of a slot's unlock latent. Only
+        predicates with enough VLM evidence assert (same evidence gate as
+        the knowledge graph — an ungrounded head must not define a skill's
+        applicability)."""
+        out: Dict[str, bool] = {}
+        lat = self._unlock_context.get(slot)
+        if self.symbolizer is None or lat is None:
+            return out
+        try:
+            from developmental_ai.llm.vlm_symbolizer import PREDICATES
+            probs = self.symbolizer.head.predict(
+                torch.from_numpy(lat).reshape(1, -1).to(
+                    self.symbolizer.device)).squeeze(0)
+            for i, pred in enumerate(PREDICATES):
+                if (self.symbolizer.label_counts.get(pred, 0)
+                        >= self.symbolizer.min_labels):
+                    out[pred] = bool(probs[i] > 0.5)
+        except Exception:
+            pass
+        return out
+
+    def _write_skill_note(self, skill, slot: int, frame) -> None:
+        """Render a skill's note.md from EARNED evidence only.
+
+        effects        primary-stream block types broken this episode
+                       (ground truth; refined later by KG causal facts)
+        preconditions  grounded-predicate readout of the unlock latent
+                       (only predicates with enough VLM evidence assert)
+        prerequisites  the achieved-before mask of this slot's unlock event
+                       (observed precedence, not similarity)
+        """
+        try:
+            from developmental_ai.skill_bank import skill_notes
+            skill_dir = os.path.join(
+                self.skill_bank.storage_dir, skill.skill_id)
+            skill_notes.save_discovery_frame(frame, skill_dir)
+
+            preconditions = self._preconditions_from_latent(slot)
+
+            prerequisites = []
+            if (self.broadcaster is not None
+                    and hasattr(self.broadcaster, "unlock_log")):
+                for ev in reversed(self.broadcaster.unlock_log):
+                    if int(ev["slot"]) == slot:
+                        mask = np.asarray(ev["achieved_before"])
+                        names = self.broadcaster.slot_names
+                        prerequisites = [
+                            f"ach_{i:02d}_{names[i]}"[:64]
+                            for i in np.nonzero(mask > 0)[0]
+                            if i < len(names)]
+                        break
+
+            skill_notes.write_note(
+                skill, skill_dir,
+                effects=sorted(self._prev_mine.keys()),
+                preconditions=preconditions,
+                prerequisites=prerequisites,
+                provenance={
+                    "episode": int(self.total_episodes),
+                    "timestep": int(self.total_timesteps),
+                    "env": str(self.config.get("environment", {})
+                               .get("name", "?")),
+                },
+                competence_history=[(time.time(),
+                                     float(skill.success_rate))],
+            )
+        except Exception as e:  # notes are provenance, never fatal
+            logger.warning("skill note write failed for %s: %s",
+                           skill.skill_id, e)
+
+    def _log_progress(self) -> None:
+        """Print training progress to stdout."""
+        metrics = {}
+        for key, values in self.training_metrics.items():
+            if values:
+                metrics[key] = np.mean(list(values))
+
+        kg_stats = self.knowledge_graph.get_stats()
+        skill_stats = self.skill_bank.get_stats()
+        curiosity_stats = self.curiosity.stats
+
+        print(f"\n{'='*60}")
+        print(f"Episode {self.total_episodes} | Timestep {self.total_timesteps}")
+        print(f"{'='*60}")
+        _ep_r = self.training_metrics.get('episode_reward')
+        _last_r = _ep_r[-1] if _ep_r else 0.0
+        # print BOTH: the running mean AND this segment's raw reward. The mean is
+        # a cumulative deque average (=sum/N) that decays like 8.46/N after one
+        # big early episode and reads like a "decline" even when nothing changed;
+        # the raw per-episode value is the honest recent signal.
+        print(f"  Reward (avg):     {metrics.get('episode_reward', 0):.2f}"
+              f"   (this ep: {_last_r:.2f})")
+        print(f"  Episode length:   {metrics.get('episode_length', 0):.0f}")
+        print(f"  Intrinsic reward: {metrics.get('intrinsic_reward', 0):.4f}")
+        print(f"  WM loss:          {metrics.get('world_model_loss', 0):.4f}")
+        print(f"  KL divergence:    {metrics.get('kl_divergence', 0):.4f}")
+        print(f"  Policy loss:      {metrics.get('policy_loss', 0):.4f}")
+        print(f"  Curiosity loss:   {metrics.get('curiosity_loss', 0):.4f}")
+        print(f"  New facts/ep:     {metrics.get('new_facts', 0):.1f}")
+        sd_stats = self.symbolic_decoder.stats
+        print(f"  Sym decoder:      loss={metrics.get('symbolic_decoder_loss', 0):.4f}, "
+              f"acc={metrics.get('symbolic_decoder_accuracy', 0):.1%}, "
+              f"conf={sd_stats['symbolic_decoder_confidence']:.2f}")
+        if self.world_model.inverse_dynamics_enabled:
+            print(f"  Inverse dynamics: loss={metrics.get('inverse_dynamics_loss', 0):.4f}")
+        print(f"  SD facts/ep:      {metrics.get('symbolic_decoder_facts', 0):.1f}")
+        print(f"  Knowledge graph:  {kg_stats['num_facts']} facts, "
+              f"{kg_stats['num_entities']} entities, "
+              f"{kg_stats['num_action_rules']} rules")
+        # ---- BODY + BEHAVIOUR (2026-07-27, rung 0) --------------------
+        # gui_frac is the number that made the stall diagnosable only by
+        # frame-classifying 20 videos after the fact. Printed every segment
+        # now, so paralysis is visible in seconds instead of a forensic pass.
+        try:
+            _w0 = (getattr(self, "_last_world_info", None) or {})
+            _pp = (getattr(self, "_proprio_per_env", None) or [None])[0]
+            _bits = []
+            if _w0.get("gui_frac") is not None:
+                _bits.append(f"gui={_w0['gui_frac']:.0%}"
+                             f"(run{int(_w0.get('gui_run_max', 0))})")
+            if _pp is not None and len(_pp) >= 8:
+                _bits.append(f"food={_pp[0]:.2f} hp={_pp[2]:.2f} "
+                             f"depth={_pp[3]:.2f} tool={int(_pp[4])} "
+                             f"carry={_pp[7]:.2f}")
+            if _w0.get("mainhand"):
+                _bits.append(f"hand={_w0['mainhand']}")
+            if _bits:
+                print("  Body/behaviour:   " + " | ".join(_bits))
+            _gi = getattr(self, "_gui_intr", None)
+            if _gi and _gi[1] and _gi[3]:
+                _in_gui, _in_world = _gi[0] / _gi[1], _gi[2] / _gi[3]
+                print(f"  Curiosity split:  in-menu={_in_gui:+.4f}/step "
+                      f"vs world={_in_world:+.4f}/step "
+                      f"(ratio {(_in_gui / _in_world if abs(_in_world) > 1e-9 else float('nan')):+.2f}) "
+                      f"— RAW surprise, pre-suppression: >1 means the menu would still out-pay the world if we paid for it")
+        except Exception:
+            pass
+        print(f"  Skills learned:   {skill_stats['total_skills']} "
+              f"({skill_stats['mastered_skills']} mastered)")
+        # MASTERY LEDGER + NESTED COMPOSITION (arch v3): asked/success per
+        # skill and the earned invocation graph. One line each, greppable.
+        try:
+            _ml = [(s.skill_id, sum(s.asked_log or []), len(s.asked_log or []),
+                    s.wm_fidelity)
+                   for s in self.skill_bank.skills.values()
+                   if (s.asked_total or 0) > 0]
+            if _ml:
+                _ml.sort(key=lambda x: -x[2])
+                _msg = ", ".join(
+                    f"{sid.split('_', 2)[-1]}={hit}/{n}"
+                    + (f" wm={fid:.2f}" if fid is not None else "")
+                    for sid, hit, n, fid in _ml[:6])
+                print(f"  Mastery ledger:   {_msg}")
+            if self.option_executor is not None:
+                _ns = self.option_executor
+                if _ns.nested_pushes or _ns.max_skill_depth > 1:
+                    print(f"  Nested options:   pushes={_ns.nested_pushes}, "
+                          f"cycle_blocks={_ns.nested_cycle_blocks}, "
+                          f"depth_blocks={_ns.nested_depth_blocks}, "
+                          f"max_depth={_ns.max_skill_depth}")
+        except Exception:
+            pass    # telemetry must never kill the run
+        print(f"  Exploration ratio: {curiosity_stats['exploration_ratio']:.3f}")
+        print(f"  Reward weights:   intrinsic={self.reward_mixer.weights['intrinsic']:.3f}, "
+              f"extrinsic={self.reward_mixer.weights['extrinsic']:.3f}")
+        print(f"  Dev stage:        {self.stage_controller.stage} "
+              f"(WM-error={self.stage_controller._level():.4f}, "
+              f"slope={self.stage_controller._slope():.5f})")
+        if self._lifelong and self._ll is not None:
+            # ||h||: THE stability signal for the continuous stream. If it
+            # settles into a band (not monotonic growth over hours) the
+            # never-resetting RSSM is stable — the interim run's core question.
+            # h_evolve = mean cosine distance between successive segments' carried
+            # h: ~0 => the cross-segment carry is frozen (the bug), >0 => the
+            # continuous state genuinely evolves. ||h|| is a magnitude band only
+            # (gru_norm LayerNorm pins it near sqrt(H), BLIND to evolution).
+            print(f"  Lifelong stream:  h_evolve={self._ll.h_liveness():.4f}, "
+                  f"||h||={self._ll.h_norm():.3f}, "
+                  f"decay={self._ll.state_decay}, "
+                  f"total_steps={self.total_timesteps}")
+        if getattr(self, "_goal_ltm", None) is not None:
+            ls = self._goal_ltm.stats()
+            pe = getattr(self, "_page_events_total", {"out": 0, "in": 0})
+            print(f"  Working set:      {ls['active']} active / "
+                  f"{ls['dormant']} dormant goals (total known {ls['total']}), "
+                  f"paged out={pe['out']}, recalled={pe['in']}")
+        if self.vision_scaffold is not None:
+            vs = self.vision_scaffold.stats
+            _cat = ", ".join(f"{k.split('_')[0]}={v:.3f}"
+                             for k, v in vs["cat_lp"].items())
+            print(f"  Curiosity magnet: w={vs['weight']:.4f}, "
+                  f"target={vs['target']}, "
+                  f"global_lp={vs['global_lp']:.4f} | {_cat}")
+            # OBSERVABILITY (2026-07-25): w=0 has THREE distinct causes and the
+            # line above cannot tell them apart — the 19h zero-reward stall was
+            # the cold-start BUDGET latching, which was invisible here. Print
+            # the budget/seek internals the scaffold already tracks.
+            _cs = vs.get("cold_spent") or {}
+            _sk = vs.get("seek") or {}
+            if _cs or _sk:
+                _csx = ", ".join(f"{k.split('_')[0]}={v}"
+                                 for k, v in sorted(_cs.items()))
+                print(f"    magnet internals: cold_spent[{_csx}] "
+                      f"budget={vs.get('cold_start_budget', '?')} "
+                      f"seek_nudge_left={_sk.get('nudge_left', '?')} "
+                      f"seek_cats={_sk.get('cats', '?')}")
+            # FOVEA (2026-08-06): P(goal under the crosshair) per seek cat
+            # (-1.0 = not yet grounded / channel off) + the gaze-righting
+            # levelness. These are the two new gradients — if fovea stays -1
+            # the crop labels are not landing; if pitch_level dwells at 0.65
+            # the agent is still sky-clamped.
+            _fv = vs.get("fovea") or {}
+            _sym_fv = (self.symbolizer.stats.get("fovea")
+                       if self.symbolizer is not None else None) or {}
+            if _fv or _sym_fv:
+                _fvx = ", ".join(f"{k.split('_')[0]}={v:.3f}"
+                                 for k, v in _fv.items())
+                print(f"    fovea: [{_fvx}] labels={_sym_fv.get('labels', 0)} "
+                      f"agreement={_sym_fv.get('agreement')} "
+                      f"grounded={_sym_fv.get('grounded', 0)}/"
+                      f"{len(_sym_fv.get('last', {})) or 8} "
+                      f"pitch_level={vs.get('pitch_level', '?')}")
+        # OPTION INVOCATIONS (2026-07-25): with the raw per-step chop income
+        # removed, shaping only walks the agent TO the trunk — the scripted
+        # chop_trunk option is what holds attack, and the env's +5.0 log break
+        # does the teaching. If that option is never sampled the chain is
+        # broken and the agent approaches forever without chopping. This is
+        # the number that distinguishes those two cases; nothing logged it.
+        if getattr(self, "option_executor", None) is not None:
+            _bank = self.option_executor.bank
+            _inv = getattr(_bank, "invoked", {}) or {}
+            _tot = sum(_inv.values())
+            _named = []
+            for _slot, _n in sorted(_inv.items(), key=lambda kv: -kv[1])[:4]:
+                _b = _bank.slots[_slot] if _slot < len(_bank.slots) else None
+                _nm = (_b or {}).get("name") or (_b or {}).get("skill_id") or _slot
+                _named.append(f"{_nm}={_n}")
+            _scripted = [s for s in range(len(_bank.slots))
+                         if _bank.is_scripted(s)]
+            _scr = ", ".join(
+                f"slot{s}:{_inv.get(s, 0)}" for s in _scripted) or "none"
+            print(f"  Option invocations: total={_tot} | scripted[{_scr}] | "
+                  f"top: {', '.join(_named) if _named else '(none yet)'}")
+            # OFFERED vs CHOSEN — the line that distinguishes "the gate never
+            # offered it" from "it was offered and the policy never picked it".
+            # Those are opposite bugs with opposite fixes, and without this
+            # they look IDENTICAL from the logs (total= simply stops rising).
+            try:
+                # NOTE: the method is snapshot(), NOT stats(). A first cut
+                # called stats() — which does not exist — and the broad
+                # `except: pass` below swallowed the AttributeError, so the
+                # line silently never printed while everything looked fine.
+                # That is why the failure is now REPORTED rather than passed.
+                _ovc = (self.option_executor.snapshot() or {}).get(
+                    "offered_vs_chosen") or {}
+                _d = int(_ovc.get("decisions", 0))
+                _wo = int(_ovc.get("with_offer", 0))
+                _pk = int(_ovc.get("picked", 0))
+                _wl = int(_ovc.get("with_learned", 0))
+                _ls = int(_ovc.get("learned_offered_sum", 0))
+                _pr = int(_ovc.get("probation", 0))
+                if _d:
+                    print(f"  Option offers: {_wo}/{_d} decisions had a slot "
+                          f"offered ({100.0*_wo/_d:.1f}%), picked {_pk} "
+                          f"({100.0*_pk/max(1,_wo):.2f}% of offered)"
+                          + ("  <-- OFFERED BUT NEVER CHOSEN: meta-policy "
+                             "collapse, not a gate problem"
+                             if _wo > 200 and _pk == 0 else ""))
+                    # LEARNED-only view: the ratio above includes the scripted
+                    # slot (gate-exempt) and so reads ~100% even when every
+                    # learned skill is gated. This line is what shows the
+                    # competence gate actually closing, and probation
+                    # re-opening it.
+                    print(f"  Gate state: learned offered on {_wl}/{_d} "
+                          f"({100.0*_wl/_d:.1f}%), mean {_ls/max(1,_d):.2f} "
+                          f"slots/decision, probation re-offers {_pr}, "
+                          f"fovea-vetoes "
+                          f"{getattr(self.option_executor, 'contact_vetoes', 0)}")
+                else:
+                    print("  Option offers: (no open decisions recorded yet)")
+            except Exception as _e:
+                # Never take down a multi-day run — but NEVER fail silently
+                # either: a telemetry line that vanishes without a trace is
+                # indistinguishable from a metric that is legitimately zero.
+                print(f"  Option offers: UNAVAILABLE ({type(_e).__name__}: "
+                      f"{_e}) — telemetry broken, not a zero measurement")
+        # CHOP-COMPLETION MEASUREMENT (2026-07-25): every motivational
+        # subsystem verified healthy while extrinsic reward stayed ~0, so the
+        # remaining suspect is the chop TIMING OUT. A chop holds attack for
+        # max_option_steps x action_repeat ticks; a log needs ~8 with an axe
+        # but ~60 barehanded. Print what is actually in hand and the budget,
+        # so one segment settles it instead of another hypothesis.
+        try:
+            _w0 = (getattr(self, "_last_world_info", None) or {})
+            _mh = _w0.get("mainhand", "?")
+            # config path is skills_as_options.* (NOT options.*) — reading
+            # the wrong key made this diagnostic report a stale default 25
+            # while the real budget was 40, i.e. the measurement would have
+            # lied about the very thing it exists to measure.
+            _mos = int(self.config.get("skills_as_options", {}).get(
+                "max_option_steps", 25))
+            _ar = int(self.config.get("environment", {}).get(
+                "action_repeat", 1))
+            print(f"  Chop budget: mainhand={_mh} | {_mos} option-steps x "
+                  f"action_repeat {_ar} = {_mos * _ar} ticks "
+                  f"(log needs ~8 with an axe, ~60 barehanded)")
+            # THE MEASURED QUANTITY (2026-07-26). Two days were lost inferring
+            # break time from proxies — a dead `mainhand` sensor, then option
+            # durations — and both inferences were wrong. This prints what
+            # actually happened: attack ticks that produced each real break,
+            # and the longest unbroken attack streak. A large streak with no
+            # breaks means the swing is NOT LANDING (aim), not that it is too
+            # short (timing). Never infer this again; read it here.
+            _wi = getattr(self, "_last_env_info", None) or {}
+            _bt = _wi.get("break_ticks") or []
+            _ar_now = _wi.get("attack_run")
+            _ar_max = _wi.get("attack_run_max")
+            if _bt or _ar_max is not None:
+                _s = ", ".join(f"{b}:{t}t" for b, t in _bt[-5:]) or "NO BREAKS YET"
+                print(f"  Ticks-to-break: {_s} | attack streak now="
+                      f"{_ar_now} max={_ar_max}")
+            # ---- CHOP DIAGNOSIS: aim vs timing vs target selection --------
+            # The old one-line hint ("long streaks, no breaks => AIM") could
+            # only fire when the agent had broken NOTHING AT ALL, so it was
+            # silent in every real run and the question was settled by
+            # argument instead of data. These three statistics separate the
+            # modes outright, and the verdict is stated rather than implied.
+            _nb = _wi.get("runs_nobreak") or []
+            # KEY-TYPE GUARD: breaks_by_type is keyed by BLOCK NAME. A
+            # display bug printed INTEGER keys here — they were action
+            # indices — so "blocks broken: 2 total | top: [(3, 570)]"
+            # read as though 570 of block-type 3 had been broken.
+            # Accept only string keys, so a mis-wired dict shows as
+            # empty rather than as confident nonsense.
+            _bbt = {k: v for k, v in
+                    (_wi.get("breaks_by_type") or {}).items()
+                    if isinstance(k, str)}
+            if _nb or _bbt:
+                _need = 8            # ticks for a log WITH the held iron axe
+                _long = [r for r in _nb if r >= _need]
+                _tot_breaks = sum(_bbt.values())
+                _logs = sum(v for k, v in _bbt.items() if "log" in k)
+                _top = sorted(_bbt.items(), key=lambda kv: -kv[1])[:4]
+                _med = (sorted(_nb)[len(_nb) // 2] if _nb else 0)
+                if _tot_breaks == 0 and _long:
+                    _verdict = "AIM — long swings connect with nothing"
+                elif _nb and not _long and _tot_breaks == 0:
+                    _verdict = "TIMING — every swing ends short of a break"
+                elif _tot_breaks and _logs == 0:
+                    _verdict = ("TARGET SELECTION — it breaks things, just "
+                                "not logs")
+                elif _logs:
+                    _verdict = f"CHOPPING — {_logs} log(s) felled"
+                else:
+                    _verdict = "insufficient data"
+                # WHERE IT IS LOOKING + WHAT IT IS CHOOSING. Both were
+                # inferred from consequences until now, which is how "stuck
+                # looking up" and "cannot look down" stayed unanswerable.
+                _pitch = _w0.get("pitch")
+                _ah = _wi.get("action_hist") or {}
+                if _ah:
+                    _tot = max(1, sum(_ah.values()))
+                    _names = {0: "noop", 1: "walk", 2: "jump", 3: "turnL",
+                              4: "turnR", 5: "attack", 6: "atk+walk",
+                              7: "lookUP", 8: "lookDOWN", 9: "back",
+                              10: "INVENTORY", 11: "use", 12: "HOLD"}
+                    # NOT `_top`: that name already holds the blocks-broken
+                    # ranking computed above, and reusing it here silently
+                    # overwrote it — which is why the "blocks broken" line
+                    # kept printing ACTION indices long after its key-type
+                    # guard was correct. The guard was fine; the variable was
+                    # being clobbered between computing and printing it.
+                    # FULL, not top-5 (fix 2026-08-06). The table is 13 wide
+                    # and a top-5 view could not answer the simplest question
+                    # about the newest action: "is HOLD ever chosen?" It never
+                    # placed in the top 5, so its share was unknowable from
+                    # the log — the exact blindness that makes a capability
+                    # look broken when it may simply be unpreferred.
+                    _atop = sorted(_ah.items(), key=lambda kv: -kv[1])
+                    _s = " ".join(
+                        f"{_names.get(int(k), k)}:{100.0*v/_tot:.0f}%"
+                        for k, v in _atop)
+                    _up = 100.0 * _ah.get(7, 0) / _tot
+                    _dn = 100.0 * _ah.get(8, 0) / _tot
+                    # WHERE IT IS STANDING (2026-08-02). 67,584 steps were
+                    # spent with a frozen inventory, a 10,068-tick attack
+                    # streak and ZERO blocks broken, and the log could not say
+                    # whether the agent was somewhere it is ALLOWED to break
+                    # blocks — server spawn-protection and adventure mode both
+                    # look exactly like "the swing missed" from in here.
+                    # Coordinates make that answerable in one glance instead of
+                    # another week of inferring aim from consequences.
+                    _px = _w0.get("xpos")
+                    _py = _w0.get("ypos")
+                    _pz = _w0.get("zpos")
+                    if _px is not None and _pz is not None:
+                        print(f"  Position: x={_px:+.1f} y="
+                              f"{'?' if _py is None else f'{_py:.1f}'} "
+                              f"z={_pz:+.1f}  cell={_w0.get('cell')}"
+                              # ONLY flag when breaking is ALSO failing.
+                              # Printed on position alone it accused the server
+                              # of spawn-protection while the agent was happily
+                              # breaking blocks 8 blocks from origin — a false
+                              # lead left in the log forever. MEASURED
+                              # 2026-08-02: the real cause of the 33-segment
+                              # "0 breaks" was POSITION — the agent was perched
+                              # on a tree canopy, pitch clamped down, with
+                              # nothing within reach. A rejoin put it back on
+                              # the ground and it broke 16 blocks in one
+                              # segment at these very coordinates.
+                              + ("   <-- near origin AND nothing broken: "
+                                 "check spawn-protection / land claims"
+                                 if (abs(float(_px)) <= 16
+                                     and abs(float(_pz)) <= 16
+                                     and not (_wi.get("breaks_by_type") or {}))
+                                 else ""))
+                    print(f"  Looking: pitch="
+                          f"{'n/a' if _pitch is None else f'{_pitch:+.0f}'}"
+                          f"  (-90=up +90=down)"
+                          + ("  <-- PINNED" if _pitch is not None
+                             and abs(abs(_pitch) - 90.0) < 2.0 else ""))
+                    print(f"  Actions: {_s} | lookUP {_up:.0f}% vs "
+                          f"lookDOWN {_dn:.0f}%")
+                _cn = int(getattr(self, "_cov_n", 0) or 0)
+                if _cn:
+                    _cavg = float(getattr(self, "_cov_sum", 0.0)) / _cn
+                    _icm = float(np.mean(
+                        list(self.training_metrics["intrinsic_reward"])[-1:])
+                        if self.training_metrics["intrinsic_reward"] else 0.0)
+                    print(f"  Coverage: {_cavg:+.4f}/step from territory "
+                          f"(weight {self._coverage_weight}) | cells seen "
+                          f"{getattr(self, '_cov_cells', 0)} | total intrinsic "
+                          f"{_icm:+.4f}/step -> territory is "
+                          f"{100.0 * _cavg / _icm if _icm > 1e-9 else 0.0:.0f}% "
+                          f"of the drive")
+                    self._cov_sum, self._cov_n = 0.0, 0
+                _ent = (list(self.training_metrics["policy_entropy"])[-1]
+                        if self.training_metrics.get("policy_entropy")
+                        else None)
+                _mt = float(getattr(self, "_mag_turn", 0.0))
+                _mtn = int(getattr(self, "_mag_turn_n", 0))
+                _mo = float(getattr(self, "_mag_other", 0.0))
+                _mon = int(getattr(self, "_mag_other_n", 0))
+                if _ent is not None or _mtn or _mon:
+                    _emax = float(np.log(max(2, self.action_dim)))
+                    print(
+                        "  Policy: entropy "
+                        + ("n/a" if _ent is None else
+                           f"{_ent:.2f}/{_emax:.2f} nats "
+                           f"({100.0 * _ent / _emax:.0f}% of max)")
+                        + ("  <-- COLLAPSED" if _ent is not None
+                           and _ent < 0.5 * _emax else ""))
+                    _pp = getattr(self, "_last_ppo", None)
+                    if _pp:
+                        _ras = _pp.get("raw_adv_std", float("nan"))
+                        _osp = _pp.get("obs_spread", float("nan"))
+                        _mxp = _pp.get("max_prob", float("nan"))
+                        _kl = _pp.get("approx_kl")
+                        _er = _pp.get("epochs_run")
+                        if _kl is not None:
+                            print(f"  PPO trust region: approx_kl={_kl:.4f} | "
+                                  f"epochs run {_er}/"
+                                  f"{self.config.get('policy', {}).get('n_epochs', 10)}"
+                                  + ("  <-- stopped early (good: the policy "
+                                     "hit its movement budget)"
+                                     if _er and _er < int(self.config.get(
+                                         'policy', {}).get('n_epochs', 10))
+                                     else ""))
+                        print(f"  PPO forensics: raw_adv_std={_ras:.2e} "
+                              f"(|adv|={_pp.get('raw_adv_absmean', 0.0):.2e}) "
+                              f"| obs_spread={_osp:.4f} | max_prob={_mxp:.3f} "
+                              f"| rows={_pp.get('rows', 0)} "
+                              f"updates={_pp.get('n_updates', 0)}")
+                        # Say which cause the numbers actually support, rather
+                        # than leaving three hypotheses to argue about.
+                        if _ras == _ras and _ras < 1e-4:
+                            print("      <-- NOISE AMPLIFICATION: the raw "
+                                  "advantage spread is ~0, so normalising it "
+                                  "to unit variance feeds PPO pure noise at "
+                                  "full gradient scale every update")
+                        if _osp == _osp and _osp < 1e-3:
+                            print("      <-- STATE COLLAPSE: the rollout is "
+                                  "essentially ONE observation, so a "
+                                  "deterministic policy is genuinely optimal "
+                                  "for it — entropy 0 is correct here, and "
+                                  "self-reinforcing")
+                        if _mxp == _mxp and _mxp > 0.99:
+                            print("      <-- SATURATED: softmax is one-hot; "
+                                  "no bounded entropy bonus can pull the "
+                                  "logits back from here")
+                    # HAS THE MAGNET EVER LEFT ITS COLD-START FLOOR?
+                    # Measured over this whole run: 144 of 144 segments at
+                    # w=0.3500 with cold_spent[tree]=144827. It never once
+                    # entered its curiosity-ranked branch, and finding that
+                    # required grepping cold_spent by hand. Say it out loud.
+                    try:
+                        _vs2 = self.vision_scaffold.stats
+                        _wnow = float(_vs2.get("weight", 0.0) or 0.0)
+                        _cs = float(getattr(
+                            self.vision_scaffold, "cold_start_weight", 0.0))
+                        if abs(_wnow - _cs) < 1e-6:
+                            self._magnet_cold = getattr(
+                                self, "_magnet_cold", 0) + 1
+                        else:
+                            self._magnet_cold = 0
+                        if self._magnet_cold >= 10:
+                            print(f"      <-- MAGNET INERT: pinned at its "
+                                  f"cold-start floor for {self._magnet_cold} "
+                                  f"segments. Its contrastive score is 0, so "
+                                  f"it has never ranked anything by curiosity "
+                                  f"— it is a constant pull, not guidance.")
+                    except Exception:
+                        pass
+                    print(f"  Magnet pay: turning {_mt/max(1,_mtn):+.4f}/step "
+                          f"vs other {_mo/max(1,_mon):+.4f}/step"
+                          + ("   <-- ROTATION IS BEING PAID"
+                             if _mtn and _mon
+                             and _mt/max(1,_mtn) > _mo/max(1,_mon) + 1e-6
+                             else ""))
+                    self._mag_turn = self._mag_other = 0.0
+                    self._mag_turn_n = self._mag_other_n = 0
+                _rvn = int(getattr(self, "_reachval_n", 0) or 0)
+                if _rvn:
+                    _rvm = getattr(self, "_reachval_sum", 0.0) / _rvn
+                    _rvh = int(getattr(self, "_reachval_hi", 0) or 0)
+                    print(f"  Reach (segment): mean {_rvm:.3f} | in-reach on "
+                          f"{100.0 * _rvh / _rvn:.1f}% of steps "
+                          f"[{getattr(self, '_reach_gate', 'n/a')}]")
+                    self._reachval_sum, self._reachval_n = 0.0, 0
+                    self._reachval_hi = 0
+                _pn = int(getattr(self, "_pitch_n", 0) or 0)
+                if _pn:
+                    _pm = getattr(self, "_pitch_sum", 0.0) / _pn
+                    _pc = int(getattr(self, "_pitch_clamped", 0) or 0)
+                    print(f"  Pitch (segment): mean {_pm:+.1f}deg | at the "
+                          f"+-90 clamp on {100.0 * _pc / _pn:.1f}% of steps "
+                          f"(-90=up +90=down)")
+                    self._pitch_sum, self._pitch_n = 0.0, 0
+                    self._pitch_clamped = 0
+                print(f"  Reach sense (last step): {float(getattr(self, '_reach_now', 0.0)):.2f} "
+                      f"[{getattr(self, '_reach_gate', 'n/a')}] raw="
+                      f"{float(getattr(self, '_reach_raw', 0.0)):.2f} "
+                      f"(P breakable_in_reach, 0=nothing touchable)")
+                _pn = int(getattr(self, "_persist_n", 0) or 0)
+                _rn2 = int(getattr(self, "_reach_n", 0) or 0)
+                if _pn or _rn2:
+                    print(f"  Shaping: persistence "
+                          f"{getattr(self, '_persist_sum', 0.0)/max(1,_pn):+.4f}"
+                          f"/step | approach-to-reach "
+                          f"{getattr(self, '_reach_sum', 0.0)/max(1,_rn2):+.4f}"
+                          f"/step  (both telescoping -> net ~0 per cycle)")
+                    self._persist_sum = self._reach_sum = 0.0
+                    self._persist_n = self._reach_n = 0
+                _sn = int(getattr(self, "_sym_n", 0) or 0)
+                if _sn:
+                    print(f"  Symbols: {getattr(self, '_sym_sum', 0.0)/max(1,_sn):+.4f}"
+                          f"/step | grounded vocabulary "
+                          f"{getattr(self, '_sym_known', 0)} "
+                          f"| distinct scenes {len(self._symbol_counts)}")
+                    _scn = int(getattr(self, "_symc_n", 0) or 0)
+                    if _scn:
+                        # MEAN |F|, NOT MEAN F. A telescoping potential sums to
+                        # ~0 over any trajectory BY CONSTRUCTION, so printing
+                        # the signed mean showed "-0.0003/step" and read as
+                        # "this term is doing nothing" no matter how strongly
+                        # it was steering. The magnitude is the informative
+                        # number; Phi says where it currently sits.
+                        print(f"  Centring: |{getattr(self, '_symc_abs', 0.0)/_scn:.4f}"
+                              f"|/step magnitude, Phi now "
+                              f"{float(getattr(self, '_sym_center_phi', 0.0)):.3f} "
+                              f"(signed mean {getattr(self, '_symc_sum', 0.0)/_scn:+.5f}"
+                              f" ~ 0 = telescoping correctly, NOT inert)")
+                        self._symc_sum, self._symc_n = 0.0, 0
+                        self._symc_abs = 0.0
+                    # WHAT IS IT BEING PAID FOR WHILE IT STANDS STILL?
+                    _cn2 = int(getattr(self, "_cen_n", 0) or 0)
+                    if _cn2:
+                        _b = getattr(self, "_cen_base", 0.0) / _cn2
+                        _im = getattr(self, "_cen_imag", 0.0) / _cn2
+                        _tot_now = float(np.mean(
+                            list(self.training_metrics["intrinsic_reward"])[-1:])
+                            if self.training_metrics["intrinsic_reward"] else 0.0)
+                        print(f"  Reward census: ICM/LP base {_b:+.4f}/step "
+                              f"({100.0 * abs(_b) / max(1e-9, abs(_tot_now)):.0f}% "
+                              f"of the {_tot_now:+.4f} drive) | imagination "
+                              f"{_im:+.4f}/step | everything itemised above is "
+                              f"the remainder")
+                        # WHY is the base what it is? LP is a DERIVATIVE with
+                        # a significance gate, so on a mastered static view it
+                        # should be ~0 — the user's point exactly: standing
+                        # still ought to pay nothing. If it does not, the
+                        # normalizer is the first suspect:
+                        #     reward = (lp - median) / max(std, 1e-3)
+                        # LP is mostly zeros, so when the pool's true spread
+                        # falls under that 1e-3 FLOOR, residual jitter that
+                        # squeaks past the significance gate is amplified
+                        # toward O(0.1) — an income for existing.
+                        _cu = self.curiosity
+                        _an = int(getattr(self, "_attr_n", 0) or 0)
+                        if _an and getattr(_cu, "action_conditional", False):
+                            _amean = getattr(self, "_attr_sum", 0.0) / _an
+                            _anz = int(getattr(self, "_attr_nz", 0) or 0)
+                            print(f"      Action attribution: mean {_amean:.4f} "
+                                  f"over {_an} steps | nonzero on "
+                                  f"{100.0 * _anz / _an:.1f}% of them")
+                            # The two ways this goes wrong look identical in a
+                            # single number, so say which one the data shows.
+                            if _anz == 0:
+                                print("        <-- ZERO ON EVERY STEP: the "
+                                      "forward model is ignoring its action "
+                                      "input, so this gate suppresses ALL "
+                                      "curiosity rather than selectively. "
+                                      "Set curiosity.action_conditional=false")
+                            elif _amean < 0.02:
+                                print("        <-- very low: the agent's "
+                                      "actions explain almost none of what it "
+                                      "sees. Either the world is dominated by "
+                                      "ambient change (intended target) or the "
+                                      "forward model is barely action-aware")
+                            self._attr_sum, self._attr_n = 0.0, 0
+                            self._attr_nz = 0
+                        _rs = getattr(_cu, "_running_std", None)
+                        _rm = getattr(_cu, "_running_median", None)
+                        if _rs is not None:
+                            print(f"      LP internals: running_std={_rs:.2e} "
+                                  f"median={_rm:.2e} raw_pred_err="
+                                  f"{getattr(_cu, 'last_pred_error', 0.0):.2e}"
+                                  # A low std alone is NOT a fault — on a
+                                  # mastered view it is the correct reading.
+                                  # It only matters if the BASE is still being
+                                  # paid despite it, which is the amplification
+                                  # signature. Warning on std alone cried wolf
+                                  # the moment the progress floor started
+                                  # working (std 3.6e-06 with the base down to
+                                  # +0.0011/step is exactly right).
+                                  + ("   <-- std under the 1e-3 floor AND the "
+                                     "base is still paying: the normalizer is "
+                                     "amplifying jitter into an income"
+                                     if (_rs < 1e-3 and abs(_b) > 0.02)
+                                     else ""))
+                        if abs(_b) > 0.5 * abs(_tot_now):
+                            print("      <-- THE BASE DOMINATES: prediction "
+                                  "error alone pays this much for EXISTING, "
+                                  "so standing still is already profitable "
+                                  "and no shaping term can outbid it")
+                        self._cen_base = self._cen_imag = 0.0
+                        self._cen_n = 0
+                    _gn2 = int(getattr(self, "_gaze_n", 0) or 0)
+                    if _gn2:
+                        _gb = sorted(self._gaze_counts.items(),
+                                     key=lambda kv: -kv[1])[:3]
+                        print(f"  Gaze: {getattr(self, '_gaze_sum', 0.0)/_gn2:+.4f}"
+                              f"/step over {len(self._gaze_counts)} pitch "
+                              f"buckets | most-dwelt "
+                              + ", ".join(
+                                  f"{int(b)*int(self._gaze_bucket_deg):+d}deg"
+                                  f"x{c}" for b, c in _gb))
+                        self._gaze_sum, self._gaze_n = 0.0, 0
+                    self._sym_sum = 0.0
+                    self._sym_n = 0
+                _nn = int(getattr(self, "_nov_n", 0) or 0)
+                if _nn:
+                    print(f"  Novelty(seen): "
+                          f"{getattr(self, '_nov_sum', 0.0)/max(1,_nn):+.4f}/step "
+                          f"| distinct views {len(self._nov_counts)} "
+                          f"(what it SEES, not distance travelled)")
+                    self._nov_sum = 0.0
+                    self._nov_n = 0
+                _mbp = _wi.get("mine_block_present")
+                if _mbp is not None:
+                    print(f"  Break sensor: mine_block present={_mbp} "
+                          f"entries={_wi.get('mine_block_entries')} "
+                          f"nonzero={_wi.get('mine_block_nonzero')}"
+                          + ("   <-- SENSOR DEAD: breaks cannot be seen"
+                             if not _mbp or _wi.get('mine_block_entries', 0) == 0
+                             else ""))
+                print(f"  Chop diagnosis: {_verdict}")
+                print(f"    swings ending with no break: {len(_nb)} "
+                      f"(median {_med}t, >={_need}t: {len(_long)})")
+                print(f"    blocks broken: {_tot_breaks} total, {_logs} logs"
+                      + (f" | top: {_top}" if _top else ""))
+        except Exception:
+            pass
+        if self.symbolizer is not None:
+            ss = self.symbolizer.stats
+            _agr = ss["agreement"]
+            print(f"  Symbol grounding: "
+                  f"labels={ss['labels']}, vlm_every={ss['vlm_interval']}, "
+                  f"agreement={'n/a' if _agr is None else f'{_agr:.2f}'}, "
+                  f"grounded={ss['grounded_predicates']}/"
+                  f"{ss['n_predicates']}, facts={ss['facts']}, "
+                  f"retracted={self._symbolizer_retractions}, "
+                  f"parse_fail={ss['parse_failures']}, "
+                  f"neg_evt={getattr(self, '_neg_evt_total', 0)}")
+        if self.curriculum:
+            print(f"  Difficulty:       {self.curriculum.current_difficulty}")
+        glue_stats = self.glue.stats
+        kv_status = "active" if glue_stats["has_knowledge_vector"] else "pending"
+        print(f"  Knowledge vector: {kv_status}")
+        print(f"  Goals generated:  {glue_stats['goals_generated']}")
+        print(f"  Goal hierarchy:   depth={glue_stats['goal_stack_depth']}, "
+              f"completed={glue_stats['completed_goals']}, "
+              f"failed={glue_stats['failed_goals']}")
+        print(f"  Mastery score:    {metrics.get('glue_mastery_score', 0):.3f}")
+        print(f"  KG density:       {metrics.get('glue_kg_density', 0):.2f}")
+        # Skill composition stats
+        comp_count = self.skill_composer.compositions_created
+        if comp_count > 0:
+            print(f"  Compositions:     {comp_count} composite skills created")
+        # LLM stats
+        llm_stats = self.llm.stats
+        if llm_stats["llm_available"]:
+            print(f"  LLM calls:        perception={llm_stats['perception_calls']}, "
+                  f"goals={llm_stats['goal_calls']}, "
+                  f"reasoning={llm_stats['reasoning_calls']}")
+        # Dream training stats
+        if self.dream_training_active:
+            print(f"  Dream policy:     actor_loss={metrics.get('dream_actor_loss', 0):.4f}, "
+                  f"critic_loss={metrics.get('dream_critic_loss', 0):.4f}, "
+                  f"returns={metrics.get('dream_returns_mean', 0):.2f}")
+        elif self.dream_enabled:
+            remaining = max(0, self.dream_warmup - self.total_episodes)
+            print(f"  Dream policy:     warmup ({remaining} episodes remaining)")
+        # Pixel observation mode
+        if self.pixel_obs:
+            print(f"  Observation mode: pixel ({self.image_channels}x{self.image_size}x{self.image_size})")
+        print(f"{'='*60}")
+
+    def _training_summary(self, elapsed_time: float) -> Dict[str, Any]:
+        """Generate a summary of the training run."""
+        return {
+            "total_timesteps": self.total_timesteps,
+            "total_episodes": self.total_episodes,
+            "elapsed_time_seconds": elapsed_time,
+            "avg_episode_reward": (
+                np.mean(list(self.training_metrics["episode_reward"]))
+                if self.training_metrics["episode_reward"] else 0.0
+            ),
+            "knowledge_graph": self.knowledge_graph.get_stats(),
+            "skill_bank": self.skill_bank.get_stats(),
+            "curiosity": self.curiosity.stats,
+            "reward_weights": self.reward_mixer.weights,
+            "compositions_created": self.skill_composer.compositions_created,
+            "llm": self.llm.stats,
+            "pixel_obs": self.pixel_obs,
+            "dream_training_active": self.dream_training_active,
+            "developmental_stage": self.stage_controller.stage,
+        }
+
+    # -----------------------------------------------------------------------
+    # Default configuration
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _default_config() -> Dict:
+        """Minimal default configuration for quick prototyping."""
+        return {
+            "environment": {
+                "name": "CartPole-v1",
+                "max_episode_steps": 500,
+            },
+            "world_model": {
+                "stochastic_size": 16,
+                "stochastic_classes": 16,
+                "deterministic_size": 256,
+                "encoder_hidden": 128,
+                "buffer_capacity": 50000,
+                "batch_size": 8,
+                "sequence_length": 30,
+                "learning_rate": 1e-4,
+            },
+            "curiosity": {
+                "feature_dim": 128,
+                "hidden_dim": 128,
+                "forward_loss_weight": 0.8,
+                "inverse_loss_weight": 0.2,
+                "curiosity_reward_scale": 1.0,
+                "curiosity_reward_clip": 5.0,
+                "learning_rate": 1e-4,
+            },
+            "knowledge_graph": {
+                "embedding_dim": 32,
+                "embedding_model": "TransE",
+                "embedding_epochs": 50,
+                "min_confidence": 0.7,
+            },
+            "symbolic_decoder": {
+                "num_categories": 5,
+                "hidden_dim": 128,
+                "learning_rate": 1e-4,
+                "confidence_threshold": 0.6,
+            },
+            "skill_bank": {
+                "storage_dir": "./skill_bank_data",
+                "mastery_threshold": 0.8,
+                "mastery_window": 50,
+                "min_episodes_before_save": 20,
+            },
+            "policy": {
+                "learning_rate": 3e-4,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "intrinsic_reward_weight": 0.7,
+                "extrinsic_reward_weight": 0.3,
+            },
+            "glue": {
+                "gnn_hidden_dim": 64,
+                "gnn_output_dim": 32,
+                "goal_embedding_dim": 16,
+            },
+            "llm": {
+                "enabled": True,
+                "model": "llama3.1:8b",
+                "perception_interval": 50,
+                "goal_interval": 25,
+                "reasoning_interval": 100,
+            },
+            "dream_training": {
+                "enabled": True,
+                "warmup_episodes": 50,
+                "imagination_horizon": 15,
+                "batch_size": 16,
+                "n_dream_batches": 1,
+                "dream_curiosity": False,
+                "hidden_dim": 400,
+                "actor_lr": 3e-5,
+                "critic_lr": 3e-5,
+                "gamma": 0.997,
+                "lambda_": 0.95,
+                "entropy_scale": 3e-4,
+                "target_ema": 0.98,
+            },
+            "loop": {
+                "total_timesteps": 50000,
+                "curriculum_enabled": True,
+                "log_dir": "./logs",
+                "verbose": 1,
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
+# ============= GLUE LAYER INTERFACE =============
+# ---------------------------------------------------------------------------
+# This is the placeholder for the custom glue code you'll write later.
+# It defines the INTERFACE that connects DreamerV3's latent world model
+# to the skill bank and back into the policy layer.
+#
+# The glue layer is the novel research contribution (Section 3.2 in the
+# reference doc). It handles:
+#   1. Skill detection logic: when has the agent mastered a capability?
+#   2. Skill retrieval: how to select relevant prior skills for new goals
+#   3. Curriculum management: how to escalate difficulty as skills compound
+#   4. Neo4j ↔ DreamerV3 bridge: extracting symbolic facts from latent data
+# ---------------------------------------------------------------------------
+
+class GlueLayerInterface:
+    """
+    Interface for the glue layer connecting RSSM latent space to symbolic reasoning.
+
+    Concrete implementation: developmental_ai.core.glue_layer.GlueLayer
+    which is wired into the DevelopmentalAI loop above.
+
+    All four methods are now implemented:
+      1. extract_symbolic_from_latent → via SymbolicDecoderManager
+      2. select_skills_for_goal → via SkillSelector (cosine + graph + prereqs)
+      3. detect_skill_mastery → via AdvancedMasteryDetector (KL + reward + rules)
+      4. manage_curriculum → via AdvancedCurriculumManager (depth + density + error)
+    """
+
+    def extract_symbolic_from_latent(
+        self,
+        latent_state: torch.Tensor,
+        world_model: WorldModel,
+    ) -> List[SymbolicFact]:
+        """Implemented via SymbolicDecoderManager — latent → category probabilities → facts."""
+        raise NotImplementedError
+
+    def select_skills_for_goal(
+        self,
+        goal_embedding: torch.Tensor,
+        skill_bank: SkillBank,
+        knowledge_graph: InMemoryKnowledgeGraph,
+    ) -> List[str]:
+        """Implemented via SkillSelector — cosine similarity + graph overlap + prereqs."""
+        raise NotImplementedError
+
+    def detect_skill_mastery(
+        self,
+        latent_trajectory: torch.Tensor,
+        reward_history: List[float],
+        knowledge_graph: InMemoryKnowledgeGraph,
+    ) -> bool:
+        """Implemented via AdvancedMasteryDetector — KL trend + reward stability + rule confidence."""
+        raise NotImplementedError
+
+    def manage_curriculum(
+        self,
+        skill_bank: SkillBank,
+        knowledge_graph: InMemoryKnowledgeGraph,
+        current_difficulty: int,
+    ) -> int:
+        """Implemented via AdvancedCurriculumManager — skill depth + KG density + pred error."""
+        raise NotImplementedError

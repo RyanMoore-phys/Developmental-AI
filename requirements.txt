@@ -1,0 +1,53 @@
+# ============================================================
+# Developmental AI Framework — Python Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# Python 3.9+ required (3.11+ recommended for best performance)
+# No GPU required for prototyping; CUDA optional for training
+# ============================================================
+
+# --- Core ML Framework ---
+torch>=2.0.0
+numpy>=1.24.0
+
+# --- Reinforcement Learning ---
+gymnasium>=0.29.0          # Environment interface (replaces OpenAI Gym)
+stable-baselines3>=2.0.0   # Policy algorithms (PPO, SAC, etc.)
+
+# --- Knowledge Graph ---
+neo4j>=5.0.0               # Graph database driver (requires Neo4j server)
+pykeen>=1.11.0             # Knowledge graph embedding models (TransE, etc.)
+
+# --- Graph Neural Networks ---
+torch-geometric>=2.4.0     # GNN framework for learning over graph topology
+
+# --- LLM Integration (Local, via Ollama) ---
+ollama>=0.4.0              # Ollama SDK for local LLM (optional)
+
+# --- Skill Sharing ---
+huggingface-hub>=0.20.0    # Push/pull skills to Hugging Face Hub (optional)
+
+# --- Distributed Training ---
+# ray[rllib]>=2.10.0       # Uncomment for multi-worker training
+                            # pip install "ray[rllib]>=2.10.0"
+
+# --- Image Processing (for pixel observations) ---
+Pillow>=10.0.0             # Image resizing for CNN observations (optional)
+
+# --- Richer Environments (optional — uncomment what you need) ---
+# For MuJoCo continuous control (HalfCheetah, Ant, Hopper, etc.):
+#   pip install gymnasium[mujoco]
+# For grid-world compositional tasks:
+#   pip install minigrid>=2.3.0
+# For Minecraft-like survival with pixel observations (Crafter integration
+# landed 2026-07 — required for configs/crafter.yaml runs; the import is
+# deferred inside crafter_env.py so MiniGrid-only setups can skip it):
+crafter>=1.8.0
+
+# --- Utilities ---
+pyyaml>=6.0                # Configuration file parsing
+tqdm>=4.65.0               # Progress bars
+matplotlib>=3.7.0          # Visualization and plotting
+tensorboard>=2.14.0        # Training metric logging
+scipy>=1.10.0              # Scientific computing utilities
+scikit-learn>=1.3.0        # Clustering, metrics for skill detection
