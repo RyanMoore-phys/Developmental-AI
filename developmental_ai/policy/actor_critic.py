@@ -30,6 +30,11 @@ from typing import Dict, Optional, Tuple, Any
 import gymnasium as gym
 import logging
 
+# The world model already solved "one reward stream spanning four orders of
+# magnitude" for its own reward head (symlog + twohot, rssm.py). The PPO
+# critic never got the treatment; see `value_space` in PPOAgent.
+from developmental_ai.world_model.rssm import symlog, symexp
+
 logger = logging.getLogger(__name__)
 
 # SB3 is optional — we provide a standalone actor-critic as fallback
@@ -122,7 +127,8 @@ class RewardMixer:
         self._int_ema = 0.0
         self._ext_ema = 0.0
 
-    def mix(self, intrinsic_reward: float, extrinsic_reward: float) -> float:
+    def mix(self, intrinsic_reward: float, extrinsic_reward: float,
+            update_stats: bool = True) -> float:
         """
         Combine intrinsic and extrinsic rewards into a single training signal.
 
@@ -146,10 +152,18 @@ class RewardMixer:
         warmup would divide by ~0 and detonate the intrinsic drive, which is
         the exploration engine this project depends on.
         """
+        # `update_stats=False` (2026-09-01): mix WITHOUT advancing the return
+        # EMAs. Scout streams pass False. The EMAs are a per-STEP clock —
+        # `ret_ema_alpha` 1e-4 was chosen against one stream's step rate — so
+        # letting N bodies each tick it would silently multiply the anneal
+        # rate by N and retune the return-ratio damper by changing the fleet
+        # size. The primary stream remains the single clock; scouts read the
+        # damping it has learned without voting on it.
         i_abs, e_abs = abs(float(intrinsic_reward)), abs(float(extrinsic_reward))
-        a = self._ret_ema_alpha
-        self._int_ema = (1 - a) * self._int_ema + a * i_abs
-        self._ext_ema = (1 - a) * self._ext_ema + a * e_abs
+        if update_stats:
+            a = self._ret_ema_alpha
+            self._int_ema = (1 - a) * self._int_ema + a * i_abs
+            self._ext_ema = (1 - a) * self._ext_ema + a * e_abs
         scaled = float(intrinsic_reward)
         if (self.target_ratio > 0.0
                 and self._ext_ema > 1e-8 and self._int_ema > 1e-8):
@@ -165,7 +179,8 @@ class RewardMixer:
                               self.target_ratio / ratio)
         mixed = (self.intrinsic_weight * scaled +
                  self.extrinsic_weight * extrinsic_reward)
-        self.step_count += 1
+        if update_stats:
+            self.step_count += 1
         return mixed
 
     def decay(self, steps: int = 1) -> None:
@@ -430,7 +445,10 @@ class StandaloneActorCritic:
     which is both the safe choice and the biologically honest one.
     """
 
-    ARCHS = ("flat", "conv", "wm")
+    # Bound on the symlog-space value before symexp decodes it. See _value_of.
+    _VALUE_SYMLOG_CLAMP = 20.0
+
+    ARCHS = ("flat", "conv", "wm", "rssm")
 
     def __init__(
         self,
@@ -453,6 +471,10 @@ class StandaloneActorCritic:
         minibatch_size: int = 0,
         target_kl: float = 0.0,
         logit_range: float = 0.0,
+        min_rows_per_update: int = 0,
+        max_env_steps_per_update: int = 0,
+        max_rows_per_update: int = 0,
+        rollout_uint8: bool = False,
     ):
         assert arch in self.ARCHS, f"unknown policy arch {arch!r}"
         self.obs_dim = obs_dim
@@ -470,6 +492,14 @@ class StandaloneActorCritic:
         # claimed, which is most of why the policy looked frozen between
         # segments. 0 keeps the old full-batch behaviour exactly.
         self.minibatch_size = int(minibatch_size or 0)
+        # See should_update(). 0/0 = the historical env-step-only trigger.
+        self.min_rows_per_update = int(min_rows_per_update or 0)
+        self.max_env_steps_per_update = int(max_env_steps_per_update or 0)
+        self.max_rows_per_update = int(max_rows_per_update or 0)
+        self.last_update_forced = False
+        # See store_transition. Pixel envs only — a vector env's normalized
+        # obs can be negative and unbounded, where x255-and-round is nonsense.
+        self._rollout_uint8 = bool(rollout_uint8)
         # ---- KL EARLY STOPPING (2026-08-05) ------------------------------
         # THE MISSING TRUST REGION. PPO's clip bounds the SURROGATE
         # OBJECTIVE, not how far the policy actually moves — so running
@@ -543,7 +573,23 @@ class StandaloneActorCritic:
         # accident — the sharing is by reference, and the gradient isolation
         # has to survive someone later writing `params = self.parameters()`.
         self._shared_encoder = None
-        if arch == "wm":
+        if arch == "rssm":
+            # ---- THE POLICY SEES THE WORLD MODEL'S STATE (2026-09-01) ----
+            # arch='wm' feeds the actor DETACHED ENCODER FEATURES OF THE
+            # CURRENT FRAME. The 2048-d deterministic RSSM state h — the
+            # entire reason for having an RSSM — never reached it, so the
+            # policy was memoryless on a task whose defining difficulty is
+            # sustaining one action through ~60 ticks of no visible feedback.
+            # A frame mid-swing and a frame at rest look nearly identical
+            # (the crack overlay is a few pixels at 128px); h does not.
+            #
+            # `enc_dim` here is the LATENT width the caller must pass:
+            # deterministic_size + stochastic_size * stochastic_classes.
+            # There is no encoder to attach — the loop already computes this
+            # latent every step for the RSSM and hands it over via
+            # select_action(feats=...).
+            feat_dim = self.enc_dim
+        elif arch == "wm":
             side = int(round((obs_dim / 3) ** 0.5))
             if 3 * side * side != int(obs_dim):
                 raise ValueError(
@@ -618,7 +664,31 @@ class StandaloneActorCritic:
         # current policy — the failure mode where an agent learns to see what
         # pays rather than what is there.
         self.optimizer = torch.optim.Adam(params, lr=learning_rate)
+        # Clip groups, built ONCE. The actor and the critic are clipped
+        # SEPARATELY (see train_step): with one shared clip, a value-loss
+        # spike consumed the whole norm budget and scaled the policy gradient
+        # toward zero — in exactly the update that carried the run's only real
+        # signal. On this task a felled log is ~51 in one row against a
+        # typical ~0.1, so `value_loss` jumps ~4 orders of magnitude on the
+        # single most informative rollout the agent will ever collect.
+        self._clip_actor = list(self.actor.parameters())
+        if self.conditioner is not None:
+            self._clip_actor += list(self.conditioner.parameters())
+        if self.encoder is not None:
+            # the shared trunk serves both heads; clipped with the actor so
+            # perception is never starved by a value spike either
+            self._clip_actor += list(self.encoder.parameters())
+        self._clip_critic = list(self.critic.parameters())
 
+        # ---- VALUE SPACE (2026-09-01) ------------------------------------
+        # "symlog": the critic predicts symlog(return) and every READ decodes
+        # with symexp, so the head is scale-free and a 51.0 return is a target
+        # of ~3.95 instead of 51. "linear": the pre-2026-09-01 raw-return
+        # head, kept so a checkpoint written before this change can be
+        # identified rather than silently mis-scaled by a factor of e^|v|.
+        self.value_space = "symlog"
+        self._value_clamp_hits = 0
+        self._value_clamp_n = 0
         # Rollout storage
         self.rollout_obs = []
         self.rollout_actions = []
@@ -636,6 +706,20 @@ class StandaloneActorCritic:
         # support). Empty/all-ones when options are off -> byte-identical.
         self.rollout_taus = []
         self.rollout_masks = []
+        # ---- WHICH BODY PRODUCED THIS ROW (2026-09-01) -------------------
+        # All rows used to come from stream 0; the scouts' experience reached
+        # the world model and never the policy. Rows now carry their stream
+        # so _compute_gae can run its recursion PER TRAJECTORY — interleaving
+        # two streams in one reversed pass would splice one body's future
+        # onto another body's present, which is a worse error than the
+        # missing data it would be fixing.
+        self.rollout_stream = []
+        # ---- arch='rssm': the FEATURES the decision was made on -----------
+        # For flat/conv/wm the update recomputes features from the stored
+        # observation. For rssm it cannot — h is recurrent — so the latent
+        # that was actually acted on is stored alongside the row. Empty on
+        # every other arch, so nothing else changes shape or cost.
+        self.rollout_feats = []
 
     def _prep_knowledge(self, knowledge: Optional[np.ndarray]) -> Optional[torch.Tensor]:
         """Coerce a knowledge feature to a (1, knowledge_dim) tensor, or None
@@ -691,6 +775,21 @@ class StandaloneActorCritic:
         with grad enabled. Detaching here rather than at each caller means a
         future call site cannot reintroduce the leak by forgetting.
         """
+        if self.arch == "rssm":
+            # THERE IS NOTHING TO COMPUTE HERE, AND THAT IS THE POINT.
+            # h is recurrent: it depends on the whole history, not on this
+            # observation, so no function of `obs_tensor` can produce it.
+            # Every caller must hand the latent over explicitly
+            # (select_action(feats=...), or the stored rollout_feats at update
+            # time). Raising is the same refusal arch='wm' already makes when
+            # no encoder is attached — a silent obs-shaped fallback would
+            # look like it worked and quietly train the policy on the wrong
+            # input.
+            raise RuntimeError(
+                "arch='rssm' policy cannot encode an observation: the "
+                "deterministic state h is recurrent and is not a function of "
+                "one frame. Pass the latent explicitly — select_action(..., "
+                "feats=latent) when acting, rollout_feats when training.")
         if self.arch == "wm":
             if self._shared_encoder is None:
                 raise RuntimeError(
@@ -705,6 +804,37 @@ class StandaloneActorCritic:
         if self.encoder is None:
             return obs_tensor
         return self.encoder(obs_tensor)
+
+    def _value_of(self, aug: torch.Tensor) -> torch.Tensor:
+        """V(s) in REWARD SPACE, whatever space the head is trained in.
+
+        THE ONE DECODE SITE. Every consumer of a value — action selection,
+        the GAE bootstrap, the option decision record — reads through here,
+        so the head's parameterization can never disagree with the arithmetic
+        performed on its output. Putting the symexp at each call site instead
+        is how you get one path that forgets, and a value function that is
+        wrong by a factor of e^|v| on exactly that path.
+        """
+        v = self.critic(aug)
+        if self.value_space != "symlog":
+            return v
+        # CLAMP BEFORE symexp. The critic head is an unbounded MLP, and
+        # symexp is sign(v)*(exp(|v|)-1): a head output of 20 is 4.8e8, 90 is
+        # inf. That value flows into _compute_gae as both `values` and the
+        # bootstrap, so ONE diverging update turns every advantage into NaN,
+        # NaNs the weights, and poisons the checkpoint — on a brain that
+        # lives only on the pod. Before symlog a divergence grew linearly and
+        # was survivable; this makes it exponential, so the bound comes with
+        # it. Sizing: the largest single-row reward here is ~51 (a felled
+        # log) and a discounted option-horizon return stays well under 1e3,
+        # i.e. symlog ~6.9. 20 is ~3x beyond anything legitimate, so it never
+        # binds in normal operation and only ever catches divergence —
+        # `value_clamped_frac` says which.
+        _c = v.clamp(-self._VALUE_SYMLOG_CLAMP, self._VALUE_SYMLOG_CLAMP)
+        if torch.is_grad_enabled() is False:
+            self._value_clamp_hits += int((v != _c).sum().item())
+            self._value_clamp_n += int(v.numel())
+        return symexp(_c)
 
     def _bound_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Cap the SPREAD of the action logits, preserving their order.
@@ -856,7 +986,15 @@ class StandaloneActorCritic:
                         f"select_action got feats of shape {tuple(_f.shape)}, "
                         f"expected (1, {self.enc_dim}) — refusing to act on a "
                         f"feature vector that is not this observation's")
-                if verify_feats:
+                if verify_feats and self.arch != "rssm":
+                    # arch='rssm' EXEMPT, and not as a convenience: the check
+                    # recomputes features from the observation, and h is
+                    # recurrent, so there is nothing to recompute and
+                    # _encode would raise. The failure this check exists to
+                    # catch — a carried feature from the wrong frame or the
+                    # wrong env — cannot occur there either: the latent is
+                    # produced fresh from that env's own RSSM row every step
+                    # and never carried across a step boundary.
                     # LIVE SELF-CHECK: recompute and compare. The tolerance is
                     # deliberate, not sloppy — the shared encoder TRAINS
                     # asynchronously (wm_train_every 250), so features carried
@@ -895,7 +1033,7 @@ class StandaloneActorCritic:
             else:
                 action, log_prob = self.actor.get_action(
                     aug, deterministic=deterministic)
-            value = self.critic(aug)
+            value = self._value_of(aug)
 
         # ---- ONE DEVICE->HOST TRANSFER, NOT THREE (2026-08-23) -----------
         # Every `.item()` is a full pipeline drain: the CPU blocks until the
@@ -927,17 +1065,24 @@ class StandaloneActorCritic:
 
     def compute_last_value(self, obs: np.ndarray,
                            knowledge: Optional[np.ndarray] = None,
-                           proprio: Optional[np.ndarray] = None) -> float:
+                           proprio: Optional[np.ndarray] = None,
+                           feats: Optional[np.ndarray] = None) -> float:
         """V(s) for the state AFTER the last stored transition — the GAE
         bootstrap for a rollout that ends MID-trajectory (a lifelong segment
         boundary). Mirrors select_action's value path; stores nothing, no
         grad. Not used on the episodic path (which ends on real terminals)."""
         with torch.no_grad():
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
             knowledge_tensor = self._prep_knowledge(knowledge)
-            aug = self._augment(self._encode(obs_tensor), knowledge_tensor,
+            if feats is not None:
+                _f = torch.as_tensor(
+                    np.asarray(feats, dtype=np.float32)
+                ).reshape(1, -1).to(self.device)
+            else:
+                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+                _f = self._encode(obs_tensor)   # raises for arch='rssm'
+            aug = self._augment(_f, knowledge_tensor,
                                 self._prep_proprio(proprio))
-            return float(self.critic(aug).item())
+            return float(self._value_of(aug).item())
 
     def store_transition(
         self,
@@ -951,13 +1096,46 @@ class StandaloneActorCritic:
         tau: int = 1,
         action_mask: Optional[np.ndarray] = None,
         proprio: Optional[np.ndarray] = None,
+        stream: int = 0,
+        feats: Optional[np.ndarray] = None,
     ) -> None:
-        """Store a transition (tau = env steps this decision spanned)."""
+        """Store a transition (tau = env steps this decision spanned).
+
+        `stream` names the body this row came from. Rows from different
+        streams may be interleaved in the buffer in any order; GAE segments
+        them before running its recursion. Default 0 keeps every existing
+        caller single-stream and byte-identical.
+        """
+        if self.arch == "rssm":
+            if feats is None:
+                raise ValueError(
+                    "arch='rssm' store_transition needs `feats` (the latent "
+                    "the decision was made on) — it cannot be recovered from "
+                    "the observation at update time")
+            self.rollout_feats.append(
+                np.asarray(feats, dtype=np.float32).reshape(-1))
+        self.rollout_stream.append(int(stream))
         self.rollout_taus.append(int(tau))
         self.rollout_masks.append(
             None if action_mask is None
             else np.asarray(action_mask, dtype=bool))
-        self.rollout_obs.append(obs)
+        # ---- QUANTIZED ROLLOUT OBSERVATIONS (2026-09-01) ------------------
+        # Same convention the replay buffer has always used for pixels
+        # (`ReplayBuffer._obs_uint8`) — deliberately the SAME one, so this
+        # codebase has one quantization scheme rather than two that can drift.
+        # A row is 49152 floats = 196 KB; as uint8 it is 48 KB. That matters
+        # now that rows arrive from every stream and the row floor can hold a
+        # rollout open across segments: 2048 rows goes from ~400 MB to
+        # ~100 MB, plus the same saving again on the np.stack copy at update
+        # time. Quantization error is 1/255, far below the encoder's noise
+        # floor, and the agent still SEES full-precision pixels — this is
+        # only how the decision is carried to the update.
+        # Gated on obs_uint8 (pixel envs only): a vector env's normalized obs
+        # can be negative and unbounded, where x255-and-round is nonsense.
+        self.rollout_obs.append(
+            np.clip(np.round(np.asarray(obs, np.float32) * 255.0),
+                    0, 255).astype(np.uint8)
+            if self._rollout_uint8 else obs)
         self.rollout_actions.append(action)
         self.rollout_rewards.append(reward)
         self.rollout_dones.append(done)
@@ -982,6 +1160,64 @@ class StandaloneActorCritic:
             self.rollout_proprio.append(
                 self._fit_proprio_width(proprio))
 
+    def _clear_rollout(self) -> None:
+        """Drop every rollout column. ONE place, so a column added later
+        cannot be cleared on the normal path and forgotten on the skip path —
+        a half-cleared rollout is ragged on the next update, and that failure
+        surfaces as advantages attached to the wrong observations."""
+        for _c in (self.rollout_obs, self.rollout_actions,
+                   self.rollout_rewards, self.rollout_dones,
+                   self.rollout_log_probs, self.rollout_values,
+                   self.rollout_knowledge, self.rollout_proprio,
+                   self.rollout_taus, self.rollout_masks,
+                   self.rollout_stream, self.rollout_feats):
+            _c.clear()
+
+    def should_update(self, env_step_target: int) -> bool:
+        """Is the rollout ready for a PPO update?
+
+        ---- WHY THIS IS NOT JUST `env_steps >= n_steps` (2026-09-01) ------
+        The env-step trigger was correct as far as it went: counting
+        DECISIONS would have let option use delay updates indefinitely. But
+        it made the opposite error — it fires on schedule while the number of
+        stored ROWS collapses with the option mix. At mean tau ~40 a
+        1024-env-step rollout holds ~25 rows, and 25 rows is below any
+        sensible minibatch, so the update degenerates to a single full-batch
+        gradient step. Rows are scarce EXACTLY when options are used, which
+        is the regime this project is trying to get into.
+
+        So both conditions must hold: enough env steps to be on schedule AND
+        enough rows to make a real update out of. `max_env_steps_per_update`
+        is the escape path — a rollout that somehow never accumulates rows
+        (every decision a maximal option) still updates rather than waiting
+        forever, so this gate cannot become a latch. Memory is bounded by
+        construction: the ceiling is only reachable while rows are FEW, and
+        rows are what cost memory.
+
+        Both bounds off (0) == the historical behaviour exactly.
+        """
+        _steps = self.rollout_env_steps()
+        _rows = len(self.rollout_obs)
+        # ROW CEILING (2026-09-01). Each row holds a full observation — at
+        # 128px RGB that is ~196 KB — and three things now compound: rows come
+        # from every stream, the row FLOOR can hold a rollout open across
+        # several segments, and the trigger is only evaluated at segment end.
+        # Two streams of all-primitive decisions reach ~2048 rows in one
+        # segment (~400 MB), plus a second full copy at np.stack time in
+        # train_step. That is survivable at 2 clients and not at 4, and 4 is a
+        # configuration this repo has run.
+        if self.max_rows_per_update > 0 and _rows >= self.max_rows_per_update:
+            self.last_update_forced = True
+            return True
+        if self.max_env_steps_per_update > 0 and \
+                _steps >= self.max_env_steps_per_update:
+            self.last_update_forced = True
+            return True
+        self.last_update_forced = False
+        if _steps < int(env_step_target):
+            return False
+        return _rows >= self.min_rows_per_update
+
     def rollout_env_steps(self) -> int:
         """ENV steps represented by the rollout buffer (sum of taus). The
         update trigger must count env steps, not decisions: under heavy
@@ -992,7 +1228,7 @@ class StandaloneActorCritic:
         return len(self.rollout_obs)
 
     def train_step(self, n_epochs: int = 10,
-                   last_value: float = 0.0) -> Dict[str, float]:
+                   last_value=0.0) -> Dict[str, float]:
         """
         PPO update using collected rollout data.
 
@@ -1017,10 +1253,34 @@ class StandaloneActorCritic:
         # Bound the reuse instead: one epoch per ROWS_PER_EPOCH rows, capped at
         # the configured n_epochs. Large batches are unaffected (parity with
         # the old behaviour whenever rows >= n_epochs * ROWS_PER_EPOCH).
+        # ---- THE CAP IS FOR THE FULL-BATCH PATH ONLY (2026-09-01) ---------
+        # The collapse this guard was written for (2026-07-25) happened with
+        # NO minibatching: `n_epochs` full-batch passes over ~25 rows is ~10
+        # near-identical gradient steps on one advantage-normalized batch, and
+        # it crushed the option logits. That is a property of REUSING one
+        # batch, not of taking many steps — and the cap's cure was to remove
+        # updates, which on the live config left ONE gradient step per 1024
+        # env steps (~5 minutes of wall clock per policy update).
+        #
+        # So the cap now applies exactly where its evidence came from: the
+        # un-minibatched path keeps it, byte-identical. When minibatching is
+        # on, each step sees a DIFFERENT 64-row slice, reuse is bounded by
+        # n_epochs directly, and the budget below is what bounds total
+        # movement — with target_kl as the guard that actually watches the
+        # policy rather than counting rows.
         _ROWS_PER_EPOCH = 32
         _rows = len(self.rollout_obs)
         _req = int(n_epochs)
-        n_epochs = max(1, min(_req, _rows // _ROWS_PER_EPOCH))
+        _mb_cfg = int(self.minibatch_size or 0)
+        _will_mb = 0 < _mb_cfg < _rows
+        if not _will_mb:
+            n_epochs = max(1, min(_req, _rows // _ROWS_PER_EPOCH))
+        # Gradient-step budget for the minibatched path. Bounds total movement
+        # per rollout independently of how the rows happen to split, so a
+        # segment that is mostly options (few, long rows) and one that is
+        # mostly primitives (many, short rows) get comparable amounts of
+        # learning instead of differing by 40x.
+        _max_updates = max(4, _rows // 8) if _will_mb else 10 ** 9
         # ---- MAKE THE GUARD VISIBLE (2026-08-23) --------------------------
         # This cap prevents the collapse above by REMOVING UPDATES, and it
         # reported that at DEBUG — i.e. never, in production. Worse, the
@@ -1043,7 +1303,7 @@ class StandaloneActorCritic:
         self.last_tau_mean = (float(sum(_taus)) / len(_taus)) if _taus else 1.0
         self.last_env_steps = int(self.rollout_env_steps())
         self.last_epochs_requested = _req
-        self.last_epochs_capped = bool(n_epochs < _req)
+        self.last_epochs_capped = bool(n_epochs < _req and not _will_mb)
         if self.last_epochs_capped:
             logger.warning(
                 "PPO STARVED: %d rows (%d env steps, %d option rows, mean "
@@ -1058,8 +1318,21 @@ class StandaloneActorCritic:
         # would raise) and build the device tensors alongside it.
         # from_numpy shares the stacked array's memory (FloatTensor(np.array())
         # made a second full CPU copy — ~250-500MB per update on 128px obs).
-        obs = torch.from_numpy(np.stack(self.rollout_obs).astype(
-            np.float32, copy=False)).to(self.device)
+        # DEQUANTIZE HERE, once, for the whole rollout. `.astype(np.float32)`
+        # on a uint8 stack already makes the copy this line always made, so
+        # the /255 rides along for free.
+        _obs_np = np.stack(self.rollout_obs)
+        if self._rollout_uint8:
+            _obs_np = _obs_np.astype(np.float32) / 255.0
+        else:
+            _obs_np = _obs_np.astype(np.float32, copy=False)
+        obs = torch.from_numpy(_obs_np).to(self.device)
+        # arch='rssm': features come from the rollout, not from `obs`. `obs`
+        # is still stored and stacked because the forensics (obs_spread) and
+        # every other arch need it; it just is not the policy's input here.
+        feats_t = (torch.from_numpy(
+            np.stack(self.rollout_feats).astype(np.float32, copy=False)
+        ).to(self.device) if self.arch == "rssm" else None)
         actions = (torch.LongTensor(self.rollout_actions) if not self.continuous
                    else torch.FloatTensor(self.rollout_actions)).to(self.device)
         old_log_probs = torch.FloatTensor(self.rollout_log_probs).to(self.device)
@@ -1085,9 +1358,37 @@ class StandaloneActorCritic:
         # taus: SMDP decision spans (all-ones == shipped behaviour).
         taus_np = (np.array(self.rollout_taus, dtype=np.float32)
                    if self.rollout_taus else None)
+        streams_np = (np.array(self.rollout_stream, dtype=np.int64)
+                      if self.rollout_stream else None)
+        # The rollout arrays must stay index-aligned or the advantages get
+        # attached to the wrong observations — the failure mode is silent and
+        # looks like "PPO just isn't learning".
+        assert streams_np is None or len(streams_np) == len(self.rollout_obs)
         advantages_np = self._compute_gae(rewards, old_values_np, dones,
-                                          taus=taus_np, last_value=last_value)
+                                          taus=taus_np, last_value=last_value,
+                                          streams=streams_np)
         returns_np = advantages_np + old_values_np
+
+        # ---- NEVER TRAIN ON NaN (2026-09-01) ----------------------------
+        # A skipped update costs one rollout; a NaN gradient costs the run AND
+        # the checkpoint, because Adam's moments go NaN with the weights and
+        # every later update inherits it. The rollout is cleared either way so
+        # the next segment starts clean rather than re-feeding the same bad
+        # rows. Loud, because a silently skipped update looks exactly like a
+        # policy that has stopped learning.
+        if not (np.isfinite(advantages_np).all()
+                and np.isfinite(returns_np).all()):
+            logger.error(
+                "PPO update SKIPPED: non-finite advantages/returns "
+                "(%d rows, %d bad adv, %d bad ret). The value head is "
+                "diverging — check value_clamped_frac and value_loss.",
+                len(advantages_np),
+                int((~np.isfinite(advantages_np)).sum()),
+                int((~np.isfinite(returns_np)).sum()))
+            self._clear_rollout()
+            return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+                    "n_updates": 0, "rows": int(len(advantages_np)),
+                    "nonfinite_skip": True}
 
         # Selection-time action masks (options): build ONE (N, A) bool
         # tensor; rows stored as None -> all-True. Skipped entirely when no
@@ -1133,8 +1434,24 @@ class StandaloneActorCritic:
             _obs_spread = float("nan")
 
         # Normalize advantages
+        _adv_clipped_frac = 0.0
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # ---- WINSORIZE (2026-09-01) ---------------------------------
+            # Z-normalization is computed over the batch, so ONE huge row
+            # drags the mean and inflates the std for everything else. On a
+            # ~25-row rollout containing the first log break the outlier
+            # lands near +4.9 and EVERY OTHER ROW GOES UNIFORMLY NEGATIVE —
+            # a segment containing the run's first success actively
+            # suppresses every other action taken in it, including the
+            # approach and the swing that produced it. Bounding at +-5
+            # leaves the log break the largest advantage in the batch
+            # (nothing about the ordering changes) while stopping one row
+            # from setting the sign of all the others.
+            _ADV_LIMIT = 5.0
+            _adv_clipped_frac = float(
+                (advantages.abs() > _ADV_LIMIT).float().mean().item())
+            advantages = advantages.clamp(-_ADV_LIMIT, _ADV_LIMIT)
 
         # PPO update epochs
         total_policy_loss = 0.0
@@ -1151,6 +1468,16 @@ class StandaloneActorCritic:
         _n_updates = 0
         _stop = False
         _epochs_run = 0
+        # ACTOR-ONLY KL STOP (2026-09-01). The 2026-08-05 rollback of
+        # target_kl diagnosed two faults; this is the second one's fix. Once
+        # the policy has moved its budget, the ACTOR freezes but the CRITIC
+        # keeps fitting to the end of the schedule. Previously the stop
+        # abandoned the whole update, so a guard aimed at the policy left the
+        # value function underfit — "larger advantage errors, bigger policy
+        # moves" — which made the next update worse, i.e. the guard fed the
+        # problem it existed to prevent.
+        _actor_frozen = False
+        _kl_stopped = False
         for _ in range(n_epochs):
             if _stop:
                 break
@@ -1158,6 +1485,12 @@ class StandaloneActorCritic:
             if _use_mb:
                 _perm = torch.randperm(_n_rows, device=self.device)
                 _chunks = [_perm[i:i + _mb] for i in range(0, _n_rows, _mb)]
+                # A trailing slice of 1-7 rows is noise, not a gradient: its
+                # advantage mean is dominated by whichever rows happened to
+                # land in it. Fold it away rather than taking a full-size Adam
+                # step on it. (`or _chunks[:1]` keeps at least one chunk when
+                # the whole rollout is shorter than the floor.)
+                _chunks = [c for c in _chunks if len(c) >= 8] or _chunks[:1]
             else:
                 _chunks = [None]
             for _ix in _chunks:
@@ -1172,11 +1505,18 @@ class StandaloneActorCritic:
                         else proprio_t[_ix])
                 _msk = (masks_t if (masks_t is None or _ix is None)
                         else masks_t[_ix])
+                _ft = (None if feats_t is None
+                       else (feats_t if _ix is None else feats_t[_ix]))
 
                 # Rebuild the (optionally knowledge-augmented) policy input.
                 # The gate — and under arch='conv' the encoder — runs WITH
                 # gradient here so the whole stack is trained by the PPO loss.
-                aug = self._augment(self._encode(_obs), _kn, _pro)
+                # arch='rssm' uses the STORED latent: h cannot be recomputed
+                # from an observation, and the update must see exactly the
+                # input the action was sampled from or every importance ratio
+                # is against a different distribution.
+                aug = self._augment(
+                    _ft if _ft is not None else self._encode(_obs), _kn, _pro)
 
                 # For discrete actions, we need log_prob of the TAKEN action
                 features = self.actor.shared(aug)
@@ -1205,22 +1545,49 @@ class StandaloneActorCritic:
                                     1 + self.clip_range) * _adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss (clipped)
-                value_loss = F.mse_loss(new_values, _ret)
+                # ---- VALUE LOSS IN SYMLOG SPACE (2026-09-01) -------------
+                # The head is compared against symlog(return), not the raw
+                # return. WHY, in this task's numbers: a felled log pays
+                # log_break_reward 20 plus 0.5/tick capped at 300 ticks, so a
+                # single stored row can carry ~170 extrinsic -> ~51 after the
+                # 0.3 extrinsic weight, against a typical mixed reward of
+                # ~0.1. Against a prediction near 0 that is an MSE of ~2600
+                # on the one rollout that matters, and at value_coef 0.5 it
+                # buried the policy term completely. symlog turns 51 into
+                # ~3.95 and 0.1 into ~0.095 — the rare event stays the
+                # LARGEST target without being the ONLY one.
+                # NOT a change to the incentive: the reward the agent is
+                # optimizing is untouched, and GAE still runs entirely in
+                # reward space (see _value_of). This is the estimator.
+                value_loss = F.mse_loss(
+                    new_values,
+                    symlog(_ret) if self.value_space == "symlog" else _ret)
 
-                # Total loss
-                loss = (policy_loss + self.value_coef * value_loss
-                        - self.entropy_coef * entropy)
+                # ACTOR FROZEN once the KL budget is spent, critic still
+                # learning — see `_actor_frozen` above. Dropping the policy
+                # and entropy terms (rather than breaking out) is what lets
+                # the value function finish fitting.
+                if _actor_frozen:
+                    loss = self.value_coef * value_loss
+                else:
+                    loss = (policy_loss + self.value_coef * value_loss
+                            - self.entropy_coef * entropy)
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                clip_params = (list(self.actor.parameters())
-                               + list(self.critic.parameters()))
-                if self.encoder is not None:
-                    clip_params += list(self.encoder.parameters())
-                if self.conditioner is not None:
-                    clip_params += list(self.conditioner.parameters())
-                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=0.5)
+                # ---- TWO CLIPS, NOT ONE (2026-09-01) ---------------------
+                # A single clip_grad_norm_ over actor+critic normalises them
+                # TOGETHER, so a large value gradient shrinks the policy
+                # gradient in the same proportion. With the raw-return head
+                # that happened precisely on the first log break: the update
+                # carrying the run's only real signal became a value-fitting
+                # step with the policy term scaled to near zero. Clipping the
+                # groups separately gives each its own budget; the symlog
+                # target above makes the spike small in the first place, and
+                # this makes it structurally unable to steal the actor's step
+                # even if it were not.
+                torch.nn.utils.clip_grad_norm_(self._clip_actor, max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self._clip_critic, max_norm=0.5)
                 self.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
@@ -1233,30 +1600,39 @@ class StandaloneActorCritic:
                 with torch.no_grad():
                     _kl = float(((ratio - 1.0) - _logratio).mean().item())
                 self.last_approx_kl = _kl
-                if self.target_kl > 0.0 and _kl > self.target_kl:
+                if (self.target_kl > 0.0 and _kl > self.target_kl
+                        and not _actor_frozen):
+                    _actor_frozen = True
+                    _kl_stopped = True
+                    if not _use_mb:
+                        # full-batch path: there is no finer granularity to
+                        # continue at, so preserve the historical behaviour
+                        # exactly (stop the update) rather than spending the
+                        # remaining epochs on critic-only full-batch steps.
+                        _stop = True
+                        break
+                # GRADIENT-STEP BUDGET (minibatched path only; +inf
+                # otherwise). Bounds total movement per rollout so the amount
+                # of learning does not swing 40x with the option mix.
+                if _n_updates >= _max_updates:
                     _stop = True
                     break
 
         # Clear rollout buffer
-        self.rollout_obs.clear()
-        self.rollout_actions.clear()
-        self.rollout_rewards.clear()
-        self.rollout_dones.clear()
-        self.rollout_log_probs.clear()
-        self.rollout_values.clear()
-        self.rollout_knowledge.clear()
-        self.rollout_proprio.clear()
-        self.rollout_taus.clear()
-        self.rollout_masks.clear()
+        self._clear_rollout()
 
         self.last_epochs_run = _epochs_run
+        _vcf = (self._value_clamp_hits / self._value_clamp_n
+                if self._value_clamp_n else 0.0)
+        self._value_clamp_hits = self._value_clamp_n = 0
         # How deterministic is the policy NOW, on the states it just trained
         # on? mean max-probability: 1.0 == one-hot == nothing left to sample.
         _max_prob = float("nan")
         try:
             with torch.no_grad():
-                _f = self.actor.shared(
-                    self._augment(self._encode(obs), knowledge, proprio_t))
+                _f = self.actor.shared(self._augment(
+                    feats_t if feats_t is not None else self._encode(obs),
+                    knowledge, proprio_t))
                 _lg = self._bound_logits(self.actor.action_head(_f))
                 if masks_t is not None:
                     _lg = _lg.masked_fill(~masks_t, -1e9)
@@ -1291,6 +1667,23 @@ class StandaloneActorCritic:
             "rows_primitive": int(self.last_rows_primitive),
             "tau_mean": float(self.last_tau_mean),
             "env_steps": int(self.last_env_steps),
+            # update-budget forensics (2026-09-01). `epochs_capped` used to be
+            # the only signal and it conflated three causes; these separate
+            # them: kl_stopped = the policy hit its movement budget (the
+            # HEALTHY stop), max_updates = the rollout's step budget ran out,
+            # epochs_capped = the full-batch tiny-row guard removed updates
+            # (the STARVED case). adv_clipped_frac says how often one row was
+            # trying to set the sign of the whole batch.
+            "kl_stopped": bool(_kl_stopped),
+            "max_updates": int(_max_updates if _max_updates < 10 ** 9 else 0),
+            "minibatched": bool(_use_mb),
+            "adv_clipped_frac": float(_adv_clipped_frac),
+            "value_space": self.value_space,
+            # Fraction of value READS that hit the symlog clamp since the last
+            # update. Zero is the normal reading and the clamp is a pure
+            # safety net; anything non-zero means the critic is diverging and
+            # is the finding, not a nuisance to tune away.
+            "value_clamped_frac": _vcf,
         }
 
     def _compute_gae(
@@ -1300,6 +1693,7 @@ class StandaloneActorCritic:
         dones: np.ndarray,
         taus=None,
         last_value: float = 0.0,
+        streams=None,
     ) -> np.ndarray:
         """
         Generalized Advantage Estimation (GAE).
@@ -1308,7 +1702,36 @@ class StandaloneActorCritic:
         - lambda=1: high variance, low bias (Monte Carlo-like)
         - lambda=0: low variance, high bias (TD-like)
         - lambda=0.95: good balance (standard choice)
+
+        MULTI-STREAM (2026-09-01): when `streams` is given, rows are grouped
+        by stream and the recursion below runs INDEPENDENTLY per group, in
+        that group's own chronological order, with that stream's own
+        bootstrap from `last_value`. The advantage trace is a statement
+        about one trajectory's future; running it over interleaved bodies
+        would credit env 0's reward to env 1's action and vice versa — the
+        rows are adjacent in a list, not in time. Results are scattered back
+        to the original row positions so every other array stays aligned.
+
+        `streams=None` (or a single distinct stream) takes the original
+        single-pass path unchanged.
         """
+        if streams is not None:
+            _st = np.asarray(streams)
+            _uniq = np.unique(_st)
+            if len(_uniq) > 1:
+                out = np.zeros_like(rewards)
+                _lv = last_value if isinstance(last_value, dict) else {}
+                for s in _uniq:
+                    _m = np.flatnonzero(_st == s)
+                    _bv = (float(_lv.get(int(s), 0.0)) if _lv
+                           else (float(last_value) if int(s) == 0 else 0.0))
+                    out[_m] = self._compute_gae(
+                        rewards[_m], values[_m], dones[_m],
+                        taus=None if taus is None else taus[_m],
+                        last_value=_bv, streams=None)
+                return out
+        if isinstance(last_value, dict):
+            last_value = float(last_value.get(0, 0.0))
         # SMDP form (Sutton-Precup-Singh): decision t spanned tau_t env
         # steps and stored the ONLINE-ACCUMULATED discounted reward
         # R_t = sum over i<tau of gamma^i * r_(t+i). Bootstrapping uses
@@ -1347,6 +1770,12 @@ class StandaloneActorCritic:
         sd = {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
+            # WHICH SPACE THE CRITIC SPEAKS (2026-09-01). Absent = a
+            # pre-symlog checkpoint. Reading a linear head as symlog is wrong
+            # by e^|v| and would look like a plausible value function rather
+            # than a broken one, which is exactly the kind of silent
+            # mis-scaling this project keeps paying for.
+            "value_space": self.value_space,
         }
         if self.conditioner is not None:
             sd["conditioner"] = self.conditioner.state_dict()
@@ -1388,7 +1817,32 @@ class StandaloneActorCritic:
                 f"policy arch mismatch: stored={sd_arch} live={self.arch} "
                 f"— refusing before any partial copy")
         self.actor.load_state_dict(state_dict["actor"])
-        self.critic.load_state_dict(state_dict["critic"])
+        # ---- VALUE-SPACE MIGRATION (2026-09-01) --------------------------
+        # A checkpoint with no `value_space` marker holds a critic trained on
+        # RAW returns. Loading it into a symlog policy would silently
+        # mis-scale every value by e^|v| — the bootstrap, the advantages and
+        # every option's stored value at once — and it would look like a
+        # working value function, not a broken one.
+        #
+        # RE-INITIALISE rather than fall back. The alternative (keep the head
+        # linear for the rest of that run) is safe but means the live brain
+        # never gets the fix, which is the same as not shipping it. The
+        # critic is the single most re-learnable module in the stack — two
+        # linear layers refit within a few thousand updates — while the
+        # actor, the conditioner and the world-model perception it reads are
+        # all preserved untouched. Weigh that against what the linear head is
+        # actually worth here: it has been fitting a target that spans 1e-3
+        # to 1.7e2 with one gradient step per five minutes.
+        _sd_space = state_dict.get("value_space")
+        if _sd_space == self.value_space:
+            self.critic.load_state_dict(state_dict["critic"])
+        else:
+            logger.warning(
+                "critic value_space mismatch (stored=%s live=%s) — the value "
+                "HEAD is re-initialised; actor/conditioner/encoder are loaded "
+                "unchanged. Expect value_loss to be large for the first few "
+                "updates while V refits; nothing else is lost.",
+                _sd_space or "linear(pre-2026-09-01)", self.value_space)
         if self.conditioner is not None and "conditioner" in state_dict:
             self.conditioner.load_state_dict(state_dict["conditioner"])
         if self.encoder is not None:

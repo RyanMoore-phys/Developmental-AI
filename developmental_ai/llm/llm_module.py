@@ -48,6 +48,30 @@ except ImportError:
 # instead of deadlocking. 120s comfortably clears even slow CPU generations.
 _OLLAMA_TIMEOUT_S = 120.0
 _ollama_client = None
+# ---- WHERE THE VLM LIVES (2026-09-01, cluster migration) ------------------
+# None = the bare module's own resolution (OLLAMA_HOST env, else
+# http://127.0.0.1:11434) — i.e. exactly the shipped behaviour. Set via
+# `llm.endpoint` in config to point the labeller at a DIFFERENT NODE. The VLM
+# is the largest single GPU tenant and is measurably on the critical path
+# (fovea_interval 12 cost 28% of the step rate), so on a cluster it is the
+# first thing worth moving off the training device. The symbolizer is already
+# async, so a remote endpoint costs latency, not throughput.
+_ollama_host = None
+
+
+def set_ollama_endpoint(host: Optional[str]) -> None:
+    """Point every Ollama client at `host` (e.g. http://10.0.0.5:11434).
+
+    Must be called before the first client is built; resets the cached client
+    so a late call still takes effect rather than silently doing nothing.
+    """
+    global _ollama_host, _ollama_client
+    if host == _ollama_host:
+        return
+    _ollama_host = host or None
+    _ollama_client = None
+    logger.info("Ollama endpoint set to %s",
+                _ollama_host or "(default: OLLAMA_HOST or localhost:11434)")
 
 
 def _get_ollama_client():
@@ -56,7 +80,8 @@ def _get_ollama_client():
     if _ollama_client is None and OLLAMA_AVAILABLE:
         # host=None → same default resolution as the bare module (OLLAMA_HOST env
         # or http://127.0.0.1:11434); timeout flows through to the httpx client.
-        _ollama_client = ollama_lib.Client(timeout=_OLLAMA_TIMEOUT_S)
+        _ollama_client = ollama_lib.Client(
+            host=_ollama_host, timeout=_OLLAMA_TIMEOUT_S)
     return _ollama_client
 
 
@@ -122,6 +147,51 @@ def _check_ollama_server() -> bool:
         return True
     except Exception:
         return False
+
+
+def probe_ollama_model(model: str) -> bool:
+    """Is `model` actually present on the Ollama server? Log what we found.
+
+    ---- WHY THIS IS LOUD AND DOES NOT FALL BACK (2026-09-01) -------------
+    The VLM is a SENSOR. Swapping it silently is how this project spent a
+    run on llava, whose tree_visible drifted to reliability 1.0 unopposed
+    because the verifier cannot see false positives. When the configured tag
+    is missing, Ollama's default behaviour is to try to pull it — which on a
+    fresh cluster node either stalls the run or produces a DIFFERENT sensor
+    from the one the config names, and neither shows up anywhere except as
+    weird labels days later.
+
+    So: say the resolved model out loud at startup, list what IS available,
+    and return False. The caller decides; nothing is substituted here.
+    Returns True when unverifiable (no ollama lib / server down) so this can
+    never itself become the thing that stops a run.
+    """
+    if not OLLAMA_AVAILABLE:
+        return True
+    try:
+        _resp = ollama_lib.list() or {}
+        _models = _resp.get("models", _resp) or []
+        names = set()
+        for m in _models:
+            n = (m.get("model") or m.get("name")) if isinstance(m, dict) else m
+            if n:
+                names.add(str(n))
+                names.add(str(n).split(":")[0])
+    except Exception as e:
+        logger.info("ollama model probe unavailable (%s) — continuing", e)
+        return True
+    if model in names:
+        logger.info("VLM resolved: %s (present on the Ollama server)", model)
+        return True
+    logger.warning(
+        "VLM MODEL NOT FOUND: %r is not on the Ollama server. Available: %s. "
+        "The labeller is a SENSOR — a missing tag means either a stall on "
+        "first use or a different model answering, and neither is visible "
+        "later except as strange predicates. Build it with:\n"
+        "  printf 'FROM qwen2.5vl:7b\\n' > /tmp/Modelfile && "
+        "ollama create %s -f /tmp/Modelfile -q q4_K_M",
+        model, sorted(names) or "(none)", model)
+    return False
 
 
 class LLMPerception:

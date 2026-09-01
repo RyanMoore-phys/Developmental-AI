@@ -128,7 +128,16 @@ TREECHOP_MACROS: list = [
     # button down rather than clicking thirty times.
     # APPEND-ONLY: indices 0-11 are untouched, as every stored skill and
     # policy indexes actions by position.
-    {"attack": 1, "_ticks": 20},                         # 12 HOLD attack
+    # `_ticks` is ABSOLUTE — _macro_ticks returns m.get("_ticks",
+    # action_repeat), so this does NOT scale with action_repeat. That matters:
+    # at repeat 2 this macro was 10x a plain attack (20 vs 2 ticks), and the
+    # 10x is what made a barehanded log reachable in 3 consecutive picks
+    # instead of 30. At repeat 4 a plain attack is 4 ticks, so leaving this at
+    # 20 would quietly halve the advantage to 5x and put the log back out of
+    # reach. 40 preserves the ratio and keeps the arithmetic in the note above
+    # true: ~60 ticks for a barehanded oak log is still ~2 consecutive picks.
+    # Editing the VALUE is safe; only the INDEX is append-only.
+    {"attack": 1, "_ticks": 40},                         # 12 HOLD attack
 ]
 
 
@@ -311,6 +320,11 @@ class MineRLEnvAdapter(gym.Env):
                 f"render_size {self.render_size} must be a multiple of "
                 f"image_size {self.image_size}")
         self.action_repeat = max(1, int(action_repeat))
+        # "Full speed" in blocks per AGENT STEP, which is action_repeat game
+        # ticks long. MOVE_SCALE is quoted per 2 ticks (its original
+        # calibration), so this keeps `moved` spanning [0,1] across a normal
+        # walk at any repeat instead of pinning at 1.0.
+        self._move_scale = self.MOVE_SCALE * self.action_repeat / 2.0
         self._last_pov: Optional[np.ndarray] = None
         self._log_count = 0
         self._mine_baseline: Dict[str, int] = {}
@@ -784,7 +798,12 @@ class MineRLEnvAdapter(gym.Env):
     # Minecraft walks ~4.3 blocks/s; at action_repeat 2 (0.1s) that is ~0.43,
     # sprinting ~0.56 — so 0.5 puts a normal walk near the top of the range
     # without pinning it there.
-    MOVE_SCALE = 0.5
+    # DERIVED FROM action_repeat SINCE 2026-09-01 (see _move_scale). A fixed
+    # 0.5 at repeat 4 saturates on every ordinary walk (~0.86 blocks/step),
+    # so `moved` reads 1.0 whether the agent is strolling or sprinting and
+    # stops discriminating — the exact fate of a normalized sense whose
+    # denominator is calibrated for a different step length.
+    MOVE_SCALE = 0.5            # per 2 ticks; scaled by action_repeat/2
     PROPRIO_DIM = len(PROPRIO_KEYS)
 
     def _proprio(self, world: Dict[str, Any]) -> np.ndarray:
@@ -819,7 +838,7 @@ class MineRLEnvAdapter(gym.Env):
             # AM I MOVING (2026-08-23)
             _mv = world.get("moved")
             v[10] = (0.0 if _mv is None else
-                     float(np.clip(float(_mv) / self.MOVE_SCALE, 0.0, 1.0)))
+                     float(np.clip(float(_mv) / self._move_scale, 0.0, 1.0)))
             # WHICH WAY AM I FACING. sin/cos rather than raw degrees so the
             # wrap at 360->0 is continuous rather than a cliff.
             #
@@ -1871,8 +1890,20 @@ class MineRLEnvAdapter(gym.Env):
             _now = (_px, _pz, _pi, _ya)
             _prev = getattr(self, "_prev_aim", None)
             if _prev is not None and None not in _now and None not in _prev:
-                _moved = (abs(_now[0] - _prev[0]) > 0.05
-                          or abs(_now[1] - _prev[1]) > 0.05)
+                # ---- THRESHOLD SCALES WITH action_repeat (2026-09-01) -----
+                # This measures displacement BETWEEN AGENT STEPS, and a step
+                # now covers `action_repeat` game ticks. At repeat 2 a
+                # stationary agent drifts well under 0.05; at repeat 4 the
+                # same physical stillness accumulates twice the drift
+                # (knockback, water, slope, server rubber-banding), so a
+                # fixed 0.05 would read as a RETARGET and zero `attack_run`
+                # on a swing that never moved. The streak counter is the one
+                # signal telling the agent that persistence accumulates —
+                # spuriously resetting it is the quiet way to make chopping
+                # unlearnable again.
+                _mv_eps = 0.025 * float(self.action_repeat)
+                _moved = (abs(_now[0] - _prev[0]) > _mv_eps
+                          or abs(_now[1] - _prev[1]) > _mv_eps)
                 _looked = (abs(_now[2] - _prev[2]) > 1.0
                            or abs(_now[3] - _prev[3]) > 1.0)
                 _retargeted = bool(_moved or _looked)

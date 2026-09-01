@@ -384,6 +384,31 @@ class DevelopmentalAI:
         # per-element nonsense and a large silent per-step tax. Low-dim
         # symbolic envs (MiniGrid 151-d, CartPole 4-d) are unaffected.
         self._skip_perdim_symbolic = self.pixel_obs or self.obs_dim > 2000
+        # Cadence for the symbolic-decoder read in the step loop when it IS
+        # live (see the block in _collect_segment). 1 = every step = the
+        # pre-2026-09-01 behaviour, so any config that wants it back can have
+        # it; the KG consumers read at 25-50, which is where 25 comes from.
+        self._sd_every = max(1, int(
+            self.config.get("symbolic", {}).get("decoder_interval", 25)))
+        # ---- DO SCOUT STREAMS FEED THE POLICY? (2026-09-01) --------------
+        # LIFELONG ONLY, deliberately. The episodic body (_run_episode_parallel)
+        # ends on the primary's terminal, so its scouts are cut mid-trajectory
+        # at an arbitrary point with no bootstrap — storing those rows would
+        # add truncation bias rather than data. The lifelong body has no
+        # episode boundary at all, which is exactly what makes a scout's
+        # trajectory as well-formed as the primary's.
+        # Per-stream potential state for _scout_mixed_reward lives here too;
+        # it is cleared per stream on that stream's death.
+        self._scouts_in_ppo = bool(
+            self.config.get("lifelong", {}).get("enabled", False)
+            and self.config.get("policy", {}).get("scouts_in_ppo", True))
+        self._sc_phi: Dict[int, Dict[str, float]] = {}
+        # World-model gradient steps per block. Seeded from config; adapted
+        # from the measured async skip rate only when train_iters_auto is on
+        # (off by default — it changes the WM's data diet).
+        _wmc = self.config.get("world_model", {}) or {}
+        self._wm_train_iters = int(_wmc.get("train_iters", 4))
+        self._train_iters_auto = dict(_wmc.get("train_iters_auto") or {})
 
         # Get human-readable labels for this environment
         self.obs_labels, self.action_labels = get_env_labels(self.env_name)
@@ -461,6 +486,7 @@ class DevelopmentalAI:
                 per_beta=per_cfg.get("beta", 0.4),
                 per_epsilon=per_cfg.get("epsilon", 1e-2),
                 obs_uint8=_obs_uint8,
+                growth=wm_cfg.get("buffer_growth"),
             )
         else:
             self.replay_buffer = ReplayBuffer(
@@ -471,6 +497,7 @@ class DevelopmentalAI:
                 per_beta=per_cfg.get("beta", 0.4),
                 per_epsilon=per_cfg.get("epsilon", 1e-2),
                 obs_uint8=_obs_uint8,
+                growth=wm_cfg.get("buffer_growth"),
             )
         # Prioritized + asynchronous replay are opt-in. When both are off, the
         # buffer behaves exactly like the original uniform/synchronous sampler.
@@ -808,6 +835,18 @@ class DevelopmentalAI:
         self._unlock_block: Dict[int, str] = {}
         if sg_cfg.get("enabled", False) and self.pixel_obs:
             from developmental_ai.llm.vlm_symbolizer import VLMSymbolizer
+            # Say which sensor is actually about to label the world, before a
+            # single fact is minted from it (see probe_ollama_model).
+            try:
+                from developmental_ai.llm.llm_module import (
+                    probe_ollama_model, set_ollama_endpoint)
+                # Point the labeller at whatever node serves it. None keeps
+                # the shipped resolution (OLLAMA_HOST, else localhost).
+                set_ollama_endpoint(
+                    (self.config.get("llm", {}) or {}).get("endpoint"))
+                probe_ollama_model(sg_cfg.get("model", "llava:7b"))
+            except Exception:
+                pass
             self.symbolizer = VLMSymbolizer(
                 model=sg_cfg.get("model", "llava:7b"),
                 interval=sg_cfg.get("interval", 60),
@@ -823,6 +862,7 @@ class DevelopmentalAI:
                 fovea=sg_cfg.get("fovea", False),
                 fovea_frac=sg_cfg.get("fovea_frac", 0.4),
                 fovea_interval=sg_cfg.get("fovea_interval", None),
+                input_max_side=int(sg_cfg.get("input_max_side", 0) or 0),
                 # CROP-CONSISTENT FOVEA (2026-08-12): put the fovea head on
                 # ENCODER FEATURES OF THE CROP rather than the whole-frame
                 # RSSM latent, so its input describes the same region its
@@ -1197,6 +1237,24 @@ class DevelopmentalAI:
                 logger.warning("policy.arch=wm needs pixel obs — the world "
                                "model encoder is a CNN. Falling back to flat.")
                 _arch = "flat"
+        elif _arch == "rssm":
+            # ---- THE POLICY SEES THE RSSM (2026-09-01) -------------------
+            # Width is the world model's LATENT, not a free parameter and not
+            # the encoder's: h (deterministic) concatenated with the
+            # flattened categorical z. Derived here so it cannot be set
+            # inconsistently with the world model that produces it.
+            _enc_dim = int(self.world_model.rssm.latent_dim)
+            logger.info(
+                "policy.arch=rssm: the actor reads the world model's latent "
+                "(%d = deterministic + stochastic*classes), not encoder "
+                "features of one frame. The policy is no longer memoryless.",
+                _enc_dim)
+            # The carried-encoder-features optimisation and its self-check are
+            # wm-only: the latent is produced fresh per env per step and is
+            # never carried across a step boundary, so there is nothing to
+            # verify and _encode would raise if asked.
+            self._reuse_enc_feats = False
+            self._verify_enc_feats = False
         self.policy = StandaloneActorCritic(
             obs_dim=self.obs_dim,
             action_dim=self.meta_action_dim,
@@ -1246,6 +1304,22 @@ class DevelopmentalAI:
                 getattr(self, "_proprio_source", None), "PROPRIO_DIM", 0))
                 + (4 if getattr(self, "_proprio_source", None) is not None
                    and self.symbolizer is not None else 0)),
+            # ROW-AWARE UPDATE TRIGGER (2026-09-01) — see should_update().
+            # 0/0 keeps the historical env-step-only behaviour.
+            min_rows_per_update=int(
+                pol_cfg.get("min_rows_per_update", 0) or 0),
+            max_env_steps_per_update=int(
+                pol_cfg.get("max_env_steps_per_update", 0) or 0),
+            max_rows_per_update=int(
+                pol_cfg.get("max_rows_per_update", 0) or 0),
+            # Same gate and same scheme as the replay buffer's obs_uint8:
+            # pixels only, x255 round-trip. Defaults to whatever the buffer
+            # does so the two cannot silently disagree about how a frame is
+            # carried.
+            rollout_uint8=bool(
+                self.pixel_obs
+                and pol_cfg.get("rollout_uint8",
+                                wm_cfg.get("obs_uint8", True))),
         )
         # A CONFIG KEY THAT DOES NOTHING MUST SAY SO. `policy.batch_size` has
         # been present and unread since the first config; silence made it look
@@ -1481,6 +1555,18 @@ class DevelopmentalAI:
             ),
             adaptive_gating=pol_cfg.get("adaptive_gating", False),
             adaptive_rate=pol_cfg.get("adaptive_gating_rate", 5e-5),
+            # ---- WIRED 2026-09-01, AND IT HAD TO BE ----------------------
+            # `solve_threshold` decides what counts as "the task is being
+            # solved" and therefore how fast curiosity is annealed away. It
+            # has never been passed, so it sat at the 0.1 default — and on
+            # this env ANY dirt break clears 0.1. Enabling adaptive gating
+            # without this would have read "solved" on the ground-clearing
+            # behaviour the whole reward economy exists to defund, and
+            # annealed the exploration drive to its floor while the agent had
+            # still never felled a log. The config sets it to a LOG-sized
+            # return for that reason.
+            solve_threshold=float(pol_cfg.get("solve_threshold", 0.1)),
+            solve_ema_beta=float(pol_cfg.get("solve_ema_beta", 0.05)),
             # ---- RETURN NORMALIZATION, ACTUALLY WIRED (2026-08-02) --------
             # RewardMixer has carried this guard since 2026-07-27 and NOTHING
             # ever passed it, so `return_ratio_cap` sat at its 0.0 default and
@@ -2242,6 +2328,20 @@ class DevelopmentalAI:
                 "world_model.encoder, so a fresh policy starts on a TRAINED "
                 "visual system and only relearns its action mapping")
 
+    def _drop_curiosity_batch(self) -> None:
+        """Discard any part-filled ICM training batch.
+
+        Called on shutdown and on a stream death. The transitions in it are
+        individually valid, so this is hygiene rather than a correctness fix:
+        it keeps a batch from outliving the run (or the world) that produced
+        it, which is the rule the perception/familiarity work settled on —
+        evidence must not outlive its head.
+        """
+        try:
+            self._cur_train_buf.clear()
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Clean up resources (Neo4j connections, LLM threads, etc.)."""
         if hasattr(self.knowledge_graph, "close"):
@@ -2252,6 +2352,7 @@ class DevelopmentalAI:
             self.vision_scaffold.close()
         if getattr(self, "symbolizer", None) is not None:
             self.symbolizer.close()
+        self._drop_curiosity_batch()
         # Stop the async WM trainer FIRST (before the sampler it consumes and
         # before env/CUDA teardown): a daemon thread killed at interpreter
         # exit mid-optimizer-step segfaults, and closing the sampler first
@@ -3122,7 +3223,19 @@ class DevelopmentalAI:
                     _latent = self.world_model.rssm.get_latent(rssm_state)
                 action, policy_info = self.dream_actor.select_action(_latent)
             else:
-                action, policy_info = self.policy.select_action(obs, knowledge=kv_np)
+                # arch='rssm' reads the world model's belief, which this path
+                # already carries in `rssm_state`. Computed BEFORE the step,
+                # so it is the state the decision is actually made from.
+                if self.policy.arch == "rssm":
+                    with torch.no_grad():
+                        self._act_latent = self.world_model.rssm.get_latent(
+                            rssm_state).detach()
+                else:
+                    self._act_latent = None
+                action, policy_info = self.policy.select_action(
+                    obs, knowledge=kv_np,
+                    feats=(None if self._act_latent is None
+                           else self._act_latent[0:1]))
 
             # ---- 2. EXECUTE IN ENVIRONMENT ----
             next_obs, extrinsic_reward, terminated, truncated, step_info = self.env.step(action)
@@ -3273,7 +3386,7 @@ class DevelopmentalAI:
                 self.policy.store_transition(
                     obs, action, mixed_reward, done,
                     policy_info["log_prob"], policy_info["value"],
-                    knowledge=kv_np,
+                    knowledge=kv_np, feats=self._feats_row(0),
                 )
 
             # ---- 7. TRAIN CURIOSITY MODULE ----
@@ -3304,7 +3417,7 @@ class DevelopmentalAI:
         # a frozen, zero-gradient policy (Policy loss ~0) that never learned.
         if (
             not self.dream_training_active
-            and self.policy.rollout_env_steps() >= self.policy_update_steps
+            and self.policy.should_update(self.policy_update_steps)
         ):
             # policy.n_epochs, not a hardcoded 10 (fix 2026-08-02): the two
             # other call sites read the config and this one did not, so the
@@ -3675,6 +3788,7 @@ class DevelopmentalAI:
         primary_kv = None       # knowledge feature stored with the PPO rollout
         primary_pol = None      # PPO policy_info for the primary stream
         while not primary_done:
+            _pt = time.perf_counter()          # phase clock (see _phase_mark)
             obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
 
             # ---- 1. SELECT ACTIONS ----
@@ -3696,19 +3810,39 @@ class DevelopmentalAI:
                 # WAKING: real PPO policy per env. Primary stream keeps its
                 # log_prob/value for the on-policy update; scouts just act.
                 primary_kv = self._current_knowledge_feature()
+                # THE BELIEF THIS DECISION IS MADE FROM, hoisted ABOVE the
+                # options branch (2026-09-01). arch='rssm' needs it on BOTH
+                # paths — with options disabled the loop stores scout and
+                # primary rows from the `else` branch below, and reading a
+                # latent set only inside the options branch would have handed
+                # the update last step's belief, silently.
+                if self.policy.arch == "rssm":
+                    with torch.no_grad():
+                        self._act_latent = self.world_model.rssm.get_latent(
+                            rssm_state).detach()
+                else:
+                    self._act_latent = None
                 if self.option_executor is not None:
                     # options path: executor resolves primitives per env,
                     # opening/continuing skill invocations as sampled. Its
                     # decision records replace primary_pol for storage;
                     # keep primary_pol non-None so the dream-phase guard
                     # below still distinguishes waking from dreaming.
+                    # THE BELIEF THE DECISION IS MADE FROM. Computed once,
+                    # before the action, and reused by both consumers: the
+                    # precondition gate and (arch='rssm') the policy input
+                    # itself. This is the state the agent is actually in when
+                    # it chooses — computing it after the step would score the
+                    # initiation set against a world the choice already
+                    # changed.
                     _preds = None
                     if self.option_executor.gate_by_preconditions:
-                        # belief BEFORE this step's action == the state the
-                        # initiation set must be evaluated against
                         with torch.no_grad():
                             _preds = self._predicates_batch(
-                                self.world_model.rssm.get_latent(rssm_state))
+                                self._act_latent
+                                if self._act_latent is not None
+                                else self.world_model.rssm.get_latent(
+                                    rssm_state))
                     # live per-skill competence for the warmup gate:
                     # broadcaster slot N -> skill ach_NN_.. -> competence[N]
                     _comp = None
@@ -3742,11 +3876,24 @@ class DevelopmentalAI:
                                    or {"log_prob": 0.0, "value": 0.0})
                 else:
                     env_actions = []
+                    # SCOUT DECISIONS ARE KEPT HERE TOO (2026-09-01). This
+                    # branch runs when options are DISABLED, and it already
+                    # computed `pinfo` for every env and then discarded it for
+                    # e_i != 0. The scout-PPO storage below hangs off the
+                    # option executor, which is None on this path — so with
+                    # skills_as_options.enabled false, `_scouts_in_ppo` read
+                    # true and not one scout row was ever stored. That is the
+                    # _viewer_push / gui_open / felt-reach pattern exactly: a
+                    # correct mechanism nobody calls.
+                    self._noopt_pol = [None] * n
                     for e_i in range(n):
                         a, pinfo = self.policy.select_action(
                             obs_list[e_i],
-                            knowledge=primary_kv if e_i == 0 else None)
+                            knowledge=primary_kv if e_i == 0 else None,
+                            feats=(None if self._act_latent is None
+                                   else self._act_latent[e_i:e_i + 1]))
                         env_actions.append(int(a) if self.is_discrete else a)
+                        self._noopt_pol[e_i] = pinfo
                         if e_i == 0:
                             primary_pol = pinfo
                 if self.is_discrete:
@@ -3758,6 +3905,8 @@ class DevelopmentalAI:
                     action_tensor = torch.from_numpy(
                         np.stack(env_actions).astype(np.float32)
                     ).to(self.device)
+
+            _pt = self._phase_mark("act", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
             from concurrent.futures import TimeoutError as _FTimeout
@@ -3776,12 +3925,18 @@ class DevelopmentalAI:
             futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
                     for e_i in range(n)]
             next_obs_list, rewards, dones = [], [], []
+            # Whether this step's `done` is a CLIENT REBUILD rather than a
+            # real terminal. The episodic body needs it for the same reason
+            # the lifelong one does: the world model must not be taught the
+            # splice across a rebuild as dynamics (see ReplayBuffer.add).
+            restarted: List[bool] = []
             prim_info: Dict[str, Any] = {}
             step_infos: List[Dict[str, Any]] = [None] * n
             # keep the body sense fresh for the NEXT act() (see _props)
             if self._proprio_source is not None:
                 self._proprio_per_env = [None] * n
             for e_i, f in enumerate(futs):
+                _rst = False
                 try:
                     nobs, rew, term, trunc, _inf = f.result(timeout=_step_to)
                     if isinstance(_inf, dict):
@@ -3805,9 +3960,10 @@ class DevelopmentalAI:
                     nobs = (obs_list[e_i]
                             if obs_list[e_i] is not None
                             else np.zeros(self.obs_dim, dtype=np.float32))
-                    rew, term, trunc = 0.0, False, True
+                    rew, term, trunc, _rst = 0.0, False, True, True
                 next_obs_list.append(np.asarray(nobs, dtype=np.float32))
                 rewards.append(float(rew))
+                restarted.append(_rst)
                 dones.append(bool(term or trunc))
             # envs step CONCURRENTLY, so this is the wait for the SLOWEST
             # client, which is exactly what the serial loop pays. Present in
@@ -3818,6 +3974,7 @@ class DevelopmentalAI:
             self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
+            _pt = self._phase_mark("env", _pt)
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -3897,8 +4054,19 @@ class DevelopmentalAI:
 
             next_obs_t = torch.from_numpy(np.stack(next_obs_list)).to(self.device)
 
-            if not use_dream_actor and self.option_executor is not None:
+            if (not use_dream_actor and self.option_executor is not None
+                    and not self._scouts_in_ppo):
                 # scout option terminations (raw reward; no credit records)
+                #
+                # SKIPPED WHEN SCOUTS FEED PPO (2026-09-01). Accumulating a
+                # scout option's SMDP return needs the MIXED reward, which
+                # does not exist until the shaping block further down, so
+                # that path calls observe_scouts there instead. Calling it in
+                # both places would advance `steps_done` twice per env step
+                # and terminate every scout option at half its horizon — the
+                # two sites are mutually exclusive by construction rather
+                # than by convention. `_scouts_in_ppo` is false on the
+                # episodic path, so this body is unchanged there.
                 self.option_executor.observe_scouts(
                     rewards, dones, self.total_timesteps)
 
@@ -3922,6 +4090,8 @@ class DevelopmentalAI:
                     self._broadcaster_update(
                         e, _i, effect_key=self._new_break_by_env.get(_i))
 
+            _pt = self._phase_mark("goals", _pt)
+
             # ---- 3. CURIOSITY (batched) ----
             intrinsic = self.curiosity.compute_intrinsic_reward(
                 obs_t, action_tensor, next_obs_t
@@ -3933,6 +4103,7 @@ class DevelopmentalAI:
             icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
             )
+            _pt = self._phase_mark("curiosity", _pt)
 
             # ---- 4. RSSM observe (batched) + primary-only symbolic facts ----
             # _wm_param_lock (review fix): with the async trainer these
@@ -3954,6 +4125,12 @@ class DevelopmentalAI:
             # No-op off the lifelong path (self._ll is None).
             if self._ll is not None:
                 self._ll.rssm_state = rssm_state
+            # arch='rssm': the belief the NEXT decision will be made from, kept
+            # for the segment-end GAE bootstrap. Cheap (a reference), and it
+            # has to be the post-observe latent — that is the state the next
+            # segment resumes at, which is exactly what V(s_last) means.
+            if self.policy.arch == "rssm":
+                self._bootstrap_latent = latent.detach()
 
             # pair fresh unlocks with the latent of the stream that earned
             # them (context provenance for skill minting / the brain graph)
@@ -3999,23 +4176,57 @@ class DevelopmentalAI:
             # sd heads + discretizer are trained on the async trainer thread;
             # lock the reads/writes here (review fix — write-write race on the
             # discretizer, torn sd-head reads)
-            with self._wm_param_lock:
-                with torch.no_grad():
-                    augmented_primary = self.glue.augment_latent(latent[0:1])
-                sd_facts = self.symbolic_decoder.extract_facts(
-                    augmented_primary.squeeze(0),
-                    timestep=self.total_timesteps
-                )
-                self.symbolic_decoder.update_discretizer(next_obs_list[0])
-            for fact in sd_facts:
-                if self.knowledge_graph.add_fact(fact):
-                    symbolic_decoder_facts_count += 1
+            #
+            # ---- GATED BY THE SAME FLAG AS THE BLOCK ABOVE (2026-09-01) ----
+            # MEASURE FIRST, AND THE FIRST MEASUREMENT WAS WRONG. This was
+            # flagged as "Welford over a 49,152-dim frame every step"; it is
+            # not. `_skip_perdim_symbolic` already swaps in
+            # `_NullSymbolicDecoder`, whose update_discretizer/extract_facts
+            # are `pass`/`[]`, so on a pixel env the decoder arithmetic here
+            # has always been free. Recording the correction rather than the
+            # theory, because §5 is explicit that this project keeps paying
+            # for plausible stories.
+            #
+            # WHAT IS ACTUALLY BOUGHT. Two things that are NOT free and have
+            # no reachable value on a pixel env:
+            #   * `_wm_param_lock` is ACQUIRED EVERY STEP. The async WM
+            #     trainer holds it per gradient step and runs 384 back to
+            #     back, so the acting thread can block a full optimizer step
+            #     here — for a decoder that returns [].
+            #   * `glue.augment_latent` is a GNN-gate forward whose only
+            #     consumer is `extract_facts`, which on this path returns [].
+            # So the gate removes a per-step lock handshake and a wasted
+            # forward, and changes nothing about what is learned.
+            #
+            # AND ON A CADENCE WHEN IT IS ON: the KG consumers of `sd_facts`
+            # read at `perception_interval`/`goal_interval` (50/25), so paying
+            # for a fresh extraction every step bought nothing. `_sd_every`
+            # keeps step 0 of every window so a cold start still primes the
+            # discretizer and the heads on the first frame they see.
+            _sd_now = (not self._skip_perdim_symbolic
+                       and (self.total_timesteps % self._sd_every == 0))
+            if _sd_now:
+                with self._wm_param_lock:
+                    with torch.no_grad():
+                        augmented_primary = self.glue.augment_latent(
+                            latent[0:1])
+                    sd_facts = self.symbolic_decoder.extract_facts(
+                        augmented_primary.squeeze(0),
+                        timestep=self.total_timesteps
+                    )
+                    self.symbolic_decoder.update_discretizer(
+                        next_obs_list[0])
+                for fact in sd_facts:
+                    if self.knowledge_graph.add_fact(fact):
+                        symbolic_decoder_facts_count += 1
 
             if episode_length % 50 == 0 and not self._skip_perdim_symbolic:
                 scene = self.fact_extractor.extract_scene_graph(
                     next_obs_list[0], timestep=self.total_timesteps
                 )
                 self.knowledge_graph.save_scene_snapshot(scene)
+
+            _pt = self._phase_mark("world", _pt)
 
             # ---- 5. STORE EXPERIENCE (one stream per env) ----
             # Primary stream (0) gets vision-scaffold shaping folded into its
@@ -4209,6 +4420,8 @@ class DevelopmentalAI:
                             "KG retraction failed for %s: %s", _stale, _e)
                 self._symbol_clock += 1
 
+            _pt = self._phase_mark("vlm", _pt)
+
             if self.brain_emitter is not None:
                 self._brain_clock += 1
                 if self._brain_clock % self._brain_interval == 0:
@@ -4219,6 +4432,16 @@ class DevelopmentalAI:
                     obs_list[e_i], env_actions[e_i],
                     prim_extrinsic if e_i == 0 else rewards[e_i],
                     dones[e_i], stream=e_i,
+                    # WHICH KIND OF `done` THIS IS (2026-09-01). Both the
+                    # loop-level step timeout (`restarted`) and the
+                    # adapter-caught crash (`env_restarted`) rebuild the
+                    # CLIENT, so the frames either side are different worlds.
+                    # The advantage trace wants them severed exactly like a
+                    # terminal — which is why `dones` folds them together —
+                    # but the world model must not learn the splice as
+                    # dynamics, and must certainly not OVERSAMPLE it.
+                    restart=bool(restarted[e_i]) or bool(
+                        (step_infos[e_i] or {}).get("env_restarted")),
                 )
 
             # Primary stream feeds the on-policy PPO rollout (waking only).
@@ -4337,7 +4560,8 @@ class DevelopmentalAI:
                                 knowledge=_closed["kv"],
                                 tau=_closed["tau"],
                                 action_mask=_closed["mask"],
-                                proprio=_closed.get("proprio"))
+                                proprio=_closed.get("proprio"),
+                                feats=_closed.get("feats"))
                             self.skill_bank.record_invocation(
                                 _closed["skill_id"], _closed["outcome"],
                                 _closed["reward"])
@@ -4362,12 +4586,13 @@ class DevelopmentalAI:
                                 dones[0], _pp["log_prob"], _pp["value"],
                                 knowledge=primary_kv, tau=1,
                                 action_mask=_pp["mask"],
-                                proprio=_pp.get("proprio"))
+                                proprio=_pp.get("proprio"),
+                                feats=_pp.get("feats"))
                 else:
                     self.policy.store_transition(
                         obs_list[0], env_actions[0], mixed, dones[0],
                         primary_pol["log_prob"], primary_pol["value"],
-                        knowledge=primary_kv)
+                        knowledge=primary_kv, feats=self._feats_row(0))
 
             # ---- 6. ADVANCE / AUTORESET ----
             primary_done = dones[0]
@@ -4411,13 +4636,14 @@ class DevelopmentalAI:
             episode_intrinsic += float(intrinsic[0].item())
             episode_length += 1
             self.total_timesteps += n  # all N transitions are real experience
+            _pt = self._phase_mark("store", _pt)
 
         # On-policy PPO update from the primary stream's rollout (waking only;
         # single-stream GAE, exactly as the serial path does at episode end).
         policy_loss = 0.0
         if (not use_dream_actor
-                and self.policy.rollout_env_steps()
-                >= self.policy_update_steps):
+                and self.policy.should_update(self.policy_update_steps)):
+            _pt_ppo = time.perf_counter()
             pm = self.policy.train_step(n_epochs=self.config.get(
                 "policy", {}).get("n_epochs", 10))
             policy_loss = pm.get("policy_loss", 0.0)
@@ -4429,6 +4655,7 @@ class DevelopmentalAI:
                 self.training_metrics.setdefault(
                     "policy_entropy", deque(maxlen=100)).append(
                         float(pm["entropy"]))
+            self._phase_mark("ppo", _pt_ppo)
 
         return {
             "episode_reward": episode_reward,
@@ -4537,6 +4764,7 @@ class DevelopmentalAI:
         primary_pol = None
 
         for _seg_i in range(segment_len):
+            _pt = time.perf_counter()          # phase clock (see _phase_mark)
             obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
 
             # ---- 1. SELECT ACTIONS ----
@@ -4558,19 +4786,39 @@ class DevelopmentalAI:
                 # WAKING: real PPO policy per env. Primary stream keeps its
                 # log_prob/value for the on-policy update; scouts just act.
                 primary_kv = self._current_knowledge_feature()
+                # THE BELIEF THIS DECISION IS MADE FROM, hoisted ABOVE the
+                # options branch (2026-09-01). arch='rssm' needs it on BOTH
+                # paths — with options disabled the loop stores scout and
+                # primary rows from the `else` branch below, and reading a
+                # latent set only inside the options branch would have handed
+                # the update last step's belief, silently.
+                if self.policy.arch == "rssm":
+                    with torch.no_grad():
+                        self._act_latent = self.world_model.rssm.get_latent(
+                            rssm_state).detach()
+                else:
+                    self._act_latent = None
                 if self.option_executor is not None:
                     # options path: executor resolves primitives per env,
                     # opening/continuing skill invocations as sampled. Its
                     # decision records replace primary_pol for storage;
                     # keep primary_pol non-None so the dream-phase guard
                     # below still distinguishes waking from dreaming.
+                    # THE BELIEF THE DECISION IS MADE FROM. Computed once,
+                    # before the action, and reused by both consumers: the
+                    # precondition gate and (arch='rssm') the policy input
+                    # itself. This is the state the agent is actually in when
+                    # it chooses — computing it after the step would score the
+                    # initiation set against a world the choice already
+                    # changed.
                     _preds = None
                     if self.option_executor.gate_by_preconditions:
-                        # belief BEFORE this step's action == the state the
-                        # initiation set must be evaluated against
                         with torch.no_grad():
                             _preds = self._predicates_batch(
-                                self.world_model.rssm.get_latent(rssm_state))
+                                self._act_latent
+                                if self._act_latent is not None
+                                else self.world_model.rssm.get_latent(
+                                    rssm_state))
                     # live per-skill competence for the warmup gate:
                     # broadcaster slot N -> skill ach_NN_.. -> competence[N]
                     _comp = None
@@ -4604,11 +4852,24 @@ class DevelopmentalAI:
                                    or {"log_prob": 0.0, "value": 0.0})
                 else:
                     env_actions = []
+                    # SCOUT DECISIONS ARE KEPT HERE TOO (2026-09-01). This
+                    # branch runs when options are DISABLED, and it already
+                    # computed `pinfo` for every env and then discarded it for
+                    # e_i != 0. The scout-PPO storage below hangs off the
+                    # option executor, which is None on this path — so with
+                    # skills_as_options.enabled false, `_scouts_in_ppo` read
+                    # true and not one scout row was ever stored. That is the
+                    # _viewer_push / gui_open / felt-reach pattern exactly: a
+                    # correct mechanism nobody calls.
+                    self._noopt_pol = [None] * n
                     for e_i in range(n):
                         a, pinfo = self.policy.select_action(
                             obs_list[e_i],
-                            knowledge=primary_kv if e_i == 0 else None)
+                            knowledge=primary_kv if e_i == 0 else None,
+                            feats=(None if self._act_latent is None
+                                   else self._act_latent[e_i:e_i + 1]))
                         env_actions.append(int(a) if self.is_discrete else a)
+                        self._noopt_pol[e_i] = pinfo
                         if e_i == 0:
                             primary_pol = pinfo
                 if self.is_discrete:
@@ -4620,6 +4881,8 @@ class DevelopmentalAI:
                     action_tensor = torch.from_numpy(
                         np.stack(env_actions).astype(np.float32)
                     ).to(self.device)
+
+            _pt = self._phase_mark("act", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
             from concurrent.futures import TimeoutError as _FTimeout
@@ -4685,6 +4948,7 @@ class DevelopmentalAI:
             self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
+            _pt = self._phase_mark("env", _pt)
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -4764,8 +5028,19 @@ class DevelopmentalAI:
 
             next_obs_t = torch.from_numpy(np.stack(next_obs_list)).to(self.device)
 
-            if not use_dream_actor and self.option_executor is not None:
+            if (not use_dream_actor and self.option_executor is not None
+                    and not self._scouts_in_ppo):
                 # scout option terminations (raw reward; no credit records)
+                #
+                # SKIPPED WHEN SCOUTS FEED PPO (2026-09-01). Accumulating a
+                # scout option's SMDP return needs the MIXED reward, which
+                # does not exist until the shaping block further down, so
+                # that path calls observe_scouts there instead. Calling it in
+                # both places would advance `steps_done` twice per env step
+                # and terminate every scout option at half its horizon — the
+                # two sites are mutually exclusive by construction rather
+                # than by convention. `_scouts_in_ppo` is false on the
+                # episodic path, so this body is unchanged there.
                 self.option_executor.observe_scouts(
                     rewards, dones, self.total_timesteps)
 
@@ -4788,6 +5063,8 @@ class DevelopmentalAI:
                     # the same behaviour keys one slot (kills break_*_leaves x8)
                     self._broadcaster_update(
                         e, _i, effect_key=self._new_break_by_env.get(_i))
+
+            _pt = self._phase_mark("goals", _pt)
 
             # ---- 3. CURIOSITY (batched) ----
             intrinsic = self.curiosity.compute_intrinsic_reward(
@@ -4847,6 +5124,7 @@ class DevelopmentalAI:
             icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
             )
+            _pt = self._phase_mark("curiosity", _pt)
 
             # ---- 4. RSSM observe (batched) + primary-only symbolic facts ----
             # _wm_param_lock (review fix): with the async trainer these
@@ -4868,6 +5146,12 @@ class DevelopmentalAI:
             # No-op off the lifelong path (self._ll is None).
             if self._ll is not None:
                 self._ll.rssm_state = rssm_state
+            # arch='rssm': the belief the NEXT decision will be made from, kept
+            # for the segment-end GAE bootstrap. Cheap (a reference), and it
+            # has to be the post-observe latent — that is the state the next
+            # segment resumes at, which is exactly what V(s_last) means.
+            if self.policy.arch == "rssm":
+                self._bootstrap_latent = latent.detach()
 
             # ---- IMAGINATION CURIOSITY (primary stream, INTRINSIC only) ----
             # Rolls the WM forward from the live latent: pays for reaching
@@ -4895,6 +5179,23 @@ class DevelopmentalAI:
                     self._current_knowledge_feature())
 
                 def _imag_policy(_lat, _P=_P, _ikv=_ikv):
+                    # arch='rssm' SHORT-CIRCUITS THE ROUND TRIP. The policy's
+                    # input IS the latent, so decoding it to pixels and
+                    # re-encoding them is not merely wasted compute — it
+                    # pushes the imagined state through a lossy
+                    # decode/encode pair and asks the actor about the
+                    # result. Feeding `_lat` straight in is both faster and
+                    # strictly closer to what the actor sees when awake.
+                    if self.policy.arch == "rssm":
+                        _k = (_ikv.expand(_lat.shape[0], -1)
+                              if _ikv is not None else None)
+                        _aug = self.policy._augment(
+                            _lat, _k, self._cur_proprio_t())
+                        _lg = self.policy.actor.action_head(
+                            self.policy.actor.shared(_aug))
+                        _a = torch.distributions.Categorical(
+                            logits=_lg[..., :_P]).sample()
+                        return torch.nn.functional.one_hot(_a, _P).float()
                     _obs = self.world_model.decoder(_lat)
                     _obs = (_obs.flatten(1) if self.pixel_obs
                             else symexp(_obs))
@@ -5270,23 +5571,57 @@ class DevelopmentalAI:
             # sd heads + discretizer are trained on the async trainer thread;
             # lock the reads/writes here (review fix — write-write race on the
             # discretizer, torn sd-head reads)
-            with self._wm_param_lock:
-                with torch.no_grad():
-                    augmented_primary = self.glue.augment_latent(latent[0:1])
-                sd_facts = self.symbolic_decoder.extract_facts(
-                    augmented_primary.squeeze(0),
-                    timestep=self.total_timesteps
-                )
-                self.symbolic_decoder.update_discretizer(next_obs_list[0])
-            for fact in sd_facts:
-                if self.knowledge_graph.add_fact(fact):
-                    symbolic_decoder_facts_count += 1
+            #
+            # ---- GATED BY THE SAME FLAG AS THE BLOCK ABOVE (2026-09-01) ----
+            # MEASURE FIRST, AND THE FIRST MEASUREMENT WAS WRONG. This was
+            # flagged as "Welford over a 49,152-dim frame every step"; it is
+            # not. `_skip_perdim_symbolic` already swaps in
+            # `_NullSymbolicDecoder`, whose update_discretizer/extract_facts
+            # are `pass`/`[]`, so on a pixel env the decoder arithmetic here
+            # has always been free. Recording the correction rather than the
+            # theory, because §5 is explicit that this project keeps paying
+            # for plausible stories.
+            #
+            # WHAT IS ACTUALLY BOUGHT. Two things that are NOT free and have
+            # no reachable value on a pixel env:
+            #   * `_wm_param_lock` is ACQUIRED EVERY STEP. The async WM
+            #     trainer holds it per gradient step and runs 384 back to
+            #     back, so the acting thread can block a full optimizer step
+            #     here — for a decoder that returns [].
+            #   * `glue.augment_latent` is a GNN-gate forward whose only
+            #     consumer is `extract_facts`, which on this path returns [].
+            # So the gate removes a per-step lock handshake and a wasted
+            # forward, and changes nothing about what is learned.
+            #
+            # AND ON A CADENCE WHEN IT IS ON: the KG consumers of `sd_facts`
+            # read at `perception_interval`/`goal_interval` (50/25), so paying
+            # for a fresh extraction every step bought nothing. `_sd_every`
+            # keeps step 0 of every window so a cold start still primes the
+            # discretizer and the heads on the first frame they see.
+            _sd_now = (not self._skip_perdim_symbolic
+                       and (self.total_timesteps % self._sd_every == 0))
+            if _sd_now:
+                with self._wm_param_lock:
+                    with torch.no_grad():
+                        augmented_primary = self.glue.augment_latent(
+                            latent[0:1])
+                    sd_facts = self.symbolic_decoder.extract_facts(
+                        augmented_primary.squeeze(0),
+                        timestep=self.total_timesteps
+                    )
+                    self.symbolic_decoder.update_discretizer(
+                        next_obs_list[0])
+                for fact in sd_facts:
+                    if self.knowledge_graph.add_fact(fact):
+                        symbolic_decoder_facts_count += 1
 
             if episode_length % 50 == 0 and not self._skip_perdim_symbolic:
                 scene = self.fact_extractor.extract_scene_graph(
                     next_obs_list[0], timestep=self.total_timesteps
                 )
                 self.knowledge_graph.save_scene_snapshot(scene)
+
+            _pt = self._phase_mark("world", _pt)
 
             # ---- 5. STORE EXPERIENCE (one stream per env) ----
             # Primary stream (0) gets vision-scaffold shaping folded into its
@@ -5555,6 +5890,8 @@ class DevelopmentalAI:
                             "KG retraction failed for %s: %s", _stale, _e)
                 self._symbol_clock += 1
 
+            _pt = self._phase_mark("vlm", _pt)
+
             if self.brain_emitter is not None:
                 self._brain_clock += 1
                 if self._brain_clock % self._brain_interval == 0:
@@ -5565,6 +5902,16 @@ class DevelopmentalAI:
                     obs_list[e_i], env_actions[e_i],
                     prim_extrinsic if e_i == 0 else rewards[e_i],
                     dones[e_i], stream=e_i,
+                    # WHICH KIND OF `done` THIS IS (2026-09-01). Both the
+                    # loop-level step timeout (`restarted`) and the
+                    # adapter-caught crash (`env_restarted`) rebuild the
+                    # CLIENT, so the frames either side are different worlds.
+                    # The advantage trace wants them severed exactly like a
+                    # terminal — which is why `dones` folds them together —
+                    # but the world model must not learn the splice as
+                    # dynamics, and must certainly not OVERSAMPLE it.
+                    restart=bool(restarted[e_i]) or bool(
+                        (step_infos[e_i] or {}).get("env_restarted")),
                 )
 
             # Primary stream feeds the on-policy PPO rollout (waking only).
@@ -5683,7 +6030,8 @@ class DevelopmentalAI:
                                 knowledge=_closed["kv"],
                                 tau=_closed["tau"],
                                 action_mask=_closed["mask"],
-                                proprio=_closed.get("proprio"))
+                                proprio=_closed.get("proprio"),
+                                feats=_closed.get("feats"))
                             self.skill_bank.record_invocation(
                                 _closed["skill_id"], _closed["outcome"],
                                 _closed["reward"])
@@ -5708,12 +6056,82 @@ class DevelopmentalAI:
                                 dones[0], _pp["log_prob"], _pp["value"],
                                 knowledge=primary_kv, tau=1,
                                 action_mask=_pp["mask"],
-                                proprio=_pp.get("proprio"))
+                                proprio=_pp.get("proprio"),
+                                feats=_pp.get("feats"))
                 else:
                     self.policy.store_transition(
                         obs_list[0], env_actions[0], mixed, dones[0],
                         primary_pol["log_prob"], primary_pol["value"],
-                        knowledge=primary_kv)
+                        knowledge=primary_kv, feats=self._feats_row(0))
+
+            # ---- 5b. SCOUT STREAMS FEED PPO TOO (2026-09-01) -------------
+            # Every scout decision is the SHARED policy choosing under a
+            # known mask, so it is on-policy experience and there was never a
+            # reason for it to be invisible to the update — it was simply
+            # never plumbed. Two things it fixes at once: the fleet's whole
+            # wall clock now produces policy gradient (on a 2-client fleet
+            # that is 2x the data for 0 extra Minecraft clients, and the
+            # server's client count is the binding constraint), and the row
+            # starvation that made the update degenerate to a single
+            # full-batch step goes away with it.
+            # GAE segments rows by stream, so interleaving is safe; see
+            # _compute_gae.
+            if (not use_dream_actor and self._scouts_in_ppo and n > 1):
+                _sc_mixed = [0.0] * n
+                for _e in range(1, n):
+                    _sc_mixed[_e] = self._scout_mixed_reward(
+                        _e, step_infos[_e] or {}, float(rewards[_e]),
+                        float(intrinsic[_e].item()))
+            if (not use_dream_actor and self._scouts_in_ppo and n > 1
+                    and self.option_executor is None):
+                # OPTIONS DISABLED: every scout decision is a plain primitive
+                # and its policy_info was kept in the act branch above.
+                for _e in range(1, n):
+                    _pi = (getattr(self, "_noopt_pol", None) or [None] * n)[_e]
+                    if _pi is None:
+                        continue
+                    self.policy.store_transition(
+                        obs_list[_e], env_actions[_e], _sc_mixed[_e],
+                        dones[_e], _pi["log_prob"], _pi["value"],
+                        knowledge=None, tau=1, stream=_e,
+                        feats=self._feats_row(_e))
+            elif (not use_dream_actor and self.option_executor is not None
+                    and self._scouts_in_ppo and n > 1):
+                _sc_closed = self.option_executor.observe_scouts(
+                    rewards, dones, self.total_timesteps,
+                    mixed_rewards=_sc_mixed)
+                for _e in range(1, n):
+                    _cl = _sc_closed.get(_e)
+                    if _cl is not None:
+                        # SMDP row: one decision spanning tau env steps
+                        self.policy.store_transition(
+                            _cl["obs"], _cl["meta_action"], _cl["reward"],
+                            dones[_e], _cl["log_prob"], _cl["value"],
+                            knowledge=_cl["kv"], tau=_cl["tau"],
+                            action_mask=_cl["mask"],
+                            proprio=_cl.get("proprio"), stream=_e,
+                            feats=_cl.get("feats"))
+                        # stream=_e keeps `option_spike_ema` primary-only, so
+                        # paging and the competence gate keep reading the
+                        # same quantity they always have (see
+                        # SkillBank.record_invocation)
+                        self.skill_bank.record_invocation(
+                            _cl["skill_id"], _cl["outcome"], _cl["reward"],
+                            stream=_e)
+                        continue
+                    _sp = self.option_executor._scout_primitive[_e]
+                    if _sp is not None:
+                        # a record is present only when a decision was MADE
+                        # this step (act() clears them), so a scout inside an
+                        # option stores nothing here — its reward is being
+                        # accumulated into the option's return instead
+                        self.policy.store_transition(
+                            obs_list[_e], _sp["action"], _sc_mixed[_e],
+                            dones[_e], _sp["log_prob"], _sp["value"],
+                            knowledge=None, tau=1,
+                            action_mask=_sp["mask"],
+                            proprio=_sp.get("proprio"), stream=_e,
+                            feats=_sp.get("feats"))
 
             # ---- 6. ADVANCE (lifelong: DEATH-ONLY reset; no episode) ----
             # A time-truncation carries on unbroken. Only a true terminal
@@ -5730,6 +6148,15 @@ class DevelopmentalAI:
                     "env_restarted")
                 if dones[e_i] or _crashed:
                     self._ll.death_reset(e_i)        # zero h/z row + mask row
+                    self._drop_curiosity_batch()
+                    # A POTENTIAL MUST NOT CROSS A WORLD BOUNDARY. Every
+                    # episode is a fresh world here, so a phi carried over
+                    # pays a phantom delta on the first step of the new life
+                    # — e.g. a swing streak that "ended" because the world
+                    # was rebuilt would be charged back as if the agent had
+                    # let go. Same reason the vision scaffold re-adopts its
+                    # phi with no delta at a boundary.
+                    self._sc_phi.pop(e_i, None)
                     self._mine_by_env.pop(e_i, None)
                     self._new_break_by_env.pop(e_i, None)
                     if hasattr(self, "_loginv_by_env"):
@@ -5775,6 +6202,7 @@ class DevelopmentalAI:
             episode_intrinsic += float(intrinsic[0].item())
             episode_length += 1
             self.total_timesteps += n  # all N transitions are real experience
+            _pt = self._phase_mark("store", _pt)
 
             # ---- lifelong cadences (step-based, not episode-based) ----
             self._ll.wm_steps += 1
@@ -5822,6 +6250,40 @@ class DevelopmentalAI:
                     print(f"  AsyncWM replay-ratio: {self._wm_blocks_run}"
                           f"/{self._wm_cadence_hits} blocks run "
                           f"(skip {_skip:.1%})", flush=True)
+                    # ---- train_iters FROM MEASURED SKIP (2026-09-01) ------
+                    # `train_iters: 384` is a NOMINAL figure. With the async
+                    # trainer's skip-if-busy, the ratio the GPU actually
+                    # sustains is 384 x (1 - skip) — so the config has been
+                    # stating an intent while the hardware decided the real
+                    # number, and nothing reconciled the two. This closes the
+                    # loop: high skip means the block is longer than the
+                    # cadence, so shorten it and run MORE blocks on FRESHER
+                    # data; low skip means there is headroom.
+                    #
+                    # SHIPPED OFF. It changes the world model's data diet,
+                    # which is the one thing in this wave that cannot be
+                    # judged from a smoke test — same discipline as
+                    # curiosity.train_every. Turn it on with a cluster to
+                    # watch, alone, and read `wm/loss` for three horizons.
+                    _ai = self._train_iters_auto
+                    if _ai.get("enabled") and self._wm_cadence_hits >= 4:
+                        _tgt = float(_ai.get("target_skip", 0.2))
+                        _cur = int(self._wm_train_iters)
+                        # proportional, and deliberately gentle: a 2x lurch in
+                        # replay ratio between horizons would confound every
+                        # other measurement in the run.
+                        _new = _cur * (1.0 - 0.25 * (_skip - _tgt) /
+                                       max(0.05, 1.0 - _tgt))
+                        _new = int(max(int(_ai.get("min_iters", 32)),
+                                       min(int(_ai.get("max_iters", 512)),
+                                           round(_new))))
+                        if _new != _cur:
+                            print(f"  AsyncWM train_iters: {_cur} -> {_new} "
+                                  f"(skip {_skip:.1%} vs target {_tgt:.0%})",
+                                  flush=True)
+                            self._wm_train_iters = _new
+                    self._wm_cadence_hits = 0
+                    self._wm_blocks_run = 0
                 # Re-open the env-side first-break tiers on the SAME horizon
                 # (audit fix): without this the broadcaster re-armed goal masks
                 # that could never re-unlock (first-break rewards had become
@@ -5836,9 +6298,34 @@ class DevelopmentalAI:
         # PPO update: bootstrap with V(s_last) because the segment ends
         # MID-trajectory (the rollout is not a terminated episode).
         policy_loss = 0.0
-        if self.policy.rollout_env_steps() >= self.policy_update_steps:
-            last_v = self.policy.compute_last_value(
-                obs_list[0], knowledge=self._current_knowledge_feature())
+        if self.policy.should_update(self.policy_update_steps):
+            _pt_ppo = time.perf_counter()
+            # ---- ONE BOOTSTRAP PER STREAM (2026-09-01) -------------------
+            # The segment ends MID-trajectory for every body, not just the
+            # primary, so each stream needs V(s_last) from ITS OWN last
+            # observation. Giving the scouts 0.0 would tell the estimator
+            # their future is worthless and bias every advantage on those
+            # rows downward — the same truncation bias `last_value` was
+            # introduced to remove for stream 0.
+            # knowledge=None for scouts: that is what they ACTED under, and
+            # the bootstrap has to be computed on the same input as the
+            # values it is being compared against.
+            # arch='rssm': bootstrap from the CURRENT belief (the RSSM state
+            # the next segment will resume from), not from a re-encode of the
+            # last observation — which for a recurrent state is not even
+            # defined. `_bootstrap_latent` is set right after the last
+            # observe_step below.
+            _blat = getattr(self, "_bootstrap_latent", None)
+            last_v = {0: self.policy.compute_last_value(
+                obs_list[0], knowledge=self._current_knowledge_feature(),
+                feats=(None if _blat is None
+                       else _blat[0].detach().cpu().numpy()))}
+            if self._scouts_in_ppo:
+                for _e in range(1, n):
+                    last_v[_e] = self.policy.compute_last_value(
+                        obs_list[_e], knowledge=None,
+                        feats=(None if _blat is None or _e >= _blat.shape[0]
+                               else _blat[_e].detach().cpu().numpy()))
             pm = self.policy.train_step(
                 n_epochs=self.config.get("policy", {}).get("n_epochs", 10),
                 last_value=last_v)
@@ -5853,6 +6340,7 @@ class DevelopmentalAI:
                 self.training_metrics.setdefault(
                     "policy_entropy", deque(maxlen=100)).append(
                         float(pm["entropy"]))
+            self._phase_mark("ppo", _pt_ppo)
 
         return {
             "episode_reward": episode_reward,
@@ -5921,8 +6409,30 @@ class DevelopmentalAI:
         wm_cfg = self.config.get("world_model", {})
         batch_size = wm_cfg.get("batch_size", 16)
         seq_len = wm_cfg.get("sequence_length", 50)
-        train_iters = wm_cfg.get("train_iters", 4)
+        # LIVE value, not the config literal: `_wm_train_iters` is seeded from
+        # config and may be adapted from the measured async skip rate (see the
+        # goal-horizon block). Reading wm_cfg here would have made that
+        # adaptation a no-op that still printed as if it worked.
+        train_iters = self._wm_train_iters
         prioritized = self._use_per
+        # ---- TERMINAL OVERSAMPLING IS NOW A KNOB (2026-09-01) ------------
+        # This call never passed `terminal_fraction`, so it silently used the
+        # sampler's 0.25 default — tuned for EPISODIC runs where terminals are
+        # common. In lifelong mode `reset_on_death_only` is true, so a
+        # terminal is a death: rare by design. A quarter of every batch was
+        # being spent on them (see the sampler for the 768-draws-per-block
+        # arithmetic). The sampler now also refuses to duplicate a small pool,
+        # so this fraction is a CEILING rather than a quota.
+        terminal_fraction = float(wm_cfg.get("terminal_fraction", 0.25))
+        # ---- GROW THE BUFFER HERE, NOT ON THE ACTING THREAD --------------
+        # This is the "async learning period between intervals": the WM block
+        # is already off the step loop (async trainer) or already a pause in
+        # it (sync), so a block allocation costs nothing that is not already
+        # being spent. add() only ever sets a flag; this is where it lands.
+        try:
+            self.replay_buffer.maybe_grow()
+        except Exception as _ge:      # never let sizing kill a training block
+            logger.warning("replay growth check failed: %s", _ge)
 
         def _do_train(batch: Dict[str, Any]) -> Dict[str, float]:
             """Run one gradient step on a sampled batch, updating PER
@@ -5976,6 +6486,7 @@ class DevelopmentalAI:
                         device=self.device,
                         prioritized=prioritized,
                         reward_fraction=self._goal_replay_fraction,
+                        terminal_fraction=terminal_fraction,
                     )
                     metrics = _do_train(batch)
 
@@ -6018,6 +6529,8 @@ class DevelopmentalAI:
                 device=self.device,
                 prioritized=prioritized,
                 reward_fraction=self._goal_replay_fraction,
+                terminal_fraction=float(self.config.get(
+                    "world_model", {}).get("terminal_fraction", 0.25)),
             )
         return self._bg_sampler
 
@@ -6526,14 +7039,22 @@ class DevelopmentalAI:
                                    if kv is not None else None)
 
                             def policy_fn(latent, _kvK=kvK):
-                                obs_hat = self.world_model.decoder(latent)
-                                if self.pixel_obs:
-                                    obs_hat = obs_hat.flatten(1)
+                                # arch='rssm': no decode/encode round trip —
+                                # the latent IS the policy's input, so the
+                                # imagined state goes straight in instead of
+                                # through a lossy decoder/encoder pair.
+                                if self.policy.arch == "rssm":
+                                    aug = self.policy._augment(
+                                        latent, _kvK, self._cur_proprio_t())
                                 else:
-                                    obs_hat = symexp(obs_hat)
-                                aug = self.policy._augment(
-                                    self.policy._encode(obs_hat), _kvK,
-                                    self._cur_proprio_t())
+                                    obs_hat = self.world_model.decoder(latent)
+                                    if self.pixel_obs:
+                                        obs_hat = obs_hat.flatten(1)
+                                    else:
+                                        obs_hat = symexp(obs_hat)
+                                    aug = self.policy._augment(
+                                        self.policy._encode(obs_hat), _kvK,
+                                        self._cur_proprio_t())
                                 feats = self.policy.actor.shared(aug)
                                 # options-aware: primitive slice only (the WM
                                 # was built P-wide; slot logits cancel)
@@ -7359,9 +7880,14 @@ class DevelopmentalAI:
         # Detach: the distill updates the ACTOR weights given the current
         # conditioning; it must not backprop into the conditioner (whose params
         # _distill_opt does not own — that would corrupt PPO's gradients).
+        # arch='rssm': `latent` above is already the policy's input space —
+        # computed from the SAME observe_sequence the teacher was scored on,
+        # so student and teacher are read on identical states. Re-encoding
+        # obs_flat would have handed the student a different one.
         aug = self.policy._augment(
-            self.policy._encode(obs_flat), kv,
-            self._cur_proprio_t()).detach()
+            latent if self.policy.arch == "rssm"
+            else self.policy._encode(obs_flat),
+            kv, self._cur_proprio_t()).detach()
         with torch.no_grad():
             v_real = self.policy.critic(aug).reshape(-1)                       # (N,)
         # (b) value gate: distill only where the dream expects to do strictly better
@@ -7682,6 +8208,20 @@ class DevelopmentalAI:
         self._gaze_counts[bkt] = n + 1
         return float(self._gaze_weight) * (1.0 / ((1.0 + n) ** 0.5))
 
+    def _feats_row(self, e_i: int):
+        """This env's decision features as a numpy row, or None.
+
+        Only arch='rssm' stores features with a transition — every other arch
+        recomputes them from the observation at update time. `_act_latent` is
+        the belief BEFORE this step's action, which is the state the decision
+        was actually made from; using the post-step latent would score the
+        choice against a world the choice itself produced.
+        """
+        _lat = getattr(self, "_act_latent", None)
+        if _lat is None or e_i >= int(_lat.shape[0]):
+            return None
+        return _lat[e_i].detach().cpu().numpy()
+
     def _feats_for_act(self, n: int):
         """Per-env encoder features carried from last step, or None.
 
@@ -7693,6 +8233,17 @@ class DevelopmentalAI:
         frame actually carried, and a cache that guessed would eventually
         serve a pre-reset frame after a world rebuild, silently.
         """
+        # arch='rssm': the policy's input IS the world model's latent, which
+        # the loop holds for every env at this exact moment. Hand it over per
+        # env. No carry, no validity mask, no self-check — it is produced
+        # fresh from that env's own RSSM row this step, so the failure modes
+        # the carry machinery below guards against (a stale frame after a
+        # world rebuild, a wrong env index) cannot arise.
+        if getattr(self.policy, "arch", "") == "rssm":
+            _lat = getattr(self, "_act_latent", None)
+            if _lat is None or int(_lat.shape[0]) != int(n):
+                return None
+            return [_lat[e:e + 1] for e in range(n)]
         if not self._reuse_enc_feats:
             return None
         _c = getattr(self, "_enc_carry", None)
@@ -7732,6 +8283,37 @@ class DevelopmentalAI:
             return
         self._enc_carry = (
             _f, [obs_list[_e] is next_obs_list[_e] for _e in range(_n)])
+
+    # ---- per-step wall-clock attribution (2026-09-01) ---------------------
+    # WHY THIS EXISTS. The env round-trip has been timed since 2026-08-17 and
+    # reported ~3.4 steps/s against a 10 steps/s ceiling with the GPU idle —
+    # i.e. two thirds of every step spent somewhere in OUR OWN per-step
+    # Python, with no way to say where. §5 of CLAUDE.md is explicit that this
+    # project has burned days on plausible theories; "the loop is slow" is a
+    # theory until the phases are numbers. These buckets make the remainder
+    # attributable, and they are what lets the other four fixes in this wave
+    # be measured rather than argued.
+    #
+    # Cost: one perf_counter() per phase per step (~50ns each), no locks, no
+    # allocation beyond one dict. Reset by _log_progress each segment.
+    _PHASES = ("act", "env", "goals", "curiosity", "world", "vlm", "store",
+               "ppo")
+
+    def _phase_mark(self, name: str, t0: float) -> float:
+        """Add elapsed wall clock to phase `name`; return a fresh timestamp.
+
+        Returns the new mark so call sites read as a chain
+        (`_pt = self._phase_mark(<phase>, _pt)`) and no phase can be silently
+        omitted from the total — an unaccounted gap shows up as the printed
+        phases failing to sum to the step time, which is exactly the signal
+        this instrument exists to give.
+        """
+        _now = time.perf_counter()
+        _acc = getattr(self, "_phase_acc", None)
+        if _acc is None:
+            _acc = self._phase_acc = {}
+        _acc[name] = _acc.get(name, 0.0) + (_now - t0)
+        return _now
 
     def _curiosity_train(self, obs_t, action_t, next_obs_t) -> Dict[str, float]:
         """One curiosity gradient step, optionally BATCHED across env steps.
@@ -7923,7 +8505,15 @@ class DevelopmentalAI:
             t = torch.as_tensor(np.asarray(obs_row, dtype=np.float32),
                                 device=self.device).reshape(1, -1)
             with torch.no_grad():
-                enc = getattr(self.policy, "_shared_encoder", None)
+                # arch='rssm' has no _shared_encoder (its input is the latent,
+                # not encoder features), but this key has always wanted a
+                # pure function of the FRAME — so read the world model's
+                # encoder directly rather than losing the frozen-snapshot
+                # behaviour below. The latent would be wrong here for the
+                # reason the docstring gives.
+                enc = (getattr(self.policy, "_shared_encoder", None)
+                       or (self.world_model.encoder
+                           if self.policy.arch == "rssm" else None))
                 # FROZEN SNAPSHOT (see _nov_enc_refresh at init): the live
                 # encoder trains every step, so its bucket map drifts and old
                 # sights re-key as new. Hash through a periodic snapshot so
@@ -8621,6 +9211,84 @@ class DevelopmentalAI:
         except Exception:
             return 0.0
 
+    def _scout_mixed_reward(self, e_i: int, info, raw_ext: float,
+                            intrinsic_e: float) -> float:
+        """The reward a SCOUT stream's PPO row carries (2026-09-01).
+
+        ---- WHY THIS EXISTS, AND WHAT IT DELIBERATELY OMITS --------------
+        Until now only stream 0 stored PPO rows. The scouts' curiosity was
+        computed every step and thrown away, and their transitions reached
+        the world model but never the policy — so on a 2-client fleet, half
+        the wall clock (and half the server's client budget, which is the
+        binding constraint) produced no policy gradient at all. It is also
+        what starved the update of rows: at mean tau ~40 a segment yielded
+        ~25 of them.
+        ONE POLICY MUST NOT BE TRAINED ON TWO REWARD FUNCTIONS. That is a
+        worse failure than a small batch, so the rule here is: a scout is
+        paid by exactly those terms that are COMPUTABLE PER STREAM from that
+        stream's own step_info, and by nothing else.
+          included: env reward, curiosity, persistence, GUI-dwell cost,
+                    gaze-level cost, and the GUI intrinsic zeroing
+          omitted:  the vision magnet and the infra/empowerment shaping —
+                    both are VLM/fovea-backed and primary-only, because
+                    exactly one stream renders frames for the VLM
+        The omission is real and is logged (`magnet` in the income census is
+        stream 0's alone), so the divergence is a number someone can look at
+        rather than an assumption. Making it zero would mean running the VLM
+        on every client, which is the throughput the fovea work already
+        measured as unaffordable.
+
+        Potentials are kept PER STREAM (`_sc_phi`) and reset on that
+        stream's death — a potential carried across a world boundary pays a
+        phantom delta on the first step of the new world.
+        """
+        _w = (info or {}).get("world") or {}
+        _st = self._sc_phi.setdefault(e_i, {})
+        _g = float(self.config.get("policy", {}).get("gamma", 0.99))
+        _ext = float(raw_ext)
+        _int = float(intrinsic_e)
+
+        # PERSISTENCE (telescoping: progress, so gamma applies)
+        _pw = float(self._persist_weight)
+        if _pw > 0.0:
+            _phi = min(1.0, float(info.get("attack_run", 0.0) or 0.0)
+                       / max(1.0, float(self._persist_ticks)))
+            _int += _pw * (_g * _phi - float(_st.get("persist", 0.0)))
+            _st["persist"] = _phi
+
+        # GAZE LEVEL (plain difference: a STATE COST must pay 0 while pinned
+        # — see the 2026-08-17 gamma-discounting incident)
+        _plw = float(self._pitch_level_weight)
+        _pv = _w.get("pitch")
+        if _plw > 0.0 and _pv is not None:
+            _php = -((min(90.0, abs(float(_pv))) / 90.0) ** 4)
+            if "pitch" in _st:
+                _int += _plw * (_php - float(_st["pitch"]))
+            _st["pitch"] = _php
+
+        # OCCLUSION: no world change, no world curiosity. Same category
+        # argument as the primary — inside a GUI the observation changes a
+        # great deal and the world does not change at all.
+        _gui = bool(info.get("gui_open"))
+        if _gui:
+            _int = 0.0
+
+        # GUI DWELL: paid into EXTRINSIC on purpose. The intrinsic channel is
+        # zeroed above, so a cost placed there would be erased by the very
+        # guard it complements (reward-channel confusion, §4.4).
+        _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
+        if _gdw > 0.0:
+            _run = (int(_st.get("gui_run", 0)) + 1) if _gui else 0
+            _st["gui_run"] = _run
+            _gphi = -min(1.0, _run / max(1.0, self._gui_dwell_steps))
+            if "gui" in _st:
+                _ext += _gdw * (_gphi - float(_st["gui"]))
+            _st["gui"] = _gphi
+
+        # update_stats=False: the return EMAs are a per-STEP clock tuned on
+        # ONE stream; letting N bodies tick it would scale the anneal by N.
+        return self.reward_mixer.mix(_int, _ext, update_stats=False)
+
     def _magnet_step_shaping(self, action, lp_scalar, latent_row) -> float:
         """THE one magnet invocation, shared by all three loop bodies.
 
@@ -9255,14 +9923,38 @@ class DevelopmentalAI:
                                        self.config.get('policy', {}).get(
                                            'n_epochs', 10))
                             _capped = bool(_pp.get("epochs_capped", False))
+                            # THREE CAUSES NOW, NOT TWO (2026-09-01). With
+                            # target_kl back on (and minibatched, so it stops
+                            # per-minibatch rather than after a whole
+                            # full-batch pass) "stopped early" is reachable
+                            # again — which is exactly the condition
+                            # _throughput_wave_smoke::B1e said must be
+                            # re-checked rather than assumed. The update now
+                            # exports which one it was, so the log states it
+                            # instead of inferring it:
+                            #   epochs_capped -> the tiny-batch guard removed
+                            #     updates (STARVED; full-batch path only)
+                            #   kl_stopped    -> the actor spent its movement
+                            #     budget and froze while the critic finished
+                            #   n_updates >= max_updates -> the rollout's
+                            #     gradient-step budget ran out (healthy)
+                            _klstop = bool(_pp.get("kl_stopped", False))
+                            _mxu = int(_pp.get("max_updates", 0) or 0)
+                            _nup = int(_pp.get("n_updates", 0) or 0)
+                            _budget = bool(_mxu and _nup >= _mxu)
                             print(f"  PPO trust region: approx_kl={_kl:.4f} | "
-                                  f"epochs run {_er}/{_req}"
+                                  f"epochs run {_er}/{_req} | "
+                                  f"updates {_nup}"
+                                  + (f"/{_mxu}" if _mxu else "")
                                   + ("  <-- STARVED: too few rows for more "
                                      "(collapse guard removed updates)"
                                      if _capped else
-                                     "  <-- stopped early (good: the policy "
-                                     "hit its movement budget)"
-                                     if _er and _er < _req else ""))
+                                     "  <-- KL-STOPPED: actor froze at its "
+                                     "movement budget, critic kept fitting"
+                                     if _klstop else
+                                     "  <-- budget: the rollout's gradient-"
+                                     "step allowance was spent (healthy)"
+                                     if _budget else ""))
                             if _capped:
                                 print(f"  PPO update rate: "
                                       f"{_pp.get('env_steps', 0)} env steps -> "
@@ -9364,6 +10056,29 @@ class DevelopmentalAI:
                               f"({100.0*_ew_ms/max(1e-6,_step_ms):.0f}%) | "
                               f"own {_step_ms-_ew_ms:.0f} ms | "
                               f"{1000.0/max(1e-6,_step_ms):.2f} steps/s")
+                        # WHERE THE OWN-TIME GOES (2026-09-01). The line
+                        # above has said "own = 2/3 of every step" since
+                        # 2026-08-17 without ever naming a phase, which is
+                        # exactly the kind of half-measurement §5 warns
+                        # about. UNACCOUNTED is printed on purpose: if the
+                        # phases do not sum to the step time, the gap is
+                        # real work nobody is timing, and pretending the
+                        # buckets are exhaustive would hide it.
+                        _acc = getattr(self, "_phase_acc", None) or {}
+                        if _acc:
+                            _parts, _sum = [], 0.0
+                            for _ph in self._PHASES:
+                                _v = 1000.0 * _acc.get(_ph, 0.0) / max(1, _ewn)
+                                _sum += _v
+                                _parts.append(
+                                    f"{_ph} {_v:.0f}ms "
+                                    f"({100.0*_v/max(1e-6,_step_ms):.0f}%)")
+                            _un = _step_ms - _sum
+                            _parts.append(
+                                f"UNACCOUNTED {_un:.0f}ms "
+                                f"({100.0*_un/max(1e-6,_step_ms):.0f}%)")
+                            print("  Phase timing: " + " | ".join(_parts))
+                    self._phase_acc = {}
                     self._env_wait_sum = 0.0
                     self._env_wait_n = 0
                 # A2 self-check readout: the largest |carried - recomputed|

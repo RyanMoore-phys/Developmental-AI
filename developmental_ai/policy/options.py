@@ -984,6 +984,14 @@ class OptionExecutor:
         self.learned_offered_sum = 0
         self.decisions_with_learned = 0
         self.runtimes = [OptionRuntime() for _ in range(self.num_envs)]
+        # Per-scout primitive decision records (2026-09-01), the mirror of
+        # `_primary_primitive`. Index 0 is unused and stays None so the two
+        # paths can never be confused for one another.
+        self._scout_primitive: List[Optional[Dict]] = [
+            None] * self.num_envs
+        # Scout option-steps whose reward could not be attributed to any
+        # storable decision (see observe_scouts). Reported, never silent.
+        self.scout_rows_dropped = 0
         # ---- BOUNDED NESTING (arch v3) -----------------------------------
         # `substacks[e]` holds frames ABOVE the root runtime: a conv skill
         # sampling one of its slot rows pushes a child frame here. The root
@@ -1086,10 +1094,36 @@ class OptionExecutor:
             if not feats_per_env or e >= len(feats_per_env):
                 return None
             return feats_per_env[e]
+
+        def _feats_np(e):
+            """This env's decision features as a plain numpy row, or None.
+
+            Only arch='rssm' needs these stored (the update cannot recompute
+            a recurrent state from an observation); every other arch
+            recomputes from the stored obs and gets None here, so nothing
+            changes shape or cost for them.
+            """
+            if getattr(policy, "arch", "") != "rssm":
+                return None
+            _f = _feats(e)
+            if _f is None:
+                return None
+            try:
+                return np.asarray(
+                    _f.detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+            except Exception:
+                return None
         # base mask already applies the competence gate (offered set shrinks
         # to competent skills); precondition gating narrows further per env
         base_mask = self.bank.mask(competence=competence,
                                    competence_floor=self.competence_floor)
+        # Cleared every act(): a record present after this call means a
+        # decision was MADE THIS STEP on that stream. A stream continuing
+        # inside an option made no decision and must store no row — leaving
+        # last step's record in place would store the same decision twice.
+        self._scout_primitive = [None] * self.num_envs
+        # Once per step, before any option can close (see observe_scouts).
+        self.last_closed_this_step = [None] * self.num_envs
         actions: List[int] = []
         for e_i in range(self.num_envs):
             rt = self.runtimes[e_i]
@@ -1108,6 +1142,19 @@ class OptionExecutor:
                     a, _info = policy.select_action(
                         obs_list[e_i], feats=_feats(e_i),
                         verify_feats=verify_feats, **_pk)
+                    # RECORD IT (2026-09-01): this decision was made by the
+                    # shared policy under a known mask, so it is on-policy
+                    # experience and belongs in the rollout. See
+                    # `_scout_primitive`.
+                    self._scout_primitive[e_i] = {
+                        "action": int(a) if int(a) < P else 0,
+                        "log_prob": _info["log_prob"],
+                        "value": _info["value"],
+                        "mask": (_pk["action_mask"].copy()
+                                 if "action_mask" in _pk else None),
+                        "proprio": (None if _pro(e_i) is None
+                                    else np.asarray(_pro(e_i)).copy()),
+                        "feats": _feats_np(e_i)}
                     actions.append(int(a) if int(a) < P else 0)
                     continue
                 kv = primary_kv if e_i == 0 else None
@@ -1166,30 +1213,50 @@ class OptionExecutor:
                 if int(a) >= P:
                     self.option_picks += 1
                 if a < P:
+                    _rec = {
+                        "action": int(a), "log_prob": info["log_prob"],
+                        "value": info["value"], "mask": mask.copy(),
+                        "proprio": (None if _pro(e_i) is None
+                                    else np.asarray(_pro(e_i)).copy()),
+                        # arch='rssm': the latent this decision was made on.
+                        # Captured HERE, at the decision, because the update
+                        # cannot recompute it and by close time the belief
+                        # has moved on. None for every other arch.
+                        "feats": _feats_np(e_i)}
                     if e_i == 0:
                         # primitive decision: recorded by the caller's store
                         # block exactly as before (tau=1)
-                        self._primary_primitive = {
-                            "action": int(a), "log_prob": info["log_prob"],
-                            "value": info["value"], "mask": mask.copy(),
-                            "proprio": (None if _pro(0) is None
-                                        else np.asarray(_pro(0)).copy())}
+                        self._primary_primitive = _rec
+                    else:
+                        self._scout_primitive[e_i] = _rec
                     actions.append(int(a))
                     continue
                 slot = int(a) - P
-                decision = None
+                # DECISION RECORDED FOR EVERY STREAM (2026-09-01), not just
+                # the primary. A scout's option invocation is the same
+                # shared policy making the same kind of choice; without the
+                # record its SMDP row could not be stored and the whole
+                # stream stayed invisible to PPO.
+                decision = {
+                    "obs": np.asarray(obs_list[e_i]),
+                    # THE BELIEF AT THE MOMENT OF CHOOSING. An option runs for
+                    # tau steps and the latent moves the whole time, so this
+                    # has to be frozen at the decision or the update would
+                    # score the choice against a state the option itself
+                    # produced. None for every arch but 'rssm'.
+                    "feats": _feats_np(e_i),
+                    "meta_action": int(a),
+                    "log_prob": info["log_prob"],
+                    "value": info["value"],
+                    "kv": (None if (e_i != 0 or primary_kv is None)
+                           else np.asarray(primary_kv).copy()),
+                    "proprio": (None if _pro(e_i) is None
+                                else np.asarray(_pro(e_i)).copy()),
+                    "mask": mask.copy()}
                 if e_i == 0:
-                    decision = {
-                        "obs": np.asarray(obs_list[0]),
-                        "meta_action": int(a),
-                        "log_prob": info["log_prob"],
-                        "value": info["value"],
-                        "kv": (None if primary_kv is None
-                               else np.asarray(primary_kv).copy()),
-                        "proprio": (None if _pro(0) is None
-                                    else np.asarray(_pro(0)).copy()),
-                        "mask": mask.copy()}
                     self._primary_primitive = None
+                else:
+                    self._scout_primitive[e_i] = None
                 rt.open(slot, self.bank.slots[slot]["skill_id"],
                         timestep, decision)
                 self.bank.note_invoked(slot)
@@ -1498,20 +1565,68 @@ class OptionExecutor:
             logger.warning("record_asked failed for %s: %s", sid, e)
 
     # ---- post-step bookkeeping -----------------------------------------------
-    def observe_scouts(self, rewards, dones, timestep: int) -> None:
-        """Scout termination checks (no credit assignment)."""
-        self.last_closed_this_step = [None] * self.num_envs
+    def observe_scouts(self, rewards, dones, timestep: int,
+                       mixed_rewards=None) -> Dict[int, Dict]:
+        """Scout accumulation + termination checks.
+
+        Returns {stream: closed decision record} for every scout option that
+        ENDED this step, in the same shape `observe_primary` returns — the
+        caller stores them as SMDP rows.
+
+        `mixed_rewards` (optional, per-stream): the shaped reward the policy
+        is actually optimizing. Supplied => scout options accumulate a
+        discounted return exactly as the primary does and their rows can be
+        stored. Omitted => the pre-2026-09-01 behaviour (terminations only,
+        no credit assignment) and an empty dict, so any caller that has not
+        been updated is unchanged.
+        """
+        # NOTE: `last_closed_this_step` is reset in act(), once per step,
+        # BEFORE any close can happen. It used to be reset here, which was
+        # only safe while this ran before the primary's observe_primary —
+        # moving scout accumulation after the reward mix (it needs the mixed
+        # reward, which does not exist until then) would otherwise have wiped
+        # the primary's entry every step.
+        closed_by_stream: Dict[int, Dict] = {}
         for e_i in range(1, self.num_envs):
             rt = self.runtimes[e_i]
             if not rt.active:
                 continue
             self._advance_substack(e_i, float(rewards[e_i]),
                                    bool(dones[e_i]), timestep)
+            if mixed_rewards is not None:
+                # ONLY ACCUMULATE WHERE A ROW CAN ACTUALLY BE PRODUCED
+                # (2026-09-01). A runtime opened by a path that builds no
+                # decision record — a nested frame pushed by _stack_action,
+                # or restored runtime state — would otherwise pile up a
+                # discounted return that _close() silently throws away, with
+                # nothing anywhere saying so. Count those instead: a counter
+                # at zero is a proof, a counter climbing is the next finding.
+                if rt.decision is not None:
+                    rt.r_disc_acc += rt.gamma_pow * float(mixed_rewards[e_i])
+                    rt.gamma_pow *= self.gamma
+                else:
+                    self.scout_rows_dropped += 1
             rt.steps_done += 1
             outcome = self._termination(rt, float(rewards[e_i]),
                                         bool(dones[e_i]))
             if outcome:
+                # Snapshot BEFORE _close(), which calls rt.close() and wipes
+                # the runtime — the primary path has the same ordering and
+                # the same reason.
+                if mixed_rewards is not None and rt.decision is not None:
+                    _d = rt.decision
+                    closed_by_stream[e_i] = {
+                        "obs": _d["obs"], "feats": _d.get("feats"),
+                        "meta_action": _d["meta_action"],
+                        "reward": rt.r_disc_acc, "log_prob": _d["log_prob"],
+                        "value": _d["value"], "kv": _d["kv"],
+                        "mask": _d["mask"], "tau": rt.steps_done,
+                        "outcome": outcome, "skill_id": rt.skill_id,
+                        "proprio": _d.get("proprio"),
+                        "wm_err_mean": None,
+                    }
                 self._close(e_i, rt, timestep, outcome)
+        return closed_by_stream
 
     def observe_primary(self, reward_raw: float, done: bool,
                         mixed_reward: float, timestep: int,
@@ -1539,7 +1654,8 @@ class OptionExecutor:
             return None
         dec = rt.decision
         closed = {
-            "obs": dec["obs"], "meta_action": dec["meta_action"],
+            "obs": dec["obs"], "feats": dec.get("feats"),
+            "meta_action": dec["meta_action"],
             "reward": rt.r_disc_acc, "log_prob": dec["log_prob"],
             "value": dec["value"], "kv": dec["kv"], "mask": dec["mask"],
             "tau": rt.steps_done, "outcome": outcome,
@@ -1632,6 +1748,7 @@ class OptionExecutor:
                 "retry_after": self.retry_after,
                 "with_learned": self.decisions_with_learned,
                 "learned_offered_sum": self.learned_offered_sum,
+                "scout_rows_dropped": self.scout_rows_dropped,
             },
             "gating": {"enabled": self.gate_by_preconditions,
                        "offers": self.total_offers,

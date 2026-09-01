@@ -51,6 +51,188 @@ _BUF_ARRAYS = ("observations", "actions", "rewards", "dones", "priorities")
 _BUF_MANIFEST = "manifest.json"
 
 
+# ---------------------------------------------------------------------------
+# Block storage + a memory budget (2026-09-01, cluster migration)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS. `np.zeros((capacity, obs_dim))` at capacity 1e6 and obs_dim
+# 49152 reserves ~24.5 GB PER STREAM. calloc hands back lazily-mapped zero
+# pages, so nothing fails at startup — RSS just climbs as the buffer fills and
+# the process is killed part-way. At ~7 transitions/s that is ~40 hours in,
+# i.e. precisely the multi-day runs this project exists to do.
+# `buffer_persist_max_gb` caps only what is written to DISK and never touched
+# this.
+#
+# THE HONEST BOUND. A buffer cannot grow without limit. What this gives is:
+# grow in blocks, on the training cadence rather than the acting path, up to a
+# ceiling derived from the CONTAINER's real memory limit — and when that
+# ceiling is reached, fall back to the circular overwrite that shipped before,
+# loudly. Degradation instead of death.
+
+class BlockArray:
+    """A grow-only array stored as a list of fixed-size blocks.
+
+    Growth appends a block: no reallocation, no copy, and therefore no
+    transient 2x spike — which is the whole reason for not simply resizing a
+    contiguous array (a 24.5 GB column would need 49 GB to grow by one row).
+
+    Supports the indexing forms this buffer actually uses: integer, 1-D index
+    arrays, 2-D (batch, seq) gathers, `[:n]` slices, and boolean-free scatter
+    assignment. Deliberately NOT a general ndarray substitute — an unsupported
+    form raises rather than silently returning something plausible.
+    """
+
+    __slots__ = ("block", "row_shape", "dtype", "fill", "_blocks", "_n")
+
+    def __init__(self, block: int, row_shape: Tuple[int, ...],
+                 dtype, fill: float = 0.0, initial_blocks: int = 1):
+        self.block = int(block)
+        self.row_shape = tuple(row_shape)
+        self.dtype = dtype
+        self.fill = fill
+        self._blocks: List[np.ndarray] = []
+        self._n = 0
+        for _ in range(max(1, int(initial_blocks))):
+            self.add_block()
+
+    # ---- capacity -----------------------------------------------------
+    def add_block(self) -> None:
+        b = np.empty((self.block,) + self.row_shape, dtype=self.dtype)
+        b.fill(self.fill)
+        self._blocks.append(b)
+        self._n += self.block
+
+    def __len__(self) -> int:
+        return self._n
+
+    @property
+    def nbytes(self) -> int:
+        return sum(b.nbytes for b in self._blocks)
+
+    # ---- access -------------------------------------------------------
+    def _split(self, idx):
+        idx = np.asarray(idx)
+        return np.divmod(idx, self.block)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            # only the `[:n]` / `[:]` forms the buffer uses
+            start, stop, step = key.indices(self._n)
+            if step != 1:
+                raise IndexError("BlockArray: strided slices unsupported")
+            return self[np.arange(start, stop, dtype=np.int64)]
+        if np.isscalar(key):
+            b, o = divmod(int(key), self.block)
+            return self._blocks[b][o]
+        b, o = self._split(key)
+        out = np.empty(b.shape + self.row_shape, dtype=self.dtype)
+        # one gather per touched block; `b` is small (few blocks) so this
+        # stays a handful of vectorized copies, not a Python loop over rows
+        for bi in np.unique(b):
+            m = (b == bi)
+            out[m] = self._blocks[int(bi)][o[m]]
+        return out
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self._n)
+            if step != 1:
+                raise IndexError("BlockArray: strided slices unsupported")
+            key = np.arange(start, stop, dtype=np.int64)
+        if np.isscalar(key):
+            b, o = divmod(int(key), self.block)
+            self._blocks[b][o] = value
+            return
+        b, o = self._split(key)
+        value = np.asarray(value, dtype=self.dtype)
+        bcast = value.shape != b.shape + self.row_shape
+        for bi in np.unique(b):
+            m = (b == bi)
+            self._blocks[int(bi)][o[m]] = value if bcast else value[m]
+
+    def any(self) -> bool:
+        return any(bool(b.any()) for b in self._blocks)
+
+
+class _MemoryBudget:
+    """How much RAM the replay buffers may collectively occupy.
+
+    ONE budget for the whole process. Every stream asking the machine how big
+    it is and taking a fraction is an N-times overshoot, and the fleet size is
+    exactly the thing that varies.
+
+    CGROUP FIRST, and that ordering is load-bearing: under a container
+    (`/sys/fs/cgroup/...`) the host's RAM is not the limit, and reading the
+    host figure is the container-vs-host measurement trap this project has
+    already paid for once. On a cluster the container is the normal case.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reserved = 0
+        self.limit = 0
+        self.source = "unset"
+
+    def configure(self, max_ram_frac: float, hard_max_gb: float) -> None:
+        with self._lock:
+            if self.limit:
+                return          # first configuration wins; streams share it
+            total, src = self._detect_total()
+            lim = int(total * float(max_ram_frac)) if total else 0
+            if hard_max_gb and hard_max_gb > 0:
+                cap = int(float(hard_max_gb) * 1e9)
+                lim = min(lim, cap) if lim else cap
+                src += "+hard_max_gb"
+            self.limit, self.source = lim, src
+            logger.info(
+                "replay memory budget: %.1f GB (%.0f%% of %.1f GB, source=%s)",
+                lim / 1e9, 100.0 * float(max_ram_frac),
+                (total or 0) / 1e9, src)
+
+    @staticmethod
+    def _detect_total() -> Tuple[int, str]:
+        # cgroup v2
+        try:
+            with open("/sys/fs/cgroup/memory.max") as fh:
+                v = fh.read().strip()
+            if v.isdigit():
+                return int(v), "cgroup2"
+        except Exception:
+            pass
+        # cgroup v1
+        try:
+            with open(
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes") as fh:
+                v = int(fh.read().strip())
+            # v1 reports a sentinel ~2^63 when unlimited
+            if 0 < v < (1 << 62):
+                return v, "cgroup1"
+        except Exception:
+            pass
+        try:
+            import psutil
+            return int(psutil.virtual_memory().total), "psutil"
+        except Exception:
+            pass
+        try:
+            return (os.sysconf("SC_PHYS_PAGES")
+                    * os.sysconf("SC_PAGE_SIZE")), "sysconf"
+        except Exception:
+            return 0, "unknown"
+
+    def request(self, nbytes: int) -> bool:
+        """Reserve `nbytes` if the budget allows. False = at the ceiling."""
+        with self._lock:
+            if self.limit <= 0:
+                return False
+            if self.reserved + nbytes > self.limit:
+                return False
+            self.reserved += nbytes
+            return True
+
+
+MEMORY_BUDGET = _MemoryBudget()
+
+
 class ReplayBuffer:
     """
     Stores experience for world model training.
@@ -79,6 +261,7 @@ class ReplayBuffer:
         per_beta: float = 0.4,
         per_epsilon: float = 1e-2,
         obs_uint8: bool = False,
+        growth: Optional[Dict] = None,
     ):
         self.capacity = capacity
         self.obs_dim = obs_dim
@@ -91,19 +274,60 @@ class ReplayBuffer:
         # (their normalized obs can be negative / unbounded).
         self._obs_uint8 = bool(obs_uint8)
 
-        # Pre-allocate arrays for efficiency
-        self.observations = np.zeros(
-            (capacity, obs_dim),
-            dtype=np.uint8 if self._obs_uint8 else np.float32)
-        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.dones = np.zeros(capacity, dtype=np.float32)
-
-        # ---- Prioritized Experience Replay state ----
-        # Per-transition priority. New transitions get max_priority so they
-        # are guaranteed to be sampled at least once before being deprioritized.
-        self.priorities = np.zeros(capacity, dtype=np.float32)
+        # ---- STORAGE: BLOCKS WHEN GROWABLE, ONE ARRAY WHEN NOT -----------
+        # growth disabled -> np.zeros exactly as before, byte-for-byte.
+        # growth enabled  -> BlockArray, starting at ONE block rather than the
+        # full configured capacity, so a run does not reserve 24.5 GB of
+        # lazily-mapped pages up front and then walk RSS into the reaper. The
+        # configured `capacity` becomes the STARTING TARGET, not a hard size.
+        _g = dict(growth or {})
+        self._growable = bool(_g.get("enabled", False))
+        self._block = max(1000, int(_g.get("block_transitions", 25000)))
+        self._grow_at = float(_g.get("grow_at_frac", 0.85))
+        self._grow_pending = False
+        self._growth_capped = False
+        self._grow_events = 0
+        _obs_dtype = np.uint8 if self._obs_uint8 else np.float32
+        if self._growable:
+            MEMORY_BUDGET.configure(
+                float(_g.get("max_ram_frac", 0.6)),
+                float(_g.get("hard_max_gb", 0.0)))
+            self.capacity = self._block
+            self.observations = BlockArray(
+                self._block, (obs_dim,), _obs_dtype)
+            self.actions = BlockArray(self._block, (action_dim,), np.float32)
+            self.rewards = BlockArray(self._block, (), np.float32)
+            self.dones = BlockArray(self._block, (), np.float32)
+        else:
+            self.observations = np.zeros((capacity, obs_dim), dtype=_obs_dtype)
+            self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+            self.rewards = np.zeros(capacity, dtype=np.float32)
+            self.dones = np.zeros(capacity, dtype=np.float32)
+        # ---- RESTART IS NOT A DEATH (2026-09-01) -------------------------
+        # The loop stores `done = terminal or crash_restart`, because for the
+        # ADVANTAGE trace both sever the trajectory identically. For the
+        # WORLD MODEL they are opposite things: a terminal is an event the
+        # continue head should learn to predict; a crash restart is a client
+        # rebuild that splices two DIFFERENT WORLDS across one index, and
+        # every earlier note in this project says a new mission means a new
+        # world. Teaching that splice as dynamics is teaching a fiction, and
+        # oversampling it (terminal_fraction) taught it hardest of all.
+        # Flagged separately so sequences can EXCLUDE it while `dones` keeps
+        # meaning what the GAE path needs it to mean.
         self.max_priority = 1.0
+        if self._growable:
+            self.restarts = BlockArray(self._block, (), bool, fill=False)
+            # PER: a fresh block must start at MAX priority, not 0, or every
+            # newly grown slot is unsamplable until something writes it.
+            self.priorities = BlockArray(
+                self._block, (), np.float32, fill=self.max_priority)
+        else:
+            self.restarts = np.zeros(capacity, dtype=bool)
+            # ---- Prioritized Experience Replay state ----
+            # Per-transition priority. New transitions get max_priority so they
+            # are guaranteed to be sampled at least once before being
+            # deprioritized.
+            self.priorities = np.zeros(capacity, dtype=np.float32)
         self.per_alpha = per_alpha      # how strongly to prioritize (0 = uniform)
         self.per_beta = per_beta        # importance-sampling correction strength
         self.per_epsilon = per_epsilon  # floor so nothing has zero probability
@@ -124,6 +348,7 @@ class ReplayBuffer:
         action: np.ndarray,
         reward: float,
         done: bool,
+        restart: bool = False,
     ) -> None:
         """
         Add a single transition to the buffer.
@@ -133,6 +358,10 @@ class ReplayBuffer:
             action: Action taken (will be converted to array if scalar)
             reward: Reward received
             done: Whether episode ended
+            restart: this `done` is a CLIENT REBUILD, not a real terminal —
+                the frames either side belong to different worlds. Defaults
+                False so every existing caller (and every buffer written
+                before 2026-09-01) behaves exactly as it did.
         """
         # Handle scalar/discrete actions by converting to array
         if np.isscalar(action):
@@ -151,16 +380,80 @@ class ReplayBuffer:
             self.actions[self.position] = action_array
             self.rewards[self.position] = reward
             self.dones[self.position] = float(done)
+            self.restarts[self.position] = bool(restart)
             # New experience enters at max priority so PER will sample it soon.
             self.priorities[self.position] = self.max_priority
 
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
+            # GROWTH IS FLAGGED HERE, NEVER PERFORMED HERE. This runs on the
+            # acting thread once per env step; allocating a 1.2 GB block in it
+            # would stall the agent mid-episode. `maybe_grow()` does the work
+            # on the world-model cadence instead. Flagged at 85% so the block
+            # is in place BEFORE the write position reaches the end and no
+            # transition is ever overwritten while the buffer could have grown.
+            if (self._growable and not self._growth_capped
+                    and self.size >= self._grow_at * self.capacity):
+                self._grow_pending = True
+
             # Track episode boundaries
             if done:
                 self.episode_starts.append(self.position)
                 self._current_episode_start = self.position
+
+    def maybe_grow(self) -> bool:
+        """Append one block to every column if the buffer is nearly full.
+
+        CALLED FROM THE TRAINING CADENCE, not from add(). That is the whole
+        point: allocation happens during the world-model block — the "async
+        learning period between intervals" — where a pause costs nothing,
+        rather than on the acting thread where it would stall the agent
+        mid-episode.
+
+        Returns True if the buffer grew.
+
+        AT THE CEILING it does not raise and does not keep trying: it says so
+        once, sets `_growth_capped`, and from then on add() wraps circularly
+        exactly as the fixed-capacity buffer always did. The newest N
+        transitions are kept and the run continues. A memory guard that kills
+        the process is not a guard.
+        """
+        if not (self._growable and self._grow_pending
+                and not self._growth_capped):
+            return False
+        _need = (self._block * self.obs_dim
+                 * (1 if self._obs_uint8 else 4)          # observations
+                 + self._block * self.action_dim * 4      # actions
+                 + self._block * (4 + 4 + 4 + 1))         # rew/done/pri/restart
+        if not MEMORY_BUDGET.request(_need):
+            self._growth_capped = True
+            self._grow_pending = False
+            logger.warning(
+                "replay buffer AT ITS MEMORY CEILING at %d transitions "
+                "(%.1f GB budget, source=%s). Growth stops here and the "
+                "buffer reverts to circular overwrite — the newest %d "
+                "transitions are kept and the run continues. Raise "
+                "world_model.buffer_growth.max_ram_frac / hard_max_gb, or "
+                "give the container more memory, to go further.",
+                self.capacity, MEMORY_BUDGET.limit / 1e9,
+                MEMORY_BUDGET.source, self.capacity)
+            return False
+        with self._lock:
+            # PUBLISH ORDER IS LOAD-BEARING: every column gets its block
+            # BEFORE `capacity` moves. A reader racing this sees the old
+            # capacity over a consistent buffer, never an index past the end
+            # of a column that has not grown yet.
+            for _c in (self.observations, self.actions, self.rewards,
+                       self.dones, self.priorities, self.restarts):
+                _c.add_block()
+            self.capacity += self._block
+            self._grow_pending = False
+            self._grow_events += 1
+        logger.info("replay buffer grew to %d transitions (%.1f GB reserved "
+                    "of %.1f GB)", self.capacity,
+                    MEMORY_BUDGET.reserved / 1e9, MEMORY_BUDGET.limit / 1e9)
+        return True
 
     def sample_sequences(
         self,
@@ -213,10 +506,26 @@ class ReplayBuffer:
             n_reward = int(batch_size * reward_fraction)
 
             # --- choose terminal sequences (preserves continue-predictor fix) ---
+            # ---- QUOTA SHRINKS, IT DOES NOT DUPLICATE (2026-09-01) -------
+            # `replace=True` against a small pool is how a fixed FRACTION
+            # becomes a fixed set. In lifelong mode `done` fires only on a
+            # real death, so the pool is a few dozen windows for a run of
+            # millions of steps — and at terminal_fraction 0.25, train_iters
+            # 384 and batch_size 8, that is 768 draws per training block,
+            # every 250 env steps, from the same handful of death frames.
+            # The world model was spending a quarter of its capacity
+            # memorizing them.
+            # Cap the quota at what the pool can supply WITHOUT repeats; the
+            # freed slots go to `n_normal` below (ordinary experience),
+            # which is the honest thing to train on when there are no
+            # terminals to learn from. When the pool IS large the behaviour
+            # is unchanged apart from being repeat-free.
+            n_terminal = min(n_terminal, len(terminal_starts))
             if len(terminal_starts) > 0 and n_terminal > 0:
                 t_probs = self._priority_probs(terminal_starts, seq_len) if prioritized else None
                 t_pick = np.random.choice(
-                    len(terminal_starts), size=n_terminal, replace=True, p=t_probs
+                    len(terminal_starts), size=n_terminal, replace=False,
+                    p=t_probs
                 )
                 t_idx = terminal_starts[t_pick]
             else:
@@ -234,6 +543,13 @@ class ReplayBuffer:
                 reward_starts = self._find_reward_starts(seq_len)
                 if len(reward_starts) > 0:
                     r_probs = self._priority_probs(reward_starts, seq_len) if prioritized else None
+                    # Repeats ARE allowed here, unlike the terminal pool
+                    # above, and deliberately: the reward pool is the SIGNAL
+                    # this task is starved of (399 breaks, 1 log, ever), so
+                    # seeing the same log break several times per batch is
+                    # the point rather than the pathology. It is also
+                    # self-limiting — the pool grows every time the agent
+                    # succeeds, which is exactly when it needs less help.
                     r_pick = np.random.choice(
                         len(reward_starts), size=n_reward, replace=True, p=r_probs
                     )
@@ -396,6 +712,21 @@ class ReplayBuffer:
         # training a spurious done->reset "teleport" into the dynamics.
         terminal_mask = any_done & (first_done == seq_len - 1)
 
+        # ---- A CLIENT REBUILD IS NOT A TERMINAL (2026-09-01) -------------
+        # Windows containing a restart row are dropped from BOTH pools. The
+        # same argument the write-seam exclusion above already makes: those
+        # frames are not temporally contiguous, so nothing true can be
+        # learned from the transition across them. Previously they were not
+        # merely included, they were the ones OVERSAMPLED — restarts land in
+        # `dones`, `dones` feeds terminal_starts, and terminal_fraction 0.25
+        # drew from that pool with replacement 768 times per training block.
+        # The rarest, most corrupt windows in the buffer had the highest
+        # sampling weight.
+        if self.restarts.any():
+            has_restart = self.restarts[idx].any(axis=1)
+            normal_mask = normal_mask & ~has_restart
+            terminal_mask = terminal_mask & ~has_restart
+
         normal = starts[normal_mask]
         terminal = starts[terminal_mask]
 
@@ -469,6 +800,7 @@ class ReplayBuffer:
                 "rewards": self.rewards[order],
                 "dones": self.dones[order],
                 "priorities": self.priorities[order],
+                "restarts": self.restarts[order],
             }
             meta = {
                 "n": n,
@@ -524,7 +856,27 @@ class ReplayBuffer:
             if not os.path.isfile(os.path.join(path, k + ".npy")):
                 raise FileNotFoundError(f"{path} is missing {k}.npy")
         cols = {k: np.load(os.path.join(path, k + ".npy")) for k in _BUF_ARRAYS}
+        # `restarts` is NOT in _BUF_ARRAYS: it arrived 2026-09-01 and the live
+        # pod's persisted buffer predates it. Absent means "nothing is known
+        # to be a rebuild splice", which is precisely the pre-change
+        # behaviour — so an old buffer resumes identically rather than
+        # refusing to load. Making a new column mandatory would have bricked
+        # the only copy of the agent's experience.
+        _rp = os.path.join(path, "restarts.npy")
+        cols["restarts"] = (np.load(_rp) if os.path.isfile(_rp)
+                            else np.zeros(int(cols["observations"].shape[0]),
+                                          dtype=bool))
         n = int(cols["observations"].shape[0])
+        # GROW TO FIT rather than discard (2026-09-01). Truncating to "newest"
+        # is right for a shrunken fixed buffer, but with growth on it would
+        # throw away experience the machine has room for — and the restored
+        # buffer is the one thing on a rebuilt node that cannot be
+        # re-collected.
+        while (self._growable and not self._growth_capped
+               and n > self.capacity):
+            self._grow_pending = True
+            if not self.maybe_grow():
+                break
         if n > self.capacity:                 # capacity shrank: keep newest
             cols = {k: v[-self.capacity:] for k, v in cols.items()}
             n = self.capacity
@@ -534,6 +886,7 @@ class ReplayBuffer:
             self.rewards[:n] = cols["rewards"]
             self.dones[:n] = cols["dones"]
             self.priorities[:n] = cols["priorities"]
+            self.restarts[:n] = cols["restarts"].astype(bool)
             self.size = n
             self.position = n % self.capacity
             self.max_priority = float(meta.get("max_priority", 1.0)) or 1.0
@@ -582,6 +935,7 @@ class MultiStreamReplayBuffer:
         per_beta: float = 0.4,
         per_epsilon: float = 1e-2,
         obs_uint8: bool = False,
+        growth: Optional[Dict] = None,
     ):
         self.num_streams = num_streams
         self.obs_dim = obs_dim
@@ -597,12 +951,28 @@ class MultiStreamReplayBuffer:
                 per_beta=per_beta,
                 per_epsilon=per_epsilon,
                 obs_uint8=obs_uint8,
+                # ONE shared MEMORY_BUDGET across every stream — see
+                # _MemoryBudget. Each stream grows independently (a busy
+                # stream outgrows a quiet one, which is correct), but they
+                # draw on the same pool, so N streams cannot each take a
+                # fraction of the machine and overshoot by N.
+                growth=growth,
             )
             for _ in range(num_streams)
         ]
 
-    def add(self, observation, action, reward, done, stream: int = 0) -> None:
-        self.streams[stream].add(observation, action, reward, done)
+    def maybe_grow(self) -> bool:
+        """Give every stream a chance to grow. Called on the WM cadence."""
+        return any(s.maybe_grow() for s in self.streams)
+
+    @property
+    def capacity(self) -> int:
+        return sum(s.capacity for s in self.streams)
+
+    def add(self, observation, action, reward, done, stream: int = 0,
+            restart: bool = False) -> None:
+        self.streams[stream].add(observation, action, reward, done,
+                                 restart=restart)
 
     def save(self, path: str, max_transitions: Optional[int] = None) -> int:
         """Persist every stream under `path/stream_<i>`. Returns total written.

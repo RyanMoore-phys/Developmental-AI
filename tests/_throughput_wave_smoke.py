@@ -156,7 +156,15 @@ def test_A3_single_sync_in_select_action():
         aug = p._augment(p._encode(t), p._prep_knowledge(None),
                          p._prep_proprio(None))
         act_ref, lp_ref = p.actor.get_action(aug, deterministic=True)
-        v_ref = p.critic(aug)
+        # `_value_of`, NOT `p.critic` (2026-09-01). The critic now predicts
+        # symlog(return) and every READ decodes with symexp, so the raw head
+        # output is no longer a value in reward space. This assertion is
+        # about the fused device->host transfer not perturbing anything, so
+        # the reference has to be the same quantity select_action returns —
+        # comparing against the undecoded head would be testing the value
+        # parameterization by accident, and would have "passed" only while
+        # the two spaces happened to coincide.
+        v_ref = p._value_of(aug)
     assert int(act_ref.reshape(-1)[0].item()) == a, (act_ref, a)
     assert float(lp_ref.reshape(-1)[0].item()) == info["log_prob"]
     assert float(v_ref.reshape(-1)[0].item()) == info["value"]
@@ -321,13 +329,19 @@ def test_B1_starved_policy_is_reported_as_starved():
 
     # The arithmetic the guard implements, asserted directly: this is the
     # regime the live run is in whenever options are used.
+    # NOTE (2026-09-01): this arithmetic now describes the UN-MINIBATCHED
+    # path only, which is where its evidence came from — the 2026-07-25
+    # collapse was 10 near-identical FULL-BATCH passes over one small,
+    # advantage-normalized batch. The live config minibatches, so each step
+    # sees a different slice and the bound is `max_updates` plus target_kl
+    # instead. Kept as a regression witness for the path it belongs to.
     def epochs(rows, req=10):
         return max(1, min(req, rows // 32))
     assert epochs(51) == 1 and epochs(25) == 1 and epochs(12) == 1
     assert epochs(320) == 10
-    print("  B1b. guard arithmetic: 1024 env steps at tau 20/40/80 -> "
-          "51/25/12 rows -> 1/1/1 epochs; 320 rows needed for the "
-          "configured 10")
+    print("  B1b. guard arithmetic (full-batch path): 1024 env steps at tau "
+          "20/40/80 -> 51/25/12 rows -> 1/1/1 epochs; 320 rows needed for "
+          "the configured 10")
 
     src = open(AC).read()
     assert "PPO STARVED" in src, "the guard must say so at WARNING, not DEBUG"
@@ -335,14 +349,20 @@ def test_B1_starved_policy_is_reported_as_starved():
     assert '"epochs_capped": bool(' in src, (
         "metrics must carry epochs_capped — without it a starved update is "
         "indistinguishable from KL early-stopping downstream")
-    print("  B1c. the guard reports at WARNING and exports `epochs_capped`")
+    assert '"kl_stopped": bool(' in src and '"max_updates": int(' in src, (
+        "with target_kl back on there are THREE causes of a short update "
+        "(starved / KL-stopped / budget spent); each must be exported or "
+        "they collapse back into one ambiguous 'stopped early'")
+    print("  B1c. the guard reports at WARNING and exports `epochs_capped`, "
+          "`kl_stopped` and `max_updates`")
 
     loop = open(LOOP).read()
     assert "<-- STARVED: too few rows for more" in loop
     i_starved = loop.index("<-- STARVED")
-    i_good = loop.index("stopped early (good: the policy")
-    assert i_starved < i_good, (
-        "the STARVED branch must be tested BEFORE the 'good' branch, or a "
+    i_kl = loop.index("<-- KL-STOPPED")
+    i_good = loop.index("<-- budget: the rollout's gradient-")
+    assert i_starved < i_kl < i_good, (
+        "the STARVED branch must be tested BEFORE the healthy branches, or a "
         "starved update is again reported as a healthy one")
     assert "PPO update rate:" in loop, (
         "the row composition (option vs primitive, mean tau) must print — it "
@@ -351,15 +371,43 @@ def test_B1_starved_policy_is_reported_as_starved():
     print("  B1d. the loop distinguishes STARVED from KL-stopped, and prints "
           "the row composition that explains which")
 
-    # target_kl really is off, which is what makes the old label wrong
+    # ---- B1e, REWRITTEN 2026-09-01 --------------------------------------
+    # This used to assert target_kl == 0.0, and said why: with it ON,
+    # "stopped early" becomes reachable again "and the two causes must be
+    # re-checked, not assumed". target_kl IS on now (0.05), so this discharges
+    # that obligation rather than deleting it — the check becomes the thing
+    # the old one was protecting: that the causes stay distinguishable.
+    #
+    # Why turning it on is defensible at all: the 2026-08-05 rollback measured
+    # the early stop in the FULL-BATCH path, where an "epoch" is one gradient
+    # step over the whole rollout, so the check could only ever fire after the
+    # move was already made. The check has always lived inside the minibatch
+    # loop, so at minibatch_size 32 it now enforces a budget instead of
+    # observing an overshoot. And its second complaint — that stopping left
+    # the critic underfit — is fixed directly: the stop freezes the ACTOR and
+    # lets the critic train on.
     import yaml
     pol = yaml.safe_load(open(os.path.join(
         "configs", "minecraft_skybot.yaml"))).get("policy", {})
-    assert float(pol.get("target_kl", 0.0)) == 0.0, (
-        "target_kl is ON — then 'stopped early' becomes reachable again and "
-        "the two causes must be re-checked, not assumed")
-    print(f"  B1e. target_kl={pol.get('target_kl')} (off) — so ANY epoch "
-          f"reduction today is starvation, never a movement budget")
+    _kl_cfg = float(pol.get("target_kl", 0.0))
+    _mb_cfg = int(pol.get("minibatch_size", 0) or 0)
+    if _kl_cfg > 0.0:
+        assert _mb_cfg > 0, (
+            f"target_kl={_kl_cfg} with minibatch_size=0 recreates the exact "
+            f"2026-08-05 failure: an 'epoch' is then ONE full-batch step, so "
+            f"the KL check always overshoots its budget instead of enforcing "
+            f"it. Enable minibatching or turn target_kl back off.")
+        assert "_actor_frozen" in src, (
+            "target_kl is on but the stop is not actor-only — the 2026-08-05 "
+            "rollback's second finding was that abandoning the update leaves "
+            "the critic underfit, which makes the NEXT update worse")
+        assert "kl_stopped" in loop, (
+            "target_kl is on and the loop cannot report it — 'stopped early' "
+            "is reachable again and must be named, not inferred")
+    print(f"  B1e. target_kl={_kl_cfg} with minibatch_size={_mb_cfg}: the "
+          f"stop is per-minibatch (enforces a budget, not observes an "
+          f"overshoot), actor-only (critic keeps fitting), and named in the "
+          f"log — the three conditions the 2026-08-05 rollback required")
 
 
 if __name__ == "__main__":

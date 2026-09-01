@@ -399,6 +399,7 @@ class VLMSymbolizer:
         # existing config keeps exactly its old labelling cadence and head.
         fovea: bool = False,
         fovea_frac: float = 0.4,
+        input_max_side: int = 0,
         # FOVEA CADENCE DECOUPLING (2026-08-08). The fovea used to alternate
         # with the full channel and therefore inherit its ANNEALED interval —
         # but the anneal is driven by FULL-frame agreement, which says nothing
@@ -463,6 +464,14 @@ class VLMSymbolizer:
         # the target?" gradient.
         self.fovea_enabled = bool(fovea)
         self.fovea_frac = float(fovea_frac)
+        # Downscale the WHOLE-FRAME request to this longest side before the
+        # PNG encode; 0 = off. 336 is qwen2.5vl's ViT tile size, so the model
+        # sees the same tiling it would anyway and the extra pixels the 384
+        # render carries were being re-tiled at cost for nothing. The fovea
+        # crop is deliberately exempt — it is the high-detail channel and the
+        # whole reason it exists is that a downscaled full frame could not
+        # tell a zombie from a skeleton.
+        self.input_max_side = int(input_max_side or 0)
         # CROP-CONSISTENT INPUT (2026-08-12). The head used to read the
         # WHOLE-FRAME RSSM latent while its labels described the CENTRE CROP
         # — it was asked to decode "what is in the middle 16% of the image"
@@ -555,7 +564,27 @@ class VLMSymbolizer:
             return None
 
     @staticmethod
-    def _encode_png(frame) -> Optional[bytes]:
+    def _encode_png(frame, max_side: int = 0) -> Optional[bytes]:
+        """Frame -> PNG bytes for the VLM, optionally downscaled first.
+
+        ---- max_side (2026-09-01) ---------------------------------------
+        The env renders natively at 384 so the VLM gets a sharp frame, but
+        qwen2.5vl's vision tower tiles at 336 — anything above that is
+        re-tiled at cost and buys nothing. Downscaling to `max_side` before
+        the PNG encode cuts bytes per request ~(384/336)^2 and, more to the
+        point, cuts the tiles the model has to attend over. 0 = off = the
+        pre-2026-09-01 behaviour exactly.
+
+        NOTHING ABOUT THE AGENT'S PERCEPTION CHANGES: the policy and the
+        world model read the 128px observation, which never passes through
+        here. This is only how many bytes carry the picture to the labeller.
+
+        CROP BEFORE RESIZE, always: the fovea crop is taken from the full
+        frame by _crop_center and encoded separately, so it keeps the render
+        resolution. Resizing first and cropping second would silently shrink
+        the fovea — the fovea exists because a downscaled whole frame could
+        not tell a zombie from a skeleton.
+        """
         try:
             f = np.asarray(frame)
             if f.ndim == 1:
@@ -569,6 +598,17 @@ class VLMSymbolizer:
             if f.shape[0] < 128:
                 k = max(1, 256 // f.shape[0])
                 f = np.repeat(np.repeat(f, k, 0), k, 1)
+            _ms = int(max_side or 0)
+            if _ms > 0 and max(f.shape[:2]) > _ms:
+                # integer-factor box downsample: no interpolation library, no
+                # new dependency, and an exact block mean rather than a
+                # resampling filter whose kernel we would then have to reason
+                # about when the labels move.
+                k = int(np.ceil(max(f.shape[:2]) / float(_ms)))
+                h, w = f.shape[0] // k * k, f.shape[1] // k * k
+                if h >= k and w >= k:
+                    f = (f[:h, :w].reshape(h // k, k, w // k, k, -1)
+                         .mean(axis=(1, 3)).astype(np.uint8))
             import imageio.v2 as imageio
             buf = io.BytesIO()
             imageio.imwrite(buf, f, format="png")
@@ -755,6 +795,8 @@ class VLMSymbolizer:
             / max(1.0, float(self.interval)))
         if pick_fovea:
             crop = self._crop_center(frame, self.fovea_frac)
+            # The CROP is already small (fovea_frac of the render) and is
+            # the high-detail channel — never downscale it. See _encode_png.
             png = self._encode_png(crop) if crop is not None else None
             if png is None:
                 return
@@ -770,7 +812,7 @@ class VLMSymbolizer:
                                         else latent.detach().clone())
                 self._pending_is_fovea = True
             return
-        png = self._encode_png(frame)
+        png = self._encode_png(frame, max_side=self.input_max_side)
         if png is None:
             return
         if self._channel.submit(self._assess, png):
