@@ -50,23 +50,34 @@ def main() -> None:
     assert float(cp.predict_all().max()) < 0.01, \
         "sanity: a poisoned bias should flatten competence to ~0"
 
-    # ---- B. GATE OPEN AT THE CONFIGURED FLOOR -------------------------
+    # ---- B. THE MECHANISM STAYS SOUND; THE CONFIG TURNS IT OFF --------
+    # 2026-08-10 (pre-boot point 4): skybot sets competence_floor 0.0 —
+    # after the FOURTH guard-becomes-latch, eligibility may no longer
+    # depend on a statistic that can only move once eligibility is
+    # granted (probation + contact gate + preconditions still govern).
+    # The mechanism itself is pinned against the historical floor so it
+    # keeps working wherever a config still asks for it.
     cfg = yaml.safe_load(open("configs/minecraft_skybot.yaml"))
     floor = float(cfg["skills_as_options"]["competence_floor"])
+    assert floor == 0.0, (
+        f"skybot competence_floor is {floor}, not the 0.0 the pre-boot "
+        f"point-4 decision set — a latch-capable gate is back in play")
+    _REF_FLOOR = 0.25                    # the historical gating value
     fresh = CompetencePredictor(n_tasks=8)          # zeros init, bias 0
     c0 = float(fresh.predict_all()[0])
     assert abs(c0 - 0.5) < 1e-6, f"fresh competence should be 0.5, got {c0}"
-    assert c0 >= floor, (
-        f"a NEVER-TRIED skill starts below competence_floor {floor} — it can "
-        f"never be offered, so it can never earn competence: a latch")
+    assert c0 >= _REF_FLOOR, (
+        "a NEVER-TRIED skill starts below the reference floor — it could "
+        "never be offered, so it could never earn competence: a latch")
 
-    # and a genuinely failing task must still close the gate (it is a GATE)
+    # a genuinely failing task must still close a NON-ZERO gate (the
+    # mechanism is intact even though skybot now sets the floor to 0)
     for _ in range(60):
         fresh.update(0, 0.0)
-    assert float(fresh.predict_all()[0]) < floor, \
+    assert float(fresh.predict_all()[0]) < _REF_FLOOR, \
         "repeated failure no longer closes the gate — it is not a gate at all"
     # ...while an untouched task stays open (bias freeze = decoupled tasks)
-    assert float(fresh.predict_all()[1]) >= floor, \
+    assert float(fresh.predict_all()[1]) >= _REF_FLOOR, \
         ("failing task 0 dragged task 1 down — the shared-bias coupling bug "
          "has returned")
 

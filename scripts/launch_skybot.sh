@@ -16,7 +16,11 @@ timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 >/dev/null 2>&1 \
     || { echo "REFUSED: server unreachable through bridge"; exit 1; }
 pgrep -f "Xvfb [:]77" >/dev/null || { nohup Xvfb :77 -screen 0 800x600x24 >/dev/null 2>&1 < /dev/null & sleep 2; }
 DISPLAY=:77 sh -c "pgrep -x openbox >/dev/null" || { DISPLAY=:77 nohup openbox >/dev/null 2>&1 < /dev/null & sleep 1; }
-pgrep -x ollama >/dev/null || { nohup ollama serve > podlogs/ollama.log 2>&1 < /dev/null & sleep 5; }
+pgrep -x ollama >/dev/null || { OLLAMA_DEBUG=0 nohup ollama serve >> podlogs/ollama.log 2>&1 < /dev/null & sleep 5; }
+# append-mode above + capper below: 581 MB of VLM-server chatter in 5 days
+# (measured 2026-08-16) would eat the disk on a long lifelong run
+pgrep -f "cap_log[.]sh podlogs/ollama[.]log" >/dev/null || \
+  { nohup bash scripts/cap_log.sh podlogs/ollama.log >> podlogs/cap_log.log 2>&1 < /dev/null & }
 rm -rf podlogs/brain
 DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MINERL_HEADLESS=1 \
   setsid ./venv_mc/bin/python run_minecraft.py \

@@ -74,6 +74,14 @@ NON_STEERABLE_PREDICATES = frozenset({
     # caused by the instinct itself. You cannot walk toward your own
     # inventory any more than toward `holding_tool`.
     "inventory_visible", "crafting_grid_visible", "craft_output_visible",
+    # THE TEACHER IS WATCHED, NOT CHASED (review 2026-08-09). A mobile
+    # magnet target defeats the phi ratchet: each appear->approach->vanish
+    # cycle pays the climb and the re-adopted baseline never charges the
+    # descent, so "orbit the user" would be repeatable income — and the
+    # chop-instinct/cold-start floors would literally pay for stalking or
+    # swinging at them. Social value flows through the joint-attention
+    # boost, demonstration priming and episodic memory instead.
+    "player_visible",
 })
 
 
@@ -141,6 +149,9 @@ class VisionScaffold:
         # deadlock. Fades to 0 for a category the instant it becomes curious
         # (contrastive takes over) or is later mastered.
         cold_start_weight: float = 0.10,
+        # see `_rank`: reorders equally-curious categories by unconsummated
+        # consequence. 0.0 keeps pure LP ranking (default, byte-identical).
+        promise_weight: float = 0.0,
         # COLD-START BUDGET (audit fix): the floor above never faded for a
         # category that never becomes distinctively curious (e.g. static stone
         # yields below-average LP forever), so "park at stone" paid a standing
@@ -228,6 +239,14 @@ class VisionScaffold:
         # re-opens neutral and must re-earn curiosity. 0 = off (exact old
         # behaviour); never decays toward zero, so the anti-latch survives.
         lp_stale_tau: float = 0.0,
+        # ---- SOCIAL LEARNING (2026-08-09) ----------------------------------
+        # JOINT ATTENTION: when the other player is under the gaze, learning-
+        # progress attribution for co-present categories is scaled by
+        # (1 + social_attention_boost) — "what happens near the teacher
+        # teaches more". This is the infant pattern (adult attention is a
+        # salience pointer), and it uses the magnet's own attribution
+        # machinery rather than a new reward stream. 0 = off.
+        social_attention_boost: float = 0.0,
     ):
         self.enabled = bool(enabled)
         # see _score: contrast against peer categories instead of a global
@@ -259,9 +278,21 @@ class VisionScaffold:
         self.lp_stale_tau = float(lp_stale_tau)
         # consecutive steps each category has been ABSENT (stale-LP ageing)
         self._cat_absent: Dict[str, int] = {}
+        self.social_attention_boost = float(social_attention_boost)
+        self._social_present = False
+        # demonstration priming (see social_prime): cat -> expiry timestep
+        self._primed: Dict[str, int] = {}
+        self.demos_primed = 0
         self.weight = float(weight)
         self.min_weight = float(min_weight)
         self.cold_start_weight = float(cold_start_weight)
+        # CONSEQUENCE-WEIGHTED RANKING (2026-08-13). How much an unconsummated
+        # consequence record may reorder equally-curious categories. Ranking
+        # only — never reaches `_score`/`_w`, so it can never become a
+        # world-model reward label. 0.0 = pure learning-progress ranking (the
+        # historical behaviour, and the default everywhere else).
+        self.promise_weight = float(promise_weight)
+        self._deficit_fn = None
         self.cold_start_budget = int(cold_start_budget)
         self.focus_distractors = list(
             focus_distractors if focus_distractors is not None
@@ -407,6 +438,71 @@ class VisionScaffold:
         # NOTE: _cold_spent is deliberately NOT cleared — a waned instinct
         # stays waned across episode/death boundaries (lifelong memory).
 
+    # ---- persistence (2026-08-17): curiosity memory across RESTARTS -------
+    # `reset()` above already keeps this memory across episodes, deaths and
+    # dream/segment boundaries — but nothing carried it across a process
+    # restart, so every launch began with `w=0.0000, target=None` and every
+    # category at LP 0.000, exactly as measured after the relaunch of
+    # 2026-08-17. The magnet then has to re-derive what it is curious about
+    # from scratch while the run's first hours go unsteered — the same
+    # restart tax the perception/familiarity checkpoints were introduced to
+    # remove, still being paid by the drive that decides WHERE TO LOOK.
+
+    def state(self) -> Dict[str, object]:
+        """The lifelong curiosity memory, as plain data.
+
+        Deliberately EXCLUDES `_cold_spent`. That counter is the cold-start
+        instinct budget, and persisting it would carry a spent budget into
+        the next process — which is precisely the latch behind the 19-hour
+        zero-reward stall, promoted from run-scoped to permanent. A fresh
+        instinct allowance each boot is bounded, self-waning, and errs
+        toward looking around; the opposite error has already cost this
+        project a day of compute. Per-episode belief is excluded for the
+        same reason `reset()` clears it: it is about the current approach,
+        not about what is worth approaching.
+        """
+        return {
+            "cat_lp": dict(self._cat_lp),
+            "global_lp": float(self._global_lp),
+            "lp_scale": dict(self._lp_scale),
+            "ever_curious": {k: bool(v)
+                             for k, v in self._ever_curious.items()},
+            "cat_absent": dict(self._cat_absent),
+        }
+
+    def load_state(self, m: Dict[str, object]) -> str:
+        """Restore curiosity memory. MERGE, never replace — a fresh dict is
+        a valid state, and a vocabulary that has grown since the checkpoint
+        must keep its new categories rather than be overwritten by an older,
+        smaller world. Returns a one-line summary for the run log; never
+        raises, because a failed curiosity restore must cost the run its
+        memory, not its life."""
+        if not isinstance(m, dict):
+            return "FRESH (no payload)"
+        try:
+            _lp = dict(m.get("cat_lp") or {})
+            self._cat_lp.update({str(k): float(v) for k, v in _lp.items()})
+            self._lp_scale.update({str(k): float(v) for k, v in
+                                   dict(m.get("lp_scale") or {}).items()})
+            self._ever_curious.update(
+                {str(k): bool(v) for k, v in
+                 dict(m.get("ever_curious") or {}).items()})
+            self._cat_absent.update(
+                {str(k): int(v) for k, v in
+                 dict(m.get("cat_absent") or {}).items()})
+            _g = m.get("global_lp")
+            if _g is not None:
+                self._global_lp = float(_g)
+            # Report against the CURRENT vocabulary: entries for categories
+            # this run does not steer on are carried but inert, and counting
+            # them would overstate the restore.
+            _live = [c for c in self.target_categories if _lp.get(c)]
+            return (f"{len(_live)}/{len(self.target_categories)} steerable "
+                    f"categories carry prior LP, global_lp="
+                    f"{self._global_lp:.4f}")
+        except Exception as e:
+            return f"partial ({type(e).__name__}: {e})"
+
     def current_weight(self, timestep: int = 0) -> float:
         """CONDITION-based now: the cached curiosity-driven weight; the
         timestep arg is ignored (kept for call-site compatibility)."""
@@ -417,6 +513,49 @@ class VisionScaffold:
         while w==0 so the EMAs can detect a NEW novel object and re-arm. Cheap
         now (dict math; no VLM, no render)."""
         return self.enabled and not self._closed
+
+    def set_deficit_source(self, fn) -> None:
+        """Supply `category -> consequence deficit in [0,1]` (ConsequenceMap).
+
+        RANKING ONLY. See `_rank`. Passing None restores pure LP ranking.
+        """
+        self._deficit_fn = fn
+
+    def _rank(self, c: str) -> float:
+        """Selection key: curiosity WEIGHTED BY unconsummated consequence.
+
+        THIS IS NOT `_score`, AND THE DIFFERENCE IS LOAD-BEARING. `_score`
+        sets `self._w`, which scales the magnet's shaping, which is added to
+        `prim_extrinsic`, which is written into the replay buffer AS THE
+        WORLD MODEL'S REWARD LABEL. Anything derived from the agent's own
+        inference must therefore never touch `_score`, or the model ends up
+        trained on its own beliefs. `_rank` decides only WHICH category to
+        attend to; every magnitude the agent is actually PAID still comes
+        from `_score` alone.
+
+        Form: score * (1 + promise_weight * deficit), so deficit can reorder
+        categories the agent is roughly equally curious about but can never
+        manufacture interest in one it has learned everything about — a
+        mastered category has score ~0 and 0 * anything is still 0. That
+        conjunction is the point: attend to what you are STILL LEARNING
+        about AND have never AFFECTED.
+
+        HONEST LIMITATION: a category that cannot be affected at all (water)
+        keeps deficit ~1.0 forever, since no attempt is observable — only
+        outcomes are. It is the LP factor that retires such a category, as
+        learning progress on it decays toward zero once it is understood.
+        Deficit alone would be an attractor; deficit x LP is not.
+        """
+        s = self._score(c)
+        fn = getattr(self, "_deficit_fn", None)
+        if fn is None or s <= 0.0:
+            return s
+        try:
+            d = float(fn(c) or 0.0)
+        except Exception:
+            return s
+        return s * (1.0 + float(self.promise_weight)
+                    * max(0.0, min(1.0, d)))
 
     def _score(self, c: str) -> float:
         """How distinctively curious is this category vs the alternatives?
@@ -585,9 +724,47 @@ class VisionScaffold:
                     "(contrastive LP %.4f) — permanently steerable",
                     n, int(d["attends"]), self._score(n))
 
+    def social_prime(self, category: str, now: int,
+                     duration: int = 4000) -> bool:
+        """GOAL EMULATION (2026-08-09): a demonstration was witnessed — the
+        other player made something happen to `category` — so make that
+        category DISTINCTIVELY CURIOUS for a while.
+
+        This is the developmental finding made mechanism: children imitate
+        GOALS far more than motor programs (emulation over mimicry). Watching
+        the teacher fell a tree does not teach the swing; it teaches that
+        trees are WORTH ATTENDING TO, and the agent's own body discovers the
+        how. Implementation: the category's LP estimate is lifted above the
+        global for `duration` steps (curiosity injection, not reward — it
+        rides every existing safeguard: telescoping shaping, habituation,
+        the farm detector), and the seek budget refills so search can act on
+        it at once. Repeated demos re-prime; the injection expires on its
+        own, so it can never latch."""
+        c = str(category)
+        if c not in self.target_categories and c not in self._proposed:
+            return False
+        # EDGE-TRIGGERED (review 2026-08-09): a category already primed
+        # cannot be re-primed — re-firing on every observed_change pushed the
+        # expiry forward indefinitely (a de facto latch) and, worse, the
+        # budget refill below would have turned the bounded seek nudge into
+        # a standing wage whenever ANY recurring change source coincided
+        # with the teacher being nearby. Curiosity is injected once per
+        # demonstration episode; a new prime needs a natural expiry first.
+        if self._primed.get(c, -1) >= int(now):
+            return False
+        self._primed[c] = int(now) + int(duration)
+        self._cat_lp[c] = max(self._cat_lp.get(c, 0.0),
+                              self._global_lp + 4.0 * self.eps_abs)
+        self._seek_nudge_left = self.seek_nudge_budget
+        self.demos_primed += 1
+        return True
+
     def _trusted_present(self, probs, reliability, label_counts) -> Set[str]:
         out: Set[str] = set()
+        _excl = getattr(self, "_excluded", None) or set()
         for c in self.target_categories:
+            if c in _excl:
+                continue        # information-free signal: cannot steer
             if (label_counts.get(c, 0) >= self.min_labels
                     and reliability.get(c, 0.0) >= self.reliability_floor
                     and float(probs.get(c, 0.0)) >= self.present_threshold):
@@ -607,12 +784,12 @@ class VisionScaffold:
         return out
 
     def _select_target(self, present: Set[str], timestep: int) -> None:
-        ranked = sorted(present, key=self._score, reverse=True)
+        ranked = sorted(present, key=self._rank, reverse=True)
         # eps_abs consistently (audit fix): "distinctively curious" is ONE bar.
         # A sub-epsilon score residue used to make best=stone, blocking the
         # cold-start handoff to a virgin tree and preempting via a numerically
         # meaningless margin (score > 0 here vs >= eps_abs at engagement).
-        best = (ranked[0] if ranked and self._score(ranked[0]) >= self.eps_abs
+        best = (ranked[0] if ranked and self._rank(ranked[0]) >= self.eps_abs
                 else None)
         # incumbent momentarily out of view -> TOLERATE a brief flicker before
         # releasing (MF-2). Raw per-step head sigmoids cross present_threshold
@@ -630,7 +807,7 @@ class VisionScaffold:
                 # flicker thrash stays fixed.
                 if (best is not None and best != self._target
                         and (timestep - self._target_since) >= self.min_dwell
-                        and self._score(best) > self._score(self._target)
+                        and self._rank(best) > self._rank(self._target)
                         * (1.0 + self.retarget_margin)):
                     self._target = best
                     self._target_since = timestep
@@ -654,7 +831,7 @@ class VisionScaffold:
         # incumbent still present: hand off only past margin AND min dwell
         if best is not None and best != self._target:
             dwell_ok = (timestep - self._target_since) >= self.min_dwell
-            if dwell_ok and self._score(best) > self._score(
+            if dwell_ok and self._rank(best) > self._rank(
                     self._target) * (1.0 + self.retarget_margin):
                 self._target = best
                 self._target_since = timestep
@@ -901,7 +1078,9 @@ class VisionScaffold:
                      reach_measured: Optional[float] = None,
                      fovea_probs: Optional[Dict[str, float]] = None,
                      fovea_counts: Optional[Dict[str, int]] = None,
-                     pitch: Optional[float] = None) -> float:
+                     pitch: Optional[float] = None,
+                     excluded: Optional[Set[str]] = None,
+                     social_present: bool = False) -> float:
         if not self.enabled or self._closed:
             return 0.0
         self._now = int(timestep)     # TTL presence for proposals reads this
@@ -910,6 +1089,13 @@ class VisionScaffold:
         self._fovea_probs = fovea_probs or {}
         self._fovea_counts = fovea_counts or {}
         self._pitch = None if pitch is None else float(pitch)
+        # DEGENERATE-SIGNAL EXCLUSION (infra #1, 2026-08-08): a predicate the
+        # signal-health monitor has flagged as carrying no information (a
+        # learned constant, like the llava-era tree_visible) must not steer.
+        # Excluded categories cannot be trusted-present and cannot be
+        # selected; they re-enter the moment the monitor un-flags them.
+        self._excluded = set(excluded) if excluded else set()
+        self._social_present = bool(social_present)
         probs = object_probs or {}
         reliability = reliability or {}
         label_counts = label_counts or {}
@@ -944,8 +1130,29 @@ class VisionScaffold:
         # `target_categories` here would leave every proposal at lp=0 forever,
         # which would evict all of them at probation and make layer 3 a no-op
         # that merely looked implemented.
+        # JOINT ATTENTION (2026-08-09): the teacher's presence under the gaze
+        # amplifies what co-present categories teach (see __init__). The
+        # boost applies to the ATTRIBUTION, not the reward — safeguards
+        # untouched. Expired demo-primes are also swept here.
+        # ...the boost NEVER applies to the trigger category itself (review
+        # 2026-08-09: boosting player_visible's own EMA whenever the player
+        # is watched is self-reinforcing stare-at-the-teacher selection)
+        _social_lp = lp
+        if self._social_present and self.social_attention_boost > 0.0:
+            _social_lp = lp * (1.0 + self.social_attention_boost)
+        if self._primed:
+            for _pc in [k for k, v in self._primed.items()
+                        if v < self._now]:
+                self._primed.pop(_pc, None)
         for c in self.live_targets():
             cur = self._cat_lp.get(c, 0.0)
+            # a primed category's curiosity is HELD above the global while
+            # the demonstration is fresh (re-asserted, since the EMA would
+            # otherwise wash the injection out in a few hundred steps)
+            if c in self._primed:
+                self._cat_lp[c] = max(cur, self._global_lp
+                                      + 4.0 * self.eps_abs)
+                cur = self._cat_lp[c]
             if c in present:
                 # STALE-LP DISCOUNT: a fossil EMA re-entering view is decayed
                 # toward the CURRENT global by how long it was absent, so a
@@ -955,7 +1162,8 @@ class VisionScaffold:
                 if self.lp_stale_tau > 0.0 and _abs_n > 0:
                     _keep = math.exp(-float(_abs_n) / self.lp_stale_tau)
                     cur = self._global_lp + (cur - self._global_lp) * _keep
-                self._cat_lp[c] = (1.0 - b) * cur + b * lp
+                self._cat_lp[c] = (1.0 - b) * cur + b * (
+                    lp if c == "player_visible" else _social_lp)
             else:
                 self._cat_absent[c] = self._cat_absent.get(c, 0) + 1
                 self._cat_lp[c] = cur * (1.0 - self.ema_leak)
@@ -1081,6 +1289,9 @@ class VisionScaffold:
                                    is not None else -1.0, 3)
                           for c in (self._seek_cats or [])},
                 "pitch_level": round(self._pitch_level(), 3),
+                "social": {"present": self._social_present,
+                           "demos_primed": self.demos_primed,
+                           "primed": sorted(self._primed)},
                 "cold_spent": dict(self._cold_spent),
                 # budget included so a log line alone explains a w=0 latch
                 "cold_start_budget": self.cold_start_budget}

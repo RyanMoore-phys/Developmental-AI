@@ -28,12 +28,27 @@ Performance / quality features (added for the parallel/async refactor):
     only reads numpy arrays + builds tensors; it never touches model params.
 """
 
+import json
+import logging
+import os
+import shutil
 import threading
 import queue
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Files a saved buffer is made of. `manifest.json` is written LAST and is the
+# commit record: a directory without a readable manifest is treated as absent,
+# which makes the whole save atomic in effect without needing an atomic
+# directory rename. (world_model.pt is written non-atomically and a truncated
+# one has already cost this project a silent partial restore — the same
+# mistake is not repeated here.)
+_BUF_ARRAYS = ("observations", "actions", "rewards", "dones", "priorities")
+_BUF_MANIFEST = "manifest.json"
 
 
 class ReplayBuffer:
@@ -414,6 +429,122 @@ class ReplayBuffer:
         boundary_ok = ~any_done | (first_done == seq_len - 1)
         return starts[has_reward & boundary_ok]
 
+    # ------------------------------------------------------------------
+    # PERSISTENCE (2026-08-23)
+    #
+    # This buffer had NO save/load path at all, so a crash-relaunch — which
+    # the supervisor performs automatically, and which live Python exceptions
+    # have caused — restarted world-model training from an EMPTY buffer. On a
+    # multi-day run the effective memory was never the configured capacity;
+    # it was "however long since the last crash".
+    #
+    # Stored in CHRONOLOGICAL order (oldest first) rather than as the raw
+    # circular layout, so a restore still works when `capacity` changes
+    # between runs: the newest min(n, capacity) entries are kept and the rest
+    # are dropped exactly as the circular buffer would have dropped them.
+    # ------------------------------------------------------------------
+    def _chronological(self) -> np.ndarray:
+        """Indices oldest-first. Before wrap that is [0, size); after wrap the
+        write position is the oldest slot."""
+        if self.size < self.capacity:
+            return np.arange(self.size, dtype=np.int64)
+        return (np.arange(self.capacity, dtype=np.int64)
+                + int(self.position)) % self.capacity
+
+    def save(self, path: str, max_transitions: Optional[int] = None) -> int:
+        """Write the most recent experience to directory `path`.
+
+        The manifest is written LAST and is the commit record — a reader that
+        finds no manifest treats the directory as absent rather than loading
+        a half-written buffer.
+        """
+        with self._lock:
+            order = self._chronological()
+            if max_transitions is not None and len(order) > int(max_transitions):
+                order = order[-int(max_transitions):]      # keep the NEWEST
+            n = int(len(order))
+            cols = {
+                "observations": self.observations[order],
+                "actions": self.actions[order],
+                "rewards": self.rewards[order],
+                "dones": self.dones[order],
+                "priorities": self.priorities[order],
+            }
+            meta = {
+                "n": n,
+                "obs_dim": int(self.obs_dim),
+                "action_dim": int(self.action_dim),
+                "obs_uint8": bool(self._obs_uint8),
+                "max_priority": float(self.max_priority),
+            }
+        tmp = path + ".tmp"
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp, exist_ok=True)
+        for k, v in cols.items():
+            np.save(os.path.join(tmp, k + ".npy"), v)
+        with open(os.path.join(tmp, _BUF_MANIFEST), "w") as fh:
+            json.dump(meta, fh)                       # COMMIT
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        os.replace(tmp, path)
+        return n
+
+    def load(self, path: str) -> int:
+        """Restore from `path`. Returns the number of transitions loaded.
+
+        PRE-FLIGHT BEFORE ANY MUTATION, the same discipline the world-model
+        restore now uses: a payload whose shapes cannot fill this buffer is
+        refused while the buffer is still pristine, rather than half-copied
+        into a hybrid that reports success.
+        """
+        mpath = os.path.join(path, _BUF_MANIFEST)
+        if not os.path.isfile(mpath):
+            raise FileNotFoundError(
+                f"{path} has no {_BUF_MANIFEST} — the save did not commit "
+                f"(partial or interrupted write); treating as absent")
+        with open(mpath) as fh:
+            meta = json.load(fh)
+        if int(meta.get("obs_dim", -1)) != int(self.obs_dim):
+            raise ValueError(
+                f"buffer obs_dim {meta.get('obs_dim')} != {self.obs_dim} — "
+                f"the observation changed shape since this was written; "
+                f"refusing before touching the buffer")
+        if int(meta.get("action_dim", -1)) != int(self.action_dim):
+            raise ValueError(
+                f"buffer action_dim {meta.get('action_dim')} != "
+                f"{self.action_dim} (action_dim moved 10 -> 12 once already) "
+                f"— refusing before touching the buffer")
+        if bool(meta.get("obs_uint8", False)) != bool(self._obs_uint8):
+            raise ValueError(
+                f"buffer obs dtype differs (saved obs_uint8="
+                f"{meta.get('obs_uint8')}, live={self._obs_uint8}) — the "
+                f"stored values would be off by 255x; refusing")
+        for k in _BUF_ARRAYS:
+            if not os.path.isfile(os.path.join(path, k + ".npy")):
+                raise FileNotFoundError(f"{path} is missing {k}.npy")
+        cols = {k: np.load(os.path.join(path, k + ".npy")) for k in _BUF_ARRAYS}
+        n = int(cols["observations"].shape[0])
+        if n > self.capacity:                 # capacity shrank: keep newest
+            cols = {k: v[-self.capacity:] for k, v in cols.items()}
+            n = self.capacity
+        with self._lock:
+            self.observations[:n] = cols["observations"]
+            self.actions[:n] = cols["actions"]
+            self.rewards[:n] = cols["rewards"]
+            self.dones[:n] = cols["dones"]
+            self.priorities[:n] = cols["priorities"]
+            self.size = n
+            self.position = n % self.capacity
+            self.max_priority = float(meta.get("max_priority", 1.0)) or 1.0
+            # Episode boundaries are deliberately NOT restored: those indices
+            # describe the old layout, and `_find_valid_starts` reads `dones`
+            # (which IS restored) to avoid sampling across a boundary.
+            # Carrying stale indices would be worse than carrying none.
+            self.episode_starts = []
+            self._current_episode_start = self.position
+        return n
+
     def __len__(self) -> int:
         return self.size
 
@@ -472,6 +603,34 @@ class MultiStreamReplayBuffer:
 
     def add(self, observation, action, reward, done, stream: int = 0) -> None:
         self.streams[stream].add(observation, action, reward, done)
+
+    def save(self, path: str, max_transitions: Optional[int] = None) -> int:
+        """Persist every stream under `path/stream_<i>`. Returns total written.
+
+        `max_transitions` is PER STREAM, so the cap means the same thing
+        however many bodies are feeding the brain.
+        """
+        os.makedirs(path, exist_ok=True)
+        total = 0
+        for i, s in enumerate(self.streams):
+            total += s.save(os.path.join(path, f"stream_{i}"),
+                            max_transitions=max_transitions)
+        return total
+
+    def load(self, path: str) -> int:
+        """Restore every stream. Missing streams are skipped, not fatal: the
+        env count can legitimately change between runs (4 clients broke the
+        Paper server once and the fleet was scaled to 2), and a brain that
+        refused to start because it now has fewer bodies would be worse than
+        one that resumes with the experience it can still account for.
+        """
+        total = 0
+        for i, s in enumerate(self.streams):
+            _p = os.path.join(path, f"stream_{i}")
+            if not os.path.isdir(_p):
+                continue
+            total += s.load(_p)
+        return total
 
     def __len__(self) -> int:
         return sum(len(s) for s in self.streams)

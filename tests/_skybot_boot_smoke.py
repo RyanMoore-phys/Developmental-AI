@@ -175,7 +175,8 @@ def test_boot_mint_bind_invoke_practise_persist():
         # LOAD-BEARING is. So assert that changing each input changes the
         # skill's output distribution. A regression that silently zeroes
         # either one fails here instead of in month three of a run.
-        actor, cond, enc = ob._materialize(slot)
+        # 2026-08-09: _materialize grew a 4th element (the owned DeltaHead)
+        actor, cond, enc, _delta = ob._materialize(slot)
         assert ob.cond_load_failures == 0, (
             f"symbolic conditioning DISABLED for {ob.cond_failed_ids} — the "
             f"skill would act on zero knowledge")

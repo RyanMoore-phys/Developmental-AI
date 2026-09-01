@@ -147,7 +147,8 @@ class MineRLEnvAdapter(gym.Env):
                  log_tick_cap: int = 120,
                  log_break_reward: float = 5.0,
                  break_decay_scale: float = 0.0,
-                 break_memory_path: Optional[str] = None):
+                 break_memory_path: Optional[str] = None,
+                 agent_name: Optional[str] = None):
         super().__init__()
         # LIFELONG: drop the 8000-tick time-up quit + TimeLimit backstop so the
         # world NEVER ends on time (death = 64-log success only). The Java
@@ -173,6 +174,9 @@ class MineRLEnvAdapter(gym.Env):
         # samples-per-hour for a lower kick rate. Applied ONLY in remote mode
         # so local generated-world runs stay exactly as fast as before.
         self.remote_step_delay_s = float(remote_step_delay_s or 0.0)
+        # server-visible identity; None keeps the historical single-client
+        # behaviour byte-for-byte (see create_agent_start)
+        self.agent_name = str(agent_name) if agent_name else None
         # ---- START TOOL (None/'' = spawn EMPTY-HANDED) --------------------
         # Handing the agent an iron axe makes a log ~8 ticks instead of ~80,
         # which is the difference between a chop it can stumble into and one
@@ -341,6 +345,17 @@ class MineRLEnvAdapter(gym.Env):
         # one un-habituated way left to manufacture novelty. Same mastery
         # counters, same decay, same file.
         self._places_by_type: Dict[str, int] = {}
+        # WHAT A `use` ACTUALLY CONSUMED — the only ground truth about what
+        # is in the hand that this env can obtain (see the mainhand
+        # derivation): `equipped_items` is dead in MineRL 1.0 and the
+        # inventory observation is FLAT (item -> count, no slot indices), so
+        # nothing else can name the held item.
+        self._last_placed_item: Optional[str] = None
+        # crafts and pickups joined the event memory with the typed event
+        # stream (infra #44): mastery/habituation is about EVENTS the agent
+        # causes, whatever their kind — the four kinds this adapter emits.
+        self._crafts_by_type: Dict[str, int] = {}
+        self._pickups_by_type: Dict[str, int] = {}
         self._inv_prev_counts: Dict[str, int] = {}
         if self._break_memory_path:
             try:
@@ -356,15 +371,30 @@ class MineRLEnvAdapter(gym.Env):
                         self._places_by_type = {
                             str(k): int(v)
                             for k, v in (_m.get("places") or {}).items()}
+                        self._crafts_by_type = {
+                            str(k): int(v)
+                            for k, v in (_m.get("crafts") or {}).items()}
+                        self._pickups_by_type = {
+                            str(k): int(v)
+                            for k, v in (_m.get("pickups") or {}).items()}
                     else:       # legacy flat format = breaks only
                         self._breaks_by_type = {str(k): int(v)
                                                 for k, v in _m.items()}
+                    for _ck, _cv in (_m.get("cells") or {}).items():
+                        try:
+                            _x, _z = _ck.split(",")
+                            self._visits[(int(_x), int(_z))] = int(_cv)
+                        except Exception:
+                            continue
                     logger.info(
                         "break memory: restored %d block types "
-                        "(%d lifetime breaks, %d placements) from %s",
+                        "(%d lifetime breaks, %d placements, %d crafts, "
+                        "%d pickups) from %s",
                         len(self._breaks_by_type),
                         sum(self._breaks_by_type.values()),
                         sum(self._places_by_type.values()),
+                        sum(self._crafts_by_type.values()),
+                        sum(self._pickups_by_type.values()),
                         self._break_memory_path)
             except Exception as _e:
                 logger.warning("break memory: restore failed (%s) — "
@@ -480,6 +510,7 @@ class MineRLEnvAdapter(gym.Env):
         _remote = self.remote_server
         # closure for the spec class below: None => spawn empty-handed
         _tool = self._start_tool
+        _agent_name = self.agent_name
         class TreechopFixed(HumanSurvival):
             def __init__(self):
                 super().__init__(
@@ -489,6 +520,13 @@ class MineRLEnvAdapter(gym.Env):
                     # under lifelong so nothing honors it as a limit.
                     max_episode_steps=(10 ** 9 if _lifelong else 8000),
                 )
+                # Rendered into <Name> by mission.xml.j2 (the template reads
+                # `agent_username | default("SkyBot")`, so an unpatched
+                # template and every other env spec are unaffected). The
+                # Malmo agent name and the multiplayer username are separate
+                # fields and BOTH have to be unique — the first identifies
+                # the agent to Malmo, the second to the Minecraft server.
+                self.agent_username = _agent_name or "SkyBot"
 
             def create_observables(self):
                 # SLIM observation (July 2026 — 16-env stall fix): stock
@@ -568,9 +606,23 @@ class MineRLEnvAdapter(gym.Env):
                 # NO TOOL -> no SimpleInventoryAgentStart at all, so nothing
                 # is re-granted on rejoin. The agent starts with empty hands
                 # and whatever it later holds it must have obtained itself.
+                _start = super().create_agent_start()
+                # MULTIPLAYER IDENTITY (2026-08-17). Every client used to
+                # join the server as the same player, because provisioning
+                # rewrote the template's per-agent
+                # `<Name>MineRLAgent{{agent_index}}` to a fixed "SkyBot".
+                # That is invisible while only env 0 is remote, and fatal the
+                # moment a second one is: Minecraft resolves a duplicate
+                # login by kicking the incumbent, so N clients would evict
+                # each other in a loop forever. EnvServer.java reads exactly
+                # this handler (getMultiplayerUsername -> setUsername), so it
+                # is the supported way to give each client its own identity.
+                if _agent_name:
+                    _start = _start + [
+                        handlers.MultiplayerUsername(name=_agent_name)]
                 if not _tool:
-                    return super().create_agent_start()
-                return super().create_agent_start() + [
+                    return _start
+                return _start + [
                     handlers.SimpleInventoryAgentStart([
                         dict(type=_tool, quantity=1)])]
 
@@ -714,9 +766,25 @@ class MineRLEnvAdapter(gym.Env):
     # literal sense — humans know where they are looking without seeing
     # themselves — and the agent had no access to it at all, which is why it
     # could sit clamped at -90 swinging at sky with nothing to tell it so.
+    # MOVED + HEADING added 2026-08-23. The body could feel hunger, health,
+    # depth, whether a menu was covering the screen, how long it had been
+    # swinging and where it was looking — but NOT whether it was actually
+    # going anywhere. Every recorded failure of this agent is a failure to
+    # move: staring at the sky, sitting in a villager's trade menu for 10,149
+    # steps, holding attack against a trunk it could not reach. "Am I moving"
+    # is the most conspicuous missing proprioceptive fact, and the adapter
+    # already reads xpos/zpos every step for coverage.
+    #
+    # STILL PROPRIOCEPTION, NOT MEANING: these describe the body, name nothing
+    # in the world, and so leave the earned-meaning principle intact.
     PROPRIO_KEYS = ("food", "saturation", "life", "depth",
                     "has_tool", "gui_open", "hurt_recent", "carrying",
-                    "swing", "pitch")
+                    "swing", "pitch", "moved", "head_sin", "head_cos")
+    # blocks of horizontal travel per agent step that reads as "full speed".
+    # Minecraft walks ~4.3 blocks/s; at action_repeat 2 (0.1s) that is ~0.43,
+    # sprinting ~0.56 — so 0.5 puts a normal walk near the top of the range
+    # without pinning it there.
+    MOVE_SCALE = 0.5
     PROPRIO_DIM = len(PROPRIO_KEYS)
 
     def _proprio(self, world: Dict[str, Any]) -> np.ndarray:
@@ -748,6 +816,24 @@ class MineRLEnvAdapter(gym.Env):
             _pt = world.get("pitch")
             v[9] = (0.5 if _pt is None else
                     float(np.clip((float(_pt) + 90.0) / 180.0, 0.0, 1.0)))
+            # AM I MOVING (2026-08-23)
+            _mv = world.get("moved")
+            v[10] = (0.0 if _mv is None else
+                     float(np.clip(float(_mv) / self.MOVE_SCALE, 0.0, 1.0)))
+            # WHICH WAY AM I FACING. sin/cos rather than raw degrees so the
+            # wrap at 360->0 is continuous rather than a cliff.
+            #
+            # RESCALED TO [0,1] like every other entry: this vector's standing
+            # invariant is that all of it is normalized to [0,1] (asserted in
+            # _proprioception_smoke), and a raw sine would have been the only
+            # member on a different scale. Unknown reads 0.5/0.5 — the exact
+            # convention `pitch` above already uses for "no reading".
+            _yw = world.get("yaw")
+            v[11] = v[12] = 0.5
+            if _yw is not None:
+                _r = float(np.radians(float(_yw)))
+                v[11] = float(np.sin(_r)) * 0.5 + 0.5
+                v[12] = float(np.cos(_r)) * 0.5 + 0.5
         except Exception:
             pass
         return v
@@ -793,6 +879,12 @@ class MineRLEnvAdapter(gym.Env):
             self._visits[cell] = n + 1
             if len(self._visits) > 50000:            # bound the memory
                 self._visits.pop(next(iter(self._visits)))
+            # territory changes EVERY step, so it needs a step-paced flush of
+            # its own — the event counter can sit still for hours (review
+            # finding 2026-08-11). Self-throttling; event=False so this does
+            # not consume the event budget.
+            self._visit_writes = int(getattr(self, "_visit_writes", 0)) + 1
+            self._save_break_memory(event=False)
             out["coverage"] = float(1.0 / np.sqrt(1.0 + n))
             out["cell"] = cell
             out["cells_seen"] = len(self._visits)
@@ -803,6 +895,11 @@ class MineRLEnvAdapter(gym.Env):
             _p = self._read_scalar(raw_obs, "pitch")
             if _p is not None:
                 out["pitch"] = float(_p)
+            # heading too (infra #38): the episodic-memory bearing sense is
+            # RELATIVE to where the agent faces, which needs yaw
+            _yw = self._read_scalar(raw_obs, "yaw")
+            if _yw is not None:
+                out["yaw"] = float(_yw)
             if y is not None:
                 out["ypos"] = y
             # ABSOLUTE POSITION (2026-08-02). Only the derived `cell` and
@@ -813,6 +910,37 @@ class MineRLEnvAdapter(gym.Env):
             # you can read x/z. Two floats, already computed above.
             out["xpos"] = float(x)
             out["zpos"] = float(z)
+            # KEY-NAME ALIAS — repairs FIVE silently dead consumers
+            # (2026-08-11). This function has always published `xpos`/`ypos`/
+            # `zpos`, but every downstream reader was written against
+            # `x`/`y`/`z`, so each got None and failed CLOSED without a word:
+            #   * the episodic sighting gate (infra/stack.py ~319 requires a
+            #     non-None position) — which is why the run reported
+            #     "sighting never" for 336k steps for ALL NINE categories,
+            #     including `dirt` at a 42.6% fovea-positive rate. MEASURED:
+            #     zero " @(x,z)" markers in the entire run log, while the
+            #     status line printed "Position: x=+36.3 ..." on the same
+            #     step because THAT reader uses xpos/ypos/zpos.
+            #   * the episodic BEARING proprio sense (loop _augment_proprio)
+            #   * _memory_pull_phi (so that term could never pay at all)
+            #   * the demonstration landmark (demos were witnessed, none
+            #     stored)
+            #   * the live viewer's position payload
+            # Aliasing at the SOURCE fixes every consumer at once, including
+            # any not yet found, and cannot disturb the xpos/ypos/zpos
+            # readers. A pure measurement repair: no new reward term.
+            out["x"] = out["xpos"]
+            out["z"] = out["zpos"]
+            # HOW FAR DID THE BODY ACTUALLY TRAVEL since the last step. Kept
+            # here rather than in _proprio so that stays a pure function of
+            # `world`; this method is already the stateful one (it owns the
+            # coverage visit counts).
+            _pxz = getattr(self, "_prev_xz", None)
+            out["moved"] = (0.0 if _pxz is None else
+                            float(np.hypot(float(x) - _pxz[0],
+                                           float(z) - _pxz[1])))
+            self._prev_xz = (float(x), float(z))
+            out["y"] = float(out.get("ypos", 0.0) or 0.0)
         # WHAT IS IN HAND — decides the chop-completion question (see
         # create_observables). "air"/none => barehanded => a log needs ~60
         # ticks but the chop option only holds attack for 50.
@@ -906,6 +1034,38 @@ class MineRLEnvAdapter(gym.Env):
                             out["tool_lost"] = self._prev_derived_hand
                             out["mainhand"] = "none"
                             self._prev_derived_hand = "none"
+                # ---- NO START TOOL -> THE HAND WAS UNKNOWABLE -------------
+                # (2026-08-17) The block above answers only "is the SPAWN
+                # tool still in the bag?". With `start_tool: null` — the
+                # shipped skybot setting — `tool` is None, so the whole
+                # branch was skipped and `mainhand` could never be anything
+                # but "none". Measured: hand=none in 160/160 samples across
+                # a 7-hour run while the agent carried 8+ items and spent
+                # 11% of its actions on `use`. It was not empty-handed; it
+                # was blind to its own hand, which is worse — every
+                # consumer (the proprio has_tool sense, the chop-budget
+                # diagnosis, tool_worn) was reading a constant.
+                #
+                # A flat inventory (item -> count, no slots) cannot name the
+                # selected slot, so this uses the one ground truth that
+                # exists: an item a `use` actually CONSUMED was, at that
+                # moment, in the hand. Nothing in TREECHOP_MACROS changes
+                # the selected slot, so it stays there while any remains.
+                # Retrospective and honest about it, exactly like the reach
+                # sense's "evidence" mode: it says "I recently placed this
+                # and still have some", never "I am definitely holding it".
+                if (not out.get("mainhand")
+                        or out.get("mainhand") in ("none", "air")):
+                    _lp = self._last_placed_item
+                    if _lp and isinstance(inv, dict):
+                        _q = inv.get(_lp)
+                        if _q is not None:
+                            try:
+                                if float(np.asarray(_q).flatten()[0]) > 0:
+                                    out["mainhand"] = str(_lp)
+                                    out["mainhand_derived"] = True
+                            except Exception:
+                                pass
             except Exception:
                 pass
         # ---- HUNGER (2026-07-27, rung-0 survival perception) --------------
@@ -1174,14 +1334,35 @@ class MineRLEnvAdapter(gym.Env):
         _n = int(self._breaks_by_type.get(str(btype), 0))
         return 1.0 / (1.0 + (_n / self._break_decay_scale))
 
-    def _save_break_memory(self) -> None:
-        """Persist breaks_by_type (throttled: every 20 breaks). Atomic
-        tmp+rename so a crash mid-write can never corrupt the memory."""
+    def _save_break_memory(self, force: bool = False,
+                           event: bool = True) -> None:
+        """Persist the lifelong event + territory memory. Atomic tmp+rename
+        so a crash mid-write can never corrupt it.
+
+        THROTTLE SCOPE FIX (2026-08-11, review finding): the every-20 counter
+        ticks only on break/place/craft/pickup EVENTS, which was right when
+        the payload held only event counts. The payload now also carries
+        `cells` (territory visits), and those change EVERY STEP — so hours of
+        pure navigation with no events flushed nothing at all, and the newly
+        added territory memory was silently lost on restart. Events still
+        force a flush every 20; a step-count floor now also flushes a run
+        that is exploring but not breaking. `force=True` (shutdown) always
+        writes."""
         if not self._break_memory_path:
             return
-        self._break_mem_dirty += 1
-        if self._break_mem_dirty < 20:
-            return
+        if not force:
+            # `event` callers bump the event counter; the per-step caller
+            # must NOT, or "every 20 events" would silently become
+            # "every 20 steps" and write the file constantly.
+            if event:
+                self._break_mem_dirty += 1
+            _steps = int(getattr(self, "_visit_writes", 0))
+            _due = (self._break_mem_dirty >= 20
+                    or _steps - int(getattr(self, "_last_mem_flush_step", 0))
+                    >= 2000)
+            if not _due:
+                return
+            self._last_mem_flush_step = _steps
         self._break_mem_dirty = 0
         try:
             import json as _json
@@ -1189,7 +1370,19 @@ class MineRLEnvAdapter(gym.Env):
             _tmp = self._break_memory_path + ".tmp"
             with open(_tmp, "w") as _f:
                 _json.dump({"breaks": self._breaks_by_type,
-                            "places": self._places_by_type}, _f)
+                            "places": self._places_by_type,
+                            "crafts": self._crafts_by_type,
+                            "pickups": self._pickups_by_type,
+                            # territory familiarity (2026-08-10): coverage
+                            # paid a fresh windfall per restart because the
+                            # visit counts died with the process. getattr:
+                            # a missing dict must cost the cells, never the
+                            # whole break-memory flush
+                            "cells": {f"{k[0]},{k[1]}": int(v)
+                                      for k, v in (getattr(self, "_visits",
+                                                           None)
+                                                   or {}).items()}},
+                           _f)
             _os.replace(_tmp, self._break_memory_path)
         except Exception as _e:
             logger.debug("break memory: save failed: %s", _e)
@@ -1322,6 +1515,10 @@ class MineRLEnvAdapter(gym.Env):
         except Exception as e:
             # The old Java process may leak; nothing more we can do from here.
             logger.warning("MineRL close() during rebuild failed: %s", e)
+        # the agency detector's previous-frame must not survive a rebuild:
+        # diffing the fresh world against a pre-rebuild frame would read the
+        # whole scene change as "someone else did something" (2026-08-09)
+        self._prev_small_pov = None
         self._env = self._make_underlying()
 
     # ---- gymnasium API ----------------------------------------------------
@@ -1329,6 +1526,14 @@ class MineRLEnvAdapter(gym.Env):
               options: Optional[Dict] = None
               ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
+        # agency-detector state never survives a world boundary (review
+        # 2026-08-09): diffing a fresh world against the previous one reads
+        # the whole scene as "someone else did something"
+        self._prev_small_pov = None
+        self._prev_agency_state = None
+        # a fresh world teleports the body: the first displacement after a
+        # reset is meaningless and must read 0, not "sprinted 200 blocks"
+        self._prev_xz = None
         if seed is not None:
             try:
                 self._env.seed(int(seed))
@@ -1459,6 +1664,13 @@ class MineRLEnvAdapter(gym.Env):
         #    High-water mark: drops never pay negative, re-collects never
         #    pay twice.
         new_count = self._count_logs(obs)
+        # ---- TYPED EVENT STREAM (infra #44, 2026-08-08) ------------------
+        # The event-centric environment contract: every effect the agent
+        # CAUSES this step is emitted as (kind, subtype). Habituation, goal
+        # admission, affordance mapping, episodic memory and farm detection
+        # all key off this stream, which is what keeps THEM domain-agnostic —
+        # the taxonomy lives here in the adapter, nowhere else.
+        _events: list = []
         # DEATH RE-BASELINE (audit fix): the spec allows survival deaths
         # (respawn wipes the inventory) and lifelong mode may not reset() for
         # days — after a death at N logs the monotone high-water silenced the
@@ -1467,6 +1679,12 @@ class MineRLEnvAdapter(gym.Env):
         # way to toss a whole stack); small drops still never re-pay.
         if new_count == 0 and self._log_count > 0:
             self._log_count = 0
+        if new_count > self._log_count:
+            _events.append(("pickup", "log"))
+            self._pickups_by_type["log"] = (
+                self._pickups_by_type.get("log", 0)
+                + int(new_count - self._log_count))
+            self._save_break_memory()
         total_reward += float(max(0, new_count - self._log_count))
         self._log_count = max(new_count, self._log_count)
         # 2. FIRST-BREAK ACHIEVEMENTS — now TIERED by block value (July 2026):
@@ -1521,6 +1739,79 @@ class MineRLEnvAdapter(gym.Env):
                     if 0 <= int(action) < len(self._macros) else False)
         if _gui:
             _use_act = False
+        # ---- EFFORT SIGNAL (2026-08-09) ----------------------------------
+        # Which steps SPENT the body: attack/use/jump are metabolically
+        # effortful in a way looking and walking are not. Emitted as a
+        # domain-agnostic contract field so the loop can price effort
+        # (observed live: sustained attack swings at CLOUDS — futile effort
+        # is free under a pure-novelty economy, so nothing extinguished it;
+        # a human stops punching air because effort costs).
+        _mac = (self._macros[int(action)]
+                if 0 <= int(action) < len(self._macros) else {})
+        # _atk, not the raw macro key: a swing the GUI swallows is not
+        # effort spent on the world (symmetric with _use_act)
+        info["effort"] = float(bool(_atk) or _use_act
+                               or bool(_mac.get("jump")))
+        # ---- EXTERNAL-AGENCY DETECTION (2026-08-09, social learning) -----
+        # "The world changed and I did not do it." When the agent is PASSIVE
+        # (no attack/use, no movement or camera macro) and STATIONARY, its
+        # own POV should be nearly static — a large frame change in that
+        # state is something ELSE acting (another player felling a block,
+        # a mob, physics). Emitted as a typed event so the loop can do
+        # observational learning; never credited as a self-caused effect.
+        # Cheap: mean |delta| on an 8x-downsampled frame, only computed on
+        # passive-stationary steps (rare), thresholded well above cloud
+        # drift / sun flicker.
+        try:
+            # PASSIVE means the AGENT issued nothing frame-changing (review
+            # 2026-08-09: the inventory toggle changes ~48% of the frame and
+            # passed as "passive" — the agent owned a button that
+            # manufactured demonstrations; any GUI step is likewise self-
+            # caused screen change)
+            _passive = (info["effort"] == 0.0
+                        and not _gui
+                        and not any(_mac.get(k) for k in
+                                    ("forward", "back", "left", "right",
+                                     "jump", "inventory", "sneak",
+                                     "sprint"))
+                        and not (_mac.get("camera")
+                                 and any(abs(float(c)) > 0.5
+                                         for c in _mac["camera"])))
+            # ...and STATIONARY is MEASURED, not asserted from the action
+            # (review: falls, knockback, water drift and momentum move the
+            # camera on noop steps and read as external agency). Position
+            # AND look must both be still vs the previous step.
+            _ax = self._read_scalar(obs, "xpos")
+            _ay = self._read_scalar(obs, "ypos")
+            _az = self._read_scalar(obs, "zpos")
+            _ap = self._read_scalar(obs, "pitch")
+            _aw = self._read_scalar(obs, "yaw")
+            _cur_state = (_ax, _ay, _az, _ap, _aw)
+            _prev_state = getattr(self, "_prev_agency_state", None)
+            _still = (_prev_state is not None
+                      and None not in _cur_state
+                      and None not in _prev_state
+                      and abs(_cur_state[0] - _prev_state[0]) < 0.05
+                      and abs(_cur_state[1] - _prev_state[1]) < 0.05
+                      and abs(_cur_state[2] - _prev_state[2]) < 0.05
+                      and abs(_cur_state[3] - _prev_state[3]) < 1.0
+                      and abs(_cur_state[4] - _prev_state[4]) < 1.0)
+            self._prev_agency_state = _cur_state
+            _pov = obs.get("pov") if isinstance(obs, dict) else None
+            if _pov is not None:
+                _small = np.asarray(_pov, dtype=np.float32)[::8, ::8]
+                _prev_small = getattr(self, "_prev_small_pov", None)
+                if (_passive and _still and _prev_small is not None
+                        and _prev_small.shape == _small.shape):
+                    _delta = float(np.mean(np.abs(
+                        _small - _prev_small))) / 255.0
+                    if _delta > float(getattr(
+                            self, "_observed_change_thresh", 0.02)):
+                        _events.append(("observed_change", "world"))
+                        info["observed_change_mag"] = round(_delta, 4)
+                self._prev_small_pov = _small
+        except Exception:
+            pass
         _inv_now = self._inv_counts(obs)
         _placed_now: list = []
         if _use_act:
@@ -1530,6 +1821,10 @@ class MineRLEnvAdapter(gym.Env):
                     self._places_by_type[_it] = (
                         self._places_by_type.get(_it, 0) + _dd)
                     _placed_now.append(_it)
+                    # A `use` that consumed this item PROVES it was in the
+                    # selected slot at that moment. Nothing here can change
+                    # the selected slot, so it stays there while any remains.
+                    self._last_placed_item = str(_it)
                     self._save_break_memory()
         self._inv_prev_counts = _inv_now
         info["placed_now"] = _placed_now
@@ -1609,6 +1904,15 @@ class MineRLEnvAdapter(gym.Env):
             # these apart, which is why the question stayed open for weeks.
             if self._attack_run > 0:
                 self._runs_nobreak.append(int(self._attack_run))
+                # A SWING THAT ACHIEVED NOTHING, exported per-step
+                # (2026-08-14). "I tried this and nothing happened" is
+                # evidence about a thing just as much as breaking it is —
+                # and without it a category the agent CANNOT affect (stone,
+                # barehanded) never closes, so it keeps maximum consequence
+                # deficit forever and holds the magnet's attention
+                # permanently. Measured live: 400 fruitless swings, 182 of
+                # them >=8 ticks, max streak 202, zero breaks.
+                self._swing_failed = int(self._attack_run)
             self._attack_run = 0
 
         mine_now = self._mine_counts(obs)
@@ -1652,6 +1956,7 @@ class MineRLEnvAdapter(gym.Env):
             # _mine_prev genuinely stood at 0.
             _d = int(_cnt) - int(self._mine_prev.get(_bt, 0))
             if _d > 0:
+                _events.append(("break", str(_bt)))
                 # ---- EFFORT PAYMENT, LOGS ONLY ----------------------------
                 # per tick actually invested in the swing that felled it,
                 # bounded so a runaway streak cannot pay thousands.
@@ -1756,11 +2061,34 @@ class MineRLEnvAdapter(gym.Env):
             _d = int(_cnt) - int(self._craft_prev.get(_it, _cnt))
             if _d > 0:
                 ach[f"craft_{_it}"] = int(_cnt)
+                _events.append(("craft", str(_it)))
+                self._crafts_by_type[str(_it)] = (
+                    self._crafts_by_type.get(str(_it), 0) + _d)
+                self._save_break_memory()
                 if _it not in self._crafted_this_episode:
                     self._crafted_this_episode.add(_it)
                     total_reward += 5.0
         self._craft_prev = dict(_crafted_now)
         info["achievements"] = ach
+        # typed event stream, assembled from every effect detected above
+        # (placements were detected earlier in the step; a death this step
+        # is read off the world info the life-stats section produced)
+        for _it in _placed_now:
+            _events.append(("place", str(_it)))
+        if bool((info.get("world") or {}).get("died")):
+            _events.append(("death", "self"))
+        info["events"] = _events
+        info["crafts_by_type"] = dict(self._crafts_by_type)
+        info["pickups_by_type"] = dict(self._pickups_by_type)
+        # WHAT IS HELD (2026-08-13). `_inv_counts` was computed every step for
+        # placement detection but never published, so nothing downstream could
+        # ask "what do I have?" — and possession is the second axis of "where
+        # I am" for the consequence frontier. Already computed above; this
+        # only exports it.
+        info["inventory"] = dict(_inv_now)
+        # ticks of the swing that just ended fruitlessly (0 = none this step)
+        info["swing_failed"] = int(getattr(self, "_swing_failed", 0))
+        self._swing_failed = 0
         # Task success: 64 logs = Treechop's completion condition.
         terminated = new_count >= 64
         # Otherwise MineRL's `done` is the step limit -> TRUNCATION (the
@@ -1772,6 +2100,15 @@ class MineRLEnvAdapter(gym.Env):
         return self._last_pov
 
     def close(self):
+        # FINAL FLUSH (2026-08-11, review finding): nothing wrote the lifelong
+        # memory on shutdown, so everything since the last throttled flush —
+        # up to 2000 steps of territory — died with the process.
+        try:
+            self._save_break_memory(force=True)
+        except Exception as _e:
+            # never block shutdown — but never lose the memory SILENTLY
+            logger.warning("break memory: final flush FAILED (%s) — "
+                           "territory since the last flush is lost", _e)
         try:
             self._env.close()
         except Exception:

@@ -511,6 +511,7 @@ def make_env(
     log_break_reward: float = 5.0,
     break_decay_scale: float = 0.0,
     break_memory_path: Optional[str] = None,
+    agent_name: Optional[str] = None,
 ) -> Tuple[DevelopmentalEnvWrapper, Optional[CurriculumWrapper]]:
     """
     Create a wrapped Gymnasium environment ready for the developmental AI framework.
@@ -564,6 +565,7 @@ def make_env(
                                log_break_reward=log_break_reward,
                                break_decay_scale=break_decay_scale,
                                break_memory_path=break_memory_path,
+                               agent_name=agent_name,
                                **({} if start_tool == "__default__"
                                   else {"start_tool": start_tool}))
         curriculum_wrapper = None

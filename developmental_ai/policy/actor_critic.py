@@ -505,6 +505,21 @@ class StandaloneActorCritic:
         self.logit_range = float(logit_range or 0.0)
         self.last_approx_kl = 0.0
         self.last_epochs_run = 0
+        # PPO update-rate forensics (2026-08-23). Under options a stored ROW
+        # spans tau env steps, so the row count — not the env-step count —
+        # is what the collapse guard divides by. Kept on the object so the
+        # loop's segment print can distinguish a starved update from a
+        # healthy one; see train_step's guard block.
+        # largest observed |carried - recomputed| feature delta while the A2
+        # self-check is on; ~0 means no encoder update fell between the two
+        self.last_feat_drift = 0.0
+        self.last_epochs_requested = 0
+        self.last_epochs_capped = False
+        self.last_rows = 0
+        self.last_rows_option = 0
+        self.last_rows_primitive = 0
+        self.last_tau_mean = 1.0
+        self.last_env_steps = 0
         self.continuous = continuous
         # Device (July 2026 audit H-GPU fix): StandaloneActorCritic is a plain
         # class, not an nn.Module, so it was never `.to(device)`'d and built all
@@ -805,6 +820,8 @@ class StandaloneActorCritic:
         deterministic: bool = False,
         action_mask: Optional[np.ndarray] = None,
         proprio: Optional[np.ndarray] = None,
+        feats: Optional[torch.Tensor] = None,
+        verify_feats: bool = False,
     ) -> Tuple[int, Dict[str, float]]:
         """
         Select an action given an observation (and optional KG knowledge vector).
@@ -819,7 +836,48 @@ class StandaloneActorCritic:
         with torch.no_grad():
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
             knowledge_tensor = self._prep_knowledge(knowledge)
-            aug = self._augment(self._encode(obs_tensor), knowledge_tensor,
+            # ---- REUSE THE ENCODER FORWARD THE LOOP ALREADY DID (A2) ------
+            # For arch='wm' this is the world model's encoder, and the loop
+            # ran it on THIS SAME FRAME one step ago (as `encoded_next`, for
+            # the RSSM). Recomputing it here is a duplicate forward on every
+            # env step. `feats` lets the caller hand the result over.
+            #
+            # EXPLICIT DATAFLOW, NOT A CACHE, ON PURPOSE: a cache keyed on
+            # anything but exact provenance could serve one env's features
+            # for another's frame, or a pre-reset frame after a world
+            # rebuild — silent, and indistinguishable from a bad policy.
+            # Passing them in means they are right by construction, and the
+            # caller is the only place that knows whether the frame carried.
+            _feat = None
+            if feats is not None:
+                _f = feats if feats.dim() == 2 else feats.reshape(1, -1)
+                if _f.shape[0] != 1 or _f.shape[1] != int(self.enc_dim):
+                    raise ValueError(
+                        f"select_action got feats of shape {tuple(_f.shape)}, "
+                        f"expected (1, {self.enc_dim}) — refusing to act on a "
+                        f"feature vector that is not this observation's")
+                if verify_feats:
+                    # LIVE SELF-CHECK: recompute and compare. The tolerance is
+                    # deliberate, not sloppy — the shared encoder TRAINS
+                    # asynchronously (wm_train_every 250), so features carried
+                    # one step can legitimately differ by one optimizer step
+                    # of drift. A WRONG FRAME or a wrong env index differs by
+                    # O(1) in conv features, so this separates the two rather
+                    # than pretending drift is a bug.
+                    _ref = self._encode(obs_tensor)
+                    _d = float((_f - _ref).abs().max().item())
+                    self.last_feat_drift = max(
+                        float(getattr(self, "last_feat_drift", 0.0)), _d)
+                    if _d > 1e-2:
+                        raise RuntimeError(
+                            f"carried features do not match this observation "
+                            f"(max|delta| {_d:.4f}) — far beyond one optimizer "
+                            f"step of encoder drift. The frame or the env "
+                            f"index is wrong. Refusing to act.")
+                _feat = _f
+            if _feat is None:
+                _feat = self._encode(obs_tensor)
+            aug = self._augment(_feat, knowledge_tensor,
                                 self._prep_proprio(proprio))
             if action_mask is not None and not self.continuous:
                 # masked meta-head (options): sample from the renormalized
@@ -839,17 +897,32 @@ class StandaloneActorCritic:
                     aug, deterministic=deterministic)
             value = self.critic(aug)
 
-        # .cpu() before .numpy() — required on CUDA (a device tensor can't be
-        # converted to numpy directly). For discrete actions .item() reads the
-        # scalar off any device.
+        # ---- ONE DEVICE->HOST TRANSFER, NOT THREE (2026-08-23) -----------
+        # Every `.item()` is a full pipeline drain: the CPU blocks until the
+        # GPU has finished all queued work. This path ran three of them
+        # (action, log_prob, value) on EVERY env step, and the drains are
+        # worst exactly when they hurt most — the VLM shares this device, so
+        # a sync can wait behind a 1.5s inference rather than a kernel.
+        # Measured context: ~2350 aten ops and ~25 syncs per step at 2% GPU
+        # utilisation; the device is idle and we are paying latency.
+        #
+        # Stacking is exact: the action INDEX is a small integer (action_dim
+        # is tens), far inside float32's exactly-representable range, so the
+        # int(...) round-trip cannot lose it.
         if self.continuous:
             action_np = action.squeeze(0).cpu().numpy()
-        else:
-            action_np = int(action.item())
-
-        return action_np, {
-            "log_prob": log_prob.item(),
-            "value": value.item(),
+            _lp, _v = log_prob.reshape(-1)[0], value.reshape(-1)[0]
+            _scalars = torch.stack((_lp, _v)).tolist()   # 1 sync
+            return action_np, {"log_prob": float(_scalars[0]),
+                               "value": float(_scalars[1])}
+        _scalars = torch.stack((
+            action.reshape(-1)[0].to(value.dtype),
+            log_prob.reshape(-1)[0].to(value.dtype),
+            value.reshape(-1)[0],
+        )).tolist()                                       # 1 sync, not 3
+        return int(_scalars[0]), {
+            "log_prob": float(_scalars[1]),
+            "value": float(_scalars[2]),
         }
 
     def compute_last_value(self, obs: np.ndarray,
@@ -948,10 +1021,36 @@ class StandaloneActorCritic:
         _rows = len(self.rollout_obs)
         _req = int(n_epochs)
         n_epochs = max(1, min(_req, _rows // _ROWS_PER_EPOCH))
-        if n_epochs < _req:
-            logger.debug(
-                "PPO: %d rows (%d env steps) -> %d/%d epochs (tiny-batch "
-                "collapse guard)", _rows, self.rollout_env_steps(),
+        # ---- MAKE THE GUARD VISIBLE (2026-08-23) --------------------------
+        # This cap prevents the collapse above by REMOVING UPDATES, and it
+        # reported that at DEBUG — i.e. never, in production. Worse, the
+        # loop's segment print annotated any epochs_run < n_epochs as
+        # "stopped early (good: the policy hit its movement budget)", which
+        # describes target_kl early-stopping. target_kl is 0.0 (withdrawn
+        # 2026-08-05), so the ONLY reachable cause is this row cap — and a
+        # starved policy was being reported as a healthy one.
+        #
+        # Under SMDP options one row spans tau env steps, so rows are scarce
+        # exactly when options are used: at tau~40 a 1024-env-step update
+        # holds ~25 rows -> 25//32 = 0 -> ONE full-batch gradient step. The
+        # composition below is what distinguishes "options are eating the
+        # rows" from "there simply was not much experience".
+        _taus = list(self.rollout_taus) if self.rollout_taus else []
+        _opt_rows = sum(1 for t in _taus if int(t) > 1)
+        self.last_rows = int(_rows)
+        self.last_rows_option = int(_opt_rows)
+        self.last_rows_primitive = int(_rows - _opt_rows)
+        self.last_tau_mean = (float(sum(_taus)) / len(_taus)) if _taus else 1.0
+        self.last_env_steps = int(self.rollout_env_steps())
+        self.last_epochs_requested = _req
+        self.last_epochs_capped = bool(n_epochs < _req)
+        if self.last_epochs_capped:
+            logger.warning(
+                "PPO STARVED: %d rows (%d env steps, %d option rows, mean "
+                "tau %.1f) -> %d/%d epochs. The tiny-batch collapse guard is "
+                "removing updates; this is NOT target_kl early-stopping "
+                "(target_kl is off).",
+                _rows, self.last_env_steps, _opt_rows, self.last_tau_mean,
                 n_epochs, _req)
 
         # Convert rollout data to tensors (all on self.device). GAE is computed
@@ -1183,6 +1282,15 @@ class StandaloneActorCritic:
             "obs_spread": _obs_spread,
             "max_prob": _max_prob,
             "rows": int(_n_rows),
+            # update-rate forensics (2026-08-23): `epochs_capped` is the one
+            # that matters — it says the collapse guard removed updates,
+            # which reads identically to KL early-stopping without it
+            "epochs_requested": int(self.last_epochs_requested),
+            "epochs_capped": bool(self.last_epochs_capped),
+            "rows_option": int(self.last_rows_option),
+            "rows_primitive": int(self.last_rows_primitive),
+            "tau_mean": float(self.last_tau_mean),
+            "env_steps": int(self.last_env_steps),
         }
 
     def _compute_gae(

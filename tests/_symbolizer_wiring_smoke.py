@@ -57,8 +57,14 @@ def _cfg():
         "hidden_dim": 32, "lr": 1e-2, "fact_threshold": 0.7,
         "min_labels": 2, "reliability_floor": 0.35, "anneal_agreement": 0.9,
         # decoupled from the vision scaffold (which is OFF here) — this is
-        # the contract that causal grounding survives without the magnet
-        "chop_actions": [0, 1, 2, 3, 4],
+        # the contract that causal grounding survives without the magnet.
+        # WIDE on purpose (2026-08-09): the assertion below needs a break
+        # edge to coincide with a chop-action step, and with a narrow set
+        # that coincidence depended on the SEEDED action sequence — any
+        # change to network widths (e.g. a new predicate) reshuffled the
+        # deterministic rollout and flipped the test. The contract under
+        # test is edge-triggered causal minting, not action-set luck.
+        "chop_actions": list(range(64)),
     }
     return cfg
 

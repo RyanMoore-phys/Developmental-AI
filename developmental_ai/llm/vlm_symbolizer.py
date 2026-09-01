@@ -148,6 +148,14 @@ PREDICATES: List[str] = [
     "inventory_visible",     # the inventory/crafting screen is open
     "crafting_grid_visible", # empty crafting slots are on screen
     "craft_output_visible",  # THE causal signal: the result slot has an item
+    # ---- SOCIAL PERCEPTION (2026-08-09): another PLAYER is a first-class
+    # percept. The user plays on the same server, and the single most human
+    # learning channel — watching a co-present adult demonstrate — was
+    # invisible: the avatar rendered in the POV but nothing could NAME it.
+    # As everywhere: the VLM supplies only presence; what a player MEANS
+    # (joint attention, demonstrations) is learned by the loop from
+    # observed-change events, never declared here.
+    "player_visible",        # another human player's avatar is in view
 ]
 # Creature predicates — used by the loop to associate what was in view with
 # what happened to the agent (damage/death). Order-independent.
@@ -192,6 +200,7 @@ _FACT_TEMPLATES: Dict[str, Tuple[str, str, str]] = {
     "inventory_visible": ("scene", "contains", "inventory"),
     "crafting_grid_visible": ("scene", "contains", "crafting_grid"),
     "craft_output_visible": ("scene", "contains", "craft_output"),
+    "player_visible": ("scene", "contains", "player"),
 }
 
 # ---- FOVEA (2026-08-06): presence-in-a-patch instead of spatial judgment --
@@ -215,6 +224,9 @@ _FACT_TEMPLATES: Dict[str, Tuple[str, str, str]] = {
 FOVEA_PREDICATES: List[str] = [
     "tree_visible", "leaves_visible", "grass_visible", "stone_visible",
     "dirt_visible", "water_visible", "sky_visible", "animal_visible",
+    # social perception (2026-08-09): "am I looking AT the other player" is
+    # the gaze half of joint attention
+    "player_visible",
 ]
 FOVEA_INDEX = {p: i for i, p in enumerate(FOVEA_PREDICATES)}
 
@@ -226,12 +238,13 @@ _FOVEA_PROMPT = (
     'Return ONLY a JSON object with exactly these keys: '
     '{{"tree_visible": bool, "leaves_visible": bool, "grass_visible": bool, '
     '"stone_visible": bool, "dirt_visible": bool, "water_visible": bool, '
-    '"sky_visible": bool, "animal_visible": bool}}\n'
+    '"sky_visible": bool, "animal_visible": bool, "player_visible": bool}}\n'
     'Guidance: "tree_visible" = a wooden TRUNK occupies part of the patch — '
     "a VERTICAL log column with bark texture (birch is white with black "
     "streaks, oak/spruce are brown). Leaves alone are NOT a trunk. "
     '"leaves_visible" = foliage blocks. "sky_visible" = open sky. '
-    "Name only what is actually in the patch."
+    '"player_visible" = another human player\'s avatar (person-like, not a '
+    "mob). Name only what is actually in the patch."
 )
 
 
@@ -250,7 +263,8 @@ _SCENE_PROMPT = (
     '"spider_visible": bool, "cow_visible": bool, "pig_visible": bool, '
     '"sheep_visible": bool, "holding_tool": bool, "tool_worn": bool, '
     '"inventory_visible": bool, "crafting_grid_visible": bool, '
-    '"craft_output_visible": bool, "novel": string}}\n'
+    '"craft_output_visible": bool, "player_visible": bool, '
+    '"novel": string}}\n'
     '"novel" = LAYER 3 INSTINCT. If something SALIENT is on screen that '
     'none of the other keys describe, name it in ONE lower_snake_case '
     'word ending in _visible (e.g. "lava_visible"). Otherwise return "". '
@@ -269,6 +283,9 @@ _SCENE_PROMPT = (
     '"crafting_grid_visible" = the small square crafting slots are on '
     'screen. "craft_output_visible" = the RESULT slot (right of the '
     'arrow) currently holds an item. '
+    '"player_visible" = another human PLAYER\'s avatar (a Steve/Alex-like '
+    'humanoid in normal skin colours, often holding an item) — NOT a green '
+    'zombie, NOT a bony skeleton; a player looks like a person. '
     'Creatures: name ONLY what you can actually identify — a green humanoid '
     'is a zombie, a white bony humanoid is a skeleton, a green four-legged '
     'creature with a flat face is a creeper, a dark many-legged creature is a '
@@ -288,6 +305,20 @@ _SCENE_PROMPT = (
 # reliability_floor before it may be asserted again, so a reliability EMA
 # resting exactly on the floor cannot flap the knowledge graph for two days.
 _REARM_MARGIN = 0.05
+
+# ---- FALSIFIABILITY REGISTRY (infra #3, 2026-08-08) -----------------------
+# Which predicates have a GROUND-TRUTH event class that can DISCONFIRM them:
+# break events + the fruitless-swing negative channel score these four; every
+# other predicate has confirmation-only or no evidence at all. A belief that
+# no observation could refute must never accumulate confidence from one-sided
+# evidence — that is exactly how a stuck-true tree_visible drifted to
+# reliability 1.0 unopposed for weeks. Unfalsifiable predicates get a hard
+# reliability CEILING at their 0.7 prior: usable, never authoritative.
+FALSIFIABLE_PREDICATES = frozenset({
+    "breakable_in_reach", "object_centered", "object_adjacent",
+    "tree_visible",
+})
+_UNFALSIFIABLE_RELIABILITY_CAP = 0.7
 
 
 class GroundedSymbolHead(nn.Module):
@@ -317,13 +348,18 @@ class GroundedSymbolHead(nn.Module):
             return torch.sigmoid(self.forward(latent))
 
     def train_step(self, latent: torch.Tensor, target: torch.Tensor,
-                   mask: Optional[torch.Tensor] = None) -> float:
+                   mask: Optional[torch.Tensor] = None,
+                   pos_weight: Optional[torch.Tensor] = None) -> float:
         """One BCE step against VLM labels. `mask` (same shape) zeroes out
         predicates the VLM did not report, so a partial label never teaches
-        the head a false negative."""
+        the head a false negative. `pos_weight` (per-predicate) upweights the
+        POSITIVE term for rare classes — without it a predicate present in
+        ~9% of frames is best served by answering "no" forever."""
         logits = self.forward(latent)
         loss_el = F.binary_cross_entropy_with_logits(
-            logits, target, reduction="none")
+            logits, target, reduction="none",
+            pos_weight=(pos_weight.reshape(1, -1).to(logits.device)
+                        if pos_weight is not None else None))
         if mask is not None:
             denom = mask.sum().clamp(min=1.0)
             loss = (loss_el * mask).sum() / denom
@@ -374,6 +410,9 @@ class VLMSymbolizer:
         # anneals independently. One worker still serves both — whichever is
         # more overdue relative to its own cadence goes first.
         fovea_interval: Optional[int] = None,
+        # Input width of the FOVEA head. Set this to the world model's
+        # encoder width to put the head on crop features (see below).
+        fovea_latent_dim: Optional[int] = None,
     ):
         self.model = model
         self.base_interval = max(1, int(interval))
@@ -396,6 +435,14 @@ class VLMSymbolizer:
 
         self._available = bool(enabled) and (
             query_fn is not None or _check_ollama_server())
+        # the falsifiable/unfalsifiable split, stated once at startup so the
+        # epistemics of every predicate are on record (infra #3)
+        _n_fals = len(FALSIFIABLE_PREDICATES & set(PREDICATES))
+        logger.info(
+            "symbolizer epistemics: %d/%d predicates falsifiable %s; the "
+            "other %d are confirmation-only and reliability-capped at %.2f",
+            _n_fals, len(PREDICATES), sorted(FALSIFIABLE_PREDICATES),
+            len(PREDICATES) - _n_fals, _UNFALSIFIABLE_RELIABILITY_CAP)
 
         import concurrent.futures
         self._executor = (
@@ -416,10 +463,33 @@ class VLMSymbolizer:
         # the target?" gradient.
         self.fovea_enabled = bool(fovea)
         self.fovea_frac = float(fovea_frac)
+        # CROP-CONSISTENT INPUT (2026-08-12). The head used to read the
+        # WHOLE-FRAME RSSM latent while its labels described the CENTRE CROP
+        # — it was asked to decode "what is in the middle 16% of the image"
+        # from a global, temporally-mixed embedding. Measured result: fovea
+        # agreement 0.876 against 0.8757 for a head that always answers "no",
+        # i.e. essentially zero information, with P(tree) pinned at its own
+        # 0.094 prior. When `fovea_latent_dim` is given, the head instead
+        # reads ENCODER FEATURES OF THE CROP ITSELF (see set_crop_encoder):
+        # a static function of the patch pixels, which is what a patch label
+        # actually describes. None keeps the old whole-frame wiring.
+        self.latent_dim = int(latent_dim)
+        self.fovea_latent_dim = (int(fovea_latent_dim)
+                                 if fovea_latent_dim else int(latent_dim))
+        self._crop_encode = None
+        self._fovea_lat_cache = None
+        self._fovea_lat_step = -1
         self.fovea_head = (GroundedSymbolHead(
-            latent_dim, len(FOVEA_PREDICATES), hidden_dim, lr
+            self.fovea_latent_dim, len(FOVEA_PREDICATES), hidden_dim, lr
         ).to(self.device) if self.fovea_enabled else None)
         self.fovea_label_counts = {p: 0 for p in FOVEA_PREDICATES}
+        # POSITIVE sightings per foveal predicate (review 2026-08-09): the
+        # label count says "the head was TAUGHT about this key", which is
+        # free after ~5 fovea labels for every key at once — it can never
+        # gate "has this thing actually been SEEN". Presence-claims (the
+        # social gate, episodic landmarks, the boring-view association)
+        # must gate on positives.
+        self.fovea_pos_counts = {p: 0 for p in FOVEA_PREDICATES}
         self.total_fovea_labels = 0
         self.last_fovea_labels: Dict[str, bool] = {}
         self._fovea_agreement: deque = deque(maxlen=50)
@@ -443,6 +513,12 @@ class VLMSymbolizer:
         # never-seen predicates over the fact threshold — that would flood
         # the KG with fabricated facts. No evidence, no assertion.
         self.label_counts = {p: 0 for p in PREDICATES}
+        # POSITIVE label counts for the FULL channel (2026-08-09): same
+        # rationale as fovea_pos_counts — presence-certification ("has a
+        # player actually been SEEN") must count positives, and the full
+        # frame sees the whole scene, so it certifies far faster than the
+        # centre crop.
+        self.pos_counts = {p: 0 for p in PREDICATES}
         # Predicates whose triple has already been handed back for retraction.
         # Makes retraction EDGE-triggered (once per collapse, not once per
         # step) and lets a recovered predicate be asserted again.
@@ -521,6 +597,43 @@ class VLMSymbolizer:
             x0 = (w - c) // 2
             return f[y0:y0 + c, x0:x0 + c]
         except Exception:
+            return None
+
+    def set_crop_encoder(self, fn) -> None:
+        """Supply `crop_hwc_uint8 -> [1, fovea_latent_dim]` features.
+
+        The OWNER of the world model supplies this, because turning a patch
+        into the encoder's input is the observation contract's business
+        (resize to image_size, /255, CHW, flatten) and this class has no
+        business knowing it. Passing None reverts to whole-frame latents.
+        """
+        self._crop_encode = fn
+
+    def _refresh_fovea_latent(self, frame, timestep: int):
+        """Encode THIS step's centre crop, at most once per step.
+
+        Called from maybe_label, which runs every step and is the only place
+        holding the frame. Cached because two consumers want it in the same
+        step (the label pairing and the magnet's per-step read) and an
+        encoder forward is not free.
+        """
+        if self._crop_encode is None or not self.fovea_enabled:
+            return None
+        if self._fovea_lat_step == int(timestep) and \
+                self._fovea_lat_cache is not None:
+            return self._fovea_lat_cache
+        try:
+            crop = self._crop_center(frame, self.fovea_frac)
+            if crop is None:
+                return None
+            lat = self._crop_encode(crop)
+            if lat is None:
+                return None
+            self._fovea_lat_cache = lat.detach()
+            self._fovea_lat_step = int(timestep)
+            return self._fovea_lat_cache
+        except Exception:
+            # a failed encode costs this step's foveal reading, never the run
             return None
 
     def _fovea_query(self, png_bytes: bytes) -> Optional[str]:
@@ -615,6 +728,11 @@ class VLMSymbolizer:
             self.reliability[_p] = _r + 0.0005 * (0.7 - _r)
         if not self._available or frame is None:
             return
+        # BEFORE any early return: the magnet reads the foveal probs EVERY
+        # step, and the busy-check below skips most steps while a ~1s query
+        # is in flight. Refreshing here (not inside the submit branch) is
+        # what keeps the per-step reading on crop features.
+        self._refresh_fovea_latent(frame, timestep)
         if self._channel.busy():
             return
         # PER-CHANNEL SCHEDULER (2026-08-08, replaces strict alternation):
@@ -643,7 +761,13 @@ class VLMSymbolizer:
             if self._channel.submit(self._assess_fovea, png):
                 self._last_submit = timestep
                 self._last_fovea_submit = timestep
-                self._pending_latent = latent.detach().clone()
+                # Pair the label with the CROP's own features when we have
+                # them, so the head is trained on the same region the VLM
+                # was shown. Falls back to the whole-frame latent (old,
+                # broken-but-compatible behaviour) when no crop encoder.
+                _cl = self._refresh_fovea_latent(frame, timestep)
+                self._pending_latent = (_cl.clone() if _cl is not None
+                                        else latent.detach().clone())
                 self._pending_is_fovea = True
             return
         png = self._encode_png(frame)
@@ -698,6 +822,8 @@ class VLMSymbolizer:
             target[0, i] = 1.0 if v else 0.0
             mask[0, i] = 1.0
             self.label_counts[p] = self.label_counts.get(p, 0) + 1
+            if v:
+                self.pos_counts[p] = self.pos_counts.get(p, 0) + 1
         lat = latent.reshape(1, -1).to(self.device)
         # agreement BEFORE the update = how well the head already knew this
         with torch.no_grad():
@@ -720,24 +846,50 @@ class VLMSymbolizer:
             target[0, i] = 1.0 if v else 0.0
             mask[0, i] = 1.0
             self.fovea_label_counts[p] = self.fovea_label_counts.get(p, 0) + 1
+            if v:
+                self.fovea_pos_counts[p] = (
+                    self.fovea_pos_counts.get(p, 0) + 1)
         lat = latent.reshape(1, -1).to(self.device)
         with torch.no_grad():
             pred = (torch.sigmoid(self.fovea_head(lat)) > 0.5).float()
             agree = float(((pred == target) * mask).sum()
                           / mask.sum().clamp(min=1.0))
         self._fovea_agreement.append(agree)
-        self.fovea_head.train_step(lat, target, mask)
+        # CLASS IMBALANCE (2026-08-12). The foveal positive rate is ~9-12%,
+        # so plain BCE is minimised by answering "no" forever — which is
+        # exactly what the head learned (agreement 0.876 vs 0.8757 for the
+        # trivial always-no head). Weight each predicate's positive term by
+        # its own measured neg/pos ratio so a miss costs what it should.
+        # Clamped: an unseen predicate would otherwise produce an infinite
+        # weight the first time it appears.
+        pw = torch.ones(1, len(FOVEA_PREDICATES), device=self.device)
+        for _i, _p in enumerate(FOVEA_PREDICATES):
+            _n = int(self.fovea_label_counts.get(_p, 0))
+            _pos = int(self.fovea_pos_counts.get(_p, 0))
+            if _n > 0 and _pos > 0:
+                pw[0, _i] = min(20.0, max(1.0, (_n - _pos) / float(_pos)))
+        self.fovea_head.train_step(lat, target, mask, pos_weight=pw)
 
     def fovea_probs(self, latent: torch.Tensor) -> Optional[Dict[str, float]]:
         """Per-step P(object under my gaze) from the agent's own latent —
         the magnet's centring signal. None when the channel is off. The
         caller gates per-category trust via `fovea_label_counts` (same
         no-evidence-no-assertion rule as everything else)."""
-        if self.fovea_head is None or latent is None:
+        if self.fovea_head is None:
             return None
         try:
+            # CROP FEATURES WHEN AVAILABLE (2026-08-12): inference must read
+            # the same thing training reads, or the head is evaluated on a
+            # distribution it never saw. `latent` stays the fallback so a
+            # config without a crop encoder behaves exactly as before.
+            lat = self._fovea_lat_cache if self._crop_encode is not None \
+                else None
+            if lat is None:
+                if latent is None:
+                    return None
+                lat = latent
             probs = self.fovea_head.predict(
-                latent.reshape(1, -1).to(self.device)).squeeze(0)
+                lat.reshape(1, -1).to(self.device)).squeeze(0)
             return {p: float(probs[i])
                     for i, p in enumerate(FOVEA_PREDICATES)}
         except Exception:
@@ -880,6 +1032,11 @@ class VLMSymbolizer:
             rel = self.reliability.get(p, 0.0)
             if rel < self.reliability_floor:
                 continue
+            # falsifiability ceiling: a predicate with no disconfirming
+            # evidence source may never be MORE trusted than its prior
+            # (see FALSIFIABLE_PREDICATES above)
+            if p not in FALSIFIABLE_PREDICATES:
+                rel = min(rel, _UNFALSIFIABLE_RELIABILITY_CAP)
             conf = float(probs[i]) * rel
             if float(probs[i]) >= self.fact_threshold:
                 subj, relation, obj = _FACT_TEMPLATES[p]
@@ -914,6 +1071,131 @@ class VLMSymbolizer:
                 self._retracted.discard(p)
         self.total_retracted += len(out)
         return out
+
+    # ---- PERCEPTION PERSISTENCE (2026-08-10) ------------------------------
+    # The grounded heads, reliability EMAs and label evidence died with every
+    # process, so each boot re-ran hours of re-grounding: 21/28 predicates
+    # DEGENERATE at cold start, the magnet idling on an untrained head, the
+    # social certification reset to zero, and a fresh symbols-novelty
+    # windfall. Perception is EXPERIENCE — it persists like the skill bank.
+
+    def state(self) -> Dict:
+        """Everything earned that a restart should not destroy."""
+        return {
+            "predicates": list(PREDICATES),
+            "fovea_predicates": list(FOVEA_PREDICATES),
+            "head": self.head.state_dict(),
+            "fovea_head": (self.fovea_head.state_dict()
+                           if self.fovea_head is not None else None),
+            "fovea_latent_dim": int(self.fovea_latent_dim),
+            "latent_dim": int(self.latent_dim),
+            "reliability": dict(self.reliability),
+            "label_counts": dict(self.label_counts),
+            "pos_counts": dict(self.pos_counts),
+            "fovea_label_counts": dict(self.fovea_label_counts),
+            "fovea_pos_counts": dict(self.fovea_pos_counts),
+            "interval": int(self.interval),
+            "total_labels": int(self.total_labels),
+            "total_fovea_labels": int(self.total_fovea_labels),
+            "retracted": sorted(self._retracted),
+        }
+
+    def load_state(self, st: Dict) -> str:
+        """Defensive restore. HEADS load only when the vocabulary matches
+        exactly (a grown vocabulary means new output rows — partial surgery
+        would silently misalign predicates, the worst possible failure for a
+        perception system); the evidence DICTS merge on common keys always,
+        so even across a vocabulary change the earned counts and reliability
+        survive. Returns a one-line summary for the log."""
+        out = []
+        _head_ok = False
+        _fovea_ok = False
+        try:
+            # WIDTH as well as VOCABULARY (2026-08-14): the head reads the
+            # RSSM latent, so scaling the world model changes its input
+            # width. torch copies matching tensors BEFORE raising on a
+            # mismatch, so attempting the load would leave a half-restored
+            # hybrid rather than a clean fresh head — the same trap already
+            # guarded on the fovea head.
+            _want_w = int(st.get("latent_dim", self.latent_dim))
+            if (list(st.get("predicates") or []) == list(PREDICATES)
+                    and _want_w == int(self.latent_dim)):
+                self.head.load_state_dict(st["head"])
+                _head_ok = True
+                out.append("head")
+            elif _want_w != int(self.latent_dim):
+                out.append(f"head=FRESH(latent {_want_w}->{self.latent_dim})")
+            else:
+                out.append("head=FRESH(vocab changed)")
+            if (self.fovea_head is not None and st.get("fovea_head")
+                    and list(st.get("fovea_predicates") or [])
+                    == list(FOVEA_PREDICATES)
+                    # INPUT WIDTH must match too (2026-08-12): the fovea head
+                    # moved from the whole-frame RSSM latent to crop encoder
+                    # features, so an older checkpoint carries a different
+                    # input width. torch copies matching tensors BEFORE
+                    # raising on a mismatch, so attempting this would leave a
+                    # half-restored hybrid rather than a clean fresh head.
+                    and int(st.get("fovea_latent_dim",
+                                   self.fovea_latent_dim))
+                    == int(self.fovea_latent_dim)):
+                self.fovea_head.load_state_dict(st["fovea_head"])
+                _fovea_ok = True
+                out.append("fovea_head")
+            elif self.fovea_head is not None and st.get("fovea_head"):
+                out.append("fovea_head=FRESH(shape/vocab changed)")
+            # EVIDENCE BELONGS TO THE HEAD THAT EARNED IT (2026-08-11, review
+            # finding). label_counts and reliability are not trivia — they ARE
+            # the grounding gate: a predicate with counts >= min_labels and
+            # reliability >= floor is allowed to assert facts into the
+            # knowledge graph at confidence p*reliability, and to mint
+            # grounded symbols for reward. Restoring them onto a FRESH
+            # (random) head therefore certifies noise as trusted perception
+            # from step 1, and it does not self-correct: only a few
+            # predicates ever receive disconfirming evidence, so reliability
+            # drifts back toward its prior instead of falling under the
+            # floor. A head that was not restored must re-earn its grounding.
+            _pairs = ((("reliability", "label_counts", "pos_counts"), _head_ok),
+                      (("fovea_label_counts", "fovea_pos_counts"), _fovea_ok))
+            _kept = []
+            for names, ok in _pairs:
+                if not ok:
+                    continue
+                for name in names:
+                    mine = getattr(self, name)
+                    for k, v in (st.get(name) or {}).items():
+                        if k in mine:
+                            mine[k] = v
+                    _kept.append(name)
+            out.append("evidence" if _kept
+                       else "evidence=DROPPED(no head restored)")
+            # The ANNEAL is also head-specific: `interval` widens as the head
+            # agrees with the teacher, so inheriting a wide interval for a
+            # fresh head would starve it of the very labels it needs to
+            # relearn. A fresh head restarts at the base cadence.
+            if _head_ok:
+                # CLAMP BOTH ENDS (2026-08-17). This clamped only the FLOOR,
+                # so a restored anneal outlived the config that bounded it:
+                # `max_interval` was lowered 600 -> 120 and the run still
+                # printed `vlm_every=600`, because the checkpoint's widened
+                # value was inherited unchecked. A tuning knob that a resume
+                # silently ignores is worse than no knob — every run after
+                # the first would have quietly kept the old cadence.
+                self.interval = min(
+                    self.max_interval,
+                    max(self.base_interval,
+                        int(st.get("interval", self.interval))))
+                self.total_labels = int(st.get("total_labels", 0))
+            else:
+                self.interval = self.base_interval
+                self.total_labels = 0
+            if _fovea_ok:
+                self.total_fovea_labels = int(
+                    st.get("total_fovea_labels", 0))
+            self._retracted = set(st.get("retracted") or [])
+        except Exception as e:      # a bad checkpoint must never block boot
+            out.append(f"partial({type(e).__name__})")
+        return "+".join(out)
 
     def close(self) -> None:
         if self._executor is not None:

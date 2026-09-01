@@ -1,5 +1,12 @@
 # General Infrastructure — problems, solutions, and reasoning
 
+> **IMPLEMENTATION STATUS (updated 2026-08-08, same day):** a first wave of
+> this programme is now BUILT, smoke-tested and deployed. See
+> **Part 13 — What was implemented** at the bottom for the per-item ledger of
+> what shipped, what is partial, and what remains deferred, plus the new
+> `developmental_ai/infra/` package map. Items are marked in place through
+> the document: ✅ implemented, 🟡 partial, ⬜ deferred.
+
 **Written 2026-08-08.** Every problem below was *measured* on this project, in
 the Minecraft/SkyBot embodiment. None of them are Minecraft problems. This
 document exists to convert a week of domain-specific firefighting into a
@@ -1307,3 +1314,341 @@ document rests on intuition alone.
   attempts for competence.
 - **Detection latency:** every one of the five farms was found by a human
   reading logs, hours to weeks after onset; the agent found each in minutes.
+
+---
+
+## Part 13 — What was implemented (2026-08-08 wave)
+
+Built the same day the document was written, as a package of DOMAIN-AGNOSTIC
+modules plus one integration facade, wired into the organism at a handful of
+call sites. Every module has its own smoke suite (all green: 22/22 suites
+including the full pre-existing regression set and a compile check).
+Honest note on review: the independent adversarial-review agents scheduled
+for this wave were blocked by account session limits; the integration was
+instead self-reviewed systematically against the three planned lenses
+(latch/crash, reward-economy, integration seams), which found and fixed one
+real defect (a blocking world-model-lock acquisition in the acting hot path,
+made non-blocking-skip). An independent review pass should be re-run when
+capacity allows.
+
+### The package
+
+```
+developmental_ai/infra/
+├── stack.py         InfraStack — the ONE facade the loop talks to; every
+│                    monitor degrades independently (a broken monitor can
+│                    never take the run down); also owns the LEARNED
+│                    fovea-category <-> event association and empowerment
+│                    shaping plumbing
+├── gate.py          #20  Gate / GateRegistry: every suppressor declares its
+│                    reopen condition + max closed steps; overdue = alarm
+├── lifecycle.py     #25/#22  Heartbeat (proof-of-life with expected
+│                    cadences) + InvariantSet (contained, streak-tracking)
+├── monitors.py      #50/#29/#30  StuckMonitor (staged escalation),
+│                    BehaviorDrift (JS divergence on action distribution),
+│                    DecisionTrace (ring buffer -> jsonl dumps)
+├── ledger.py        #10/#11  RewardLedger (income statement, share alarms,
+│                    HHI) + FarmDetector (state-cycle income — flags any
+│                    repeating loop that nets > 0)
+├── signal_health.py #1  SignalMonitor: entropy/variance per predicate;
+│                    DEGENERATE signals are auto-excluded from steering
+├── counters.py      #24  MonotoneCounter: baseline/resync/rebaseline
+│                    semantics for external counters, in one place
+├── episodic.py      #38  EpisodicEventMemory: what happened where, with
+│                    recency/position/bearing queries + summaries
+├── empowerment.py   #14  reachable-future diversity through the agent's own
+│                    world model; EmpowermentPotential (bounded, normalized)
+├── config_echo.py   #26  TrackedConfig + unread-key reporting: what was
+│                    configured but never read
+└── affordance.py    #31/#33  AffordanceMap: action -> effect statistics,
+                     actions-with-no-effect, effects-never-produced
+tools/reward_replay.py   #55  offline counterfactual scoring of trajectories
+                         through the REAL reward primitives
+tools/teacher_probe.py   #2   contrastive teacher-discrimination battery
+                         (CLI + library, --fake for offline tests)
+tests/_behavior_suite.py #54  asserted PREFERENCE ORDER of the assembled
+                         economy: chop-log must out-earn dirt-farm /
+                         sky-stare / pillar by >= 3x (it does: 23.9 vs 0.54
+                         / 1.35 / <1)
+tests/_infra_*_smoke.py  one suite per module, 70+ contracts total
+```
+
+### Wired into the organism
+
+* **Event-centric contract (#44) — the load-bearing change.** The MineRL
+  adapter now emits `info["events"] = [(kind, subtype), ...]` for everything
+  the agent causes (break / place / craft / pickup / death), and persists
+  lifetime counts for all four caused kinds. Habituation, the affordance map,
+  episodic memory, farm detection and the category-association all consume
+  ONLY this stream — no game nouns anywhere above the adapter.
+* **Habituation generalised (#12).** `_habituation_factor` now runs on the
+  event stream: any caused event kind habituates by its lifetime count,
+  least-familiar event governs, deaths never habituate. The legacy
+  achievements-parsing survives only as a fallback for adapters without the
+  stream.
+* **The hand-written category->block map is GONE.** `_boring_view_factor`
+  now asks the stack's learned association ("what was I looking at when
+  events fired") times event familiarity. Cold start = no associations = no
+  discount — the safe direction.
+* **Signal health in the steering path (#1).** Every per-step head output is
+  observed; a predicate flagged DEGENERATE (entropy+variance floors) is
+  excluded from the magnet's trusted-present set until it recovers. This is
+  the check that would have caught the llava-era constant on day one.
+* **Falsifiability (#3).** `FALSIFIABLE_PREDICATES` registry in the
+  symbolizer; the other 24 predicates are reliability-capped at their prior
+  and the split is logged at startup.
+* **Empowerment shaping (#14).** Potential-based (telescoping) shaping on
+  normalized reachable-future diversity, computed through the world model
+  every 25 steps under the WM lock. Config-gated; on for SkyBot at 0.05.
+* **Stuck escalation + help requests (#50/#51).** Segment metrics
+  (income, territory delta, caused events) feed the StuckMonitor; L1 refills
+  the search budget, L2 doubles exploration weights for one segment
+  (self-restoring — never a latch), L3 writes a structured help request to
+  `podlogs/help_requests.jsonl` and dumps the decision trace.
+* **Gates on the known suppressors (#20).** seek-nudge budget, magnet
+  weight, learned-option offers — each states its condition every segment;
+  the registry alarms past the declared budget.
+* **Ledger + farm detector (#10/#11)** harvest the existing per-term shaping
+  sums plus raw env income each segment; income concentration and
+  positive-income behavioural cycles print as alarms.
+* **Proof-of-life (#25).** vlm_label / fovea_label / magnet / consolidation
+  / viewer / option_offer heartbeats with expected cadences; overdue
+  subsystems print in every segment report.
+* **Config echo (#26).** The loop's config is wrapped at load; the first
+  segment prints how many keys were read and which were never read.
+* **Provenance (#57 light).** Run start logs a config SHA + timestamp.
+
+### Status by priority tier
+
+Tier 1: #20 ✅  #25 ✅  #26 ✅  #10 ✅  #11 ✅  #1 ✅  #3 ✅  #54 🟡 (reward-
+stack preference suite; a live-env scenario harness remains)  #55 🟡 (tool +
+canned trajectories; scoring of on-disk replay logs remains)
+Tier 2: #31 ✅ (map + reports; goal-ontology linkage pending #40)  #14 ✅
+#12 ✅  #13 🟡 (ledger share alarm caps raw-error dominance; the
+compression-progress rewrite of the base curiosity term remains)  #17 🟡
+(existing pieces enumerated — effort pay, extend-on-progress, whitelist;
+completion-bonus/option-value work remains)  #51 ✅  #46 ✅ (VLM unstuck
+advisor — see fifth wave)  #44 ✅ (MineRL adapter; other adapters emit no events
+yet and all consumers no-op safely)  #45 ⬜ (the language adapter is the
+next standalone project)
+Selected others: #22 ✅  #24 ✅ (primitive; deaths/damage keep their proven
+inline guards)  #29 ✅  #30 ✅  #38 🟡 (record/query/report; behavioural
+integration pending)  #50 ✅  #2 ✅ (tool; startup integration pending)
+#15 🟡 (nudge regen is the pattern; full reservoir refactor pending)
+#21/#23/#33/#36/#37/#40/#41/#42/#43/#47/#48/#49/#52/#53/#56 ⬜ deferred.
+
+### Second wave (2026-08-09): individuation, episodic sense, progress curiosity
+
+* **#35 Skill individuation ✅ / #37 deliberate practice ✅.** A skill is now
+  `frozen_base + owned DeltaHead` (zero-init: identity at birth; individuated
+  only by practice, which trains ONLY the delta under the same trust
+  region/revert). Stable uuid on bindings; per-skill `delta_mag` printed
+  (the previously-unmeasurable individuation number); deltas persist to disk
+  with the skill and reload on bind. Dream consolidation slot selection is
+  now ZPD ("rehearse the learning edge", success ~0.5 ranks first) with an
+  anti-starvation hunger term and jittered ties.
+* **#38 Episodic memory → behaviour ✅ (sense level).** The proprio vector
+  gains [memory-validity×proximity, sin, cos] of the body-relative bearing
+  to the most recent goal sighting/achievement — wandering can become
+  returning. Fixed en route: the reach sense was silently DEAD in the
+  lifelong body (7th duplicated-body casualty — proprio assembly is now one
+  shared helper), and the Minecraft yaw sign (clockwise) was pinned by test.
+* **#13 Compression-progress curiosity ✅.** `infra/progress_curiosity.py`:
+  fixed probe set from replay, WM loss re-evaluated under a NON-BLOCKING
+  lock, improvement (never surprise) paid as a slowly-varying rate;
+  noisy-TV analogue pays ~0 by test. The raw ICM base term is damped
+  (`icm_base_scale: 0.5` on SkyBot) so learning leads the drive.
+* **Metabolic effort cost (new, #15-flavoured).** Observed live: sustained
+  attack swings at CLOUDS — futile effort was exactly free under the
+  whitelisted economy. attack/use/jump steps now cost a small constant via
+  the adapter's domain-agnostic "effort" field (a 60-tick chop ≈ −0.09 vs
+  +20 for the log; air-punching just bleeds). Ledger source "effort".
+* **Review honesty.** Independent reviewers ran this time and confirmed 4
+  real defects (all fixed): a stale per-slot Adam after LRU eviction that
+  made practice a silent no-op with phantom strength gains; deltas trained
+  but never persisted across restarts; ZPD stable-sort starvation; a boot
+  smoke crashed by the 4-tuple change. The refutation stage was again
+  killed by account session limits, so the remaining claims were triaged by
+  hand: fixed — progress payout dead via a private-attr AttributeError
+  (which also silently killed empowerment), fleet-factor underpayment,
+  consolidation feature-column misalignment (knowledge sat in proprio
+  columns), farm detector blind to the new income sources, revert path
+  leaving grads enabled; accepted as minor and documented — icm scale vs
+  absolute eps_abs interplay, uuid not yet consumed, serial-body scale
+  without progress compensation (path unused by SkyBot), 1-step-stale world
+  info in the bearing sense.
+
+### Third wave (2026-08-09): social learning — monkey-see-monkey-do, honestly
+
+The user plays on the same server; the single most human learning channel —
+watching a co-present adult demonstrate — was invisible. Now:
+
+* **The teacher is a percept**: `player_visible` in both vocabularies (full
+  frame + fovea), KG triple, WATCHED BUT NEVER CHASED (non-steerable: a
+  mobile magnet target defeats the phi ratchet — orbiting the user would be
+  repeatable income; review-confirmed and excluded).
+* **External-agency detection**: on measured-passive, measured-STATIONARY
+  steps (position AND camera still; inventory/GUI excluded), a large frame
+  change emits `("observed_change","world")` — "the world changed and I did
+  not do it". Never credited as self-caused: excluded from habituation,
+  affordance, and the stuck monitor's sign-of-life; throttled in episodic.
+* **Joint attention**: with the teacher under the gaze, LP attribution for
+  co-present categories doubles (never for the trigger category itself).
+* **Goal emulation**: observed change + teacher recently in view =
+  DEMONSTRATION → the top co-present PRIMEABLE category is socially primed
+  (curiosity injected ~4000 steps + search refilled), edge-triggered with a
+  500-step refractory — imitate the WHAT, discover the HOW, matching the
+  developmental finding that children emulate goals over motor programs.
+* **Adversarial review (ran fully this time)** found 2 criticals + a dozen
+  more before deployment, all fixed: the inventory toggle manufactured
+  "demonstrations" (48% frame change classed as passive); re-priming per
+  observed change turned the bounded seek nudge into a standing wage near
+  the user; uncounted event kinds defeated habituation via max(); the
+  magnet heartbeat fell inside the social branch (indentation); the social
+  gate was satisfiable by an untrained head (now gated on POSITIVE teacher
+  sightings); falls/knockback/water read as external agency (now measured
+  stationarity); the association could learn to make the TEACHER boring
+  (excluded); the magnet-seek envelope was raised (weight 1.0, seek 1.5,
+  cold-start 0.5) at user request — all still telescoping-only.
+
+### Fourth wave (2026-08-10): pre-boot points 1–4 — implemented local-only
+(pod terminated; this wave ships with the next VM)
+
+The pre-boot assessment named four structural issues in how SkyBot learns;
+all four are now code, smoke-tested (`tests/_preboot_wave_smoke.py`, 8
+contracts) with the full local regression sweep green:
+
+* **1. Perception and familiarity now persist** (the biggest restart tax:
+  every boot rebooted the grounded heads to random, re-idled the magnet
+  behind DEGENERATE flags, and re-paid the novelty windfall for a world
+  already seen — measured at 55–65% of all income after restart-heavy
+  waves). `symbolizer.pt` carries heads + reliability + label/positive
+  evidence + retractions (heads restore only on an exact vocabulary match —
+  partial surgery would silently misalign predicates; evidence merges on
+  common keys across any vocabulary change). `familiarity.pt` carries the
+  view/gaze/symbol "what have I seen" counts (merge, never replace;
+  `known_symbols` serialized as a sorted list so `weights_only` loads
+  survive). Env-side territory (`_visits`) rides `breaks_by_type.json` as
+  `"cells"`, getattr-guarded so a missing dict can never poison the whole
+  break-memory flush. Both components joined `loop.resume_components`;
+  policy/dream_actor/curiosity remain refused by name.
+* **2. Degenerate-gate cold-start patience** (the gate flagged 21/28
+  predicates at every fresh boot — an untrained head outputs near-constants
+  for everything, and that is ignorance, not the learned-constant pathology
+  the gate exists for). A signal may now only be flagged DEGENERATE once
+  its teacher has supplied `degenerate_min_labels` (25) labels; the loop
+  passes `signal_evidence = symbolizer.label_counts` into the segment ctx.
+  Absent evidence data keeps the old strict behaviour, so no other config
+  changes meaning.
+* **3. Memory-pull potential — episodic memory becomes motivating** (the
+  bearing sense INFORMED the policy where trees were last seen, but
+  nothing made acting on it PAY; memory was a map with no pull). New
+  telescoping potential `phi = validity(age) · proximity(dist)` to the
+  freshest remembered goal-site record (sighting/break of the seek
+  category): returning pays once, loitering pays zero, leaving charges
+  back, and the pull fades with memory age. A changed record re-adopts the
+  baseline UNPAID (fresh sightings gift nothing) and a death clears the
+  baseline (die-to-travel would otherwise be a farm). Ledger source
+  `memory_pull`, weight 0.5 (skybot) / 0.0 (default off).
+* **4. Competence floor 0.0 — options actually fire** (the fourth
+  guard-becomes-latch: every skill's frozen bias inherited a poisoned
+  −5.68, no invocation could ever raise competence, so all 16 skills sat
+  at invocations=0 forever and mastery was unmeasurable). Eligibility no
+  longer depends on a statistic that can only move once eligibility is
+  granted; probation, the contact gate, precondition matching and the
+  option value still govern firing. The gate MECHANISM is untouched and
+  test-pinned against the historical 0.25 for configs that still want it.
+
+### Fifth wave (2026-08-16): the unstuck wave — DEPLOYED to the vast.ai pod
+(synced + relaunched the same night; the prior run had confirmed the latch
+live twice, once per clamp)
+
+Live diagnosis on the running pod found the agent parked at one coordinate
+for 2+ hours, gaze pinned at +90, every vision predicate DEGENERATE, magnet
+at w=0/target=None, seg extrinsic 0, help requests unanswered. After the
+first fixes were staged, the SAME run flipped to the −90 clamp (sky), which
+exposed the fifth item below. Five fixes, all smoke-tested
+(`tests/_unstuck_wave_smoke.py`) with the full local regression sweep
+green:
+
+* **#46 Unstuck advisor ✅ — help requests get answered, by the VLM.** At
+  stuck L3 the request PLUS the agent's current view goes to the local VLM
+  (same model that teaches perception; `infra/advisor.py`, query injected
+  so infra stays dependency-free). The answer is validated hard (unknown
+  remedy / hallucinated category / prose → None, run unaffected) and can
+  only pick from existing self-expiring drive levers: `look_around` (cap
+  gaze buckets + refill seek), `prime` (social_prime a KNOWN category —
+  emulate the what, discover the how), `explore_wider` (the L2 boost on
+  request), `conserve` (no-op is an answer). Rate-limited; dialogue logged
+  to `podlogs/help_responses.jsonl`.
+* **STARVED vs BROKEN degenerate split (the 5th guard-becomes-latch).**
+  The min-positives gate fixed cold start, then latched on a WARM head:
+  historical positives + ground-filled view → constant-low → flagged → the
+  magnet forbidden from steering toward the one thing that cures the
+  constancy. Now constant-LOW with proven positives stays steerable
+  (honest absence is what seeking is FOR; a stuck-low broken head fails
+  inert, not as a farm); only stuck-HIGH or positive-free signals are
+  excluded. Mass starvation (≥`gaze_starved_frac` of predicates) is
+  surfaced as `actions["gaze_starved"]` — a GAZE verdict, remedied on the
+  behaviour side (gaze buckets capped at 25 + seek refill, cooldown-gated).
+* **Gaze-leveling potential.** The pitch clamp was an attractor with no
+  exit tax (the gaze-bucket bonus saturates 1/sqrt(n)). Telescoping
+  potential Phi = −(|pitch|/90)^4: mining tilts ≤60° cost ~2% of the
+  weight, the last 30° into a clamp carry the whole gradient, exit pays
+  back what entry charged. Ledger source `gaze_level`, weight 0.02
+  (skybot) / 0.0 (default off).
+* **Boring-view discount on the BASE curiosity term.** At the −90 clamp
+  the census read: ICM/LP base +0.0147/step = 96% of the drive, paid for
+  watching clouds drift — the sky discount only ever covered the itemised
+  novelty term, so the base was a standing wage "no shaping term can
+  outbid" (the census caption's own words). `icm_boring_discount` (0.85
+  skybot / 0.0 default) applies the same measured `_boring_view_factor`
+  judgement (geometry past 55°, fovea sky reading, learned boringness,
+  floor 0.15) to the primary stream's base, BEFORE the census accumulator
+  so the census cannot lie. Cloud wage 0.0147 → ~0.004/step; horizon
+  views keep full pay; the world model still trains on every frame.
+* **(ops) ollama log cap.** 581 MB in 5 days at llama-server verbosity 4.
+  Launch scripts now start ollama with append-mode redirect + a reusable
+  `scripts/cap_log.sh` watchdog (du-based — apparent size lies for sparse
+  files); the live pod got an equivalent crontab entry and an immediate
+  truncate (10 MB tail kept).
+
+### Persistence fixes (2026-08-17) — deployed with the fifth wave
+
+Two restart/storage defects found while auditing what actually learns
+(`tests/_persistence_fixes_smoke.py`; verified on the pod GPU):
+
+* **Skill deltas were never compressed on a GPU box.** The bank writes its
+  shared base encoder with `.cpu()` and reads it back with
+  `map_location="cpu"`, while the live encoder sits on the run's device —
+  so `to_delta`'s `w - b` raised a device mismatch, which the caller caught
+  and answered by storing the skill WHOLE. Measured live: 14 MB per skill,
+  i.e. the compression win absent on exactly the hardware that trains.
+  Devices are now aligned inside `to_delta` (and mirrored in `from_delta`),
+  and `_deltaify_encoder` hands it CPU tensors so no CUDA tensor reaches a
+  checkpoint file.
+* **The magnet was amnesiac across restarts, not suppressed.** `reset()`
+  preserves curiosity memory across episodes, deaths and dream boundaries,
+  but nothing carried it across a process restart: every launch began
+  `w=0.0000, target=None` with all categories at LP 0.000 and spent its
+  first hours unsteered — the same restart tax the perception/familiarity
+  checkpoints removed, still being paid by the drive that aims the other
+  senses. `VisionScaffold.state()/load_state()` → `magnet.pt`, joined
+  `resume_components` and **gated on `world_model`** like its siblings (LP
+  is a rate measured *through* that world model; against a fresh one it is
+  a stale claim). Merge-not-replace, so a vocabulary that has grown since
+  the checkpoint keeps its new categories. `_cold_spent` is deliberately
+  excluded: persisting a spent cold-start budget would promote the 19-hour
+  zero-reward latch from run-scoped to permanent.
+
+### Data-reset decision (2026-08-08 relaunch)
+
+Per the "reset only what prevents proper learning" rule: the skill bank +
+broadcaster state were ARCHIVED (not deleted) — they encode goals, skills and
+competence minted under five broken reward regimes (junk goals whose extrinsic
+is now 0, byte-copy skills, poisoned competence bias), which actively fight
+the corrected economy. The event-mastery memory (breaks/places/crafts/pickups
+counts) was KEPT: it is legitimate measured experience whose only effect is
+preventing relapse into already-mastered farms. No world-model or policy
+checkpoints exist for SkyBot runs (each run trains fresh), so there was
+nothing else to reset.

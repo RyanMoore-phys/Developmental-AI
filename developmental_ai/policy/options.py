@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import time
+import uuid as _uuid
 from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -361,6 +362,15 @@ class SkillOptionBank:
             cond_sd = None
         self.slots[slot] = {
             "skill_id": sk.skill_id, "name": sk.name,
+            # STABLE IDENTITY (infra #35): survives slot reuse and renames —
+            # 3 of 16 skills were once orphaned from their competence records
+            # by a slot rename. Never derived from name or slot.
+            "uuid": _uuid.uuid4().hex[:12],
+            # the skill's OWNED parameters (DeltaHead state) — restored from
+            # disk when the skill was ever practised, else None and
+            # materialize builds a zero-init head. See skill_practice.
+            "delta_sd": ({k: v.to(self.dtype) for k, v in sd["delta"].items()}
+                         if isinstance(sd.get("delta"), dict) else None),
             # None/empty => ALWAYS ELIGIBLE. Legacy skills carry no
             # grounded preconditions, and gating them out would silently
             # disable the entire existing bank.
@@ -489,6 +499,10 @@ class SkillOptionBank:
         slot_map = dict(getattr(sk, "slot_map", None) or {})
         self.slots[slot] = {
             "skill_id": sk.skill_id, "name": sk.name,
+            "uuid": _uuid.uuid4().hex[:12],     # stable identity (infra #35)
+            # owned params, restored from disk when ever practised
+            "delta_sd": ({k: v.to(self.dtype) for k, v in sd["delta"].items()}
+                         if isinstance(sd.get("delta"), dict) else None),
             "preconditions": dict(sk.preconditions or {}),
             # CARRY THE REAL FAMILY. "conv" and "wm" both store an encoder and
             # both arrive here, but they rebuild with DIFFERENT encoder classes
@@ -700,7 +714,25 @@ class SkillOptionBank:
                 cond = None
             else:
                 self.cond_live += 1
-        self._resident[slot] = (actor, cond, enc)
+        # THE OWNED HALF (infra #35): a zero-init DeltaHead per skill —
+        # identity at birth, individuated only by practice. Built to the
+        # actor's exact geometry so `base + delta` is always shape-safe.
+        delta = None
+        try:
+            from developmental_ai.skill_bank.skill_practice import DeltaHead
+            delta = DeltaHead(int(actor.shared[0].in_features),
+                              int(actor.action_head.out_features))
+            if b.get("delta_sd"):
+                delta.load_state_dict({k: v.to(torch.float32)
+                                       for k, v in b["delta_sd"].items()})
+            delta.to(self.device).eval()
+            for p in delta.parameters():
+                p.requires_grad_(False)
+        except Exception as e:
+            logger.warning("delta head unavailable for slot %d (%s) — "
+                           "skill runs as base-only", slot, e)
+            delta = None
+        self._resident[slot] = (actor, cond, enc, delta)
         while len(self._resident) > self.max_resident:
             old_slot, _mods = self._resident.popitem(last=False)
             logger.debug("option cache evicted slot %d", old_slot)
@@ -715,10 +747,41 @@ class SkillOptionBank:
         if self.slots[slot] is None or self.is_scripted(slot):
             return None
         try:
-            actor, _cond, _enc = self._materialize(slot)
-            return actor
+            return self._materialize(slot)[0]
         except Exception:
             return None
+
+    @torch.no_grad()
+    def resident_delta(self, slot: int):
+        """The slot's OWNED DeltaHead (infra #35), or None."""
+        if slot is None or slot < 0 or slot >= self.K:
+            return None
+        if self.slots[slot] is None or self.is_scripted(slot):
+            return None
+        try:
+            return self._materialize(slot)[3]
+        except Exception:
+            return None
+
+    def writeback_delta(self, slot: int, delta, delta_mag: float = None
+                        ) -> None:
+        """Persist a practised delta into the slot binding (mirrors
+        writeback_actor: without this, individuation would vanish on the
+        first LRU eviction)."""
+        try:
+            b = self.slots[slot]
+            if b is None or delta is None:
+                return
+            b["delta_sd"] = {k: v.detach().to(self.dtype).cpu()
+                             for k, v in delta.state_dict().items()}
+            if delta_mag is not None:
+                b["delta_mag"] = float(delta_mag)
+            # the practised counter is what triggers the disk flush
+            # (_persist_practised_skills) — without this the delta lived
+            # only until the next restart (review finding, 2026-08-09)
+            b["practised"] = int(b.get("practised", 0)) + 1
+        except Exception:
+            pass
 
     def writeback_actor(self, slot: int, actor) -> None:
         """Persist a practised actor into the slot binding.
@@ -749,7 +812,7 @@ class SkillOptionBank:
         returned index is in the SKILL'S OWN action space, valid in today's
         wider primitive space because macros are append-only."""
         b = self.slots[slot]
-        actor, cond, enc = self._materialize(slot)
+        actor, cond, enc, _delta = self._materialize(slot)
         obs_t = torch.from_numpy(
             np.asarray(obs, dtype=np.float32)).reshape(1, -1).to(self.device)
         feats = enc(obs_t) if enc is not None else obs_t
@@ -788,6 +851,15 @@ class SkillOptionBank:
                 tail = torch.zeros(1, b["kdim"], device=self.device)
             feats = torch.cat([feats, tail], dim=-1)
         logits = actor.action_head(actor.shared(feats))
+        # the skill's OWNED adjustment (infra #35): zero at mint, grown by
+        # practice — this line is where individuation becomes behaviour
+        if _delta is not None:
+            try:
+                _d = _delta(feats)
+                if _d.shape == logits.shape:
+                    logits = logits + _d
+            except Exception:
+                pass
         if head_mask is not None:
             m = torch.as_tensor(np.asarray(head_mask, dtype=bool),
                                 device=logits.device).reshape(1, -1)
@@ -980,7 +1052,9 @@ class OptionExecutor:
     def act(self, obs_list, primary_kv, policy, timestep: int,
             predicates_per_env: Optional[List[Dict[str, bool]]] = None,
             competence: Optional[Dict[str, float]] = None,
-            proprio_per_env: Optional[List] = None
+            proprio_per_env: Optional[List] = None,
+            feats_per_env: Optional[List] = None,
+            verify_feats: bool = False
             ) -> List[int]:
         """Resolve one primitive action per env; opens options as chosen.
 
@@ -997,6 +1071,21 @@ class OptionExecutor:
             if not proprio_per_env or e >= len(proprio_per_env):
                 return None
             return proprio_per_env[e]
+
+        def _feats(e):
+            """This env's ALREADY-ENCODED features, or None to recompute.
+
+            The loop encodes every env's next_obs for the RSSM; one step
+            later that is exactly this env's obs, so the policy can skip a
+            duplicate encoder forward. None is always safe and is what the
+            caller passes whenever the frame did NOT carry — an env that
+            reset gets a FRESH observation, not last step's next_obs, and
+            handing over stale features there would silently act on the
+            world that existed before the rebuild.
+            """
+            if not feats_per_env or e >= len(feats_per_env):
+                return None
+            return feats_per_env[e]
         # base mask already applies the competence gate (offered set shrinks
         # to competent skills); precondition gating narrows further per env
         base_mask = self.bank.mask(competence=competence,
@@ -1016,7 +1105,9 @@ class OptionExecutor:
                     if _pmask is not None:
                         _pk["action_mask"] = _pmask(P + int(
                             getattr(self.bank, "K", 0) or 0))
-                    a, _info = policy.select_action(obs_list[e_i], **_pk)
+                    a, _info = policy.select_action(
+                        obs_list[e_i], feats=_feats(e_i),
+                        verify_feats=verify_feats, **_pk)
                     actions.append(int(a) if int(a) < P else 0)
                     continue
                 kv = primary_kv if e_i == 0 else None
@@ -1070,7 +1161,8 @@ class OptionExecutor:
                 # policy (or test double) predating proprioception still works
                 _pk = {"proprio": _pro(e_i)} if _pro(e_i) is not None else {}
                 a, info = policy.select_action(
-                    obs_list[e_i], knowledge=kv, action_mask=mask, **_pk)
+                    obs_list[e_i], knowledge=kv, action_mask=mask,
+                    feats=_feats(e_i), verify_feats=verify_feats, **_pk)
                 if int(a) >= P:
                     self.option_picks += 1
                 if a < P:
@@ -1355,13 +1447,20 @@ class OptionExecutor:
             if actor is None:
                 pr.discard(e_i, slot)
                 return
-            info = pr.on_close(e_i, slot, actor, produced)
+            # INDIVIDUATION (infra #35): waking practice trains the slot's
+            # OWNED delta; the base actor stays the frozen mint-time record.
+            _delta = self.bank.resident_delta(slot)
+            info = pr.on_close(e_i, slot, actor, produced, delta=_delta)
             if info and not info.get("reverted"):
                 # persist the improvement into the slot binding, so it
                 # survives LRU eviction and is written to disk at the next
                 # consolidation flush. Without this the skill would "learn"
                 # only until its module was evicted from the cache.
-                self.bank.writeback_actor(slot, actor)
+                if _delta is not None:
+                    self.bank.writeback_delta(slot, _delta,
+                                              info.get("delta_mag"))
+                else:
+                    self.bank.writeback_actor(slot, actor)
         except Exception as e:      # practice must never kill a run
             logger.warning("skill practice failed on slot %s (%s): %s",
                            slot, sid, e)

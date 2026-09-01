@@ -1,3 +1,17 @@
+# Current state (2026-08-10): POD TERMINATED — everything rescued locally
+
+The pod was deliberately stopped and terminated on 2026-08-10. Everything
+non-reproducible was pulled to `pod_repository/data/final_rescue_20260810/`
+(see its README for contents, verification, and resurrection steps). The live
+brain, all brain archives, final checkpoints, the lifelong event-mastery
+memory, every run log and all videos are preserved and hash-verified.
+
+To bring SkyBot back: docs/RECREATE.md + the final-rescue README's restore
+block. The tailnet identity and ollama models are re-creatable; the RunPod
+connection details in these docs are STALE by definition now.
+
+---
+
 # Current state (2026-07-22)
 
 ## Brain contents (rescued in `../data/`)

@@ -35,6 +35,8 @@ component later. What we build here is the orchestration framework
 that the glue layer plugs into.
 """
 
+import math
+
 import torch
 import numpy as np
 import gymnasium as gym
@@ -105,6 +107,61 @@ logger = logging.getLogger(__name__)
 # block break), so they are trusted more.
 _CREATURE_FACT_CONF = 0.7
 _TOOL_FACT_CONF = 0.9
+
+
+# ---- resume contracts (2026-08-23 review) --------------------------------
+# Weights fit to a REWARD ECONOMY rather than to how the world works. They are
+# dropped from a world-model restore on purpose (see _load_wm), so their
+# absence from a checkpoint payload is expected, not a defect.
+_WM_ECONOMY_PREFIXES = ("reward_predictor", "reward_bins")
+
+# Components expressed IN THE WORLD MODEL'S LATENT SPACE. Restoring one of
+# these onto a FRESH encoder pairs trained weights with a representation they
+# were never fit to: the symbol head reads noise, and the familiarity counters
+# mark unseen views as already-visited, zeroing exploration income exactly when
+# it is needed most.
+#
+# `magnet` is deliberately NOT a member. VisionScaffold.state() is
+# category-NAME-keyed scalars (learning progress per label like "tree"), which
+# mean the same thing against any encoder; gating it here made a failed
+# world-model restore ALSO pay the magnet's full cold-start tax, silently, in
+# the one situation where that hurts most. If you add an encoder-derived field
+# to that state (a latent centroid, an LSH bucket), put `magnet` back —
+# tests/_review_fixes_smoke.py asserts the state's key set precisely so this
+# decision cannot be made by accident.
+_RESUME_ENCODER_KEYED = ("perception", "familiarity")
+
+
+class _ResumePreflightRefusal(RuntimeError):
+    """A restore refused BEFORE any tensor was copied.
+
+    Distinct from a mid-load failure on purpose: the generic handler warns
+    that torch may have left a partial hybrid behind, which is true of a
+    shape mismatch and false here. Reporting a clean refusal as a possible
+    hybrid would send the next operator hunting for corruption that does not
+    exist — this project's rule is that a degraded outcome must never read as
+    a clean one, and the converse holds too.
+    """
+
+
+def _wm_restore_absent(model_keys, payload_keys, dropped_keys):
+    """Tensors the model NEEDS that this restore will not supply.
+
+    `load_state_dict(..., strict=False)` is required here (the reward head must
+    keep its fresh init), but strict=False silences BOTH halves of the check —
+    and only the `unexpected` half was re-implemented by hand. A checkpoint
+    missing whole submodules therefore loaded silently, `world_model` was
+    reported as restored, and the dependency gate it guards then admitted
+    perception/familiarity onto a half-fresh encoder: the exact pairing that
+    gate exists to prevent. (world_model.pt is written non-atomically, so a
+    truncated file makes this reachable, not merely theoretical.)
+
+    A key is excused ONLY if we removed it ourselves (`dropped_keys`), never by
+    prefix-matching what came back missing: if a checkpoint never carried a
+    reward head and `resume_reward_head` is on, nothing was dropped and the
+    absence is a real defect that must be reported.
+    """
+    return sorted(set(model_keys) - set(payload_keys) - set(dropped_keys))
 
 
 def _to_fact(triple, source: str, timestep: int = 0) -> "SymbolicFact":
@@ -187,6 +244,20 @@ class DevelopmentalAI:
             # Use sensible defaults
             self.config = self._default_config()
 
+        # ---- EFFECTIVE-CONFIG TRACKING (infra #26, 2026-08-08) -----------
+        # A configured log reward of 20.0 was silently ignored for its whole
+        # life (the code read a different attribute) and keys have shipped in
+        # every config with nothing reading them. Wrap the config so every
+        # .get() is recorded; the first segment log reports what was NEVER
+        # read. Failure to wrap must never block a run.
+        self._config_path = config_path
+        try:
+            from developmental_ai.infra.config_echo import TrackedConfig
+            if isinstance(self.config, dict):
+                self.config = TrackedConfig(self.config)
+        except Exception as _e:
+            logger.warning("infra: config tracking unavailable (%s)", _e)
+
         # ---- Deterministic seeding (optional) ----
         # When `seed` is set in the config, fix every RNG that affects training so
         # that two runs differing ONLY in a single config flag (e.g. the symbolic
@@ -245,6 +316,9 @@ class DevelopmentalAI:
             render_size=env_cfg.get("render_size", 0),
             lifelong=self._lifelong,
             remote_server=env_cfg.get("remote_server"),
+            # this site builds the PRIMARY env, so it keeps the bare prefix
+            # (see _agent_name_for: renaming slot 0 would orphan its player)
+            agent_name=self._agent_name_for(0),
             remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
             # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
             # the swing that fells a log, so the PROCESS of chopping out-earns
@@ -454,6 +528,23 @@ class DevelopmentalAI:
         self._persist_phi = 0.0
         # #7 approach-to-reach potential (telescoping; see its use site)
         self._reach_weight = float(_cur_cfg.get("reach_weight", 0.0))
+        # GAZE LEVELING potential (telescoping; see its use site). The pitch
+        # clamp is an attractor with no exit tax: pushing into it is a free
+        # no-op and the gaze-bucket novelty that unsticks it SATURATES
+        # (1/sqrt(n)), so a long life at the clamp reads as the cheapest
+        # place to be. Quartic in |pitch|/90 so scanning and legitimate
+        # mining tilts (<=60 deg, phi >= -0.2) cost ~nothing while the last
+        # 30 degrees into a clamp carry the whole gradient.
+        self._pitch_level_weight = float(_cur_cfg.get("pitch_level_weight",
+                                                      0.0))
+        self._pitch_level_phi = None
+        # GUI-DWELL potential (telescoping; see its use site). Zeroing income
+        # inside a menu stops the FARM but supplies no gradient OUT, and it
+        # trained the one escape button to ~zero probability.
+        self._gui_dwell_weight = float(_cur_cfg.get("gui_dwell_weight", 0.0))
+        self._gui_dwell_steps = float(_cur_cfg.get("gui_dwell_steps", 200.0))
+        self._gui_dwell_phi = None
+        self._gui_run = 0
         # ---- PERCEPTUAL NOVELTY (see _perceptual_cell) --------------------
         # Count-based novelty over WHAT IS SEEN rather than WHERE THE BODY IS.
         self._novelty_weight = float(_cur_cfg.get("novelty_weight", 0.0))
@@ -470,6 +561,12 @@ class DevelopmentalAI:
         # not the sight.
         self._nov_sky_discount = bool(_cur_cfg.get(
             "novelty_sky_discount", False))
+        # SEMANTIC NOVELTY (2026-08-11): scale this term by how new the
+        # MEANING in view is (see _semantic_novelty_factor). Default OFF so
+        # every other config keeps its exact old pricing.
+        self._nov_semantic = bool(_cur_cfg.get("novelty_semantic", False))
+        self._nov_unnamed_floor = float(_cur_cfg.get(
+            "novelty_unnamed_floor", 0.1))
         # FROZEN HASH ENCODER (2026-08-07): _view_key hashed through the LIVE
         # shared encoder, which keeps training — so the bucket map itself
         # drifts and OLD sights slowly re-key as "new" (novelty that
@@ -624,6 +721,64 @@ class DevelopmentalAI:
         else:
             self.curiosity = IntrinsicCuriosityModule(**_cur_kwargs).to(self.device)
 
+        # ---- BATCHED CURIOSITY TRAINING (2026-08-23) ---------------------
+        # MEASURED: `curiosity.train_step` is 1519 aten ops per call and runs
+        # EVERY env step at batch num_envs (2). With GPU utilisation at 2%,
+        # that device is idle — the cost is ~2350 tiny kernel launches per
+        # step, not arithmetic. Accumulating K steps and issuing ONE update
+        # on the concatenated batch carries the same gradient information
+        # with K-fold fewer launches (measured 1519 -> 95 ops/step at K=16).
+        #
+        # WHY BATCH AND NEVER SKIP: forward-model prediction error IS the
+        # curiosity reward. Training the ICM less often makes novelty decay
+        # more slowly, which is a live change to the reward economy — the
+        # thing this project has been burned by repeatedly. Batching changes
+        # only WHEN the optimizer steps.
+        #
+        # SAFE HERE because LearningProgressCuriosity does NOT override
+        # train_step: the LP bucket/history bookkeeping lives entirely in
+        # compute_intrinsic_reward, which stays per-step and untouched.
+        # ICM.train_step is a pure forward/backward/step with no state.
+        #
+        # Default 1 = byte-identical to the previous behaviour.
+        self._curiosity_train_every = max(
+            1, int((self.config.get("curiosity", {}) or {}).get(
+                "train_every", 1)))
+        self._cur_train_buf: List[Any] = []
+        self._last_icm_metrics: Dict[str, float] = {}
+
+        # ---- A2: REUSE THE ENCODER FORWARD (2026-08-23) -------------------
+        # arch='wm' means the policy encodes through world_model.encoder — the
+        # SAME module the loop already ran on this frame one step earlier (as
+        # `encoded_next`, for the RSSM). Handing that result forward removes a
+        # duplicate forward per env step. See _feats_for_act/_set_enc_carry:
+        # explicit dataflow, invalidated by an IDENTITY test on the observation
+        # arrays, never a cache.
+        #
+        # verify_encoder_feats recomputes and compares on every use. It costs
+        # the saving while on — that is the point: the first live run PROVES
+        # the carry is correct before the check is turned off. Tolerance is
+        # deliberate (the shared encoder trains asynchronously, so one
+        # optimizer step of drift is legitimate; a wrong frame is O(1)).
+        _pcfg = self.config.get("policy", {}) or {}
+        self._reuse_enc_feats = bool(_pcfg.get("reuse_encoder_feats", False))
+        self._verify_enc_feats = bool(
+            self._reuse_enc_feats
+            and _pcfg.get("verify_encoder_feats", True))
+        self._enc_carry = None
+        if self._reuse_enc_feats:
+            logger.info(
+                "policy: REUSING the world-model encoder forward across the "
+                "step boundary (self-check %s)",
+                "ON — proving correctness, saving disabled until it is off"
+                if self._verify_enc_feats else "OFF")
+        if self._curiosity_train_every > 1:
+            logger.info(
+                "curiosity: BATCHED training — one update per %d steps on "
+                "the concatenated batch (same gradients, ~%dx fewer kernel "
+                "launches)", self._curiosity_train_every,
+                self._curiosity_train_every)
+
         # ---- VLM symbolic grounding ("knows how" -> "knows why") ----
         # Turns pixels into PREDICATES so the dormant symbolic stack (KG,
         # rule induction) has input. The VLM teaches a head that predicts
@@ -667,7 +822,19 @@ class DevelopmentalAI:
                 device=self.device,
                 fovea=sg_cfg.get("fovea", False),
                 fovea_frac=sg_cfg.get("fovea_frac", 0.4),
-                fovea_interval=sg_cfg.get("fovea_interval", None))
+                fovea_interval=sg_cfg.get("fovea_interval", None),
+                # CROP-CONSISTENT FOVEA (2026-08-12): put the fovea head on
+                # ENCODER FEATURES OF THE CROP rather than the whole-frame
+                # RSSM latent, so its input describes the same region its
+                # labels do. Width is the encoder's, not the RSSM's.
+                # rssm.obs_dim IS the encoder's output width (the RSSM is
+                # constructed with obs_dim=hidden_dim). Read from the live
+                # object, never from config, so the two cannot drift.
+                fovea_latent_dim=(
+                    int(self.world_model.rssm.obs_dim)
+                    if sg_cfg.get("fovea_crop_input", True) else None))
+            if sg_cfg.get("fovea_crop_input", True):
+                self.symbolizer.set_crop_encoder(self._encode_crop)
             # Which actions count as "attacking" for the causal claim
             # ("attack_held" breaks X). Defaults to the vision scaffold's
             # chop actions, but is settable independently: causal grounding
@@ -1072,9 +1239,12 @@ class DevelopmentalAI:
             # +1 for the loop-computed REACH sense (see _reach_sense). The
             # env supplies the body; this one field is perceptual and needs
             # the RSSM latent, which only the loop has.
+            # +4 loop-side senses when grounding exists: reach + the three
+            # episodic-bearing fields (validity*proximity, sin, cos) — see
+            # _augment_proprio (2026-08-09; was +1 reach-only)
             proprio_dim=(int(getattr(
                 getattr(self, "_proprio_source", None), "PROPRIO_DIM", 0))
-                + (1 if getattr(self, "_proprio_source", None) is not None
+                + (4 if getattr(self, "_proprio_source", None) is not None
                    and self.symbolizer is not None else 0)),
         )
         # A CONFIG KEY THAT DOES NOTHING MUST SAY SO. `policy.batch_size` has
@@ -1516,6 +1686,7 @@ class DevelopmentalAI:
                 weight=vis_cfg.get("weight", 0.15),
                 min_weight=vis_cfg.get("min_weight", 0.0),
                 cold_start_weight=vis_cfg.get("cold_start_weight", 0.10),
+                promise_weight=vis_cfg.get("promise_weight", 0.0),
                 cold_start_budget=vis_cfg.get("cold_start_budget", 4000),
                 focus_distractors=vis_cfg.get("focus_distractors", None),
                 target_categories=vis_cfg.get("target_categories", None),
@@ -1547,6 +1718,8 @@ class DevelopmentalAI:
                 contrast_vs_peers=vis_cfg.get("contrast_vs_peers", False),
                 phi_from_evidence=vis_cfg.get("phi_from_evidence", False),
                 seek_pitch_level=vis_cfg.get("seek_pitch_level", False),
+                social_attention_boost=vis_cfg.get(
+                    "social_attention_boost", 0.0),
             )
             logger.info(
                 "Curiosity-ranked vision magnet active: w0=%.3f targets=%s "
@@ -1559,6 +1732,135 @@ class DevelopmentalAI:
             min_mastery=sb_cfg.get("mastery_threshold", 0.8),
         )
         self.composite_executor = CompositeSkillExecutor(self.skill_bank)
+
+        # ---- GENERAL INFRASTRUCTURE STACK (2026-08-08) -------------------
+        # One facade for the domain-agnostic monitors (gates, heartbeats,
+        # reward ledger, farm detector, signal health, drift, stuck
+        # escalation, episodic memory, affordance map, empowerment, traces).
+        # See docs/GENERAL_INFRASTRUCTURE.md and infra/stack.py. Constructed
+        # defensively: a broken monitor disables itself, never the run.
+        # ---- CONSEQUENCE FRONTIER (2026-08-13) ---------------------------
+        # "Bored of what you have already caused; curious about what you have
+        # seen but never affected" — plus possession as a second axis of
+        # location. Feeds the magnet's SELECTION only (never its weight, which
+        # would become a world-model reward label) and one count-bounded
+        # income for crossing into a possession set never held before.
+        self.consequence = None
+        try:
+            _cq_cfg = dict((self.config.get("infra", {}) or {}).get(
+                "consequence", {}) or {})
+            if _cq_cfg.get("enabled", False):
+                from developmental_ai.infra.consequence import ConsequenceMap
+                self.consequence = ConsequenceMap(_cq_cfg)
+                _cqp = os.path.join(
+                    str((self.config.get("infra", {}) or {}).get(
+                        "log_dir", "podlogs")), "consequence_state.json")
+                self._consequence_path = _cqp
+                if self.consequence.load(_cqp):
+                    logger.info(
+                        "consequence: restored banked evidence from %s — "
+                        "this state IS the bootstrap (a fresh map would "
+                        "re-latch the very problem it exists to solve)",
+                        _cqp)
+                if self.vision_scaffold is not None:
+                    self.vision_scaffold.set_deficit_source(
+                        self.consequence.deficit)
+                logger.info(
+                    "CONSEQUENCE FRONTIER ACTIVE: magnet ranking weighted by "
+                    "unconsummated consequence (promise_weight=%.2f), "
+                    "possession-frontier income=%.3f (one-shot per set)",
+                    float(vis_cfg.get("promise_weight", 0.0)),
+                    float(_cq_cfg.get("possession_weight", 0.0)))
+        except Exception as _e:
+            logger.warning("consequence map unavailable (%s) — magnet falls "
+                           "back to pure learning-progress ranking", _e)
+            self.consequence = None
+
+        self.infra = None
+        try:
+            from developmental_ai.infra.stack import InfraStack
+            self.infra = InfraStack(self.config.get("infra", {}) or {},
+                                    action_dim=int(self.action_dim))
+            # the stack consumes its section via dict() copy (untrackable
+            # C-level reads) — mark it read so the echo stays truthful
+            if hasattr(self.config, "mark_all_read"):
+                self.config.mark_all_read("infra")
+            logger.info(InfraStack.provenance_line(
+                getattr(self, "_config_path", None), dict(self.config)))
+            # expected cadences for the subsystems whose SILENT death has
+            # already cost this project weeks (proof-of-life, infra #25).
+            # Registered ONLY for subsystems that exist in this run — a
+            # vector-env run has no symbolizer/magnet, and a heartbeat for a
+            # subsystem that was never built is a permanent false alarm
+            # (measured on the CartPole integration probe).
+            # expected cadences in TOTAL-timestep units: subsystems fire per
+            # PRIMARY step but total_timesteps advances num_envs per step —
+            # register in the clock domain the report reads or every cadence
+            # is off by the fleet size (caught live: false "magnet OVERDUE")
+            _fleet = max(1, int(getattr(self, "_num_envs", 1) or 1))
+            if self.symbolizer is not None:
+                _sgi = int(sg_cfg.get("max_interval", 600) or 600)
+                self.infra.register_heartbeat("vlm_label",
+                                              3 * _sgi * _fleet, 0)
+                if getattr(self.symbolizer, "fovea_enabled", False):
+                    self.infra.register_heartbeat(
+                        "fovea_label",
+                        6 * _fleet * int(getattr(self.symbolizer,
+                                                 "fovea_interval", 60)
+                                         or 60), 0)
+            if self.vision_scaffold is not None:
+                self.infra.register_heartbeat("magnet", 64 * _fleet, 0)
+            self.infra.register_heartbeat("consolidation", 0, 0)
+            self.infra.register_heartbeat("viewer", 0, 0)
+            self.infra.register_heartbeat("option_offer", 0, 0)
+        except Exception as _e:
+            logger.warning("infra: stack unavailable (%s) — running without",
+                           _e)
+        # ---- COMPRESSION-PROGRESS CURIOSITY (infra #13, 2026-08-09) ------
+        # The base intrinsic is ICM prediction ERROR — maximized by anything
+        # visually dramatic, which funded five distinct reward farms. This
+        # term pays for the world model measurably IMPROVING on a FIXED
+        # probe set: being drawn to what you are LEARNING, not to what
+        # flickers. The base term is simultaneously scaled down
+        # (icm_base_scale) so learning, not surprise, leads the drive.
+        self._progress = None
+        self._progress_weight = float(_cur_cfg.get("progress_weight", 0.0))
+        self._icm_base_scale = float(_cur_cfg.get("icm_base_scale", 1.0))
+        # boring-view discount on the BASE term (see its use site: the sky
+        # discount never covered the base, and clouds paid 96% of the drive
+        # at the -90 clamp). 0 = off (every other config keeps old pricing).
+        self._icm_boring_discount = float(_cur_cfg.get(
+            "icm_boring_discount", 0.0))
+        # metabolic effort pricing (see _infra_step); 0 = off
+        self._effort_cost = float(_cur_cfg.get("effort_cost", 0.0))
+        # memory-pull potential (point 3, see _memory_pull_phi); 0 = off
+        self._memory_pull_weight = float(
+            _cur_cfg.get("memory_pull_weight", 0.0))
+        if self._progress_weight > 0.0:
+            try:
+                from developmental_ai.infra.progress_curiosity import (
+                    ProbeSetProgress)
+                self._progress_every = int(_cur_cfg.get(
+                    "progress_eval_every", 512))
+                self._progress = ProbeSetProgress(
+                    eval_every=self._progress_every)
+                logger.info(
+                    "compression-progress curiosity ACTIVE: weight=%.3f "
+                    "eval_every=%d icm_base_scale=%.2f",
+                    self._progress_weight, self._progress_every,
+                    self._icm_base_scale)
+            except Exception as _e:
+                logger.warning("progress curiosity unavailable (%s)", _e)
+        # stuck-escalation state (level-2 temporarily boosts exploration
+        # weights; originals restored a segment later — never a latch)
+        self._stuck_boost_until = -1
+        self._stuck_boost_orig = None
+        # when the CURRENT boost first applied — the cap on extension is
+        # measured from here, so a remedy that keeps being requested cannot
+        # quietly become permanent (see _apply_explore_boost)
+        self._stuck_boost_started = -1
+        self._seg_extrinsic_sum = 0.0
+        self._seg_cells_prev = 0
 
         # ---- Training state ----
         self.total_timesteps = 0
@@ -1635,7 +1937,88 @@ class DevelopmentalAI:
         # as a TWO-KEY DICT {"gnn", "gate"} — loading either into the outer
         # object would raise, or worse, silently no-op.
         def _load_wm(m):
-            self.world_model.load_state_dict(m)
+            # SPLIT THE RESTORE BY WHAT THE WEIGHTS MEAN (2026-08-13).
+            #
+            # `policy`/`dream_actor`/`curiosity` are refused by name because
+            # they encode an optimum converged under reward economics that
+            # has since changed. The world model's REWARD PREDICTOR is the
+            # same category and was being restored anyway: it is trained on
+            # `prim_extrinsic` labels (rewards[0] + magnet shaping), i.e. on
+            # exactly the economy in force when the checkpoint was written.
+            # This one was written when breaking dirt paid handsomely
+            # (view-novelty 34%, coverage 65%), so a restored reward head
+            # still BELIEVES dirt pays — and dream_actor, prospection and
+            # empowerment all plan against that belief. Old dirt-grinding
+            # therefore keeps influencing behaviour through imagination even
+            # though the policy itself is fresh every run.
+            #
+            # The rest of the model is economy-INDEPENDENT and worth keeping:
+            # the encoder and RSSM model how the world WORKS (pixels,
+            # dynamics), not what is worth doing. Splitting the restore keeps
+            # hard-won perception and dynamics while letting values be
+            # relearned under the current economy.
+            _drop = {k: v for k, v in m.items()
+                     if not str(k).startswith(_WM_ECONOMY_PREFIXES)}
+            _n_dropped = len(m) - len(_drop)
+            if _n_dropped and bool(self.config.get("loop", {}).get(
+                    "resume_reward_head", False)):
+                _drop = m                      # explicit opt-in to the old
+                _n_dropped = 0                 # behaviour, off by default
+            # PRE-FLIGHT, BEFORE ANY MUTATION (2026-08-23 review). torch copies
+            # matching tensors as it goes and only raises at the END, so a
+            # check made after the load leaves a partial hybrid behind. The
+            # payload's key set is knowable up front, so a checkpoint that
+            # cannot fill this model is refused while the model is still
+            # pristine — and, because the refusal keeps `world_model` out of
+            # `_ok`, the dependency gate below correctly withholds perception
+            # and familiarity instead of pairing them with a half-fresh
+            # encoder.
+            _dropped_keys = ({str(k) for k in m
+                              if str(k).startswith(_WM_ECONOMY_PREFIXES)}
+                             if _n_dropped else set())
+            _absent = _wm_restore_absent(self.world_model.state_dict().keys(),
+                                         _drop.keys(), _dropped_keys)
+            if _absent:
+                raise _ResumePreflightRefusal(
+                    f"world_model checkpoint cannot fill this model: "
+                    f"{len(_absent)} tensor(s) absent, e.g. {_absent[:4]} — "
+                    f"loading it would leave those submodules silently FRESH "
+                    f"while the resume reported success, which then admits "
+                    f"perception/familiarity onto a half-fresh encoder. "
+                    f"Usually arch drift or a truncated write. Refusing "
+                    f"before any tensor is copied.")
+            # strict=False: the reward head keeps its FRESH init rather than
+            # being overwritten; every other tensor is restored exactly.
+            _missing, _unexpected = self.world_model.load_state_dict(
+                _drop, strict=False)
+            # Invariant, not a duplicate of the pre-flight: by construction
+            # `_missing` can now only contain keys we dropped on purpose. If
+            # it ever holds anything else, the two views of the model
+            # disagree and the restore is not trustworthy.
+            _unexplained = [str(k) for k in _missing
+                            if str(k) not in _dropped_keys]
+            if _unexplained:
+                raise RuntimeError(
+                    f"world_model restore left {len(_unexplained)} tensor(s) "
+                    f"un-restored despite passing pre-flight, e.g. "
+                    f"{_unexplained[:4]} — state_dict() and load_state_dict() "
+                    f"disagree about this model's keys")
+            if _n_dropped:
+                logger.info(
+                    "resume: world_model restored WITHOUT its reward head "
+                    "(%d tensors dropped, %d params) — that head was fit to "
+                    "a reward economy that has since changed, and "
+                    "imagination plans against it. Encoder + RSSM (how the "
+                    "world works) are restored in full.",
+                    _n_dropped,
+                    sum(int(v.numel()) for k, v in m.items()
+                        if str(k).startswith(("reward_predictor",
+                                              "reward_bins"))
+                        and hasattr(v, "numel")))
+            if _unexpected:
+                raise RuntimeError(
+                    f"world_model checkpoint has unexpected keys "
+                    f"{list(_unexpected)[:4]} — shape/arch drift")
 
         def _load_sd(m):
             _dec = getattr(self.symbolic_decoder, "decoder", None)
@@ -1654,12 +2037,97 @@ class DevelopmentalAI:
             _ki.gnn.load_state_dict(m["gnn"])
             _ki.gate.load_state_dict(m["gate"])
 
+        def _load_perception(m):
+            if self.symbolizer is None:
+                raise RuntimeError("no symbolizer in this run")
+            summary = self.symbolizer.load_state(m)
+            _n = sum(1 for v in self.symbolizer.label_counts.values() if v > 0)
+            # A degraded restore must not read as a clean one (review
+            # finding): load_state swallows its own errors, so without this
+            # the operator sees "restored" at INFO for a partial load.
+            if "partial" in summary or "FRESH" in summary or "DROPPED" in summary:
+                logger.warning("resume: perception restored DEGRADED (%s) — "
+                               "%d/%d predicates carry prior evidence",
+                               summary, _n, len(self.symbolizer.label_counts))
+            else:
+                logger.info("resume: perception restored (%s) — %d/%d "
+                            "predicates carry prior evidence", summary, _n,
+                            len(self.symbolizer.label_counts))
+
+        def _load_familiarity(m):
+            # merge, never replace: a fresh dict is valid too
+            for attr, key in (("_nov_counts", "nov_counts"),
+                              ("_gaze_counts", "gaze_counts"),
+                              ("_symbol_counts", "symbol_counts"),
+                              ("_symbol_sight_counts",
+                               "symbol_sight_counts")):
+                cur = getattr(self, attr, None)
+                if isinstance(cur, dict):
+                    cur.update(m.get(key) or {})
+                else:
+                    setattr(self, attr, dict(m.get(key) or {}))
+            ks = m.get("known_symbols")
+            if ks:
+                cur = getattr(self, "_known_symbols", None)
+                if isinstance(cur, set):
+                    cur.update(ks)
+                else:
+                    self._known_symbols = set(ks)
+
+        def _load_magnet(m):
+            if self.vision_scaffold is None:
+                raise RuntimeError("no vision scaffold in this run")
+            summary = self.vision_scaffold.load_state(m)
+            if "partial" in summary or "FRESH" in summary:
+                logger.warning("resume: magnet curiosity restored DEGRADED "
+                               "(%s)", summary)
+            else:
+                logger.info("resume: magnet curiosity restored — %s", summary)
+
+        # Replay buffer: EXPERIENCE, not policy — restoring it cannot resume a
+        # converged optimum, only spare the world model re-collecting hours of
+        # the world. It is also the component whose absence was invisible: the
+        # buffer had no persistence at all, so every crash-relaunch silently
+        # restarted world-model training from empty.
+        #
+        # NOT keyed to the encoder's latent space (it stores raw observations
+        # and actions), so unlike perception/familiarity it does NOT belong in
+        # _RESUME_ENCODER_KEYED — a fresh encoder can be trained on old frames
+        # perfectly well; that is what a replay buffer IS.
+        def _load_replay(_ignored):
+            _on, _dir, _ = self._replay_persist_cfg()
+            if not _on:
+                raise RuntimeError(
+                    "world_model.buffer_persist is false — remove "
+                    "'replay_buffer' from loop.resume_components or enable it")
+            if self.replay_buffer is None:
+                raise RuntimeError("no replay buffer in this run")
+            _n = self.replay_buffer.load(_dir)
+            logger.info(
+                "resume: replay buffer restored — %d transitions (~%.1f h of "
+                "experience at 3.2 steps/s per stream); the world model does "
+                "NOT restart from empty", _n, _n / max(1.0, 3.2 * 3600.0))
+
         _loaders = {
             "world_model": ("world_model.pt", _load_wm),
             "symbolic_decoder": ("symbolic_decoder.pt", _load_sd),
             "glue_layer": ("glue_layer.pt", _load_glue),
+            # perception + familiarity (2026-08-10): experience, not policy —
+            # restoring them cannot resume a converged optimum, only spare
+            # the agent re-learning what the world looks like
+            "perception": ("symbolizer.pt", _load_perception),
+            "familiarity": ("familiarity.pt", _load_familiarity),
+            "magnet": ("magnet.pt", _load_magnet),
         }
         _ok, _skip = [], []
+        # DEPENDENCY ORDER, not config order: `perception`/`familiarity` are
+        # gated below on world_model having actually restored, and that test
+        # reads `_ok` as it fills. Trusting the order someone happened to
+        # write in YAML would make the gate silently wrong (it would skip a
+        # perfectly good perception restore merely for being listed first).
+        names = sorted(names, key=lambda n: (n in ("perception",
+                                                   "familiarity",
+                                                   "magnet")))
         for _n in names:
             if _n == "knowledge_graph":
                 _kp = _os.path.join(checkpoint_dir, "knowledge_graph.json")
@@ -1673,6 +2141,24 @@ class DevelopmentalAI:
                     logger.warning("resume: knowledge_graph FAILED (%s) — "
                                    "continuing with an empty graph", _e)
                 continue
+            if _n == "replay_buffer":
+                # a DIRECTORY of .npy arrays, not a torch file — special-cased
+                # like knowledge_graph rather than forced through the
+                # torch.load loader table
+                _on, _bd, _ = self._replay_persist_cfg()
+                if not _on or not _os.path.isdir(_bd):
+                    _skip.append(f"{_n}(absent)"); continue
+                try:
+                    _load_replay(None)
+                    _ok.append(_n)
+                except Exception as _e:
+                    _skip.append(f"{_n}({type(_e).__name__})")
+                    logger.warning(
+                        "resume: replay_buffer FAILED (%s: %s) — continuing "
+                        "with an EMPTY buffer, so the world model relearns "
+                        "the world from scratch this run", type(_e).__name__,
+                        _e)
+                continue
             if _n in ("policy", "dream_actor", "curiosity"):
                 # refused by name, so it can never happen by a config typo
                 logger.warning(
@@ -1685,6 +2171,32 @@ class DevelopmentalAI:
             _spec = _loaders.get(_n)
             if _spec is None:
                 _skip.append(f"{_n}(unknown)"); continue
+            # DEPENDENCY: perception and familiarity are both expressed in the
+            # WORLD MODEL's latent space — the symbol head is built with
+            # latent_dim from world_model.rssm, and the familiarity counts are
+            # keyed by an LSH of the encoder's output. Restoring either onto a
+            # DIFFERENT (fresh) encoder pairs trained weights with a
+            # representation they were never fit to: the head reads noise, and
+            # the novelty counters mark unseen views as already-visited, which
+            # zeroes exploration income exactly when it is needed most.
+            # (2026-08-11 review finding; world_model.pt is also written
+            # non-atomically, so a truncated file makes this reachable.)
+            #
+            # MEMBERSHIP IS A NAMED CONTRACT (2026-08-23 review), not an inline
+            # tuple: `magnet` was here by association and does not belong. Its
+            # state is category-NAME-keyed learning progress, valid against any
+            # encoder, so gating it made a failed world-model restore also
+            # throw away the curiosity memory — while logging the untrue reason
+            # "needs world_model". See _RESUME_ENCODER_KEYED.
+            if (_n in _RESUME_ENCODER_KEYED
+                    and "world_model" not in _ok):
+                _skip.append(f"{_n}(needs world_model)")
+                logger.warning(
+                    "resume: SKIPPING '%s' because world_model was not "
+                    "restored — it is keyed to that encoder's latent space "
+                    "and would be meaningless (worse: silently trusted) "
+                    "against a fresh one.", _n)
+                continue
             _fn, _apply = _spec
             _fp = _os.path.join(checkpoint_dir, _fn)
             if not _os.path.exists(_fp):
@@ -1693,13 +2205,35 @@ class DevelopmentalAI:
                 _apply(torch.load(_fp, map_location=self.device))
                 _ok.append(_n)
             except Exception as _e:
-                # LOUD, and fresh weights survive: load_state_dict raises
-                # before mutating on a shape mismatch, so the module is intact.
-                _skip.append(f"{_n}({type(_e).__name__})")
+                # LOUD — but NOT clean. The old comment here claimed
+                # load_state_dict "raises before mutating, so the module is
+                # intact". That is FALSE and was verified false (2026-08-11):
+                # Module._load_from_state_dict collects shape mismatches into
+                # error_msgs and CONTINUES, raising only at the end — so every
+                # parameter before the mismatched one has already been copied.
+                # A component reported here as skipped may therefore be a
+                # HYBRID (e.g. restored encoder + fresh action head), which is
+                # exactly the action_dim 10->12 case this guard was written
+                # for. Say so, rather than implying a clean fallback.
+                if isinstance(_e, _ResumePreflightRefusal):
+                    # refused before copying: this component IS cleanly fresh,
+                    # and saying "may be a hybrid" here would be a false alarm
+                    _skip.append(f"{_n}(refused:CLEAN)")
+                    logger.warning(
+                        "resume: '%s' REFUSED before loading — %s The module "
+                        "is cleanly FRESH (nothing was copied), and it is "
+                        "held out of the restored set, so anything gated on "
+                        "it is correctly withheld too.", _n, _e)
+                    continue
+                _skip.append(f"{_n}({type(_e).__name__}:PARTIAL?)")
                 logger.warning(
-                    "resume: '%s' NOT restored (%s: %s) — this is usually a "
-                    "shape change (action_dim, enc_dim). Continuing with "
-                    "FRESH weights for it.", _n, type(_e).__name__, _e)
+                    "resume: '%s' FAILED mid-load (%s: %s) — usually a shape "
+                    "change (action_dim, enc_dim). WARNING: torch copies "
+                    "matching tensors BEFORE raising, so this module may now "
+                    "be a partial hybrid, not fresh. If this is the world "
+                    "model, prefer restarting with that component removed "
+                    "from loop.resume_components.",
+                    _n, type(_e).__name__, _e)
         logger.info("RESUMED %s from %s%s", _ok or "nothing", checkpoint_dir,
                     f" | skipped: {', '.join(_skip)}" if _skip else "")
         if "world_model" in _ok:
@@ -2472,6 +3006,20 @@ class DevelopmentalAI:
                 self._last_checkpoint_step = self.total_timesteps
                 self._save_checkpoint()
 
+        # FINAL CHECKPOINT (2026-08-11, review finding). The only save site is
+        # the interval check above, so a graceful stop discarded up to
+        # `checkpoint_interval` (25k) steps — including the perception heads
+        # and familiarity counts this wave added precisely so they would stop
+        # dying with the process. Saving on the way out is what makes the
+        # persistence real. Never let a save failure mask the run's result.
+        try:
+            self._last_checkpoint_step = self.total_timesteps
+            self._save_checkpoint()
+            logger.info("final checkpoint written at %d timesteps",
+                        self.total_timesteps)
+        except Exception as _e:
+            logger.warning("final checkpoint FAILED (%s) — the run's learned "
+                           "state since the last interval save is lost", _e)
         elapsed = time.time() - start_time
         return self._training_summary(elapsed)
 
@@ -2625,6 +3173,10 @@ class DevelopmentalAI:
             intrinsic_reward = self.curiosity.compute_intrinsic_reward(
                 obs_tensor, action_tensor, next_obs_tensor
             ).item()
+            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
+            # compression progress does; the raw-error term is damped by
+            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic_reward *= float(getattr(self, "_icm_base_scale", 1.0))
 
             # ---- 3b. CURIOSITY-RANKED MAGNET (waking only) ----
             # Runs after LP is known: the magnet reads intrinsic_reward (this
@@ -2725,7 +3277,7 @@ class DevelopmentalAI:
                 )
 
             # ---- 7. TRAIN CURIOSITY MODULE ----
-            icm_metrics = self.curiosity.train_step(
+            icm_metrics = self._curiosity_train(
                 obs_tensor, action_tensor, next_obs_tensor
             )
 
@@ -2791,7 +3343,21 @@ class DevelopmentalAI:
         self._parallel_envs = [self.env]
         self._parallel_curricula = [self.curriculum]
         env_cfg = self.config.get("environment", {})
-        for _ in range(self._num_envs - 1):
+        if env_cfg.get("remote_server") and env_cfg.get(
+                "remote_server_scope", "primary") == "all":
+            # Say it out loud: a silent name collision here is invisible in
+            # this log and only shows up as clients evicting each other in
+            # the JAVA logs, which is where the first attempt hid.
+            logger.info("server identities: %s (slot 0 keeps the bare name "
+                        "so its player data survives)",
+                        ", ".join(self._agent_name_for(i)
+                                  for i in range(self._num_envs)))
+        # ENUMERATED (2026-08-17): this loop discarded its index, so every
+        # scout built here was anonymous — and with remote_server_scope
+        # "all" they all joined the server under slot 0's name and evicted
+        # each other. The rebuild path (_make_one_env) already knew its
+        # slot; this one, which builds the ORIGINAL scouts, did not.
+        for _sidx in range(1, self._num_envs):
             e, c = make_env(
                 env_name=self.env_name,
                 normalize=True,
@@ -2812,6 +3378,7 @@ class DevelopmentalAI:
                 remote_server=(env_cfg.get("remote_server")
                                if env_cfg.get("remote_server_scope",
                                               "primary") == "all" else None),
+                agent_name=self._agent_name_for(_sidx),
             )
             self._parallel_envs.append(e)
             self._parallel_curricula.append(c)
@@ -2819,8 +3386,25 @@ class DevelopmentalAI:
             f"Parallel collection active with {self._num_envs} environments"
         )
 
+    def _agent_name_for(self, idx: int) -> str:
+        """Server-visible player name for parallel slot `idx`.
+
+        Slot 0 keeps the BARE prefix. An offline-mode server derives the
+        player UUID from the name, so the lifelong stream's position,
+        inventory and history live under "SkyBot" — renaming it would hand
+        it a brand-new player at world spawn with empty hands and silently
+        strand everything it has built. Scouts take a suffix, because a
+        duplicate login is resolved by kicking the incumbent: without this
+        N clients evict each other forever.
+        """
+        _pref = str((self.config.get("environment", {}) or {}).get(
+            "agent_name_prefix", "SkyBot"))
+        return _pref if int(idx) <= 0 else f"{_pref}{int(idx)}"
+
     def _make_one_env(self, idx: int = -1):
         """Build one fresh env (used to replace a hung/dead parallel env).
+        See _agent_name_for for why slot 0's name is special.
+        (helper defined just above)
 
         idx is the parallel-env slot being replaced: slot 0 is the primary
         lifelong stream, which must KEEP its remote_server binding across
@@ -2831,6 +3415,12 @@ class DevelopmentalAI:
         _scope = env_cfg.get("remote_server_scope", "primary")
         _remote = env_cfg.get("remote_server") if (
             idx == 0 or _scope == "all") else None
+        # SERVER IDENTITY (2026-08-17). Slot 0 KEEPS the bare prefix on
+        # purpose: an offline-mode server derives the player UUID from the
+        # name, so renaming slot 0 would hand the lifelong stream a brand
+        # new player — world spawn, empty inventory, none of its history.
+        # Scouts get a suffix so no two clients can evict each other.
+        _name = self._agent_name_for(idx)
         e, _c = make_env(
             env_name=self.env_name, normalize=True,
             curriculum=self.config.get("loop", {}).get(
@@ -2844,6 +3434,7 @@ class DevelopmentalAI:
             render_size=env_cfg.get("render_size", 0),
             lifelong=self._lifelong,
             remote_server=_remote,
+            agent_name=_name,
             remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
             # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
             # the swing that fells a log, so the PROCESS of chopping out-earns
@@ -3144,7 +3735,9 @@ class DevelopmentalAI:
                     env_actions = self.option_executor.act(
                         obs_list, primary_kv, self.policy,
                         self.total_timesteps, predicates_per_env=_preds,
-                        competence=_comp, proprio_per_env=_props)
+                        competence=_comp, proprio_per_env=_props,
+                        feats_per_env=self._feats_for_act(n),
+                        verify_feats=self._verify_enc_feats)
                     primary_pol = (self.option_executor._primary_primitive
                                    or {"log_prob": 0.0, "value": 0.0})
                 else:
@@ -3170,6 +3763,16 @@ class DevelopmentalAI:
             from concurrent.futures import TimeoutError as _FTimeout
             _step_to = float(self.config.get("parallel_envs", {}).get(
                 "step_timeout_s", 120))
+            # WHERE THE WALL CLOCK GOES (2026-08-17). The run holds ~3.4
+            # steps/s against a 10 steps/s ceiling (20 server ticks/s over
+            # action_repeat 2) while the GPU sits idle, so two thirds of
+            # every step is unaccounted for. Timing the env round-trip is
+            # what separates "MineRL is slow" from "our own per-step Python
+            # is slow" — those call for completely different work, and
+            # guessing which has already cost this project weeks. Set in
+            # BOTH duplicated bodies on purpose: letting these two drift is
+            # how the last six same-shape bugs were born.
+            _t_env0 = time.time()
             futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
                     for e_i in range(n)]
             next_obs_list, rewards, dones = [], [], []
@@ -3185,20 +3788,12 @@ class DevelopmentalAI:
                         step_infos[e_i] = _inf
                         if (self._proprio_per_env is not None
                                 and e_i < len(self._proprio_per_env)):
-                            _pp = (_inf or {}).get("proprio")
-                            # APPEND THE REACH SENSE (primary stream only —
-                            # the grounding head runs on stream 0's latent).
-                            # Scouts get a neutral 0.0, which is the same
-                            # convention a missing sensor uses everywhere
-                            # else; only stream 0 feeds PPO, so nothing
-                            # downstream reads a scout's value.
-                            if _pp is not None and self.symbolizer is not None:
-                                _rv = (float(getattr(self, "_reach_now", 0.0))
-                                       if e_i == 0 else 0.0)
-                                _pp = np.concatenate(
-                                    [np.asarray(_pp, dtype=np.float32),
-                                     np.array([_rv], dtype=np.float32)])
-                            self._proprio_per_env[e_i] = _pp
+                            # loop-side senses (reach + episodic bearing) —
+                            # ONE shared assembly for every body, see
+                            # _augment_proprio
+                            self._proprio_per_env[e_i] = \
+                                self._augment_proprio(
+                                    (_inf or {}).get("proprio"), e_i)
                     if e_i == 0 and isinstance(_inf, dict):
                         prim_info = _inf   # symbolizer reads mine_* from here
                 except (_FTimeout, Exception) as ex:
@@ -3214,6 +3809,15 @@ class DevelopmentalAI:
                 next_obs_list.append(np.asarray(nobs, dtype=np.float32))
                 rewards.append(float(rew))
                 dones.append(bool(term or trunc))
+            # envs step CONCURRENTLY, so this is the wait for the SLOWEST
+            # client, which is exactly what the serial loop pays. Present in
+            # BOTH bodies: the timer above was duplicated but this accumulator
+            # was not, so `_t_env0` here was an unused local and this path
+            # never produced the `Loop timing:` line at all (7th instance of
+            # the drift the comment above warns about).
+            self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
+                                  + (time.time() - _t_env0))
+            self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -3322,7 +3926,11 @@ class DevelopmentalAI:
             intrinsic = self.curiosity.compute_intrinsic_reward(
                 obs_t, action_tensor, next_obs_t
             )
-            icm_metrics = self.curiosity.train_step(
+            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
+            # compression progress does; the raw-error term is damped by
+            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
+            icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
             )
 
@@ -3439,8 +4047,73 @@ class DevelopmentalAI:
             if not use_dream_actor and self.vision_scaffold is not None:
                 _sr = self._magnet_step_shaping(
                     env_actions[0], float(intrinsic[0].item()), latent[0:1])
-                if _sr:
+                # OCCLUSION APPLIES TO THIS CHANNEL TOO (2026-08-17). The
+                # gui_open guard further down zeroes `intrinsic` — but the
+                # magnet's shaping is added to prim_EXTRINSIC, which that
+                # guard never touches, so it kept paying through a menu.
+                # MEASURED LIVE: SkyBot right-clicked a wandering villager,
+                # opened its trade screen, and sat there for 9,125
+                # CONSECUTIVE steps (gui 64% of the segment, position
+                # frozen) while magnet_seek paid 77% of ALL income. This is
+                # the 2026-08-02 occlusion farm exactly, one channel over:
+                # inside a GUI the agent cannot move, look or swing, so
+                # anything that pays there is paying for blindness.
+                # Still CALLED while occluded — heartbeats, the fovea latent
+                # refresh and signal-health observation must not stall —
+                # just not PAID.
+                _gui_now2 = bool((step_infos[0] or {}).get("gui_open"))
+                if _gui_now2:
+                    # seek/centring are POTENTIALS: left holding a menu
+                    # frame's phi, the step the menu closes would collect a
+                    # windfall for closing it. Re-adopt with no delta,
+                    # exactly as reset() does at an episode boundary.
+                    self.vision_scaffold._phi_prev = None
+                    self.vision_scaffold._seek_prob_prev = None
+                elif _sr:
                     prim_extrinsic = rewards[0] + _sr
+                # ---- GETTING OUT MUST PAY -------------------------------
+                # Zeroing income inside a menu removes the FARM but leaves
+                # no gradient toward the exit — and it did something worse:
+                # because pressing `inventory` OPENS a screen that pays 0,
+                # the policy trained that action to ~zero probability
+                # (measured: 0 presses in an entire run at 92%-of-max
+                # entropy). So when a wandering villager's trade screen
+                # opened via `use`, the agent had already unlearned the only
+                # button that closes one, and sat there 10,149+ consecutive
+                # steps. Guard-becomes-latch, again.
+                # Telescoping potential on dwell: Phi = -min(1, run/N).
+                # Sitting accrues the cost once; leaving collects it back;
+                # an open/close cycle nets ~0, so this cannot be farmed in
+                # either direction. Paid into prim_EXTRINSIC on purpose —
+                # the intrinsic channel is zeroed while a GUI is open, so a
+                # cost placed there would be erased by the very guard it is
+                # meant to complement.
+                _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
+                if _gdw > 0.0:
+                    self._gui_run = (self._gui_run + 1) if _gui_now2 else 0
+                    _gphi = -min(1.0, self._gui_run
+                                 / max(1.0, self._gui_dwell_steps))
+                    _gprev = getattr(self, "_gui_dwell_phi", None)
+                    if _gprev is not None:
+                        # PLAIN DIFFERENCE, NOT gamma*Phi' - Phi. Caught by
+                        # its own test: with gamma<1 a potential PINNED at a
+                        # constant floor pays w*(1-gamma) EVERY step, so a
+                        # "cost of sitting here" silently becomes a wage for
+                        # sitting here (+0.0005/step at this weight — the
+                        # exact farm this term exists to kill). Phi' - Phi
+                        # is 0 while the state is unchanged, negative on
+                        # entry, positive on exit, and nets 0 over a cycle.
+                        prim_extrinsic = prim_extrinsic + _gdw * (
+                            _gphi - float(_gprev))
+                    self._gui_dwell_phi = _gphi
+            # general infra: event monitors + empowerment (shared helper)
+            if not use_dream_actor:
+                _ei = self._infra_step(
+                    prim_info, env_actions[0], rssm_state,
+                    float(intrinsic[0].item()) + float(prim_extrinsic),
+                    float(rewards[0]))
+                if _ei:
+                    intrinsic[0] = intrinsic[0] + _ei
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -3450,8 +4123,14 @@ class DevelopmentalAI:
             # come from real break events, never from the VLM's word.
             if not use_dream_actor and self.symbolizer is not None:
                 _lat0 = latent[0:1].detach()
+                # last frame, kept for the unstuck advisor: at stuck L3 the
+                # VLM is shown what the agent currently sees (a reference
+                # assignment per step, only read at L3 segments)
+                self._advisor_frame = _frame
                 self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
                 _labels = self.symbolizer.collect()
+                if _labels is not None and self.infra is not None:
+                    self.infra.beat("vlm_label", self.total_timesteps)
                 # LAYER 3: route a VLM-PROPOSED category to the instinct. The
                 # proposal is attention only — it goes to the magnet's
                 # probation set, never to the head and never to the KG. If
@@ -3722,6 +4401,12 @@ class DevelopmentalAI:
                 else:
                     obs_list[e_i] = next_obs_list[e_i]
 
+            # A2: hand this step's encoder output to the next act(). MUST be
+            # after the advance loop above — validity is decided by whether
+            # obs_list[e] IS next_obs_list[e] (same object = the env kept
+            # running), which is only true once that loop has assigned.
+            self._set_enc_carry(encoded_next, obs_list, next_obs_list)
+
             episode_reward += rewards[0]
             episode_intrinsic += float(intrinsic[0].item())
             episode_length += 1
@@ -3912,7 +4597,9 @@ class DevelopmentalAI:
                     env_actions = self.option_executor.act(
                         obs_list, primary_kv, self.policy,
                         self.total_timesteps, predicates_per_env=_preds,
-                        competence=_comp, proprio_per_env=_props)
+                        competence=_comp, proprio_per_env=_props,
+                        feats_per_env=self._feats_for_act(n),
+                        verify_feats=self._verify_enc_feats)
                     primary_pol = (self.option_executor._primary_primitive
                                    or {"log_prob": 0.0, "value": 0.0})
                 else:
@@ -3938,6 +4625,16 @@ class DevelopmentalAI:
             from concurrent.futures import TimeoutError as _FTimeout
             _step_to = float(self.config.get("parallel_envs", {}).get(
                 "step_timeout_s", 120))
+            # WHERE THE WALL CLOCK GOES (2026-08-17). The run holds ~3.4
+            # steps/s against a 10 steps/s ceiling (20 server ticks/s over
+            # action_repeat 2) while the GPU sits idle, so two thirds of
+            # every step is unaccounted for. Timing the env round-trip is
+            # what separates "MineRL is slow" from "our own per-step Python
+            # is slow" — those call for completely different work, and
+            # guessing which has already cost this project weeks. Set in
+            # BOTH duplicated bodies on purpose: letting these two drift is
+            # how the last six same-shape bugs were born.
+            _t_env0 = time.time()
             futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
                     for e_i in range(n)]
             next_obs_list, rewards, dones = [], [], []
@@ -3955,8 +4652,13 @@ class DevelopmentalAI:
                         step_infos[e_i] = _inf
                         if (self._proprio_per_env is not None
                                 and e_i < len(self._proprio_per_env)):
-                            self._proprio_per_env[e_i] = (
-                                (_inf or {}).get("proprio"))
+                            # loop-side senses appended here too — this body
+                            # previously stored the RAW env vector and the
+                            # reach feeling was silently zero-padded away in
+                            # every lifelong run (6th duplicated-body bug)
+                            self._proprio_per_env[e_i] = \
+                                self._augment_proprio(
+                                    (_inf or {}).get("proprio"), e_i)
                     if e_i == 0 and isinstance(_inf, dict):
                         prim_info = _inf   # symbolizer reads mine_* from here
                 except (_FTimeout, Exception) as ex:
@@ -3978,6 +4680,11 @@ class DevelopmentalAI:
                 # boundary and must not sever the advantage trace, so it is
                 # deliberately excluded here.
                 dones.append(bool(term) or _rst)
+            # envs step CONCURRENTLY, so this is the wait for the SLOWEST
+            # client, which is exactly what the serial loop pays.
+            self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
+                                  + (time.time() - _t_env0))
+            self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -4086,6 +4793,30 @@ class DevelopmentalAI:
             intrinsic = self.curiosity.compute_intrinsic_reward(
                 obs_t, action_tensor, next_obs_t
             )
+            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
+            # compression progress does; the raw-error term is damped by
+            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
+            # BORING-VIEW BASE DISCOUNT (2026-08-16). The sky discount only
+            # ever covered the itemised novelty term; the BASE was left at
+            # full pay. Measured live at the -90 clamp: ICM/LP base
+            # +0.0147/step = 96% of the whole drive, earned by watching
+            # clouds drift — the census's own caption said it: "prediction
+            # error alone pays this much for EXISTING, so standing still is
+            # already profitable and no shaping term can outbid it". Reuse
+            # the SAME measured judgement (_boring_view_factor: geometry
+            # first, fovea second, learned mastery-boringness third, floored
+            # at 0.15 so first glances pay) on the primary stream's base.
+            # Reward-side only — the WM/curiosity modules still train on
+            # every frame, so perception keeps learning from the sky; it is
+            # the WAGE that dies, not the sight. Applied BEFORE the census
+            # accumulator below, so the census cannot lie about it.
+            _bvw = float(getattr(self, "_icm_boring_discount", 0.0))
+            if _bvw > 0.0:
+                _bf = float(self._boring_view_factor())
+                intrinsic[0] = intrinsic[0] * (1.0 - _bvw * (1.0 - _bf))
+                self._bv_sum = getattr(self, "_bv_sum", 0.0) + _bf
+                self._bv_n = getattr(self, "_bv_n", 0) + 1
 
             # EVERY STEP, UNCONDITIONALLY (fix 2026-08-03). This accumulator
             # was first placed inside the imagination-curiosity block, which
@@ -4113,7 +4844,7 @@ class DevelopmentalAI:
                 self._attr_n = getattr(self, "_attr_n", 0) + 1
                 if float(_at) > 1e-6:
                     self._attr_nz = getattr(self, "_attr_nz", 0) + 1
-            icm_metrics = self.curiosity.train_step(
+            icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
             )
 
@@ -4301,6 +5032,14 @@ class DevelopmentalAI:
                     # in proportion to how much of the FOVEA they fill.
                     if self._nov_sky_discount:
                         _nv *= self._boring_view_factor()
+                    # SEMANTIC GATE (2026-08-11): price this sight by how new
+                    # its MEANING is, not by how new its pixels are. This is
+                    # what stops a self-dug hole from reading as a discovery.
+                    _sf = self._semantic_novelty_factor()
+                    _nv *= _sf
+                    self._nov_sem_sum = (getattr(self, "_nov_sem_sum", 0.0)
+                                         + float(_sf))
+                    self._nov_sem_n = getattr(self, "_nov_sem_n", 0) + 1
                     intrinsic[0] = intrinsic[0] + _nv
                     self._nov_sum = getattr(self, "_nov_sum", 0.0) + _nv
                     self._nov_n = getattr(self, "_nov_n", 0) + 1
@@ -4378,6 +5117,41 @@ class DevelopmentalAI:
                 self._persist_sum = getattr(self, "_persist_sum", 0.0) + _f
                 self._persist_n = getattr(self, "_persist_n", 0) + 1
 
+            # ---- GAZE LEVELING: the clamp costs nothing to lean on ------
+            # Measured live (2026-08-16): pitch pinned at +90, at a clamp on
+            # 21% of steps, every vision predicate starved into DEGENERATE.
+            # The gaze-bucket bonus below unsticks a clamp ONCE and then
+            # saturates, so nothing durable makes leaning on the clamp cost.
+            # POTENTIAL-BASED (Ng): Phi = -(|pitch|/90)^4, F = g*Phi' - Phi.
+            # Any look-down/look-back cycle telescopes to ~0 — no farm, no
+            # tax on transient mining tilts — but SITTING at the clamp means
+            # having paid Phi: -1 and never collecting it back, so the exit
+            # gradient is always live, unlike a count that decays. Intrinsic
+            # channel only -> never a replay reward label.
+            _plw = float(self._pitch_level_weight)
+            if _plw > 0.0 and step_infos:
+                _pvl = (getattr(self, "_last_world_info", None) or {}
+                        ).get("pitch")
+                if _pvl is not None:
+                    _php = -((min(90.0, abs(float(_pvl))) / 90.0) ** 4)
+                    _php_prev = getattr(self, "_pitch_level_phi", None)
+                    if _php_prev is not None:
+                        # PLAIN DIFFERENCE (fixed 2026-08-17). This shipped
+                        # as gamma*Phi' - Phi, which pays w*(1-gamma) every
+                        # step that Phi is PINNED — and Phi is pinned at -1
+                        # exactly when the agent is stuck at a clamp. The
+                        # log proved it: "Gaze level: +0.00014/step", a
+                        # small WAGE for the behaviour the term was added to
+                        # discourage. Phi' - Phi costs on entry, refunds on
+                        # exit, and is flat while nothing changes.
+                        _fpl = _plw * (_php - float(_php_prev))
+                        intrinsic[0] = intrinsic[0] + _fpl
+                        self._pitch_level_sum = getattr(
+                            self, "_pitch_level_sum", 0.0) + _fpl
+                        self._pitch_level_n = getattr(
+                            self, "_pitch_level_n", 0) + 1
+                    self._pitch_level_phi = _php
+
             # ---- GAZE COVERAGE: novelty of VIEW DIRECTION ---------------
             # Count-based over pitch buckets, so being pinned at a clamp is
             # the single most-visited direction there is and pays ~nothing,
@@ -4397,6 +5171,8 @@ class DevelopmentalAI:
                     env_actions[0], float(rewards[0]),
                     float(intrinsic[0].item()), rssm_state, latent[0:1],
                     episode_length)
+                if self.infra is not None:
+                    self.infra.beat("viewer", self.total_timesteps)
 
             # WHERE IT LOOKED, ALL SEGMENT — not just on the last step. A
             # single-step pitch cannot distinguish "pinned at the clamp" from
@@ -4420,6 +5196,21 @@ class DevelopmentalAI:
             if _cw > 0.0 and step_infos:
                 _wi = self._last_world_info
                 _cov = float(_wi.get("coverage", 0.0) or 0.0)
+                # DISCOVERY, NOT EXCAVATION (2026-08-09, live finding): a new
+                # cell reached within a few seconds of SELF-EXCAVATION pays
+                # nothing. Coverage credits "walked somewhere new"; the agent
+                # had priced tunnels — ~2 dirt of effort (−0.06) bores a
+                # fresh cell (+0.30), a 5x profit — and went back to eating
+                # terrain. Fourth instance of MANUFACTURED NOVELTY (sky
+                # views, pillar views, placement views, now tunnel cells):
+                # novelty created by modifying the world is not discovery.
+                if (_cov > 0.0 and self.total_timesteps
+                        - getattr(self, "_last_excav_step", -10**9)
+                        < 40 * max(1, int(getattr(self, "_num_envs", 1)
+                                          or 1))):
+                    self._cov_suppressed = getattr(
+                        self, "_cov_suppressed", 0) + 1
+                    _cov = 0.0
                 if _cov > 0.0:
                     intrinsic[0] = intrinsic[0] + _cw * _cov
                 # MEASURE THE TERRITORY DRIVE AT ITS POINT OF APPLICATION.
@@ -4522,8 +5313,74 @@ class DevelopmentalAI:
             if not use_dream_actor and self.vision_scaffold is not None:
                 _sr = self._magnet_step_shaping(
                     env_actions[0], float(intrinsic[0].item()), latent[0:1])
-                if _sr:
+                # OCCLUSION APPLIES TO THIS CHANNEL TOO (2026-08-17). The
+                # gui_open guard further down zeroes `intrinsic` — but the
+                # magnet's shaping is added to prim_EXTRINSIC, which that
+                # guard never touches, so it kept paying through a menu.
+                # MEASURED LIVE: SkyBot right-clicked a wandering villager,
+                # opened its trade screen, and sat there for 9,125
+                # CONSECUTIVE steps (gui 64% of the segment, position
+                # frozen) while magnet_seek paid 77% of ALL income. This is
+                # the 2026-08-02 occlusion farm exactly, one channel over:
+                # inside a GUI the agent cannot move, look or swing, so
+                # anything that pays there is paying for blindness.
+                # Still CALLED while occluded — heartbeats, the fovea latent
+                # refresh and signal-health observation must not stall —
+                # just not PAID.
+                _gui_now2 = bool((step_infos[0] or {}).get("gui_open"))
+                if _gui_now2:
+                    # seek/centring are POTENTIALS: left holding a menu
+                    # frame's phi, the step the menu closes would collect a
+                    # windfall for closing it. Re-adopt with no delta,
+                    # exactly as reset() does at an episode boundary.
+                    self.vision_scaffold._phi_prev = None
+                    self.vision_scaffold._seek_prob_prev = None
+                elif _sr:
                     prim_extrinsic = rewards[0] + _sr
+                # ---- GETTING OUT MUST PAY -------------------------------
+                # Zeroing income inside a menu removes the FARM but leaves
+                # no gradient toward the exit — and it did something worse:
+                # because pressing `inventory` OPENS a screen that pays 0,
+                # the policy trained that action to ~zero probability
+                # (measured: 0 presses in an entire run at 92%-of-max
+                # entropy). So when a wandering villager's trade screen
+                # opened via `use`, the agent had already unlearned the only
+                # button that closes one, and sat there 10,149+ consecutive
+                # steps. Guard-becomes-latch, again.
+                # Telescoping potential on dwell: Phi = -min(1, run/N).
+                # Sitting accrues the cost once; leaving collects it back;
+                # an open/close cycle nets ~0, so this cannot be farmed in
+                # either direction. Paid into prim_EXTRINSIC on purpose —
+                # the intrinsic channel is zeroed while a GUI is open, so a
+                # cost placed there would be erased by the very guard it is
+                # meant to complement.
+                _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
+                if _gdw > 0.0:
+                    self._gui_run = (self._gui_run + 1) if _gui_now2 else 0
+                    _gphi = -min(1.0, self._gui_run
+                                 / max(1.0, self._gui_dwell_steps))
+                    _gprev = getattr(self, "_gui_dwell_phi", None)
+                    if _gprev is not None:
+                        # PLAIN DIFFERENCE, NOT gamma*Phi' - Phi. Caught by
+                        # its own test: with gamma<1 a potential PINNED at a
+                        # constant floor pays w*(1-gamma) EVERY step, so a
+                        # "cost of sitting here" silently becomes a wage for
+                        # sitting here (+0.0005/step at this weight — the
+                        # exact farm this term exists to kill). Phi' - Phi
+                        # is 0 while the state is unchanged, negative on
+                        # entry, positive on exit, and nets 0 over a cycle.
+                        prim_extrinsic = prim_extrinsic + _gdw * (
+                            _gphi - float(_gprev))
+                    self._gui_dwell_phi = _gphi
+            # general infra: event monitors + empowerment shaping (shared
+            # helper — see _infra_step)
+            if not use_dream_actor:
+                _ei = self._infra_step(
+                    prim_info, env_actions[0], rssm_state,
+                    float(intrinsic[0].item()) + float(prim_extrinsic),
+                    float(rewards[0]))
+                if _ei:
+                    intrinsic[0] = intrinsic[0] + _ei
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -4533,11 +5390,22 @@ class DevelopmentalAI:
             # come from real break events, never from the VLM's word.
             if not use_dream_actor and self.symbolizer is not None:
                 _lat0 = latent[0:1].detach()
+                # last frame, kept for the unstuck advisor: at stuck L3 the
+                # VLM is shown what the agent currently sees (a reference
+                # assignment per step, only read at L3 segments)
+                self._advisor_frame = _frame
                 self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
                 _labels = self.symbolizer.collect()
+                if _labels is not None and self.infra is not None:
+                    self.infra.beat("vlm_label", self.total_timesteps)
+                if (self.infra is not None and self.symbolizer is not None
+                        and getattr(self.symbolizer, "total_fovea_labels", 0)
+                        != getattr(self, "_hb_fovea_seen", 0)):
+                    self._hb_fovea_seen = self.symbolizer.total_fovea_labels
+                    self.infra.beat("fovea_label", self.total_timesteps)
                 # LAYER 3: route a VLM-PROPOSED category to the instinct. The
                 # proposal is attention only — it goes to the magnet's
-                # probation set, never to the head and never to the KG. If
+                # probation set, never to the KG. If
                 # attending to it yields no learning progress it is evicted.
                 if (_labels and self.vision_scaffold is not None
                         and _labels.get("__novel__")):
@@ -4897,6 +5765,12 @@ class DevelopmentalAI:
                 else:
                     obs_list[e_i] = next_obs_list[e_i]  # (no truncation in LL)
 
+            # A2: hand this step's encoder output to the next act(). MUST be
+            # after the advance loop above — validity is decided by whether
+            # obs_list[e] IS next_obs_list[e] (same object = the env kept
+            # running), which is only true once that loop has assigned.
+            self._set_enc_carry(encoded_next, obs_list, next_obs_list)
+
             episode_reward += rewards[0]
             episode_intrinsic += float(intrinsic[0].item())
             episode_length += 1
@@ -5242,16 +6116,46 @@ class DevelopmentalAI:
         lr_scale = float(cs.get("lr_scale", 0.5))
         gamma = float(self.config.get("policy", {}).get("gamma", 0.99))
 
-        # round-robin so every skill gets sleep, not just the low-numbered
-        # ones — a fixed scan order would starve the tail of the bank forever
         cand = [i for i, b in enumerate(ex.bank.slots)
                 if b is not None and not b.get("scripted")]
         if not cand:
             return out
-        start = int(getattr(self, "_consolidate_cursor", 0))
-        picks = [cand[(start + k) % len(cand)]
-                 for k in range(min(per_seg, len(cand)))]
-        self._consolidate_cursor = (start + len(picks)) % len(cand)
+        # DELIBERATE PRACTICE (infra #37, 2026-08-09; replaces round-robin).
+        # Rehearse the skills nearest the LEARNING EDGE: success probability
+        # ~0.5 is where one rehearsal teaches the most (the zone of proximal
+        # development — arguably THE mechanism of human skill acquisition).
+        # p is Laplace-smoothed from the executor's real invocation tally;
+        # a never-tried skill scores 0.4 — worth a look, but behind anything
+        # actually at the edge — so the tail of the bank still cannot starve
+        # (the round-robin's virtue, kept without its blindness).
+        _stats = getattr(ex, "slot_stats", {}) or {}
+        # AGING + JITTER (review finding, 2026-08-09): a pure stable sort on
+        # the ZPD score starved the tail — with all slots untried every score
+        # ties at 0.4 and the SAME lowest-indexed picks win every segment
+        # (the round-robin this replaced guaranteed coverage; its virtue is
+        # restored here as a hunger term). Each unpicked segment adds
+        # priority; being picked resets it; ties break randomly. A chronic
+        # failure (score ~0.06) therefore still dreams once its hunger
+        # accumulates — rehearsal is the only path by which it can change.
+        if not hasattr(self, "_zpd_hunger"):
+            self._zpd_hunger = {}
+
+        def _zpd(slot: int) -> float:
+            st = _stats.get(slot) or {}
+            n = int(st.get("invocations", 0) or 0)
+            if n <= 0:
+                base = 0.4
+            else:
+                p = (int(st.get("spikes", 0) or 0) + 1.0) / (n + 2.0)
+                base = 1.0 - 2.0 * abs(p - 0.5)
+            return (base + 0.05 * self._zpd_hunger.get(slot, 0)
+                    + 0.01 * random.random())
+
+        picks = sorted(cand, key=_zpd, reverse=True)[:min(per_seg,
+                                                          len(cand))]
+        for _c in cand:
+            self._zpd_hunger[_c] = (0 if _c in picks
+                                    else self._zpd_hunger.get(_c, 0) + 1)
 
         for slot in picks:
             try:
@@ -5264,6 +6168,10 @@ class DevelopmentalAI:
             out["slots"] += 1.0
             if info:
                 out["updates"] += 1.0
+            if self.infra is not None:
+                # proof-of-life: consolidation ran END-TO-END (this exact
+                # subsystem silently crashed every segment for weeks once)
+                self.infra.beat("consolidation", self.total_timesteps)
         return out
 
     def _consolidate_one_slot(self, slot: int, n_roll: int, horizon: int,
@@ -5314,6 +6222,19 @@ class DevelopmentalAI:
                          if getattr(self.policy, "_shared_encoder", None)
                          is not None else obs)
                 feats = feats.reshape(obs.shape[0], -1)
+                # FIELD ORDER (review finding, 2026-08-09): the waking input
+                # is [features | PROPRIO | knowledge]. This path used to
+                # build [features | knowledge] and let the end-pad absorb the
+                # difference — which parked the KNOWLEDGE values in the
+                # proprio COLUMNS and zeros where knowledge belongs, so
+                # consolidation rehearsed a systematically misaligned input.
+                # A dream has no body-state: neutral zeros IN THE RIGHT
+                # COLUMNS, the same missing-sense convention as everywhere.
+                _pdim_c = int(b.get("proprio_dim", 0) or 0)
+                if _pdim_c > 0:
+                    feats = torch.cat(
+                        [feats, torch.zeros(feats.shape[0], _pdim_c,
+                                            device=feats.device)], dim=-1)
                 if kdim > 0:
                     tail = (_cond(feats, ctx_t.expand(feats.shape[0], -1))
                             if (_cond is not None and ctx_t is not None)
@@ -5348,6 +6269,17 @@ class DevelopmentalAI:
                     else:
                         feats = feats[:, :_want]
                 logits = actor.action_head(actor.shared(feats))
+                # the dreamed skill must be the skill it actually IS: base +
+                # owned delta (infra #35) — rehearsing the base alone would
+                # practise a behaviour the waking skill no longer produces
+                _dh = ex.bank.resident_delta(slot)
+                if _dh is not None:
+                    try:
+                        _dd = _dh(feats)
+                        if _dd.shape == logits.shape:
+                            logits = logits + _dd
+                    except Exception:
+                        pass
                 # primitives only: a dreamed NESTED invocation cannot be
                 # executed inside the world model (there is no executor in
                 # there), so slot rows are masked off rather than sampled and
@@ -5384,7 +6316,15 @@ class DevelopmentalAI:
             for e in elite:
                 if e < f.shape[0]:
                     traj.append((f[e].reshape(1, -1), int(a[e])))
-        return pr.consolidate(slot, actor, traj, lr_scale=lr_scale)
+        # sleep-practice trains the skill's OWNED delta (infra #35); the
+        # base stays the frozen mint-time record. Written back so the
+        # individuation survives LRU eviction.
+        _delta = ex.bank.resident_delta(slot)
+        _info = pr.consolidate(slot, actor, traj, lr_scale=lr_scale,
+                               delta=_delta)
+        if _info and not _info.get("reverted") and _delta is not None:
+            ex.bank.writeback_delta(slot, _delta, _info.get("delta_mag"))
+        return _info
 
     def _persist_practised_skills(self) -> int:
         """Write practised skill weights back to disk.
@@ -5421,6 +6361,13 @@ class DevelopmentalAI:
                 # what changed.
                 sd["actor"] = {k: v.to(torch.float32)
                                for k, v in b["actor_sd"].items()}
+                # the OWNED individuation travels with the skill (infra #35):
+                # without this line every restart silently zeroed all
+                # accumulated deltas — a recording again, not a memory
+                # (review finding, 2026-08-09)
+                if b.get("delta_sd"):
+                    sd["delta"] = {k: v.to(torch.float32)
+                                   for k, v in b["delta_sd"].items()}
                 self.skill_bank.save_skill(
                     skill_id=sid, name=sk.name,
                     policy_state_dict=sd,
@@ -5848,6 +6795,39 @@ class DevelopmentalAI:
     # Checkpointing
     # -----------------------------------------------------------------------
 
+    def _income_now(self, top: int = 7):
+        """LIVE income statement: shares of |reward| by source, THIS segment
+        so far — the running values of the same per-term sums the ledger
+        harvests at segment cadence, plus raw env income and the ICM/LP base.
+        Built for the viewer: the number-one question in every reward-hacking
+        incident was "what is it being paid for RIGHT NOW", and the segment
+        report only answers it every ~1024 steps, after the fact."""
+        try:
+            src = {}
+            for name, attr in (("coverage", "_cov_sum"), ("gaze", "_gaze_sum"),
+                               ("novelty", "_nov_sum"),
+                               ("symbols", "_sym_sum"),
+                               ("sym_center", "_symc_sum"),
+                               ("persistence", "_persist_sum"),
+                               ("reach", "_reach_sum"),
+                               ("imagination", "_cen_imag"),
+                               ("icm_base", "_cen_base"),
+                               ("extrinsic", "_seg_extrinsic_sum")):
+                v = float(getattr(self, attr, 0.0) or 0.0)
+                if v:
+                    src[name] = v
+            mag = (float(getattr(self, "_mag_turn", 0.0) or 0.0)
+                   + float(getattr(self, "_mag_other", 0.0) or 0.0))
+            if mag:
+                src["magnet_seek"] = mag
+            tot = sum(abs(v) for v in src.values())
+            if tot <= 0:
+                return None
+            ranked = sorted(src.items(), key=lambda kv: -abs(kv[1]))[:top]
+            return [(n, abs(v) / tot, v) for n, v in ranked]
+        except Exception:
+            return None
+
     def _viewer_push(self, action, ext_r, int_r, rssm_state, latent, ep_step,
                      pred_obs=None, actual_obs=None):
         """Stream the live env frame + world-model state to the viewer.
@@ -5894,6 +6874,7 @@ class DevelopmentalAI:
             self.viewer.push(
                 env_rgb, f"{self.env_name}", lines, z=z,
                 ret_hist=list(self.episode_rewards), recon=recon,
+                income=self._income_now(),
             )
         except Exception:
             pass
@@ -5908,6 +6889,54 @@ class DevelopmentalAI:
         """
         with self._wm_param_lock:
             self._save_checkpoint_locked()
+        # DELIBERATELY OUTSIDE THE PARAM LOCK: the replay buffer can be many
+        # GB, and holding _wm_param_lock across that write would stall the
+        # ACTING thread (its per-step observe forwards take the same lock)
+        # for the whole of a multi-second disk write. The buffer has its own
+        # internal lock, so it is safe to snapshot concurrently.
+        self._save_replay_buffer()
+
+    def _replay_persist_cfg(self):
+        """(enabled, path, max_transitions_per_stream) or (False, ..) if off."""
+        _wm = self.config.get("world_model", {}) or {}
+        if not bool(_wm.get("buffer_persist", False)):
+            return False, "", None
+        _dir = os.path.join(
+            self.config.get("loop", {}).get("log_dir", "./logs"),
+            "checkpoints", "replay_buffer")
+        _gb = float(_wm.get("buffer_persist_max_gb", 8.0) or 0.0)
+        if _gb <= 0:
+            return True, _dir, None
+        # bytes per stored transition: obs dominates (uint8 pixels), plus the
+        # action row and three float32 scalars
+        _ob = int(self.obs_dim) * (1 if bool(_wm.get("obs_uint8", True))
+                                   and self.pixel_obs else 4)
+        _per = _ob + int(self.action_dim) * 4 + 12
+        return True, _dir, max(1000, int(_gb * 1e9 / max(1, _per)))
+
+    def _save_replay_buffer(self) -> None:
+        """Persist recent experience so a crash-relaunch does not restart the
+        world model from an EMPTY buffer.
+
+        Contained: a failed buffer save must never take down a run that is
+        otherwise fine. Losing the buffer costs re-collection; losing the
+        process costs the whole session.
+        """
+        _on, _dir, _max = self._replay_persist_cfg()
+        if not _on or self.replay_buffer is None:
+            return
+        try:
+            _t0 = time.time()
+            _n = self.replay_buffer.save(_dir, max_transitions=_max)
+            logger.info(
+                "replay buffer saved: %d transitions in %.1fs -> %s "
+                "(a relaunch now resumes with this experience instead of an "
+                "empty buffer)", _n, time.time() - _t0, _dir)
+        except Exception as _e:
+            logger.warning(
+                "replay buffer save FAILED (%s: %s) — continuing; the run is "
+                "unaffected but a crash would lose this experience",
+                type(_e).__name__, _e)
 
     def _save_checkpoint_locked(self) -> None:
         checkpoint_dir = os.path.join(
@@ -5983,6 +7012,58 @@ class DevelopmentalAI:
             self.dream_actor.state_dict(),
             os.path.join(checkpoint_dir, "dream_actor.pt"),
         )
+
+        # PERCEPTION (2026-08-10): the grounded heads + reliability + label
+        # evidence — dying with the process cost hours of re-grounding and a
+        # DEGENERATE-gated magnet at every boot. Perception is experience.
+        if self.symbolizer is not None:
+            try:
+                torch.save(self.symbolizer.state(),
+                           os.path.join(checkpoint_dir, "symbolizer.pt"))
+            except Exception as _e:
+                logger.warning("symbolizer checkpoint failed: %s", _e)
+
+        # FAMILIARITY (2026-08-10): the count-based "what have I already
+        # seen" dicts (view/gaze/symbol novelty). Absent from every
+        # state_dict, they reset each launch and paid a fresh novelty
+        # WINDFALL per restart — measured as symbols at 55-65% of all income
+        # after every boot of the restart-heavy waves.
+        try:
+            torch.save({
+                "nov_counts": dict(getattr(self, "_nov_counts", {}) or {}),
+                "gaze_counts": dict(getattr(self, "_gaze_counts", {}) or {}),
+                "known_symbols": sorted(getattr(self, "_known_symbols",
+                                                set()) or set()),
+                "symbol_counts": dict(getattr(self, "_symbol_counts",
+                                              {}) or {}),
+                "symbol_sight_counts": dict(getattr(
+                    self, "_symbol_sight_counts", {}) or {}),
+            }, os.path.join(checkpoint_dir, "familiarity.pt"))
+        except Exception as _e:
+            logger.warning("familiarity checkpoint failed: %s", _e)
+
+        # MAGNET curiosity memory (2026-08-17): what the agent is curious
+        # ABOUT. familiarity.pt above carries what it has already seen; this
+        # carries the learning-progress estimates that decide where to look
+        # next. Without it every launch printed "w=0.0000, target=None" with
+        # all categories at LP 0.000 and spent its first hours unsteered —
+        # the same restart tax, on the drive that aims the other senses.
+        if self.vision_scaffold is not None:
+            try:
+                torch.save(self.vision_scaffold.state(),
+                           os.path.join(checkpoint_dir, "magnet.pt"))
+            except Exception as _e:
+                logger.warning("magnet checkpoint failed: %s", _e)
+
+        # CONSEQUENCE state: the banked evidence that lets the frontier
+        # bootstrap without a first success. Written next to the run's logs
+        # (not into the checkpoint dir) so it survives a checkpoint wipe.
+        try:
+            if self.consequence is not None:
+                self.consequence.save(getattr(self, "_consequence_path",
+                                              "podlogs/consequence_state.json"))
+        except Exception as _e:
+            logger.warning("consequence checkpoint failed: %s", _e)
 
         logger.debug(f"Checkpoint saved to {checkpoint_dir}")
 
@@ -6488,20 +7569,86 @@ class DevelopmentalAI:
             if _sc is None:
                 _sc = self._symbol_sight_counts = {}
             _wn = 0.0
+            _named = 0
             for _k in active:
                 if _k in _AFFORD:
                     continue          # an affordance is not a thing
                 _c = _sc.get(_k, 0)
                 _sc[_k] = _c + 1
+                _named += 1
                 _wn = max(_wn, 1.0 / ((1.0 + _c) ** 0.5))
             self._sym_center_phi = float(
                 max(0.0, min(1.0, max(0.0, min(1.0, _cen)) * _wn)))
+            # SEMANTIC NOVELTY SIGNAL (2026-08-11, user directive). `_wn` is
+            # "how unfamiliar is the least-seen NAMEABLE thing in view" — the
+            # honest measure of whether this sight is a DISCOVERY rather than
+            # merely an unseen pixel arrangement. Stashed with the step it was
+            # computed on so the perceptual-novelty term can consume it
+            # without recomputing, and can tell a stale value from a fresh
+            # one (this method is skipped on dream-actor steps).
+            self._sym_rarity_now = float(_wn)
+            self._sym_named_now = int(_named)
+            self._sym_rarity_step = int(self.total_timesteps)
             n = self._symbol_counts.get(sig, 0)
             self._symbol_counts[sig] = n + 1
             bonus += float(self._symbol_weight) / ((1.0 + n) ** 0.5)
             return bonus, len(self._known_symbols), sig
         except Exception:
             return 0.0, 0, None
+
+    def _semantic_novelty_factor(self) -> float:
+        """How new is the MEANING in view — not how new the pixels are.
+
+        WHY (2026-08-11, user directive, from a decisive live observation).
+        The agent was placed directly in front of a tree, ignored it, dug a
+        single dirt block and sat in the hole. Perceptual novelty explains
+        that exactly: it is a count over a hash of the visual latent, so a
+        freshly dug hole is a genuinely never-before-seen view and pays like
+        one. Digging MANUFACTURES novelty — the fourth time this project has
+        met that anti-pattern ("novelty created by modifying the world is not
+        discovery"). It was also the single largest income line at 34%.
+
+        The fix is to make novelty SEMANTIC. The payout is now scaled by how
+        unfamiliar the least-seen NAMEABLE thing in view is (`_wn` from
+        `_symbol_novelty`, the same 1/sqrt(1+n) familiarity decay used
+        everywhere else here):
+
+          * a first village / first tree -> its symbols are unseen, factor
+            ~1.0, so novelty SPIKES exactly when something is genuinely
+            discovered (and the symbol term and curiosity spike with it);
+          * a dirt hole -> `dirt` has been named thousands of times, factor
+            ~0.02, so digging stops paying;
+          * a view it cannot NAME at all -> the `unnamed_floor`, a small but
+            non-zero pull, because the symbolic layer's silence may mean
+            genuinely new territory rather than nothing of interest. That
+            floor is what keeps this exploration rather than pure exploitation
+            of the existing vocabulary.
+
+        Declares NOTHING about which symbols matter: the vocabulary is
+        whatever the VLM taught and the world confirmed, and the pull is
+        simply toward whatever has been named least.
+        """
+        try:
+            if not getattr(self, "_nov_semantic", False):
+                return 1.0
+            _floor = float(getattr(self, "_nov_unnamed_floor", 0.1))
+            # STALENESS: _symbol_novelty is skipped on dream-actor steps and
+            # when the symbol weights are 0. A stale rarity would silently
+            # price this step by a view several steps old, so fall back to
+            # the floor rather than to a wrong number.
+            if int(getattr(self, "_sym_rarity_step", -1)) != int(
+                    self.total_timesteps):
+                return _floor
+            if int(getattr(self, "_sym_named_now", 0)) <= 0:
+                return _floor          # nothing nameable in view
+            _r = float(getattr(self, "_sym_rarity_now", 0.0) or 0.0)
+            # NOTE: no floor on the named branch. A thing you can name and
+            # have seen 4000 times is LESS interesting than one you cannot
+            # name at all, so familiar-named views are allowed to decay below
+            # the unnamed floor — that asymmetry is the whole point.
+            return max(0.0, min(1.0, _r))
+        except Exception:
+            return 1.0                 # never let pricing kill the step
 
     def _gaze_bonus(self, pitch) -> float:
         """Count-based novelty over VIEW DIRECTION (pitch buckets).
@@ -6534,6 +7681,234 @@ class DevelopmentalAI:
         n = self._gaze_counts.get(bkt, 0)
         self._gaze_counts[bkt] = n + 1
         return float(self._gaze_weight) * (1.0 / ((1.0 + n) ** 0.5))
+
+    def _feats_for_act(self, n: int):
+        """Per-env encoder features carried from last step, or None.
+
+        The loop already ran `world_model.encoder(next_obs_t)` for the RSSM,
+        and one step later that IS this env's observation — so the policy's
+        own `_encode` (arch='wm' shares that same encoder) is a duplicate
+        forward on every env step. This hands the result over EXPLICITLY
+        rather than caching it: only the loop knows whether a given env's
+        frame actually carried, and a cache that guessed would eventually
+        serve a pre-reset frame after a world rebuild, silently.
+        """
+        if not self._reuse_enc_feats:
+            return None
+        _c = getattr(self, "_enc_carry", None)
+        if _c is None:
+            return None
+        _feats, _valid = _c
+        if _feats is None or int(_feats.shape[0]) != int(n):
+            return None            # env count changed (rebuild): recompute
+        return [(_feats[e:e + 1] if _valid[e] else None) for e in range(n)]
+
+    def _set_enc_carry(self, encoded_next, obs_list, next_obs_list) -> None:
+        """Remember this step's encoded next_obs for the next act().
+
+        INVALIDATION IS THE WHOLE POINT, and it is checked DIRECTLY rather
+        than inferred. Call this AFTER the obs-advance loop: an env that kept
+        running has had `obs_list[e] = next_obs_list[e]` assigned, so the two
+        entries are THE SAME OBJECT, while an env that reset holds a fresh
+        array from `envs[e].reset()`. An identity test therefore states the
+        exact precondition — "the frame the loop just encoded is the frame
+        the policy is about to act on" — with no dependence on the branch
+        conditions above (`dones[e] or _crashed`, plus a timeout path that
+        carries the obs anyway). Replicating those conditions here is how
+        this would eventually go silently wrong.
+        """
+        if not self._reuse_enc_feats or encoded_next is None:
+            self._enc_carry = None
+            return
+        try:
+            _f = encoded_next.reshape(int(encoded_next.shape[0]), -1).detach()
+        except Exception:
+            self._enc_carry = None
+            return
+        _n = int(_f.shape[0])
+        if (obs_list is None or next_obs_list is None
+                or len(obs_list) < _n or len(next_obs_list) < _n):
+            self._enc_carry = None
+            return
+        self._enc_carry = (
+            _f, [obs_list[_e] is next_obs_list[_e] for _e in range(_n)])
+
+    def _curiosity_train(self, obs_t, action_t, next_obs_t) -> Dict[str, float]:
+        """One curiosity gradient step, optionally BATCHED across env steps.
+
+        ONE implementation for all three stepping bodies on purpose. The
+        per-step reward machinery in this file has produced six-plus
+        duplicated-body bugs; a shared helper cannot drift by construction,
+        which is strictly better than three copies kept in sync by hand.
+
+        `train_every: 1` (the default) calls straight through, so the
+        behaviour is byte-identical to before this existed. Above 1, the
+        transitions are accumulated and one update is issued on the
+        concatenated batch: identical gradient information, K-fold fewer
+        kernel launches. Returns the most recent metrics on the steps that
+        do not train (they feed the `curiosity_loss` log line only).
+        """
+        _k = self._curiosity_train_every
+        if _k <= 1:
+            self._last_icm_metrics = self.curiosity.train_step(
+                obs_t, action_t, next_obs_t)
+            return self._last_icm_metrics
+        # detach: holding the autograd graph across steps would leak memory
+        # and tie this batch to graphs the optimizer has already consumed
+        self._cur_train_buf.append((obs_t.detach(), action_t.detach(),
+                                    next_obs_t.detach()))
+        if len(self._cur_train_buf) < _k:
+            return self._last_icm_metrics
+        _o = torch.cat([b[0] for b in self._cur_train_buf], dim=0)
+        _a = torch.cat([b[1] for b in self._cur_train_buf], dim=0)
+        _n = torch.cat([b[2] for b in self._cur_train_buf], dim=0)
+        self._cur_train_buf.clear()
+        self._last_icm_metrics = self.curiosity.train_step(_o, _a, _n)
+        return self._last_icm_metrics
+
+    def _apply_explore_boost(self, window: int,
+                             max_total: int = 16384) -> str:
+        """Double the exploration weights for `window` steps, or EXTEND a
+        boost that is already running. Returns a status the caller logs.
+
+        ONE implementation for two callers (2026-08-23 review). The stuck
+        ladder's L2 remedy and the VLM advisor's `explore_wider` remedy
+        open-coded the same four lines, and the advisor's copy was guarded by
+        `if self._stuck_boost_orig is None` — which, because L2 fires first in
+        the same segment hook and L3 satisfies `>= 2`, could NEVER be true.
+        The remedy was dead code: the exchange was printed and written to
+        help_responses.jsonl as accepted advice while nothing happened, which
+        corrupted the only record of whether the advisor helps.
+
+        Two invariants, both of them scars:
+
+        * WEIGHTS DOUBLE ONCE. A second call extends the window, it does not
+          re-multiply — otherwise repeated advice compounds 2x, 4x, 8x.
+        * EXTENSION IS CAPPED at `max_total` steps from when the boost
+          STARTED. The advisor is rate-limited, not silenced, so an unbounded
+          extension would hold the weights at 2x forever and the expiry line
+          would never print. A remedy that never expires is this project's
+          guard-becomes-latch failure wearing the other hat.
+        """
+        _t = int(self.total_timesteps)
+        if self._stuck_boost_orig is None:
+            self._stuck_boost_orig = (self._novelty_weight,
+                                      self._coverage_weight)
+            self._novelty_weight *= 2.0
+            self._coverage_weight *= 2.0
+            self._stuck_boost_started = _t
+            self._stuck_boost_until = _t + int(window)
+            return f"applied (x2 for {int(window)} steps)"
+        _ceil = int(getattr(self, "_stuck_boost_started", _t)) + int(max_total)
+        _new = min(_t + int(window), _ceil)
+        if _new <= int(self._stuck_boost_until):
+            # two different refusals, and an operator reading the log needs to
+            # tell them apart: a capped remedy is a bounded system working,
+            # a redundant one is just a shorter window arriving late
+            return ("declined (at max duration)"
+                    if _t + int(window) > _ceil
+                    else "declined (boost already runs longer)")
+        self._stuck_boost_until = _new
+        return f"extended (x2 until +{_new - _t} steps)"
+
+    def _advise_unstuck(self, acts: Dict) -> None:
+        """Stuck L3 -> ask the local VLM for slight guidance (infra #46).
+
+        The help request stops being write-only: the same model that
+        teaches the agent's perception reads the request plus the CURRENT
+        VIEW and picks one intervention from a bounded menu of existing
+        drive levers (see infra/advisor.py for the philosophy: guidance
+        biases what is INTERESTING; the agent's own body keeps discovering
+        the how). Everything here fails to a no-op — the run must behave
+        identically with the advisor absent, refusing, or wrong.
+        """
+        _icfg = self.config.get("infra", {}) or {}
+        if not bool(_icfg.get("advisor_enabled", False)):
+            return
+        if self.symbolizer is None:
+            return
+        adv = getattr(self, "_unstuck_advisor", None)
+        if adv is None:
+            from developmental_ai.infra.advisor import UnstuckAdvisor
+            from developmental_ai.llm.vlm_symbolizer import (
+                _get_ollama_client)
+            _model = getattr(self.symbolizer, "model", None)
+
+            def _q(prompt, images):
+                c = _get_ollama_client()
+                if c is None or not _model:
+                    return None
+                r = c.generate(model=_model, prompt=prompt,
+                               images=images or None, format="json",
+                               keep_alive=-1,
+                               options={"num_predict": 200,
+                                        "temperature": 0.0})
+                return (r.get("response") or "").strip()
+
+            adv = UnstuckAdvisor(
+                _q,
+                min_gap=int(_icfg.get("advisor_min_gap", 4096)),
+                log_dir=str(_icfg.get("log_dir", "podlogs")))
+            self._unstuck_advisor = adv
+        _cats = (list(getattr(self.vision_scaffold, "target_categories",
+                              None) or [])
+                 if self.vision_scaffold is not None else [])
+        _png = None
+        try:
+            _fr = getattr(self, "_advisor_frame", None)
+            if _fr is not None:
+                _png = self.symbolizer._encode_png(_fr)
+        except Exception:
+            _png = None
+        _wi = getattr(self, "_last_world_info", None) or {}
+        _sit = {
+            "situation": acts.get("stuck_reason"),
+            "position": (_wi.get("x"), _wi.get("y"), _wi.get("z")),
+            "recent_memory": (self.infra.episodic.summary(
+                self.total_timesteps)
+                if (self.infra is not None
+                    and self.infra.episodic is not None) else None),
+        }
+        advice = adv.advise(_sit, _cats, _png, self.total_timesteps)
+        if advice is None:
+            return
+        _r = advice["remedy"]
+        print("  infra/advisor: " + _r
+              + (f" [{advice['category']}]" if advice.get("category")
+                 else "")
+              + (f" — {advice['why']}" if advice.get("why") else ""))
+        if _r == "look_around":
+            # same lever as the gaze-starved remedy: re-open gaze novelty
+            # and let the magnet act on whatever the sweep finds
+            _gc = getattr(self, "_gaze_counts", None)
+            if isinstance(_gc, dict):
+                for _b in list(_gc):
+                    _gc[_b] = min(_gc[_b], 25)
+            if self.vision_scaffold is not None:
+                self.vision_scaffold._seek_nudge_left = \
+                    self.vision_scaffold.seek_nudge_budget
+        elif _r == "prime" and self.vision_scaffold is not None:
+            # the goal-emulation lever: category validated against the
+            # agent's OWN vocabulary in the advisor's parser; social_prime
+            # keeps its edge-trigger, so repeated advice cannot latch
+            if not self.vision_scaffold.social_prime(
+                    advice["category"], self.total_timesteps,
+                    duration=int(_icfg.get("advisor_prime_steps", 4000))):
+                print("  infra/advisor: prime declined "
+                      "(already primed or unknown category)")
+        elif _r == "explore_wider":
+            # the L2 remedy on request, with a LONGER window than the ladder's
+            # own. No `is None` precondition: L2 has always already fired by
+            # the time L3 reaches here, so requiring an unboosted state made
+            # this branch unreachable. _apply_explore_boost extends instead,
+            # and caps the extension so repeated advice cannot latch.
+            # "->" not "—": the line above already carries the VLM's REASON
+            # for the remedy; this one reports what actually happened to it,
+            # which is the half that used to be a lie
+            print("  infra/advisor: explore_wider -> "
+                  + self._apply_explore_boost(4096))
+        # "conserve" is a deliberate no-op: the advisor judged the lull
+        # transient, and doing nothing on advice is still an answer
 
     def _view_key(self, obs_row):
         """A DETERMINISTIC vector for what is on screen right now.
@@ -6694,6 +8069,43 @@ class DevelopmentalAI:
         except Exception:
             return None, None, None
 
+    def _encode_crop(self, crop):
+        """HWC uint8 centre crop -> [1, enc_dim] world-model encoder features.
+
+        The symbolizer owns the CROP (it knows fovea_frac); this owns the
+        OBSERVATION CONTRACT (resize to image_size, /255, CHW, flatten) and
+        the encoder. Keeping the split here is why the symbolizer needs no
+        knowledge of how pixels reach the model.
+
+        DETACHED on purpose: the fovea head trains on these features, and
+        gradient must never flow back into the SHARED encoder — reshaping
+        the perception every other subsystem reads, to serve one head, is
+        precisely the coupling the project has been burned by before.
+        """
+        try:
+            enc = getattr(self.world_model, "encoder", None)
+            if enc is None or crop is None:
+                return None
+            side = int(getattr(enc, "image_size", 0) or 0)
+            if side <= 0:
+                side = int(round((float(self.obs_dim) / 3.0) ** 0.5))
+            a = np.asarray(crop)
+            if a.ndim != 3 or a.shape[2] != 3:
+                return None
+            h, w = a.shape[:2]
+            if h != side or w != side:
+                # nearest-neighbour resample: no scipy/cv2 dependency, and
+                # the head only needs coarse layout, not interpolation
+                yi = np.clip((np.arange(side) * h) // side, 0, h - 1)
+                xi = np.clip((np.arange(side) * w) // side, 0, w - 1)
+                a = a[yi][:, xi]
+            obs = (a.astype(np.float32) / 255.0).transpose(2, 0, 1)
+            t = torch.as_tensor(obs.reshape(1, -1), device=self.device)
+            with torch.no_grad():
+                return enc(t).detach()
+        except Exception:
+            return None
+
     def _fovea_kwargs(self, latent_row) -> Dict[str, Any]:
         """Foveal probs + counts + measured pitch for the magnet, from the
         symbolizer's fovea head. Empty dict when the channel is off, so the
@@ -6713,6 +8125,11 @@ class DevelopmentalAI:
                     # sky-novelty discount reads it; one head forward, N uses)
                     self._last_fovea_probs = fp
                     self._last_fovea_counts = out["fovea_counts"]
+                    # POSITIVE sightings, cached separately: presence-claims
+                    # (social gate, episodic landmarks, assoc) must gate on
+                    # "actually seen", not "head was trained" (review)
+                    self._last_fovea_pos = dict(getattr(
+                        self.symbolizer, "fovea_pos_counts", {}) or {})
             _p = (getattr(self, "_last_world_info", None) or {}).get("pitch")
             if _p is not None:
                 out["pitch"] = float(_p)
@@ -6720,17 +8137,25 @@ class DevelopmentalAI:
             return {}
         return out
 
-    # fovea material category -> the block types whose lifetime break counts
-    # measure how MASTERED that material is. The mapping is name plumbing
-    # only — mastery itself is measured (breaks_by_type), never declared.
-    _MASTERY_BLOCKS = {
-        "dirt_visible": ("dirt", "coarse_dirt", "podzol"),
-        "grass_visible": ("grass_block", "grass", "tall_grass", "fern"),
-        "stone_visible": ("stone", "cobblestone", "gravel", "andesite",
-                          "diorite", "granite"),
-        "leaves_visible": ("oak_leaves", "birch_leaves", "spruce_leaves",
-                           "jungle_leaves"),
-    }
+    @staticmethod
+    def _event_count_map(info) -> Dict[str, int]:
+        """Lifetime event counts as one flat "kind:subtype" map, from the
+        adapter's per-kind exports. This is the shared vocabulary between
+        habituation, the boring-view discount and the infra stack's
+        category<->event association — one assembly point, no drift."""
+        out: Dict[str, int] = {}
+        if not isinstance(info, dict):
+            return out
+        for kind, key in (("break", "breaks_by_type"),
+                          ("place", "places_by_type"),
+                          ("craft", "crafts_by_type"),
+                          ("pickup", "pickups_by_type")):
+            for k, v in (info.get(key) or {}).items():
+                try:
+                    out[f"{kind}:{k}"] = int(v)
+                except Exception:
+                    continue
+        return out
 
     def _boring_view_factor(self) -> float:
         """View-novelty multiplier in [0.15, 1]: how much of the fovea is
@@ -6768,16 +8193,20 @@ class DevelopmentalAI:
         if fcs.get("sky_visible", 0) >= ml:
             boring = max(boring, max(0.0, min(1.0, float(
                 fps.get("sky_visible", 0.0)))))
-        if self._habituation_scale > 0.0:
-            bbt = ((getattr(self, "_last_env_info", None) or {})
-                   .get("breaks_by_type") or {})
-            for cat, blocks in self._MASTERY_BLOCKS.items():
+        # MEASURED ASSOCIATION, NOT A NAME MAP (2026-08-08). This used to
+        # consult a hand-written category->block-name table — domain
+        # knowledge a general agent cannot ship. The infra stack instead
+        # LEARNS which perceptual categories co-occur with which caused
+        # events ("what was I looking at when things happened") and mastery
+        # of those events makes the category boring. Cold start = no
+        # associations = no discount, which is the safe direction.
+        if self._habituation_scale > 0.0 and self.infra is not None:
+            for cat, b in self.infra.category_boringness(
+                    self._habituation_scale).items():
                 if fcs.get(cat, 0) < ml:
                     continue
-                n = max((int(bbt.get(b, 0)) for b in blocks), default=0)
-                mastery = 1.0 - 1.0 / (1.0 + n / self._habituation_scale)
                 boring = max(boring, max(0.0, min(1.0, float(
-                    fps.get(cat, 0.0)))) * mastery)
+                    fps.get(cat, 0.0)))) * float(b))
         return max(0.15, 1.0 - boring)
 
     def _habituation_factor(self, info) -> float:
@@ -6799,6 +8228,34 @@ class DevelopmentalAI:
         """
         if self._habituation_scale <= 0.0 or not isinstance(info, dict):
             return 1.0
+        # EVENT-STREAM FORM (infra #44/#12, 2026-08-08): adapters that emit
+        # the typed event stream get fully general habituation — any event
+        # KIND the domain has (break/place/craft/pickup/...), no taxonomy in
+        # this file. The least-familiar event still governs; deaths are not
+        # "caused effects" and never habituate. Legacy parsing below remains
+        # for adapters without the stream.
+        ev = info.get("events")
+        if ev is not None:
+            counts = self._event_count_map(info)
+            facs = []
+            for kind, sub in ev:
+                # CAUSED kinds only (review 2026-08-09): an uncounted kind
+                # (observed_change, death) reads count 0 -> factor 1.0, and
+                # max() would let it lift a co-occurring MASTERED event back
+                # to full surprise — un-defunding the very farms habituation
+                # exists to kill. Non-caused changes are not this body's
+                # repetitions and have no business in its habituation.
+                if kind not in ("break", "place", "craft", "pickup"):
+                    continue
+                n = counts.get(f"{kind}:{sub}", 0)
+                facs.append(1.0 / (1.0 + float(n) / self._habituation_scale))
+            if not facs:
+                return 1.0
+            f = max(0.1, min(1.0, float(max(facs))))
+            if f < 1.0:
+                self._habit_hits = getattr(self, "_habit_hits", 0) + 1
+                self._habit_sum = getattr(self, "_habit_sum", 0.0) + f
+            return f
         ach = info.get("achievements") or {}
         broke = []
         for k, v in ach.items():
@@ -6838,6 +8295,332 @@ class DevelopmentalAI:
             self._habit_sum = getattr(self, "_habit_sum", 0.0) + f
         return f
 
+    def _augment_proprio(self, pp, e_i: int):
+        """LOOP-SIDE BODY SENSES, appended to the env's proprio vector in ONE
+        place for every loop body (2026-08-09).
+
+        WHY A SHARED HELPER: the reach append previously lived only in the
+        parallel-episodic body — the lifelong body stored the env's raw
+        vector, `_prep_proprio` zero-padded it, and the policy's reach
+        FEELING was silently dead in every skybot run (the SIXTH
+        duplicated-body casualty). One assembly point ends the class.
+
+        Fields appended (primary stream carries real values; scouts read the
+        neutral 0.0 every missing sense uses):
+          [reach]                    P(something breakable within arm's reach)
+          [memory validity*proximity, sin(bearing_rel), cos(bearing_rel)]
+                                     the EPISODIC pull (infra #38): where, in
+                                     body-relative terms, the goal object was
+                                     last seen. This is what turns wandering
+                                     into returning — acting on one's own
+                                     remembered past instead of only the
+                                     current frame. Fades with age (memory,
+                                     not a beacon) and reads neutral when
+                                     nothing has ever been sighted.
+        """
+        if pp is None or self.symbolizer is None:
+            return pp
+        try:
+            ext = [0.0, 0.0, 0.0, 0.0]
+            if e_i == 0:
+                ext[0] = float(getattr(self, "_reach_now", 0.0))
+                if (self.infra is not None
+                        and self.infra.episodic is not None
+                        and self.vision_scaffold is not None):
+                    wi = getattr(self, "_last_world_info", None) or {}
+                    x, z, yw = wi.get("x"), wi.get("z"), wi.get("yaw")
+                    cats = list(getattr(self.vision_scaffold, "_seek_cats",
+                                        None) or [])
+                    if x is not None and z is not None and cats:
+                        rec = None
+                        for kind in ("sighting", "break"):
+                            r = self.infra.episodic.last(kind, cats[0])
+                            if r and r.get("position") and (
+                                    rec is None
+                                    or r["step"] > rec["step"]):
+                                rec = r
+                        if rec is not None:
+                            tx, _ty, tz = rec["position"]
+                            dx, dz = float(tx) - float(x), \
+                                float(tz) - float(z)
+                            dist = (dx * dx + dz * dz) ** 0.5
+                            age = max(0, self.total_timesteps
+                                      - int(rec["step"]))
+                            validity = math.exp(-age / 20000.0)
+                            proximity = 1.0 / (1.0 + dist / 32.0)
+                            bearing = math.atan2(dx, dz)
+                            # MINECRAFT YAW SIGN: yaw 0 faces +z (south) and
+                            # yaw 90 faces WEST (-x) — yaw grows CLOCKWISE
+                            # while atan2(dx,dz) grows counter-clockwise, so
+                            # body-relative bearing is bearing PLUS yaw.
+                            # (bearing - yaw read "dead ahead" as "behind";
+                            # the yaw=0 test case cannot see the sign.)
+                            rel = bearing + (math.radians(float(yw))
+                                             if yw is not None else 0.0)
+                            ext[1] = float(validity * proximity)
+                            ext[2] = float(math.sin(rel))
+                            ext[3] = float(math.cos(rel))
+            return np.concatenate([np.asarray(pp, dtype=np.float32),
+                                   np.asarray(ext, dtype=np.float32)])
+        except Exception:
+            return pp
+
+    def _memory_pull_phi(self):
+        """Potential on closeness to the freshest remembered goal site
+        (sighting/achievement/demo of a seek category), in [0,1] — and the
+        step of the record it points at, so a NEW memory re-adopts the
+        baseline without paying (the magnet's just-switched rule).
+
+        WHY (2026-08-10): the episodic bearing sense INFORMED the policy but
+        nothing MOTIVATED acting on it — memory was a map with no pull. This
+        is the bridge from "I remember where trees were" to "I go back":
+        phi = validity(age) * proximity(distance), telescoping, so returning
+        pays once, loitering pays zero, and leaving charges back — with the
+        pull fading as the memory ages (a memory, not a beacon)."""
+        try:
+            if (self.infra is None or self.infra.episodic is None
+                    or self.vision_scaffold is None):
+                return None, None
+            wi = getattr(self, "_last_world_info", None) or {}
+            x, z = wi.get("x"), wi.get("z")
+            cats = list(getattr(self.vision_scaffold, "_seek_cats",
+                                None) or [])
+            if x is None or z is None or not cats:
+                return None, None
+            rec = None
+            for kind in ("sighting", "break", "demo"):
+                r = self.infra.episodic.last(kind, cats[0])
+                if (r and r.get("position")
+                        and (rec is None or r["step"] > rec["step"])):
+                    rec = r
+            if rec is None:
+                return None, None
+            tx, _ty, tz = rec["position"]
+            dist = ((float(tx) - float(x)) ** 2
+                    + (float(tz) - float(z)) ** 2) ** 0.5
+            age = max(0, self.total_timesteps - int(rec["step"]))
+            phi = math.exp(-age / 20000.0) / (1.0 + dist / 32.0)
+            return float(phi), int(rec["step"])
+        except Exception:
+            return None, None
+
+    def _infra_step(self, info, action, rssm_state, step_income,
+                    raw_extrinsic) -> float:
+        """Per-step general-infrastructure hook, shared by both waking loop
+        bodies (same dedup rationale as _magnet_step_shaping — the fifth
+        copy-drift incident is why per-step concerns are single functions).
+        Feeds the farm detector / drift / affordance / episodic / trace
+        monitors with the adapter's typed event stream, and returns the
+        EMPOWERMENT shaping delta to add to intrinsic (0.0 when off).
+        step_income = everything the learner is being paid this step
+        (intrinsic + shaped extrinsic) — the quantity a farm farms."""
+        if self.infra is None:
+            return 0.0
+        try:
+            # marks the stuck-metrics as GENUINELY FED this segment — a run
+            # whose body never calls this hook (vector envs on the serial
+            # path) must not be judged "stuck" on metrics nobody supplied
+            self._infra_fed = True
+            self._seg_extrinsic_sum = getattr(
+                self, "_seg_extrinsic_sum", 0.0) + float(raw_extrinsic)
+            wi = (info or {}).get("world") or {}
+            pos = None
+            if wi.get("x") is not None and wi.get("z") is not None:
+                pos = (float(wi["x"]), float(wi.get("y", 0.0)),
+                       float(wi["z"]))
+            ev = (info or {}).get("events") or []
+            # excavation stamp for the coverage discovery-gate: breaking or
+            # placing marks the near future's "new cells" as manufactured
+            if any(k in ("break", "place") for k, _ in ev):
+                self._last_excav_step = self.total_timesteps
+            # ---- DEMONSTRATION -> GOAL EMULATION (2026-08-09) ------------
+            # An observed_change (the world changed, not by this body) with
+            # the other player recently under the gaze = a DEMONSTRATION.
+            # The most co-present world category in the fovea becomes the
+            # inferred goal of the demonstration and is socially primed:
+            # curiosity injected, search refilled. Watching the teacher fell
+            # a tree makes trees hot; the agent's own body still discovers
+            # the swing (goal emulation, not motor mimicry).
+            # window in the fleet-scaled clock (200 primary steps), with a
+            # REFRACTORY period so a recurring change source can neither
+            # refill the seek budget without bound nor flood the log
+            # (review 2026-08-09)
+            _fleet_w = 200 * max(1, int(getattr(self, "_num_envs", 1) or 1))
+            if (self.vision_scaffold is not None
+                    and any(k == "observed_change" for k, _ in ev)
+                    and self.total_timesteps
+                    - getattr(self, "_player_seen_step", -10**9) <= _fleet_w
+                    and self._vision_clock
+                    >= getattr(self, "_demo_cooldown_until", 0)):
+                _fps_d = getattr(self, "_last_fovea_probs", None) or {}
+                _fcs_d = getattr(self, "_last_fovea_counts", None) or {}
+                # candidates filtered to PRIMEABLE categories FIRST (review:
+                # a background like dirt under the crosshair used to win the
+                # max() and the prime silently no-opped — the demonstration
+                # was lost). Primeable = the magnet's own steerable targets.
+                _primeable = set(self.vision_scaffold.target_categories)
+                _cand = [(float(p), c) for c, p in _fps_d.items()
+                         if c in _primeable
+                         and c not in ("player_visible", "sky_visible")
+                         and _fcs_d.get(c, 0) >= 5 and float(p) >= 0.25]
+                if _cand:
+                    _top = max(_cand)[1]
+                    if self.vision_scaffold.social_prime(
+                            _top, self._vision_clock):
+                        self._demo_cooldown_until = self._vision_clock + 500
+                        self._demos_seen = getattr(
+                            self, "_demos_seen", 0) + 1
+                        if (self.infra is not None
+                                and self.infra.episodic is not None):
+                            _wi_d = (info or {}).get("world") or {}
+                            if _wi_d.get("x") is not None:
+                                self.infra.episodic.record(
+                                    "demo", _top, self.total_timesteps,
+                                    (float(_wi_d["x"]),
+                                     float(_wi_d.get("y", 0.0)),
+                                     float(_wi_d.get("z", 0.0))))
+                        logger.info(
+                            "DEMONSTRATION witnessed (#%d): observed change "
+                            "with the player in view — socially primed %r",
+                            self._demos_seen, _top)
+            g = float(self.config.get("policy", {}).get("gamma", 0.99))
+            _extra = float(self.infra.empowerment_shaping(
+                self.world_model, rssm_state, int(self.action_dim),
+                self.total_timesteps, g,
+                wm_lock=getattr(self, "_wm_param_lock", None)))
+            # ---- compression-progress curiosity (infra #13) --------------
+            # probes are offered and evaluated on the module's own cadence;
+            # the WM lock is taken NON-BLOCKING (same acting-loop rule as
+            # empowerment: a skipped reading costs nothing, a stall costs a
+            # server kick)
+            if self._progress is not None:
+                self._progress.tick(self.total_timesteps)
+                if (self.total_timesteps
+                        - getattr(self, "_probe_last_offer", -10**9)
+                        >= self._progress_every):
+                    self._probe_last_offer = self.total_timesteps
+                    try:
+                        _pb = self.replay_buffer.sample_sequences(
+                            batch_size=1,
+                            seq_len=int(self.config.get(
+                                "world_model", {}).get(
+                                "sequence_length", 16)),
+                            device=torch.device("cpu"))
+                        self._progress.maybe_add_probe(_pb)
+                    except Exception:
+                        pass
+
+                def _wm_loss(pb):
+                    out = self.world_model.compute_loss(
+                        pb["observations"], pb["actions"],
+                        pb["rewards"], pb["continues"])
+                    if isinstance(out, dict):
+                        return float(out.get("total", 0.0))
+                    return float(out[0]["total"]) if isinstance(
+                        out, tuple) else float(out)
+                _lk = getattr(self, "_wm_param_lock", None)
+                if _lk is None or _lk.acquire(blocking=False):
+                    try:
+                        self._progress.evaluate(_wm_loss,
+                                                self.total_timesteps,
+                                                device=self.device)
+                    finally:
+                        if _lk is not None:
+                            _lk.release()
+                # FLEET FACTOR (review finding): rate() amortises over
+                # eval_every TOTAL timesteps, but payment happens once per
+                # PRIMARY step and total_timesteps advances num_envs per
+                # step — without the multiplier only 1/num_envs of each
+                # window's earned progress is ever paid.
+                _pr = (self._progress_weight * float(self._progress.rate())
+                       * max(1, int(getattr(self, "_num_envs", 1) or 1)))
+                if _pr:
+                    self.infra.record_reward("progress", _pr)
+                    _extra += _pr
+            # ---- MEMORY-PULL POTENTIAL (2026-08-10, point 3) -------------
+            # gamma-potential on remembered-goal-site closeness; a CHANGED
+            # memory record re-adopts the baseline unpaid (else every fresh
+            # sighting would gift the jump in phi).
+            _mw = float(getattr(self, "_memory_pull_weight", 0.0) or 0.0)
+            if _mw > 0.0:
+                if any(k == "death" for k, _s in (ev or [])):
+                    # respawning NEARER the remembered site must not pay
+                    # (die-to-travel would be a farm) — re-adopt unpaid
+                    self._mem_pull_prev = None
+                _mp, _mrec = self._memory_pull_phi()
+                if _mp is not None:
+                    if (getattr(self, "_mem_pull_rec", None) != _mrec
+                            or getattr(self, "_mem_pull_prev", None)
+                            is None):
+                        self._mem_pull_rec = _mrec
+                        self._mem_pull_prev = _mp
+                    else:
+                        _mf = _mw * (g * _mp - self._mem_pull_prev)
+                        self._mem_pull_prev = _mp
+                        if _mf:
+                            _extra += _mf
+                            self.infra.record_reward("memory_pull", _mf)
+            # ---- CONSEQUENCE FRONTIER (2026-08-13) -----------------------
+            if self.consequence is not None:
+                # A: evidence. `caused` counts ONLY self-caused world events —
+                # ambient change must never close a consequence set (watching
+                # a tree sway is not affecting it), which is why
+                # observed_change is excluded.
+                _caused = any(k in ("break", "place", "craft", "pickup")
+                              for k, _s in (ev or []))
+                self.consequence.observe(
+                    getattr(self, "_last_fovea_probs", None), caused=_caused,
+                    # a swing that ended with nothing broken: evidence that
+                    # this thing does not respond to me (see observe)
+                    attempted=bool((info or {}).get("swing_failed", 0)))
+                # respawn/rebuild hands back an inventory the agent did not
+                # earn — and so does a human granting a tool
+                if any(k in ("death",) for k, _s in (ev or [])) or \
+                        (info or {}).get("env_restarted"):
+                    self.consequence.suppress(self.total_timesteps + 2)
+                # B: possession frontier — one-shot per never-held set
+                _inv = (info or {}).get("inventory")
+                if _inv:
+                    _pi, _new = self.consequence.possession_income(
+                        _inv, self.total_timesteps)
+                    if _pi:
+                        _extra += _pi
+                        self.infra.record_reward("frontier", _pi)
+                    if _new:
+                        logger.info(
+                            "POSSESSION FRONTIER: first time holding %s",
+                            self.consequence._key(_inv))
+            # ---- METABOLIC EFFORT COST (2026-08-09) ----------------------
+            # Effortful actions (the adapter's "effort" contract field) cost
+            # a small constant. Observed live: sustained attack at CLOUDS —
+            # under a whitelisted economy futile swings were exactly free,
+            # so entropy kept them common. Effort pricing is the general,
+            # homeostatic extinguisher: air-punching now bleeds, while a
+            # full barehanded chop (~60 effort ticks ≈ −0.09) is trivially
+            # repaid by the +20 log. Intrinsic channel, ledger-visible.
+            _ec = float(getattr(self, "_effort_cost", 0.0) or 0.0)
+            if _ec > 0.0:
+                _ef = float((info or {}).get("effort", 0.0) or 0.0)
+                if _ef:
+                    _extra -= _ec * _ef
+                    self.infra.record_reward("effort", -_ec * _ef)
+            # monitors see the WHOLE income including the shaping computed
+            # just above (review finding: a farm running ON empowerment or
+            # progress income would have been invisible to its own police)
+            self.infra.on_step(
+                step=self.total_timesteps, action=int(action), events=ev,
+                cell=wi.get("cell"), position=pos, pitch=wi.get("pitch"),
+                fovea_probs=getattr(self, "_last_fovea_probs", None),
+                # POSITIVE counts: the stack's consumers make PRESENCE
+                # claims (sighting landmarks, event association) — gate on
+                # seen, not on trained (review 2026-08-09)
+                fovea_counts=getattr(self, "_last_fovea_pos", None),
+                step_reward=float(step_income) + float(_extra),
+                event_counts=(self._event_count_map(info) if ev else None))
+            return _extra
+        except Exception:
+            return 0.0
+
     def _magnet_step_shaping(self, action, lp_scalar, latent_row) -> float:
         """THE one magnet invocation, shared by all three loop bodies.
 
@@ -6853,12 +8636,52 @@ class DevelopmentalAI:
                 or not self.vision_scaffold.wants_step(self._vision_clock)):
             return 0.0
         _op, _rel, _lab = self._grounded_object_probs(latent_row)
+        # SIGNAL HEALTH (infra #1): a predicate whose output carries no
+        # information (a learned constant — the tree_visible failure) is
+        # excluded from steering until it recovers. The monitor observes
+        # every head output; the DEGENERATE set is refreshed each segment.
+        _excl = None
+        if self.infra is not None:
+            self.infra.signal_observe(_op)
+            _excl = self.infra.degenerate_signals() or None
+        # SOCIAL PRESENCE (2026-08-09): is the other player under the gaze?
+        # Drives joint attention in the scaffold and stamps the last-seen
+        # step the demonstration detector (in _infra_step) checks against.
+        # Gated on POSITIVE teacher sightings (an untrained fresh head sits
+        # at sigmoid ~0.5 and the label-count gate is free after ~5 fovea
+        # labels — review 2026-08-09) and a threshold above cold-start
+        # noise.
+        _fps_s = getattr(self, "_last_fovea_probs", None) or {}
+        _fpp_s = getattr(self, "_last_fovea_pos", None) or {}
+        _social = (_fpp_s.get("player_visible", 0) >= 2
+                   and float(_fps_s.get("player_visible", 0.0)) >= 0.65)
+        # ...OR the FULL-FRAME channel (2026-08-09, live finding): the fovea
+        # only certifies the teacher when they happen to stand in the centre
+        # crop at a label instant, so meeting them took ages — the user
+        # stood in front of the agent and nothing happened. The full frame
+        # sees them anywhere in view.
+        if not _social and self.symbolizer is not None:
+            _pos_full = getattr(self.symbolizer, "pos_counts", {}) or {}
+            _social = (_pos_full.get("player_visible", 0) >= 2
+                       and float((_op or {}).get("player_visible", 0.0))
+                       >= 0.6)
+        if _social:
+            self._player_seen_step = self.total_timesteps
+        # proof-of-life beat: UNCONDITIONAL and guarded (review: an
+        # indentation slip nested this under the social branch, making the
+        # magnet read permanently overdue on any player-free stretch — and
+        # an unguarded deref would crash on infra=None)
+        if self.infra is not None:
+            # (same clock domain as the heartbeat report: total_timesteps)
+            self.infra.beat("magnet", self.total_timesteps)
         _sr = self.vision_scaffold.step_shaping(
             action=int(action) if self.is_discrete else -1,
             timestep=self._vision_clock,
             lp_scalar=float(lp_scalar),
             object_probs=_op, reliability=_rel, label_counts=_lab,
             reach_measured=float(getattr(self, "_reach_now", 0.0)),
+            excluded=_excl,
+            social_present=_social,
             **self._fovea_kwargs(latent_row))
         # rotation-pay split: seek is a potential on visibility and turning
         # is what changes visibility — if look-away/look-back does not
@@ -6988,6 +8811,31 @@ class DevelopmentalAI:
         for key, values in self.training_metrics.items():
             if values:
                 metrics[key] = np.mean(list(values))
+
+        # LEDGER HARVEST (infra #10) — snapshot the per-term shaping sums
+        # BEFORE their own print sections reset them further down. This is
+        # the income statement: what was the learner actually paid for?
+        _ledger_snapshot = {}
+        if self.infra is not None:
+            for _src, _attr in (("coverage", "_cov_sum"),
+                                ("gaze", "_gaze_sum"),
+                                ("novelty", "_nov_sum"),
+                                ("symbols", "_sym_sum"),
+                                ("sym_center", "_symc_sum"),
+                                ("persistence", "_persist_sum"),
+                                ("reach", "_reach_sum"),
+                                ("gaze_level", "_pitch_level_sum"),
+                                ("imagination", "_cen_imag")):
+                _v = float(getattr(self, _attr, 0.0) or 0.0)
+                if _v:
+                    _ledger_snapshot[_src] = _v
+            _mag = (float(getattr(self, "_mag_turn", 0.0) or 0.0)
+                    + float(getattr(self, "_mag_other", 0.0) or 0.0))
+            if _mag:
+                _ledger_snapshot["magnet_seek"] = _mag
+            _ext = float(getattr(self, "_seg_extrinsic_sum", 0.0) or 0.0)
+            if _ext:
+                _ledger_snapshot["extrinsic_env"] = _ext
 
         kg_stats = self.knowledge_graph.get_stats()
         skill_stats = self.skill_bank.get_stats()
@@ -7123,6 +8971,20 @@ class DevelopmentalAI:
             # levelness. These are the two new gradients — if fovea stays -1
             # the crop labels are not landing; if pitch_level dwells at 0.65
             # the agent is still sky-clamped.
+            # SOCIAL STATE (2026-08-09): teacher certification progress +
+            # demonstrations — invisible before, which is why "I stood in
+            # front of it and nothing happened" could not be diagnosed from
+            # the log.
+            _soc = vs.get("social") or {}
+            _pos_f = (getattr(self.symbolizer, "pos_counts", {})
+                      if self.symbolizer is not None else {}) or {}
+            _pos_v = (getattr(self.symbolizer, "fovea_pos_counts", {})
+                      if self.symbolizer is not None else {}) or {}
+            print(f"    social: player_pos_labels full={_pos_f.get('player_visible', 0)} "
+                  f"fovea={_pos_v.get('player_visible', 0)} | "
+                  f"demos={getattr(self, '_demos_seen', 0)} "
+                  f"primed={_soc.get('primed', [])} | coverage suppressed "
+                  f"(excavated) {getattr(self, '_cov_suppressed', 0)} steps")
             _fv = vs.get("fovea") or {}
             _sym_fv = (self.symbolizer.stats.get("fovea")
                        if self.symbolizer is not None else None) or {}
@@ -7149,6 +9011,15 @@ class DevelopmentalAI:
                 _b = _bank.slots[_slot] if _slot < len(_bank.slots) else None
                 _nm = (_b or {}).get("name") or (_b or {}).get("skill_id") or _slot
                 _named.append(f"{_nm}={_n}")
+            # INDIVIDUATION (infra #35): mean |delta| per practised skill —
+            # 0.000 = still the base policy (a recording); growth = practice
+            # has made it its own thing (a memory). The number that was
+            # previously unmeasurable because skills were byte copies.
+            _dl = [f"s{_s:02d}={float(_b.get('delta_mag', 0.0)):.3f}"
+                   for _s, _b in enumerate(_bank.slots)
+                   if _b is not None and _b.get("delta_mag")]
+            if _dl:
+                print(f"  Skill deltas:     {', '.join(_dl[:8])}")
             _scripted = [s for s in range(len(_bank.slots))
                          if _bank.is_scripted(s)]
             _scr = ", ".join(
@@ -7372,14 +9243,37 @@ class DevelopmentalAI:
                         _kl = _pp.get("approx_kl")
                         _er = _pp.get("epochs_run")
                         if _kl is not None:
+                            # TWO CAUSES, OPPOSITE MEANINGS (2026-08-23).
+                            # This line used to call ANY reduction "good:
+                            # the policy hit its movement budget" — that
+                            # describes target_kl early-stopping, which is
+                            # OFF (0.0, withdrawn 2026-08-05). So every
+                            # reduction reported here was really the
+                            # tiny-batch guard REMOVING updates, and a
+                            # starved policy read as a healthy one.
+                            _req = int(_pp.get("epochs_requested", 0) or
+                                       self.config.get('policy', {}).get(
+                                           'n_epochs', 10))
+                            _capped = bool(_pp.get("epochs_capped", False))
                             print(f"  PPO trust region: approx_kl={_kl:.4f} | "
-                                  f"epochs run {_er}/"
-                                  f"{self.config.get('policy', {}).get('n_epochs', 10)}"
-                                  + ("  <-- stopped early (good: the policy "
+                                  f"epochs run {_er}/{_req}"
+                                  + ("  <-- STARVED: too few rows for more "
+                                     "(collapse guard removed updates)"
+                                     if _capped else
+                                     "  <-- stopped early (good: the policy "
                                      "hit its movement budget)"
-                                     if _er and _er < int(self.config.get(
-                                         'policy', {}).get('n_epochs', 10))
-                                     else ""))
+                                     if _er and _er < _req else ""))
+                            if _capped:
+                                print(f"  PPO update rate: "
+                                      f"{_pp.get('env_steps', 0)} env steps -> "
+                                      f"{_pp.get('rows', 0)} rows "
+                                      f"({_pp.get('rows_option', 0)} option / "
+                                      f"{_pp.get('rows_primitive', 0)} "
+                                      f"primitive, mean tau "
+                                      f"{_pp.get('tau_mean', 1.0):.1f}) -> "
+                                      f"{_er} gradient pass(es). Options "
+                                      f"consume rows: one option row spans "
+                                      f"tau env steps.")
                         print(f"  PPO forensics: raw_adv_std={_ras:.2e} "
                               f"(|adv|={_pp.get('raw_adv_absmean', 0.0):.2e}) "
                               f"| obs_spread={_osp:.4f} | max_prob={_mxp:.3f} "
@@ -7451,6 +9345,40 @@ class DevelopmentalAI:
                           f"(-90=up +90=down)")
                     self._pitch_sum, self._pitch_n = 0.0, 0
                     self._pitch_clamped = 0
+                _ewn = int(getattr(self, "_env_wait_n", 0) or 0)
+                if _ewn:
+                    _now_w = time.time()
+                    _prev_w = getattr(self, "_seg_wall_prev", None)
+                    self._seg_wall_prev = _now_w
+                    _ew_ms = 1000.0 * getattr(self, "_env_wait_sum",
+                                              0.0) / max(1, _ewn)
+                    if _prev_w:
+                        _step_ms = 1000.0 * (_now_w - _prev_w) / max(1, _ewn)
+                        # env% is the share of each step spent waiting on the
+                        # Minecraft client. High => the world is the limit
+                        # (ceiling: 1000/20*action_repeat ms). Low => the
+                        # limit is our own per-step Python, and no amount of
+                        # faster env plumbing would help.
+                        print(f"  Loop timing: {_step_ms:.0f} ms/step total | "
+                              f"env round-trip {_ew_ms:.0f} ms "
+                              f"({100.0*_ew_ms/max(1e-6,_step_ms):.0f}%) | "
+                              f"own {_step_ms-_ew_ms:.0f} ms | "
+                              f"{1000.0/max(1e-6,_step_ms):.2f} steps/s")
+                    self._env_wait_sum = 0.0
+                    self._env_wait_n = 0
+                # A2 self-check readout: the largest |carried - recomputed|
+                # feature delta this segment. ~0 = no async WM update landed
+                # between encode and use; small but nonzero = one optimizer
+                # step of drift (expected). Anything large would have RAISED
+                # rather than printed, so this line is a proof of correctness
+                # accumulating, not a warning.
+                if getattr(self, "_verify_enc_feats", False):
+                    _fd = float(getattr(self.policy, "last_feat_drift", 0.0))
+                    print(f"  Feat drift (max): {_fd:.2e} — carried encoder "
+                          f"features vs recomputed (self-check ON; set "
+                          f"policy.verify_encoder_feats false to collect the "
+                          f"speedup once this stays ~0)")
+                    self.policy.last_feat_drift = 0.0
                 print(f"  Reach sense (last step): {float(getattr(self, '_reach_now', 0.0)):.2f} "
                       f"[{getattr(self, '_reach_gate', 'n/a')}] raw="
                       f"{float(getattr(self, '_reach_raw', 0.0)):.2f} "
@@ -7465,6 +9393,15 @@ class DevelopmentalAI:
                           f"/step  (both telescoping -> net ~0 per cycle)")
                     self._persist_sum = self._reach_sum = 0.0
                     self._persist_n = self._reach_n = 0
+                _gln = int(getattr(self, "_pitch_level_n", 0) or 0)
+                if _gln:
+                    print(f"  Gaze level: "
+                          f"{getattr(self, '_pitch_level_sum', 0.0)/max(1,_gln):+.5f}"
+                          f"/step (telescoping; Phi now "
+                          f"{float(getattr(self, '_pitch_level_phi', 0.0) or 0.0):+.3f}"
+                          f", -1 = at the clamp)")
+                    self._pitch_level_sum = 0.0
+                    self._pitch_level_n = 0
                 _sn = int(getattr(self, "_sym_n", 0) or 0)
                 if _sn:
                     print(f"  Symbols: {getattr(self, '_sym_sum', 0.0)/max(1,_sn):+.4f}"
@@ -7494,11 +9431,17 @@ class DevelopmentalAI:
                         _tot_now = float(np.mean(
                             list(self.training_metrics["intrinsic_reward"])[-1:])
                             if self.training_metrics["intrinsic_reward"] else 0.0)
+                        _bvn = int(getattr(self, "_bv_n", 0) or 0)
                         print(f"  Reward census: ICM/LP base {_b:+.4f}/step "
                               f"({100.0 * abs(_b) / max(1e-9, abs(_tot_now)):.0f}% "
                               f"of the {_tot_now:+.4f} drive) | imagination "
                               f"{_im:+.4f}/step | everything itemised above is "
-                              f"the remainder")
+                              f"the remainder"
+                              + (f" | boring-view factor "
+                                 f"{getattr(self, '_bv_sum', 0.0)/max(1,_bvn):.2f}"
+                                 f" mean (1=full pay, base already discounted)"
+                                 if _bvn else ""))
+                        self._bv_sum, self._bv_n = 0.0, 0
                         # WHY is the base what it is? LP is a DERIVATIVE with
                         # a significance gate, so on a mastered static view it
                         # should be ~0 — the user's point exactly: standing
@@ -7638,6 +9581,160 @@ class DevelopmentalAI:
         # Pixel observation mode
         if self.pixel_obs:
             print(f"  Observation mode: pixel ({self.image_channels}x{self.image_size}x{self.image_size})")
+
+        # ---- GENERAL INFRASTRUCTURE (2026-08-08) -------------------------
+        # Segment-cadence evaluation of the domain-agnostic monitors, plus
+        # the condition-fed gates and the stuck-escalation ladder. The stack
+        # only RECOMMENDS; escalation actions are applied here, visibly.
+        if self.infra is not None:
+            try:
+                _wi = getattr(self, "_last_world_info", None) or {}
+                _cells = int(_wi.get("cells_seen", 0) or 0)
+                _cells_delta = _cells - int(getattr(self, "_seg_cells_prev",
+                                                    0) or 0)
+                self._seg_cells_prev = _cells
+                _vs_i = (self.vision_scaffold.stats
+                         if self.vision_scaffold is not None else {})
+                _seek_i = _vs_i.get("seek") or {}
+                # condition-fed gates: every known suppressor states its
+                # condition here each segment; the registry alarms if one
+                # stays closed past its declared budget (infra #20)
+                self.infra.gate_state(
+                    "seek_nudge_budget",
+                    closed=(int(_seek_i.get("nudge_left", 1) or 0) == 0),
+                    step=self.total_timesteps,
+                    reason="budget exhausted",
+                    reopen="goal sighting or trickle regen",
+                    max_closed=30000)
+                self.infra.gate_state(
+                    "magnet_weight",
+                    closed=(float(_vs_i.get("weight", 1.0) or 0.0) == 0.0),
+                    step=self.total_timesteps,
+                    reason="w=0 (no target / faded)",
+                    reopen="curiosity re-arm or cold-start candidate",
+                    max_closed=60000)
+                _ovc = {}
+                if getattr(self, "option_executor", None) is not None:
+                    _ovc = getattr(self.option_executor,
+                                   "offered_vs_chosen", None)
+                    _ovc = _ovc() if callable(_ovc) else {}
+                    _lo = int(getattr(self.option_executor,
+                                      "learned_offered_sum", 0) or 0)
+                    self.infra.gate_state(
+                        "learned_options",
+                        closed=(_lo == getattr(self, "_hb_lo_prev", 0)),
+                        step=self.total_timesteps,
+                        reason="no learned option offered all segment",
+                        reopen="competence/probation/contact gates",
+                        max_closed=120000)
+                    if _lo != getattr(self, "_hb_lo_prev", 0):
+                        self.infra.beat("option_offer", self.total_timesteps)
+                    self._hb_lo_prev = _lo
+                _ss_i = (self.symbolizer.stats
+                         if self.symbolizer is not None else {})
+                _ctx = {
+                    "step": self.total_timesteps,
+                    # stuck metrics only when the per-step hook actually fed
+                    # them this segment (see _infra_step) — an unfed monitor
+                    # judging zeros produced L3 help-spam on vector envs
+                    "stuck_eligible": bool(getattr(self, "_infra_fed",
+                                                   False)),
+                    "seg_extrinsic": float(getattr(self,
+                                                   "_seg_extrinsic_sum",
+                                                   0.0) or 0.0),
+                    "cells_delta": float(_cells_delta),
+                    "events": float(self.infra.pop_segment_events()),
+                    "position": (_wi.get("x"), _wi.get("y"), _wi.get("z")),
+                    "labels": _ss_i.get("labels"),
+                    # Teacher evidence per predicate for the degenerate gate.
+                    # POSITIVE counts, not total labels (2026-08-11): one VLM
+                    # query labels every predicate, so label_counts measures
+                    # elapsed queries and gates nothing. "Has this predicate
+                    # ever been TRUE?" is the question that separates a broken
+                    # head from an honest report about the world.
+                    "signal_evidence": (dict(getattr(self.symbolizer,
+                                                     "pos_counts", {}))
+                                        if self.symbolizer is not None
+                                        else None),
+                    "intrinsic_per_step": metrics.get("intrinsic_reward"),
+                    "ledger_sources": _ledger_snapshot,
+                    # effects the goal system needs producible: caused-event
+                    # kinds. "break" is what every current goal consumes;
+                    # derived generically would read the goal ontology (#40).
+                    "required_effects": ["break"],
+                }
+                _lines, _acts = self.infra.segment(_ctx)
+                for _ln in _lines:
+                    print(_ln)
+                self._seg_extrinsic_sum = 0.0
+                self._infra_fed = False
+                # ---- stuck-escalation ladder (infra #50/#16) -------------
+                _lvl = int(_acts.get("stuck_level", 0) or 0)
+                if (self._stuck_boost_orig is not None
+                        and self.total_timesteps
+                        >= self._stuck_boost_until):
+                    self._novelty_weight, self._coverage_weight = \
+                        self._stuck_boost_orig
+                    self._stuck_boost_orig = None
+                    # clear the extension anchor too, so the NEXT boost gets a
+                    # full max_total window rather than inheriting a spent one
+                    self._stuck_boost_started = -1
+                    print("  infra/stuck: exploration boost EXPIRED "
+                          "(weights restored)")
+                if _lvl >= 1 and self.vision_scaffold is not None:
+                    self.vision_scaffold._seek_nudge_left = \
+                        self.vision_scaffold.seek_nudge_budget
+                    print("  infra/stuck: L1 remedy — search budget refilled")
+                if _lvl >= 2 and self._stuck_boost_orig is None:
+                    print("  infra/stuck: L2 remedy — "
+                          + self._apply_explore_boost(2048))
+                # ---- gaze starvation (2026-08-16): the stack judged the
+                # DEGENERATE sweep to be a VIEW problem, not a sensor
+                # problem. Remedy on the behaviour side: make looking around
+                # pay again by capping the saturated gaze-bucket counts
+                # (1/sqrt(246k) is not an incentive) and refill the seek
+                # budget so the magnet can act on whatever the sweep finds.
+                # Cooldown-gated so an agent cannot cycle starve->sweep for
+                # income; each event re-opens a bounded, decaying purse.
+                if (_acts.get("gaze_starved")
+                        and self.total_timesteps
+                        >= getattr(self, "_gaze_starve_cooldown", 0)):
+                    self._gaze_starve_cooldown = self.total_timesteps + 8192
+                    _gc = getattr(self, "_gaze_counts", None)
+                    if isinstance(_gc, dict) and _gc:
+                        for _b in list(_gc):
+                            _gc[_b] = min(_gc[_b], 25)
+                    if self.vision_scaffold is not None:
+                        self.vision_scaffold._seek_nudge_left = \
+                            self.vision_scaffold.seek_nudge_budget
+                    print("  infra/signals: gaze-starved remedy — gaze "
+                          "novelty re-opened (buckets capped at 25) + seek "
+                          "budget refilled")
+                # L3: the help request is emitted inside the stack (jsonl +
+                # trace dump) and — new 2026-08-16 (#46) — also READ, by
+                # the local VLM, which may answer with slight guidance
+                # (see _advise_unstuck). Help remains a REQUEST: any
+                # failure in the advisor path is a no-op and the run
+                # continues regardless.
+                if _lvl >= 3:
+                    try:
+                        self._advise_unstuck(_acts)
+                    except Exception as _ae:
+                        logger.debug("unstuck advisor contained: %s", _ae)
+                # effective-config echo, once, at the first segment: what was
+                # configured but never read (infra #26)
+                if not getattr(self, "_config_echoed", False):
+                    self._config_echoed = True
+                    try:
+                        from developmental_ai.infra.config_echo import (
+                            effective_summary)
+                        if hasattr(self.config, "accessed_paths"):
+                            print("  infra/config: "
+                                  + effective_summary(self.config))
+                    except Exception:
+                        pass
+            except Exception as _e:
+                print(f"  infra: segment hook error contained: {_e!r}")
         print(f"{'='*60}")
 
     def _training_summary(self, elapsed_time: float) -> Dict[str, Any]:

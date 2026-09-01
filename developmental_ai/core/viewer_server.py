@@ -90,8 +90,20 @@ def render_recon(env_name, real, pred, w=300, h=140):
     return img
 
 
+# fixed palette for income sources — deterministic per name so a source keeps
+# its colour across frames and runs (a bar that changes colour reads as a
+# different source)
+_INCOME_COLORS = [(95, 175, 240), (110, 220, 130), (245, 180, 90),
+                  (240, 120, 120), (190, 140, 240), (240, 210, 90),
+                  (120, 210, 210), (200, 200, 210)]
+
+
+def _income_color(name):
+    return _INCOME_COLORS[hash(str(name)) % len(_INCOME_COLORS)]
+
+
 def compose(env_rgb, title, lines, paused, fps, z, ret_hist,
-            recon_img=None, err=None, errs=None):
+            recon_img=None, err=None, errs=None, income=None):
     if env_rgb is not None:
         env_img = Image.fromarray(np.asarray(env_rgb, dtype=np.uint8))
         s = TARGET_H / env_img.height
@@ -112,6 +124,27 @@ def compose(env_rgb, title, lines, paused, fps, z, ret_hist,
     for k, v in lines:
         d.text((x0, y), f"{k}", font=FONT, fill=(150, 150, 160))
         d.text((x0 + 130, y), str(v), font=FONT, fill=(228, 228, 238)); y += 25
+    # --- LIVE INCOME STATEMENT (reward-ledger shares, this segment so far).
+    # What the learner is being PAID for right now — the number-one question
+    # of every reward-hacking incident this project has had. Bars are shares
+    # of |income|; the sign rides in the % label.
+    if income:
+        d.text((x0, y + 4), "income (live)", font=FONT, fill=(150, 150, 160))
+        y += 26
+        bar_x, bar_w = x0 + 118, PANEL_W - 200
+        for name, frac, signed in income:
+            c = _income_color(name)
+            d.text((x0, y), str(name)[:14], font=FONT, fill=c)
+            w = max(1, int(bar_w * max(0.0, min(1.0, float(frac)))))
+            d.rectangle([bar_x, y + 3, bar_x + bar_w, y + 13],
+                        outline=(60, 60, 72))
+            d.rectangle([bar_x, y + 3, bar_x + w, y + 13], fill=c)
+            d.text((bar_x + bar_w + 6, y),
+                   f"{100.0 * float(frac):.0f}%"
+                   + ("" if float(signed) >= 0 else " (−)"),
+                   font=FONT, fill=(200, 200, 210))
+            y += 19
+        y += 6
     # --- WM accuracy panel: predicted (orange) overlaid on actual (blue) ---
     if recon_img is not None or err is not None:
         d.text((x0, y + 4), "WM prediction", font=FONT, fill=(150, 150, 160))
@@ -199,7 +232,8 @@ class ViewerServer:
         with self._lock:
             return self._jpeg
 
-    def push(self, env_rgb, title, lines, z=None, ret_hist=None, recon=None):
+    def push(self, env_rgb, title, lines, z=None, ret_hist=None, recon=None,
+             income=None):
         """Called once per env step by the training loop. Best-effort.
 
         recon (optional): {"env_name", "real", "pred", "err"} — the actual next
@@ -219,12 +253,15 @@ class ViewerServer:
             recon_img = render_recon(recon.get("env_name", ""),
                                      recon.get("real", []), recon.get("pred", []))
         img = compose(env_rgb, title, lines, self.paused, self._fps, z, ret_hist,
-                      recon_img, err, list(self._errs))
+                      recon_img, err, list(self._errs), income=income)
         jpeg = to_jpeg(img)
         # Raw state for the terminal client (/data): small env thumbnail +
         # metrics text + a 32x32 normalized latent grid + reconstruction.
         raw = {"title": str(title), "fps": round(self._fps, 1),
                "lines": [[str(k), str(v)] for k, v in lines]}
+        if income:
+            raw["income"] = [[str(n), round(float(f), 3),
+                              round(float(s), 4)] for n, f, s in income]
         try:
             if err is not None:
                 raw["err"] = round(float(err), 4)

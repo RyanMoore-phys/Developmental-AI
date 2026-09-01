@@ -388,7 +388,13 @@ def test_boring_view_factor():
     ungated categories never do."""
     DL = _loop_cls()
     s = _Bare()
-    s._MASTERY_BLOCKS = DL._MASTERY_BLOCKS
+    # 2026-08-08: the hand-written category->block map was replaced by the
+    # infra stack's LEARNED category<->event association. The bare object
+    # carries a stand-in with the same query surface.
+    class _FakeInfra:
+        def category_boringness(self, scale):
+            return {"dirt_visible": 0.85}
+    s.infra = _FakeInfra()
     s._habituation_scale = 50.0
     s.symbolizer = None
     s._last_env_info = {"breaks_by_type": {"dirt": 400}}
@@ -447,12 +453,19 @@ def test_break_memory_persistence():
     a._break_mem_dirty = 0
     a._breaks_by_type = {"dirt": 123, "oak_log": 4}
     a._places_by_type = {"dirt": 55}
+    a._crafts_by_type = {"planks": 2}
+    a._pickups_by_type = {"log": 4}
     for _ in range(20):                       # throttle: flushes on the 20th
         MineRLEnvAdapter._save_break_memory(a)
     assert os.path.exists(path), "memory never flushed"
     assert json.load(open(path)) == {
-        "breaks": {"dirt": 123, "oak_log": 4}, "places": {"dirt": 55}}
-    print("  13. break memory: atomic save (breaks+places) + round-trip ok")
+        "breaks": {"dirt": 123, "oak_log": 4}, "places": {"dirt": 55},
+        "crafts": {"planks": 2}, "pickups": {"log": 4},
+        # territory cells (2026-08-10): absent _visits degrades to {}
+        # rather than poisoning the whole flush
+        "cells": {}}
+    print("  13. break memory: atomic save (all four event kinds + cells) "
+          "+ round-trip ok")
 
 
 if __name__ == "__main__":

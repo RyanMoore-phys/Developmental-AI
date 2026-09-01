@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "EXAMPLE probe manifest for tools/teacher_probe.py — the image paths",
+    "below are POD-SIDE paths (/tmp/t_*.png), the probe screenshots used",
+    "live on the pod during the constant-'true' teacher incident. They do",
+    "not exist on a dev machine: copy this file, point 'image' at real",
+    "screenshots (or use --fake with canned responses) before running.",
+    "Positives show a wooden trunk in view; negatives show only sky or",
+    "only canopy — the contrast the teacher must discriminate to PASS."
+  ],
+  "questions": [
+    {
+      "key": "trunk_visible",
+      "prompt": "You are shown a first-person screenshot from a 3D outdoor environment. Question: is the vertical wooden trunk of a tree visible anywhere in this image? Look for a column with bark texture; leaves alone or empty sky alone do not count. Respond with strict JSON only, exactly one of: {\"answer\": true} or {\"answer\": false}. No other text.",
+      "items": [
+        {"image": "/tmp/t_full.png", "expect": true},
+        {"image": "/tmp/t_right.png", "expect": true},
+        {"image": "/tmp/t_trunk.png", "expect": true},
+        {"image": "/tmp/t_sky.png", "expect": false},
+        {"image": "/tmp/t_canopy2.png", "expect": false}
+      ]
+    }
+  ]
+}

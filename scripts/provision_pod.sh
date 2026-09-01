@@ -13,9 +13,25 @@ mkdir -p podlogs
 echo "=== STAGE 1: apt packages ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
+# PYTHON 3.10 ON UBUNTU >=24.04 (2026-08-11, Vast RTX 5060 Ti box).
+# 24.04 (noble) ships python3.12 and carries NO python3.10 packages, but the
+# whole MineRL chain is pinned to 3.10 (legacy gym + setuptools==65.5.1; 3.12
+# also removed stdlib distutils, which those builds still expect). Rather than
+# re-qualify the entire pinned stack on 3.12, pull 3.10 from deadsnakes —
+# verified to publish python3.10 for noble. 22.04 keeps its native path
+# untouched, so the proven RunPod recipe is unchanged.
+. /etc/os-release
+if ! apt-cache policy python3.10-venv 2>/dev/null | grep -q "Candidate: [0-9]"; then
+  echo "  python3.10 absent on ${PRETTY_NAME:-this release} -> adding deadsnakes"
+  apt-get install -y -q software-properties-common
+  add-apt-repository -y ppa:deadsnakes/ppa \
+    || { echo "PROVISION-FAILED: deadsnakes-ppa"; exit 1; }
+  apt-get update -q
+fi
 apt-get install -y -q openjdk-8-jdk-headless xvfb openbox xdotool psmisc \
     python3.10-venv python3.10-dev
 java -version || { echo "PROVISION-FAILED: java"; exit 1; }
+python3.10 --version || { echo "PROVISION-FAILED: python3.10"; exit 1; }
 
 echo "=== STAGE 1b: VirtualGL (GPU headless GL via EGL) ==="
 # Root cause (2026-07-23): under Xvfb SOFTWARE GL (llvmpipe) the MineRL client
@@ -57,17 +73,46 @@ echo "tailscale: $(which tailscale 2>/dev/null || echo ABSENT) | socat: $(which 
 echo "=== STAGE 2: venv_mc (python3.10) + torch ==="
 if [ ! -d venv_mc ]; then python3.10 -m venv venv_mc; fi
 ./venv_mc/bin/pip install -q --upgrade pip wheel setuptools
-# torch from the CUDA-12.4 wheel index: the default PyPI torch bundles CUDA 13
-# (cu130), which the pod's 550.x driver (CUDA 12.4 max) cannot initialise ->
-# torch.cuda.is_available()==False (silent CPU-only training). --force-reinstall
-# so a previously-installed cu130 build is replaced on a re-run.
+# TORCH CUDA WHEEL INDEX — CHOSEN FROM THE GPU, NOT HARDCODED (2026-08-11).
+# Default PyPI torch bundles CUDA 13 (cu130), which a 550.x driver cannot
+# initialise -> torch.cuda.is_available()==False (silent CPU-only training).
+# That is why this was pinned to cu124. But cu124 wheels carry no kernels
+# NEWER than sm_90, so on Blackwell (RTX 50xx, sm_120) every kernel launch
+# dies with "no kernel image is available for execution on the device" —
+# and is_available() still returns True, so the old check waved it through.
+# Pick the index from the card's actual compute capability.
+CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+     | head -1 | tr -d ' .')
+if [ "${CC:-0}" -ge 120 ] 2>/dev/null; then
+  TORCH_IDX="${TORCH_CUDA_INDEX:-cu128}"   # Blackwell REQUIRES cu128+
+else
+  TORCH_IDX="${TORCH_CUDA_INDEX:-cu124}"   # the proven Ampere/Ada path
+fi
+echo "  compute_cap=${CC:-unknown} -> torch wheel index ${TORCH_IDX}"
 ./venv_mc/bin/pip install -q --force-reinstall torch \
-    --index-url https://download.pytorch.org/whl/cu124
+    --index-url "https://download.pytorch.org/whl/${TORCH_IDX}"
+# matplotlib + pillow are the LIVE VIEWER's dependencies. Omitting them
+# did not fail the run — the viewer caught its own ImportError and logged
+# "viewer disabled (init failed): No module named 'matplotlib'" once, at
+# INFO, on every boot. The run looked entirely healthy and the operator had
+# no window into it for days. A dependency of an OBSERVABILITY tool is
+# exactly the kind that goes unnoticed, because nothing downstream breaks.
 ./venv_mc/bin/pip install -q numpy imageio imageio-ffmpeg pyyaml \
-    gymnasium ollama psutil
-# HARD-FAIL if CUDA still isn't visible (was a silent pass before).
-./venv_mc/bin/python -c "import torch; assert torch.cuda.is_available(), 'cuda not available (driver/toolkit mismatch)'; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.version.cuda)" \
-    || { echo "PROVISION-FAILED: torch-cuda"; exit 1; }
+    gymnasium ollama psutil matplotlib pillow
+# HARD-FAIL if CUDA isn't merely VISIBLE but actually USABLE. is_available()
+# alone passed on a cu124/sm_120 mismatch that then failed on first matmul, so
+# the check now launches a real kernel and reads the result back.
+./venv_mc/bin/python -c "
+import torch
+assert torch.cuda.is_available(), 'cuda not available (driver/toolkit mismatch)'
+d = torch.device('cuda')
+x = torch.randn(64, 64, device=d) @ torch.randn(64, 64, device=d)
+torch.cuda.synchronize()
+assert torch.isfinite(x).all(), 'kernel produced garbage'
+print('torch', torch.__version__, 'cuda', torch.version.cuda,
+      '|', torch.cuda.get_device_name(0),
+      'sm_%d%d' % torch.cuda.get_device_capability(0), '| kernel OK')
+" || { echo "PROVISION-FAILED: torch-cuda"; exit 1; }
 
 echo "=== STAGE 3a: gradle forge-maven mirror (dead-URL fix) ==="
 # files.minecraftforge.net only 308-redirects now; MineRL 1.0's gradle uses
@@ -210,7 +255,15 @@ fi
 MJ=$(./venv_mc/bin/python -c "import minerl,os;print(os.path.join(os.path.dirname(minerl.__file__),'herobraine','hero','mission.xml.j2'))" 2>/dev/null)
 if [ -f "$MJ" ] && grep -q "MineRLAgent" "$MJ"; then
   cp -n "$MJ" "$MJ.orig"
-  sed -i "s|<Name>MineRLAgent{{ agent_index }}</Name>|<Name>${MC_USERNAME:-SkyBot}</Name>|" "$MJ"
+  # PER-CLIENT IDENTITY (2026-08-17). This used to hard-code a single name,
+  # which is invisible with one remote client and fatal with several: an
+  # offline server kicks the incumbent on a duplicate login, so N clients
+  # evict each other forever. The spec sets `agent_username` per instance
+  # (MineRLEnvAdapter), and `| default` keeps every other env spec — which
+  # never sets it — rendering exactly as before.
+  sed -i "s|<Name>MineRLAgent{{ agent_index }}</Name>|<Name>{{ agent_username \| default(\"${MC_USERNAME:-SkyBot}\") }}</Name>|" "$MJ"
+  # idempotent re-patch when a previous provision baked in the fixed name
+  sed -i "s|<Name>${MC_USERNAME:-SkyBot}</Name>|<Name>{{ agent_username \| default(\"${MC_USERNAME:-SkyBot}\") }}</Name>|" "$MJ"
   grep -q "${MC_USERNAME:-SkyBot}" "$MJ" && echo "  agent-name patch OK -> ${MC_USERNAME:-SkyBot}" \
     || echo "  WARN: agent-name patch did NOT apply (template changed upstream?)"
 fi
@@ -247,10 +300,33 @@ grep -q "vglrun -d egl" "$LC" || { echo "PROVISION-FAILED: launchClient wrap"; e
 echo "=== STAGE 5: tutorial toast off ==="
 printf "tutorialStep:none\npauseOnLostFocus:false\n" > "$MCP/run/options.txt"
 
-echo "=== STAGE 6: ollama + llava ==="
+echo "=== STAGE 6: ollama + the VLM THE CONFIG ASKS FOR ==="
+# MODEL NAME READ FROM THE CONFIG, NOT HARDCODED (2026-08-11). This stage
+# pulled `llava:7b` while configs/minecraft_skybot.yaml had moved to
+# qwen2.5vl:7b — and llava:7b was THE BROKEN SENSOR (it answered
+# tree_visible=true on every patch, which is what made the vision magnet
+# useless for weeks; qwen2.5vl:7b scored 8/8 on the same probe battery).
+# A provisioner that installs a different model than the run requests is a
+# silent, expensive drift, so derive the name from the config itself.
 which ollama || (curl -fsSL https://ollama.com/install.sh | sh)
-pgrep -x ollama >/dev/null || (nohup ollama serve > podlogs/ollama.log 2>&1 < /dev/null & sleep 5)
-ollama pull llava:7b || { echo "PROVISION-FAILED: llava pull"; exit 1; }
+pgrep -x ollama >/dev/null || (OLLAMA_DEBUG=0 nohup ollama serve >> podlogs/ollama.log 2>&1 < /dev/null & sleep 5)
+# append-mode above + capper below: 581 MB of VLM-server chatter in 5 days
+# (measured 2026-08-16) would eat the disk on a long lifelong run
+pgrep -f "cap_log[.]sh podlogs/ollama[.]log" >/dev/null || \
+  (nohup bash scripts/cap_log.sh podlogs/ollama.log >> podlogs/cap_log.log 2>&1 < /dev/null &)
+# NOTE the key is symbolic_grounding.model — NOT llm.model, which names the
+# (disabled) text model llama3.1:8b. Pulling that one would waste 5 GB and
+# still leave the grounding head with no teacher.
+VLM_MODEL=$(./venv_mc/bin/python -c "
+import yaml
+c = yaml.safe_load(open('configs/minecraft_skybot.yaml'))
+print((c.get('symbolic_grounding') or {}).get('model') or '')
+" 2>/dev/null | tr -d '[:space:]')
+[ -n "$VLM_MODEL" ] || VLM_MODEL="qwen2.5vl:7b"
+echo "  config asks for VLM: $VLM_MODEL"
+ollama pull "$VLM_MODEL" || { echo "PROVISION-FAILED: vlm pull ($VLM_MODEL)"; exit 1; }
+ollama list | grep -q "${VLM_MODEL%%:*}" \
+  || { echo "PROVISION-FAILED: vlm missing after pull"; exit 1; }
 
 echo "=== STAGE 7: focused headless display (Xvfb :77 + openbox) ==="
 pgrep -f "Xvfb [:]77" >/dev/null || (nohup Xvfb :77 -screen 0 800x600x24 >/dev/null 2>&1 < /dev/null & sleep 2)

@@ -1,0 +1,243 @@
+# CLAUDE.md — working notes for agents on this repo
+
+Read this before touching anything. `README.md` tells you where files are; this
+tells you how to work here and what has already gone wrong. Nearly every rule
+below was paid for by a multi-day run that produced nothing.
+
+---
+
+## 1. What this is
+
+A curiosity-driven neurosymbolic RL agent ("SkyBot") that learns Minecraft
+**from scratch — no demos, no videos, no recipes**. The stack:
+
+| Piece | Where | Role |
+|---|---|---|
+| DreamerV3-style RSSM world model | `world_model/rssm.py` | predicts latents; the dream substrate |
+| PPO actor-critic | `policy/actor_critic.py` | the shared policy all skills copy from |
+| Options / SMDP | `policy/options.py` | skills as temporally-extended actions |
+| ICM + learning-progress curiosity | `curiosity/` | the intrinsic drive |
+| Vision magnet + fovea | `llm/vision_scaffold.py` | curiosity-ranked visual seeking |
+| Local VLM (qwen2.5vl:7b via Ollama) | `llm/vlm_symbolizer.py` | symbol grounding, unstuck advice |
+| Knowledge graph | `knowledge_graph/` | asserted/retracted facts |
+| General infrastructure | `infra/` (wired by `infra/stack.py`) | gates, ledger, signal health, empowerment, episodic, affordance, advisor |
+| The loop that owns all of it | `core/developmental_loop.py` (**9.4k lines**) | reward assembly, stepping, training |
+
+**The standing principle:** meaning and skill are *earned from experience, never
+declared*. The agent gets pixels and buttons and has to find out what they do.
+This is enforced by `tests/_no_scripted_skills_smoke.py`, which fails the build
+if a scripted option reappears in the config. If you think you need a scripted
+macro — you don't; see §4.1.
+
+---
+
+## 2. Running things
+
+**Always use the repo venv.** System `python3` lacks `yaml`, `torch`, everything.
+
+```bash
+cd "/Users/rimac/Desktop/Developmental AI"
+./venv/bin/python tests/_gui_farm_smoke.py        # Python 3.9.6
+```
+
+Tests are **standalone `__main__` scripts**, not pytest. Each prints numbered
+contract lines and ends with `[name] ALL PASS`. There is no runner; run the ones
+your change touches. A `.pth` file in the venv makes `import developmental_ai`
+work from any cwd, but prefix `PYTHONPATH=.` anyway — that's the documented form
+in every test docstring, and it's what works on the pod.
+
+Training does **not** run on the Mac. It runs on a rented GPU pod
+(`scripts/launch_skybot.sh`, kept alive by `scripts/supervise_skybot.sh`).
+See `pod_repository/docs/RUNNING.md`.
+
+### Stopping a run
+
+`touch podlogs/STOP` — graceful, and the supervisor won't restart it. Do **not**
+`kill` the python process: the supervisor treats that as a crash and relaunches.
+Also note `pkill -f "tailscale nc <ip>"` will kill the **socat bridge** too
+(socat's cmdline contains that string) — this has stranded a run before.
+
+---
+
+## 3. Standing user instructions
+
+- **No git commits, no branches, no deployment ceremony** unless explicitly
+  asked. Work and edit in place. (The repo has exactly one commit by design.)
+- **Only commit pod-proven changes** — if it hasn't run live, it isn't proven.
+- **Never wipe `skill_bank_mc_curiosity/`** on the pod. It is the agent's
+  accumulated developmental memory.
+- Peer learning between SkyBots is a *feature*, not contamination. Multiple
+  agents on one server is a deliberate social-learning experiment.
+
+---
+
+## 4. The recurring bug classes
+
+These have each bitten multiple times. Check for them **by name** in review.
+
+### 4.1 Guard-becomes-latch (≥9 occurrences)
+
+A guard added to stop a bad behaviour becomes a permanent trap because nothing
+can ever satisfy it again.
+
+- The competence gate froze at an inherited bias of −5.68 → **all 16 skills, 0
+  invocations, forever**.
+- `disable_macros: [10]` removed `inventory` — the *only* GUI exit — while
+  `use` (which opens villager/chest screens) stayed enabled. SkyBot sat in a
+  wandering villager's trade menu for **10,149 consecutive steps**.
+- The magnet's cold-start BUDGET latch caused **19 hours of zero reward**.
+- The degenerate-signal gate counted *labels* instead of *positives* and
+  disabled the magnet live.
+
+**Rule:** every guard needs an escape path that the agent can actually reach,
+and you must state what re-opens it. If the answer is "a human notices," it's a
+latch.
+
+### 4.2 Duplicated-body drift
+
+`developmental_loop.py` steps the environment in **two places**:
+
+- `_run_episode_parallel` (~line 3382)
+- `_collect_segment` (~line 4282) ← this is the one SkyBot actually runs
+
+Reward logic is duplicated between them. An edit that lands in one and not the
+other is silent — it just doesn't apply live. Use `replace_all: true`, then
+**grep to confirm the count is 2**. Several tests assert exactly this, e.g.
+`assert src.count("_gui_now2 = bool(") == 2`.
+
+### 4.3 The γ-discounting defect in state costs
+
+A potential written the textbook way, `F = w(γΦ′ − Φ)`, pays **`−w(1−γ)Φ` every
+step Φ is held constant**. For a *cost* potential (Φ < 0) that flips the sign:
+sitting still becomes a **wage**.
+
+This shipped once and the log showed it: `Gaze level: +0.00014/step` — the agent
+was being *paid* to stare at the pitch clamp.
+
+**Rule:** telescoping potentials are for *progress*. A **state cost** must use
+the **plain difference** (`γ = 1`), so it charges on entry, refunds on exit, and
+pays exactly **0** while pinned. `tests/_gui_farm_smoke.py` encodes both forms —
+the flawed one is kept as a regression witness.
+
+Corollary: a telescoping potential **structurally cannot discourage dwelling**.
+If you want dwelling to hurt, you need a genuine per-step cost, not a potential.
+
+### 4.4 Reward-channel confusion
+
+`intrinsic` is **zeroed while a GUI is open**. Any penalty you put there is
+erased exactly when you need it. GUI/dwell costs must land in `prim_extrinsic`,
+*before* the zeroing line. Meanwhile the magnet's shaping was added to
+`prim_extrinsic` and so kept paying through an occluded camera — that leak was
+77% of all income during the villager incident.
+
+**Before adding any reward term, answer:** which channel, is it gated, does it
+survive occlusion, and what does it pay while the agent does nothing?
+
+### 4.5 One-way doors in the action space
+
+Never offer an action that *opens* a state without the action that *closes* it.
+Enforced by `test_no_one_way_doors` in `_gui_farm_smoke.py`.
+
+### 4.6 Skills are copies, not memories
+
+A minted skill is a **byte copy of the shared policy** (measured cosine
+0.869–1.000; three pairs bit-identical; slot signal attenuated 20×). So:
+
+- **Never key effects on a skill's `name`** — the name carries no weight.
+- Merging the skill bank **does not stick**; skills re-derive from goal
+  `slot_keys`.
+- "Mastery" is currently unmeasurable (3 of its 4 ingredients don't exist).
+
+---
+
+## 5. Debugging discipline
+
+**Measure before theorizing.** This project has burned days on plausible
+theories. Two examples worth internalizing:
+
+- The 19-hour zero-reward stall "was curiosity exhaustion." It was a cold-start
+  budget latch.
+- The `places` counter looked like it proved wasted no-ops. It lists
+  `iron_axe: 2281` and `acacia_door: 3004` — the heuristic is **garbage**. Don't
+  build an argument on a counter you haven't validated.
+
+**Falsify your own fix.** The gaze-level potential above was caught by a test
+written for a *different* bug. Write the test that would catch you being wrong,
+not the one that confirms you're right.
+
+**When you find a real failure, encode it as a test.** The convention here is a
+long docstring naming the live incident, the measured numbers, and the contracts
+— see `_gui_farm_smoke.py` and `_no_scripted_skills_smoke.py`. That's why
+reversing a principle requires deleting a test that explains itself, rather than
+quietly appending four lines of YAML.
+
+**Don't trust `STATE.md`.** It has been stale and sent a session chasing a
+terminated pod while the live one ran elsewhere. Verify against the running
+system.
+
+---
+
+## 6. Live infrastructure
+
+- **Training pod:** vast.ai, reached **only over the tailnet**. There is no
+  `vastai` CLI and no API key on this Mac — if the pod is down, only the user
+  can restart it from the console. IPs in `pod_repository/docs/RUNNING.md` and
+  `scripts/deploy_skybot.sh` are **stale** (old RunPod box).
+- **Game server:** the user's own Paper server, reached via
+  tailscale-userspace → `socat` → `127.0.0.1:25565` on the pod. The *server* is
+  the client-count bottleneck, not the pod: 4 MineRL clients produced 0 segments
+  in 17 minutes. 2 is the proven number.
+- **Ollama** serves the VLM on the same GPU. `fovea_interval: 12` cost **28% of
+  the step rate**; 30 is the tuned value. VLM frequency trades directly against
+  training throughput.
+- **Backups:** brain state (`world_model.pt`, `symbolizer.pt`, `familiarity.pt`,
+  `magnet.pt`, `knowledge_graph.json`, `options_state.json`, break memory, skill
+  bank) lives **only on the pod**. A pod died with ~11 days of unbacked state.
+  **rsync the brain pod→Mac periodically during long runs.** Code always flows
+  Mac→pod, so code is never at risk.
+
+---
+
+## 7. MineRL / environment gotchas
+
+- `mine_block` stats **restart at 0 on every reset** — a new world per mission.
+  Use per-episode marks; never baseline against a running total.
+- `FlatInventoryObservation` gives item→count with **no slot indices**. There is
+  no equip action and `equipped_items` is dead in MineRL 1.0 — mainhand must be
+  derived from evidence (see `_last_placed_item` in `minerl_env.py`).
+- World persistence is **impossible in this fork** (measured). Each episode is a
+  fresh world; anything that must persist has to live in the brain, not the map.
+- Multi-agent usernames go through `handlers.MultiplayerUsername` on a
+  **per-instance** spec. Slot 0 keeps the bare name `SkyBot` (the offline UUID
+  owns that player's data).
+- Boot hangs are solved by **VirtualGL EGL + per-core `taskset`** (an NVIDIA/AMD
+  memcpy race); this is baked into `provision_pod.sh`.
+
+---
+
+## 8. Where to look
+
+| Question | File |
+|---|---|
+| Why isn't it acting? | `docs/ACTION_STALL_AUDIT.md` — 30+ ranked issues |
+| Domain-independent redesign | `docs/GENERAL_INFRASTRUCTURE.md` — 57 changes |
+| Open findings | `AUDIT_FINDINGS.md` |
+| What's next | `NEXT_OBJECTIVES.md`, `ROADMAP.md` |
+| Pod ops | `pod_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
+| Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |
+
+---
+
+## 9. The honest scoreboard
+
+Keep this in view; it's the point of the project.
+
+- **399 blocks broken in pod history → exactly 1 log, ever.** Later runs reached
+  13,305 breaks with **35 logs**; all log skills sit at **0/20**.
+- Chopping a tree — the original objective — **has never been learned**.
+- Most historical "progress" was the agent finding a way to get paid for doing
+  nothing: staring at the sky (96% of drive), sitting in a menu (77% of income),
+  holding attack against an unreachable trunk (96% of option activity, 0 logs).
+
+When you evaluate a change, ask what it does to *that* scoreboard — not to the
+reward number. The reward number has been wrong every single time.

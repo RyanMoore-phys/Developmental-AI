@@ -46,13 +46,25 @@ OBS = 3 * 32 * 32
 def main() -> None:
     # ---- 1/2. the vector: total, normalized, world-agnostic -------------
     e = E.__new__(E)
-    # 8 -> 9 (2026-08-01): `swing` added, the current attack streak. The
-    # invariant that matters is DIM == len(KEYS), not the literal count; the
-    # count is asserted too so adding a sense stays a deliberate act.
-    assert E.PROPRIO_DIM == len(E.PROPRIO_KEYS) == 10
+    # 8 -> 9 (2026-08-01): `swing` added, the current attack streak.
+    # 10 -> 13 (2026-08-23): `moved`, `head_sin`, `head_cos`. The body could
+    # feel hunger, health, depth, whether a menu covered the screen and where
+    # it was looking — but NOT whether it was actually going anywhere, for an
+    # agent whose every recorded failure is a failure to move (sky-staring,
+    # 10,149 steps in a villager's trade menu, attacking an unreachable
+    # trunk). The adapter already read xpos/zpos every step for coverage, so
+    # the displacement was there the whole time and simply never handed over.
+    # Still proprioception, not meaning: it describes the body and names
+    # nothing in the world.
+    # The invariant that matters is DIM == len(KEYS), not the literal count;
+    # the count is asserted too so adding a sense stays a deliberate act.
+    assert E.PROPRIO_DIM == len(E.PROPRIO_KEYS) == 13
 
     neutral = e._proprio({})
-    assert neutral.shape == (10,) and np.isfinite(neutral).all()
+    assert neutral.shape == (13,) and np.isfinite(neutral).all()
+    # heading is the one sense with no meaningful "fine" value, so unknown
+    # reads the CENTRE — the same convention `pitch` uses
+    assert neutral[11] == 0.5 and neutral[12] == 0.5
     # an ABSENT sense reads as "fine", never as "starving" — a missing
     # sensor must not look like an emergency
     assert neutral[0] == 1.0 and neutral[1] == 1.0 and neutral[2] == 1.0
@@ -158,8 +170,9 @@ def main() -> None:
         "the SMDP row is stored without the self-state it acted on"
     assert "self._proprio_source" in loop, "proprio width not taken from the env"
 
-    print("[proprioception-smoke] ALL PASS: 10-dim normalized body sense "
-          "(hunger/saturation/health/depth/holding/in-menu/hurt/carrying/swing/pitch); "
+    print("[proprioception-smoke] ALL PASS: 13-dim normalized body sense "
+          "(hunger/saturation/health/depth/holding/in-menu/hurt/carrying/"
+          "swing/pitch/moved/heading); "
           "absent senses read neutral not alarming; world-agnostic (depth "
           "not y, carrying not oak_log); reaches select_action + rollout + "
           "PPO update and changes the policy input; UNGATED with the "
