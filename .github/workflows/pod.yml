@@ -37,7 +37,7 @@ on:
 
 jobs:
   pod:
-    runs-on: [self-hosted, skybot]
+    runs-on: self-hosted
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
