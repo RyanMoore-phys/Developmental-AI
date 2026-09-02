@@ -1,0 +1,201 @@
+# The whole chain in one place: preflight -> deploy -> connect -> launch -> report.
+#
+# This is the "run everything" workflow. Unlike pod.yml (one action at a time)
+# each stage here is its own JOB, so the run view shows a chain of boxes and a
+# failure tells you WHICH stage broke without reading a log.
+#
+# STAGES ARE OPT-IN. Every one is a checkbox, and `launch` defaults to FALSE.
+# Starting training is the one irreversible-ish act here — it costs the brain's
+# continuity if it restarts a live run — so it never happens because you left a
+# default alone.
+#
+# SCHEDULED RUNS ARE HEALTH CHECKS ONLY, BY CONSTRUCTION. On a `schedule`
+# event the `inputs` context is empty, so every `if: inputs.X` is false and
+# only preflight + report run. Cron therefore reports on the pod; it cannot
+# deploy to it or start it. To change that you have to edit this file
+# deliberately, which is the point.
+#
+# RUNNER: `self-hosted` with no extra label, matching the runner registered on
+# this machine (iMac-3). If you ever add a second runner, give them distinct
+# labels and target those instead, or jobs will land on whichever is free.
+name: pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "sync code to the pod (runs pod-side smoke tests)"
+        type: boolean
+        default: true
+      connect:
+        description: "bring up the socat bridge to the Paper server"
+        type: boolean
+        default: true
+      launch:
+        description: "START TRAINING (leave off unless you mean it)"
+        type: boolean
+        default: false
+      timesteps:
+        description: "launch only: total timesteps"
+        default: "4000000"
+  schedule:
+    # 09:00 UTC daily — health report only, see the note above.
+    - cron: "0 9 * * *"
+
+# One pipeline against one pod at a time. cancel-in-progress is FALSE:
+# cancelling mid-rsync would leave a half-synced tree on the pod.
+concurrency:
+  group: skybot-pipeline
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    outputs:
+      training_live: ${{ steps.probe.outputs.training_live }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pod reachable?
+        run: |
+          set -euo pipefail
+          bash scripts/pod_exec.sh 'echo "pod: $(hostname)"' \
+            || { echo "::error::cannot reach the pod. POD_SSH_PORT rotates on every pod restart — update ~/actions-runner/.env and RESTART the runner (.env is only read at start)."; exit 1; }
+
+      - name: Probe pod state
+        id: probe
+        run: |
+          set -euo pipefail
+          # Patterns SPLIT so this command line cannot match itself.
+          OUT=$(bash scripts/pod_exec.sh '
+            cd /workspace/devai 2>/dev/null || { echo "NOREPO"; exit 0; }
+            R="run_min""ecraft"
+            pgrep -f "$R[.]py" >/dev/null && echo "LIVE" || echo "IDLE"
+            test -f podlogs/STOP && echo "STOP_PRESENT" || echo "STOP_ABSENT"
+            ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "BRIDGE_UP" || echo "BRIDGE_DOWN"')
+          echo "$OUT"
+          case "$OUT" in *LIVE*) L=true ;; *) L=false ;; esac
+          echo "training_live=$L" >> "$GITHUB_OUTPUT"
+          echo "### Pod state" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: preflight
+    if: ${{ !cancelled() && inputs.deploy && needs.preflight.result == 'success' }}
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync + pod-side smoke tests
+        env:
+          # Never launches from here — that is the `launch` job's decision.
+          DEPLOY_LAUNCH: "0"
+        run: |
+          set -euo pipefail
+          echo "deploying $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
+          # deploy_skybot.sh REFUSES if training is live and LAUNCH=0, because
+          # syncing would stop the run and never restart it. Stop deliberately
+          # first (pod.yml action=stop) if that is what you want.
+          bash scripts/deploy_skybot.sh "${POD_SSH_PORT:-22}"
+
+  connect:
+    needs: [preflight, deploy]
+    if: >
+      !cancelled() && inputs.connect &&
+      needs.preflight.result == 'success' &&
+      (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bridge to the Paper server
+        run: |
+          set -euo pipefail
+          : "${MC_SERVER_TS_IP:?set MC_SERVER_TS_IP in ~/actions-runner/.env}"
+          bash scripts/pod_exec.sh \
+            "cd /workspace/devai && bash scripts/connect_server.sh bridge ${MC_SERVER_TS_IP}"
+
+  launch:
+    needs: [preflight, deploy, connect]
+    if: >
+      !cancelled() && inputs.launch &&
+      needs.preflight.result == 'success' &&
+      (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') &&
+      (needs.connect.result == 'success' || needs.connect.result == 'skipped')
+    runs-on: self-hosted
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to restart a live run
+        if: ${{ needs.preflight.outputs.training_live == 'true' }}
+        run: |
+          echo "::error::training is already LIVE. Relaunching would cost the run's continuity. Stop it deliberately first (pod.yml action=stop)."
+          exit 1
+
+      - name: Start training
+        env:
+          TS_STEPS: ${{ inputs.timesteps }}
+        run: |
+          set -euo pipefail
+          # launch_skybot.sh owns the pre-flight and REFUSES if the bridge or
+          # server is down — a run started against a dead bridge strands the
+          # primary stream in a connect-fail rebuild loop.
+          bash scripts/pod_exec.sh "
+            cd /workspace/devai
+            rm -f podlogs/STOP
+            setsid nohup bash scripts/supervise_skybot.sh ${TS_STEPS} \
+              > podlogs/supervisor.log 2>&1 < /dev/null &
+            sleep 25
+            tail -5 podlogs/supervisor.log
+            echo \"run pid: \$(cat podlogs/skybot_run.pid 2>/dev/null || echo none)\""
+
+      - name: Verify it is ACTUALLY running
+        run: |
+          set -euo pipefail
+          # A pid existing is not evidence of progress — this project has a
+          # long history of things that look started and produce nothing.
+          # Wait, then require the run log to exist AND be growing.
+          sleep 60
+          bash scripts/pod_exec.sh '
+            cd /workspace/devai
+            R="run_min""ecraft"
+            pgrep -f "$R[.]py" >/dev/null || { echo "process died within 60s"; exit 1; }
+            L=podlogs/minecraft_skybot_run.log
+            [ -f "$L" ] || { echo "no run log after 60s"; exit 1; }
+            A=$(wc -c < "$L"); sleep 30; B=$(wc -c < "$L")
+            echo "log grew $A -> $B bytes"
+            [ "$B" -gt "$A" ] || { echo "log is NOT growing — started but stalled"; exit 1; }
+            tail -5 "$L"'
+
+  report:
+    needs: [preflight, deploy, connect, launch]
+    if: always()
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Final pod state
+        run: |
+          {
+            echo "### Result"
+            echo "| stage | result |"
+            echo "|---|---|"
+            echo "| preflight | ${{ needs.preflight.result }} |"
+            echo "| deploy | ${{ needs.deploy.result }} |"
+            echo "| connect | ${{ needs.connect.result }} |"
+            echo "| launch | ${{ needs.launch.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/pod_exec.sh '
+            cd /workspace/devai 2>/dev/null || exit 0
+            R="run_min""ecraft"
+            pgrep -f "$R[.]py" >/dev/null && echo "training LIVE" || echo "training not running"
+            echo "STOP: $(test -f podlogs/STOP && echo present || echo absent)"
+            ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "bridge UP" || echo "bridge DOWN"
+            tail -8 podlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log"' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
