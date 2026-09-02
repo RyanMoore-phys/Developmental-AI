@@ -63,6 +63,7 @@ class KnowledgeIntegrator:
         gnn_hidden_dim: int = 128,
         gnn_output_dim: int = 64,
         device: torch.device = torch.device("cpu"),
+        build_gate: bool = True,
     ):
         self.device = device
         self.gnn_output_dim = gnn_output_dim
@@ -74,16 +75,42 @@ class KnowledgeIntegrator:
             output_dim=gnn_output_dim,
         ).to(device)
 
-        self.gate = SymbolicNeuralGate(
-            neural_dim=latent_dim,
-            symbolic_dim=gnn_output_dim,
-            output_dim=latent_dim,
-        ).to(device)
-
-        # Initialize gate to trust neural by default (sigmoid(-2) ≈ 0.12)
-        # This ensures the augmented latent starts close to the raw RSSM output
-        with torch.no_grad():
-            self.gate.gate_net[0].bias.fill_(-2.0)
+        # ---- THE GATE IS OPTIONAL, AND ON PIXELS IT IS DEAD (2026-09-01) --
+        # `SymbolicNeuralGate` is sized off latent_dim, so at the RSSM's 4352
+        # it is ~154 MB of VRAM. It is worth being precise about what that
+        # buys, because it is easy to mistake for latent capability:
+        #   * it is in NO optimizer — grep the tree for `gate.parameters()`;
+        #   * `augment_latent` runs it under torch.no_grad();
+        #   * its only consumer is symbolic_decoder.extract_facts, which on
+        #     pixel obs is `_NullSymbolicDecoder` and returns [].
+        # So it is a FROZEN RANDOM 4352->4352 projection whose output is
+        # discarded. Wiring it into anything live would inject init noise
+        # into the latent — the cost is real and the capability is not.
+        #
+        # AND IT WAS ALREADY REPLACED. KnowledgeConditioner in
+        # policy/actor_critic.py names this exact module as the defect it
+        # exists to fix: "the symbolic knowledge vector was blended into an
+        # RSSM latent that only ever fed a fact-extractor (a closed
+        # self-feeding loop), under torch.no_grad(), so it could never change
+        # the agent's actions and the gate received no training signal."
+        # That replacement is 1.7 MB, lives in the policy optimizer, starts
+        # near-closed at sigmoid(-3) so it must earn its way open, and feeds
+        # the actor — i.e. it can actually change behaviour.
+        #
+        # Kept constructible (build_gate=True) for the vector/symbolic envs
+        # where the decoder is real and this path still runs.
+        self.gate = None
+        if build_gate:
+            self.gate = SymbolicNeuralGate(
+                neural_dim=latent_dim,
+                symbolic_dim=gnn_output_dim,
+                output_dim=latent_dim,
+            ).to(device)
+            # Initialize gate to trust neural by default (sigmoid(-2) ≈ 0.12)
+            # This ensures the augmented latent starts close to the raw RSSM
+            # output
+            with torch.no_grad():
+                self.gate.gate_net[0].bias.fill_(-2.0)
 
         self.knowledge_vector: Optional[torch.Tensor] = None
 
@@ -113,8 +140,15 @@ class KnowledgeIntegrator:
         return self.knowledge_vector
 
     def augment_latent(self, neural_latent: torch.Tensor) -> torch.Tensor:
-        """Blend neural latent with symbolic knowledge via learned gate."""
-        if self.knowledge_vector is None:
+        """Blend neural latent with symbolic knowledge via learned gate.
+
+        Returns the latent UNCHANGED when there is no gate (build_gate=False,
+        the pixel path) — the same contract as having no knowledge vector.
+        That is not a degradation: the only consumer of the blended latent is
+        a fact extractor that is a no-op stub on pixels, so identity is
+        exactly what it was already receiving after the blend.
+        """
+        if self.knowledge_vector is None or self.gate is None:
             return neural_latent
 
         symbolic = self.knowledge_vector.unsqueeze(0).expand(
@@ -1225,6 +1259,7 @@ class GlueLayer:
         device: torch.device = torch.device("cpu"),
         reward_target: float = 475.0,
         reward_floor: float = 0.0,
+        build_gate: bool = True,
     ):
         self.knowledge_integrator = KnowledgeIntegrator(
             embedding_dim=embedding_dim,
@@ -1232,6 +1267,10 @@ class GlueLayer:
             gnn_hidden_dim=gnn_hidden_dim,
             gnn_output_dim=gnn_output_dim,
             device=device,
+            # False on the pixel path: the gate is untrained, runs under
+            # no_grad, and its only consumer is a no-op decoder. See
+            # KnowledgeIntegrator.__init__ for the full reasoning.
+            build_gate=build_gate,
         )
 
         self.goal_generator = GoalGenerator(

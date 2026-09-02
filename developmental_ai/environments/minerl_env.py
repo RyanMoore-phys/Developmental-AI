@@ -837,8 +837,18 @@ class MineRLEnvAdapter(gym.Env):
                     float(np.clip((float(_pt) + 90.0) / 180.0, 0.0, 1.0)))
             # AM I MOVING (2026-08-23)
             _mv = world.get("moved")
+            # getattr, NOT attribute access. `_proprio` is wrapped in a broad
+            # `except Exception: pass`, so an AttributeError here does not
+            # raise — it silently leaves v[10:] at zero, i.e. `moved`,
+            # `pitch` and both heading fields all read as neutral-but-wrong
+            # with nothing logged. Anything reaching this method without a
+            # full __init__ (a test double, an older pickled adapter) would
+            # lose four senses at once and look merely idle. The class
+            # constant is the correct fallback: it IS _move_scale at
+            # action_repeat 2, the calibration it was written for.
+            _ms = getattr(self, "_move_scale", None) or self.MOVE_SCALE
             v[10] = (0.0 if _mv is None else
-                     float(np.clip(float(_mv) / self._move_scale, 0.0, 1.0)))
+                     float(np.clip(float(_mv) / _ms, 0.0, 1.0)))
             # WHICH WAY AM I FACING. sin/cos rather than raw degrees so the
             # wrap at 360->0 is continuous rather than a cliff.
             #

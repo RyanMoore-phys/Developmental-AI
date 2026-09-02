@@ -1,0 +1,79 @@
+# Sync code to the live pod after `ci` passes on main. DOES NOT LAUNCH.
+#
+# RUNS ON A SELF-HOSTED RUNNER, and that choice removes secrets from GitHub
+# entirely (2026-09-02):
+#   * the runner host is ALREADY on the tailnet, so there is no OAuth client
+#     and no tailscale action — no TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET;
+#   * the runner host already holds ~/.ssh/skybot_ed25519, so no POD_SSH_KEY;
+#   * connection values come from the runner's own `.env`, which lives outside
+#     this repository and is never committed.
+# Net result: this pipeline stores NOTHING in GitHub Secrets. See
+# docs/CI_SETUP.md.
+#
+# SAFETY PRECONDITION: a self-hosted runner must only ever serve a PRIVATE
+# repo. On a public repo any fork could open a PR and execute arbitrary code
+# as the runner user, on your machine. If this repo is ever made public,
+# deregister the runner first.
+#
+# WHY workflow_run AND NOT `needs:`: `needs` only orders jobs inside ONE
+# workflow. Gating one workflow on another requires workflow_run plus an
+# explicit conclusion check, or this fires even when ci FAILED.
+#
+# WHY IT NEVER LAUNCHES: a push must not restart live training. The brain is
+# accumulated developmental memory and a restart costs its continuity, so
+# starting a run stays a deliberate act — see pod.yml.
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Two pushes must not race a half-synced tree onto the pod. cancel-in-progress
+# is FALSE on purpose: cancelling mid-rsync would leave exactly that.
+concurrency:
+  group: deploy-pod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, skybot]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # POD_HOST comes from the runner's .env (see docs/CI_SETUP.md).
+      # Deliberately NOT `${{ vars.POD_HOST }}`: if that variable were unset,
+      # the expression expands to an empty string and would SHADOW the value
+      # the runner supplied, failing in a way that looks like a missing pod.
+      - name: Preflight — tailnet reachable and pod answering
+        run: |
+          set -euo pipefail
+          : "${POD_HOST:?POD_HOST not set. Put it in the runner's .env — see docs/CI_SETUP.md}"
+          command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
+          tailscale status >/dev/null 2>&1 || { echo "::error::runner host is not connected to the tailnet"; exit 1; }
+          # Fail HERE with a clear message rather than deep inside rsync. If
+          # this HANGS instead of failing, the tailnet ACL ssh rule is almost
+          # certainly action "check" (interactive re-auth) rather than "accept".
+          tailscale ssh "root@${POD_HOST}" 'echo "pod: $(hostname)"' \
+            || { echo "::error::Tailscale SSH to ${POD_HOST} failed. Check the ACL grants this host -> tag:devai as root with action=accept, and that the pod ran 'tailscale set --ssh=true'."; exit 1; }
+
+      - name: Sync code + pod-side smoke tests (no launch)
+        env:
+          DEPLOY_TRANSPORT: tailscale
+          DEPLOY_LAUNCH: "0"
+        run: bash scripts/deploy_skybot.sh
+
+      - name: Confirm nothing was started
+        run: |
+          tailscale ssh "root@${POD_HOST}" '
+            cd /workspace/devai 2>/dev/null || exit 0
+            if pgrep -f "run_minecraft[.]py" >/dev/null; then
+              echo "::error::a training run is live after a no-launch deploy"; exit 1
+            fi
+            echo "confirmed idle; STOP file: $(test -f podlogs/STOP && echo present || echo absent)"'

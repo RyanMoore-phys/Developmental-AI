@@ -130,10 +130,22 @@ def test_A1_no_duplicated_body_drift():
         "train_every", 1))
     assert k == 1, (
         f"train_every is {k}: K>1 is NOT identical (one Adam step on K*N "
-        f"samples != K steps on N) and cannot be validated without a live "
-        f"run. Ship at 1; raise it with a pod to watch.")
-    print(f"  A1f. config ships train_every={k} (off) — the mechanism is "
-          f"staged, the live behaviour is unchanged")
+        f"samples != K steps on N). This used to say it 'cannot be validated "
+        f"without a live run'. It has now BEEN validated, on an A4000 pod "
+        f"(2026-09-02), and K=8 FAILS: it saves 12.7 ms/step (83% of ICM "
+        f"training cost) but halves the intrinsic drive — Curiosity "
+        f"(mean/step) 0.00251 -> 0.00131, -47.9%. Reason: learning progress "
+        f"is the DROP in forward-model error between two visits to a "
+        f"prototype, and the error only drops because train_step ran; "
+        f"starving it 8x starves the quantity LP integrates. Parameter "
+        f"divergence confirms non-equivalence: ||A-init||=1.87 vs 0.59, "
+        f"cosine(update dirs)=0.586. The obvious rescue was also measured "
+        f"and also fails: scaling ICM lr by K overshoots non-monotonically "
+        f"(K=2 lr x2 +168.8%, K=4 lr x4 +79.5%, K=8 lr x8 +388.9%) — big "
+        f"error drops from optimizer thrash read as learning progress, "
+        f"which is a curiosity farm, not a fix. No K is merely cheaper.")
+    print(f"  A1f. config ships train_every={k}; K=8 measured on pod: "
+          f"-83% ICM cost but -47.9% curiosity — rejected on evidence")
 
 
 # ---------------------------------------------------------------- A3 -----
@@ -152,7 +164,14 @@ def test_A3_single_sync_in_select_action():
     # EXACTNESS: recompute the same quantities the long way and require an
     # exact match — the fused transfer must not perturb any value.
     with torch.no_grad():
-        t = torch.FloatTensor(obs).unsqueeze(0)
+        # .to(p.device) — StandaloneActorCritic defaults its device to CUDA
+        # when available and moves its modules there, so a reference tensor
+        # hardcoded to CPU tests a DIFFERENT configuration than the one that
+        # ships. `select_action` survives it because it does .to(self.device)
+        # internally; only this hand-rolled "long way" path was device-naive,
+        # and it passed on the Mac purely because there was no CUDA to
+        # disagree with. Found on the A4000 pod, 2026-09-02.
+        t = torch.FloatTensor(obs).unsqueeze(0).to(p.device)
         aug = p._augment(p._encode(t), p._prep_knowledge(None),
                          p._prep_proprio(None))
         act_ref, lp_ref = p.actor.get_action(aug, deterministic=True)
@@ -222,8 +241,15 @@ def test_A2_carried_features_are_right_or_refused():
     obs_b = rs.rand(48).astype(np.float32)
 
     with torch.no_grad():
-        f_a = enc(torch.FloatTensor(obs_a).unsqueeze(0)).reshape(1, -1)
-        f_b = enc(torch.FloatTensor(obs_b).unsqueeze(0)).reshape(1, -1)
+        # .to(p.device) on the INPUTS: `attach_shared_encoder` does
+        # `encoder = encoder.to(self.device)`, and nn.Module.to() mutates in
+        # place — so `enc` above is already on CUDA by this line even though
+        # it was constructed on CPU. Feeding it a CPU tensor is the same
+        # device-naive test bug as A3, one indirection further along.
+        f_a = enc(torch.FloatTensor(obs_a).unsqueeze(0)
+                  .to(p.device)).reshape(1, -1)
+        f_b = enc(torch.FloatTensor(obs_b).unsqueeze(0)
+                  .to(p.device)).reshape(1, -1)
 
     # correct pairing: identical result to recomputing, and the self-check
     # agrees exactly (no encoder update fell between)
@@ -307,13 +333,36 @@ def test_A2_carried_features_are_right_or_refused():
     import yaml
     pol = yaml.safe_load(open(os.path.join(
         "configs", "minecraft_skybot.yaml"))).get("policy", {})
-    assert pol.get("reuse_encoder_feats") is True
-    assert pol.get("verify_encoder_feats") is True, (
-        "the self-check must ship ON — it is what turns this from an "
-        "optimisation into a proven one; turn it off only after a live run "
-        "shows Feat drift ~0")
-    print("  A2i. ships with the live self-check ON (costs the saving until "
-          "correctness is demonstrated on a real run)")
+    # ---- CONDITIONAL ON arch (2026-09-01) -----------------------------
+    # This asserted the carry and its self-check ship ON, unconditionally.
+    # Under `arch: rssm` both are MEANINGLESS and are forced off in the loop:
+    # the policy's input is the world model's LATENT, produced fresh from
+    # each env's own RSSM row every step and never carried across a step
+    # boundary — so there is nothing to carry, and `_encode` refuses by
+    # design because h is recurrent and is not a function of one frame.
+    # The obligation the original assertion carried is preserved, not
+    # dropped: for any arch where the carry IS live, the self-check must
+    # still ship ON.
+    _arch = pol.get("arch", "flat")
+    if _arch == "rssm":
+        assert pol.get("reuse_encoder_feats") is False, (
+            "arch: rssm forces the carry off in the loop; leaving the config "
+            "at true makes it assert a live self-check that is not running")
+        assert pol.get("verify_encoder_feats") is False
+        loop = open(LOOP).read()
+        assert "self._reuse_enc_feats = False" in loop, (
+            "the loop must be the thing that forces it, not the config alone")
+        print("  A2i. arch=rssm: carry + self-check correctly OFF in BOTH "
+              "config and loop (the latent is never carried, so there is "
+              "nothing to verify)")
+    else:
+        assert pol.get("reuse_encoder_feats") is True
+        assert pol.get("verify_encoder_feats") is True, (
+            "the self-check must ship ON — it is what turns this from an "
+            "optimisation into a proven one; turn it off only after a live "
+            "run shows Feat drift ~0")
+        print("  A2i. ships with the live self-check ON (costs the saving "
+              "until correctness is demonstrated on a real run)")
 
 
 # ---------------------------------------------------------------- B1 -----

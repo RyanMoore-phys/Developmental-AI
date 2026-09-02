@@ -72,16 +72,33 @@ def test_W1_sequence_spans_a_tree_break():
           f">= {LOG_BREAK_TICKS} — a sequence can now contain a whole "
           f"barehanded log-break")
 
-    # the swap must not have quietly increased memory: transitions per
-    # gradient step is what sizes the obs tensor, and VRAM is shared with the
-    # VLM's ~5 GB against a measured 1.59 GB training step
+    # ---- RE-BASED 256 -> 512 (2026-09-01 capacity wave) ---------------
+    # The original contract was "this wave buys temporal span at CONSTANT
+    # memory", written when batch 16 x seq 16 became 8 x 32 against a
+    # measured 1.59 GB training step. The capacity wave deliberately spends
+    # memory instead: batch 8 -> 16 at seq 32 is 512 transitions/grad-step,
+    # ~3.2 GB, taken because a 54M-param world model updated on 8 sequences
+    # carries high gradient noise and this model is the substrate for
+    # imagination, prospection, the policy's input under arch: rssm, and
+    # mastery's fidelity ratio.
+    #
+    # BE HONEST ABOUT WHAT IS AND IS NOT MEASURED. The 1.59 GB figure was a
+    # real measurement on the pod; the ~3.2 GB is arithmetic, and there is no
+    # GPU on the machine this was changed from. So this is a BUDGET CHANGE
+    # TAKEN ON PURPOSE, not a verified one — `AsyncWM ... block ms/iter` and
+    # the VRAM high-water on the first cluster run are what settle it, and
+    # world_model.batch_size is the first thing to revert if they do not.
+    #
+    # The check is re-based rather than deleted: its job is to stop memory
+    # growing again UNREVIEWED, and that job still matters.
     trans = int(c["world_model"]["batch_size"]) * seq
-    assert trans == 256, (
-        f"batch x seq is {trans}, was 256 — this wave buys temporal span at "
-        f"CONSTANT memory; changing both is a different (unmeasured) change")
+    assert trans == 512, (
+        f"batch x seq is {trans}, expected 512. The capacity wave set this "
+        f"deliberately; any further change needs its own justification and "
+        f"a VRAM measurement, not a quiet edit")
     print(f"  W1b. batch {c['world_model']['batch_size']} x seq {seq} = "
-          f"{trans} transitions/grad-step — identical to the old 16x16, so "
-          f"the obs tensor and VRAM are unchanged")
+          f"{trans} transitions/grad-step (re-based from 256 by the capacity "
+          f"wave — a deliberate, UNVERIFIED memory spend; see comment)")
 
 
 # ---------------------------------------------------------------- W2 -----

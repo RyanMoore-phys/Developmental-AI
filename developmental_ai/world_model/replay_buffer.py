@@ -124,6 +124,20 @@ class BlockArray:
             b, o = divmod(int(key), self.block)
             return self._blocks[b][o]
         b, o = self._split(key)
+        if b.size == 0:
+            return np.empty(b.shape + self.row_shape, dtype=self.dtype)
+        # ---- FAST PATH, AND IT IS THE COMMON ONE (2026-09-01) -----------
+        # A sampled window is `seq_len` CONTIGUOUS transitions — 32 rows
+        # against a 25,000-row block — so the overwhelming majority of
+        # gathers land wholly inside one block. Doing np.unique plus a
+        # boolean mask plus a scatter for that is three allocations to
+        # accomplish one fancy-index, on a path that runs
+        # batch_size x train_iters times per world-model block (8 x 384).
+        # This whole storage change exists to stop the buffer killing long
+        # runs; it must not pay for that by slowing the training block.
+        _b0 = int(b.flat[0])
+        if int(b.min()) == _b0 and int(b.max()) == _b0:
+            return self._blocks[_b0][o]
         out = np.empty(b.shape + self.row_shape, dtype=self.dtype)
         # one gather per touched block; `b` is small (few blocks) so this
         # stays a handful of vectorized copies, not a Python loop over rows
@@ -143,8 +157,16 @@ class BlockArray:
             self._blocks[b][o] = value
             return
         b, o = self._split(key)
+        if b.size == 0:
+            return
         value = np.asarray(value, dtype=self.dtype)
         bcast = value.shape != b.shape + self.row_shape
+        # Same single-block fast path as __getitem__ — this is the
+        # update_priorities scatter, which runs once per training iteration.
+        _b0 = int(b.flat[0])
+        if int(b.min()) == _b0 and int(b.max()) == _b0:
+            self._blocks[_b0][o] = value
+            return
         for bi in np.unique(b):
             m = (b == bi)
             self._blocks[int(bi)][o[m]] = value if bcast else value[m]

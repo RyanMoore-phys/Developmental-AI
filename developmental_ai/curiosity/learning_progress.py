@@ -129,6 +129,20 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         self._proto_next_id = 0
         self._proto_tick = 0
         self._bucket_err: dict[int, deque] = {}
+        # ---- PROTOTYPE MATRIX CACHE (2026-09-02) -------------------------
+        # `_bucket_key` used to rebuild `np.stack([...])` over the WHOLE
+        # prototype set on every call — once per env step per stream. At
+        # lp_max_protos 512 that is cheap; the cap is now 4096, which would
+        # make it 8x the allocate-and-copy on a loop whose per-step CPU is
+        # already the measured bottleneck (67.3 ms/step). Cached instead,
+        # and invalidated by the ONLY TWO WRITERS to `self._protos`:
+        # the insert and the LRU eviction, both in `_bucket_key`.
+        # A stale matrix would silently match the wrong bucket and read as
+        # "LP got worse" with nothing pointing at the cause — which is why
+        # both invalidation sites are named here and asserted in
+        # tests/_capacity_wave_smoke.py rather than left to review.
+        self._proto_arr: "np.ndarray | None" = None
+        self._proto_ids: "list | None" = None
 
     def _pooled_vec(self, obs_row: np.ndarray) -> "np.ndarray | None":
         c = int(getattr(self, "image_channels", 3))
@@ -147,12 +161,21 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
             v = self._pooled_vec(obs_row)
             if v is not None:
                 if self._protos:
-                    ids = list(self._protos.keys())
-                    arr = np.stack([self._protos[i] for i in ids])
-                    d = np.abs(arr - v).mean(axis=1)
+                    # CACHED (see _proto_arr in __init__): rebuilt only when
+                    # a prototype was inserted or evicted since the last
+                    # call, not once per env step.
+                    if self._proto_arr is None:
+                        self._proto_ids = list(self._protos.keys())
+                        self._proto_arr = np.stack(
+                            [self._protos[i] for i in self._proto_ids])
+                    ids = self._proto_ids
+                    d = np.abs(self._proto_arr - v).mean(axis=1)
                     j = int(d.argmin())
                     if d[j] < self.lp_proto_thresh:
                         if update_state:
+                            # `_proto_used` is LRU bookkeeping only — it does
+                            # not change the MATRIX, so the cache survives a
+                            # hit. Only membership changes invalidate.
                             self._proto_tick += 1
                             self._proto_used[ids[j]] = self._proto_tick
                         return ids[j]
@@ -164,11 +187,17 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                     old = min(self._proto_used, key=self._proto_used.get)
                     self._protos.pop(old, None)
                     self._proto_used.pop(old, None)
+                    # THE COST OF THE CAP: evicting a prototype throws away
+                    # its error history, so a scene the agent had already
+                    # mastered comes back reading as brand-new. That is why
+                    # lp_max_protos was raised — this line is the mechanism.
                     self._bucket_err.pop(old, None)
+                    self._proto_arr = self._proto_ids = None   # WRITER 1
                 pid = self._proto_next_id
                 self._proto_next_id += 1
                 self._protos[pid] = v.astype(np.float32)
                 self._proto_used[pid] = self._proto_tick
+                self._proto_arr = self._proto_ids = None       # WRITER 2
                 return pid
         # VECTOR path: coarse discretization so a recurring state hashes to a
         # stable bucket, while noise-corrupted observations hash uniquely.

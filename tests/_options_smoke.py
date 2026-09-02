@@ -312,11 +312,29 @@ def test_loop_integration():
     taus = list(ai.policy.rollout_taus)
     assert taus, "nothing stored"
     assert sum(taus) == 40, f"sum(taus)={sum(taus)} != episode length 40"
-    assert any(t > 1 for t in taus), (
-        "no option ever invoked in 40 steps with 2/19 slot mass — "
-        "astronomically unlikely; invocation path dead")
+    # ---- ASSERT THE CONTRACT, NOT A LUCKY DRAW (fixed 2026-09-01) ------
+    # This used to require `any(t > 1)` — a PRIMARY-stream option inside 40
+    # steps — and called its absence "astronomically unlikely". It is not:
+    # ~33 primary decisions at 2/19 slot mass gives P(none) ~ 3%, so the
+    # assertion was a coin flip the seed happened to win. It duly broke when
+    # an unrelated change (dropping an unused module) shifted the torch RNG
+    # stream, and reported "invocation path dead" for a path that was fine.
+    # MEASURED across seeds with the same code:
+    #     seed 0: 4 picks, 0 primary option rows   <- the old assertion fails
+    #     seed 1: 8 picks, 4 primary option rows
+    #     seed 2: 5 picks, 3 primary option rows
+    #     seed 3: 5 picks, 2 primary option rows
+    # The real contract is "the invocation path is alive", which
+    # `option_picks` tests directly and seed-independently. The tau/meta-id
+    # check still runs, but only over the rows that exist.
+    assert ai.option_executor.option_picks > 0, (
+        "no option invoked on ANY stream in 40 steps with 2/19 slot mass — "
+        "the invocation path is dead (this is the seed-independent claim)")
     metas = [a for a, t in zip(ai.policy.rollout_actions, taus) if t > 1]
     assert all(a >= P for a in metas), "option decision stored primitive id"
+    if not metas:
+        print("     (no PRIMARY-stream option this seed — expected ~3% of "
+              "the time; option_picks is what proves the path)")
     snap = ex.snapshot()
     assert snap["recent"], "no firing telemetry"
     json.dumps(snap)

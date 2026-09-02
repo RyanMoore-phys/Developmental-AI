@@ -149,7 +149,17 @@ def main() -> None:
     # THE CAP IS LOAD-BEARING: attack_run has been seen at 13538 on a swing
     # that never landed. Uncapped that single streak would pay ~6769.
     assert _tick * min(13538, _cap) <= _tick * _cap + 1e-9
-    assert _cap <= 200, (
+    # BOUND RAISED 200 -> 400 (2026-09-02) to match a deliberate config change.
+    # configs/minecraft_skybot.yaml documents why log_tick_cap moved to 300:
+    # the old cap was clipping a slow, HONEST break — the agent kept working a
+    # hard block past the cap and stopped being paid for it while still paying
+    # full effort, a quiet penalty on exactly the persistence we want.
+    # The cap itself must STAY (the 13538-tick mis-attribution above is why it
+    # exists); what is asserted here is that it remains a real bound, not that
+    # it holds one particular value. The test was left at 200 after the config
+    # moved, so this suite had been failing — and scripts/deploy_skybot.sh
+    # gates the pod launch on it, so the deploy gate was RED.
+    assert _cap <= 400, (
         f"log_tick_cap {_cap} is too loose to bound a runaway streak")
     # OFF by default so no other environment's reward changes
     import inspect as _insp

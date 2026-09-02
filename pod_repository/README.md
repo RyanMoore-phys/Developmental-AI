@@ -45,17 +45,32 @@ The **live code** (`developmental_ai/`, `configs/`, `scripts/`, smoke tests,
 `AUDIT_FINDINGS.md`) lives in the parent repo `../` and is byte-synced to the
 pod. This folder holds the pod-side DATA + the operational knowledge.
 
-## Connection (as of 2026-07-22)
+## Connection
+
+**Addresses are NOT written down here any more (2026-09-02).** Both the host
+and the port change on every pod rebuild, so any literal in this file is stale
+the moment it is written — and a stale address reads exactly like a dead run
+(see the port note below). Set them in your shell, or read them from the CI
+variables `POD_SSH_HOST` / `POD_SSH_PORT`, which are the single source of truth:
 
 ```bash
-ssh root@<redacted-host> -p 22681 -i ~/.ssh/skybot_ed25519 \
+export POD_HOST=<current-pod-ip>      # RunPod dashboard -> Connect
+export POD_PORT=<current-ssh-port>
+ssh root@"$POD_HOST" -p "$POD_PORT" -i ~/.ssh/skybot_ed25519 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+```
+
+Once the pod is on the tailnet you can skip host/port entirely — the MagicDNS
+name is stable across rebuilds and Tailscale SSH needs no key:
+
+```bash
+tailscale ssh root@<pod-magicdns-name>     # e.g. devai-pod-2
 ```
 
 - **Key:** `~/.ssh/skybot_ed25519` (the `~/.ssh/id_ed25519` path does NOT exist
   on this Mac, despite what the dashboard command prints).
-- **`UserKnownHostsFile=/dev/null` is REQUIRED:** RunPod reuses the IP
-  `<redacted-host>` across pods, so the host key changes and plain SSH refuses
+- **`UserKnownHostsFile=/dev/null` is REQUIRED:** RunPod reuses IPs across
+  pods, so the host key changes and plain SSH refuses
   with "REMOTE HOST IDENTIFICATION HAS CHANGED" — this flag bypasses it.
 - **Port changes every pod restart** (22655 → 22681 → 34276 → …). Get the
   current port from the RunPod dashboard → Connect → "SSH over exposed TCP",
@@ -73,10 +88,14 @@ ssh root@<redacted-host> -p 22681 -i ~/.ssh/skybot_ed25519 \
 
 ```bash
 # 1. sync code from the Mac (run from the parent repo dir)
-rsync -rlptz -e "ssh -p 22681 -i ~/.ssh/skybot_ed25519 \
+#    POD_HOST/POD_PORT as exported above — no literals, they go stale.
+rsync -rlptz -e "ssh -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   developmental_ai configs scripts run_minecraft.py \
-  root@<redacted-host>:/workspace/devai/
+  root@"$POD_HOST":/workspace/devai/
+
+#    or just: POD_HOST=<magicdns-name> DEPLOY_TRANSPORT=tailscale \
+#               bash scripts/deploy_skybot.sh
 
 # 2. launch (idempotent; refuses if a run or stale java is alive)
 ssh <conn> 'cd /workspace/devai && bash scripts/launch_lifelong.sh 1000000'

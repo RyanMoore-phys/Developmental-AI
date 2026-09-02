@@ -69,6 +69,20 @@ fi
 which socat >/dev/null 2>&1 || apt-get install -y -q socat || \
   echo "WARN: socat install failed (external-server play unavailable)"
 echo "tailscale: $(which tailscale 2>/dev/null || echo ABSENT) | socat: $(which socat 2>/dev/null || echo ABSENT)"
+# NON-INTERACTIVE TAILNET JOIN (2026-09-02). With TS_AUTHKEY exported, join
+# here so a CI provision produces a pod that is already reachable — otherwise
+# provisioning finishes and then blocks forever on a human clicking a URL,
+# which is exactly what made this stage un-automatable before.
+# Deliberately NOT fatal: a pure-MineRL run (no external server) does not need
+# the tailnet, and provisioning should not die for an optional capability.
+if [ -n "${TS_AUTHKEY:-}" ]; then
+  echo "  TS_AUTHKEY present -> non-interactive tailnet join (+Tailscale SSH)"
+  bash scripts/connect_server.sh login --authkey "$TS_AUTHKEY" \
+    || echo "WARN: non-interactive tailnet join failed (key expired/untagged?)"
+else
+  echo "  no TS_AUTHKEY -> tailnet join is a MANUAL step:"
+  echo "     bash scripts/connect_server.sh login"
+fi
 
 echo "=== STAGE 2: venv_mc (python3.10) + torch ==="
 if [ ! -d venv_mc ]; then python3.10 -m venv venv_mc; fi
@@ -153,7 +167,57 @@ if [ -f "$BG" ] && grep -qE "DEVAI:.*(plugin|block) (dropped|removed)" "$BG"; th
     chmod +x "$MCP/gradlew"
 else
     rm -rf mc-build
-    git clone -q --branch v1.0.0 https://github.com/minerllabs/minerl.git mc-build
+    # NO git clone HERE — GitHub 401s git-upload-pack FROM POD IPs.
+    # Measured 2026-09-02 on an A4000 pod, with clean git
+    # config (no credential helper, no .netrc, no proxy, no insteadOf):
+    #     GET  /minerllabs/minerl.git/info/refs      -> 200   (ls-remote works)
+    #     POST /minerllabs/minerl.git/git-upload-pack -> 401
+    #                        www-authenticate: Basic realm="GitHub"
+    # So `git ls-remote` succeeds and `git clone` cannot, which produces the
+    # thoroughly misleading pair:
+    #     fatal: could not read Username for 'https://github.com'
+    #     fatal: the remote end hung up unexpectedly
+    # That reads as auth-on-a-private-repo. The repo is public; this is
+    # GitHub's abuse throttle on a shared cloud IP. Nothing in our config
+    # fixes it — the TRANSPORT has to change. Two dead ends already paid
+    # for, do not retry them: forcing protocol.version=0 (fixes ls-remote,
+    # NOT clone), and blaming the ref (`--branch v1.0.0` is correct; v1.0.0
+    # is a BRANCH, refs/heads/v1.0.0 — there is no v1.0.0 tag, which is why
+    # a .../tags/v1.0.0 tarball 404s).
+    #
+    # codeload.github.com serves plain tarballs over GET and is NOT throttled
+    # here, so both clones become fetches. Safe because setup_mcp.sh itself
+    # does `rm -rf .git` immediately after checkout — the git metadata is
+    # disposable and a tarball at the right ref is a faithful substitute.
+    MINERL_TGZ=/tmp/minerl_v1.0.0.tgz
+    MCPR_TGZ=/tmp/mcp_reborn_1.16.5-20210115.tgz
+    curl -fsSL --retry 3 --max-time 600 -o "$MINERL_TGZ" \
+      "https://codeload.github.com/minerllabs/minerl/tar.gz/refs/heads/v1.0.0" \
+      || { echo "PROVISION-FAILED: minerl tarball fetch"; exit 1; }
+    mkdir -p /tmp/_mlx && rm -rf /tmp/_mlx/* && tar xzf "$MINERL_TGZ" -C /tmp/_mlx
+    mv /tmp/_mlx/minerl-1.0.0 mc-build \
+      || { echo "PROVISION-FAILED: minerl tarball layout"; exit 1; }
+    # MCP-Reborn is the SECOND clone, inside minerl's own setup_mcp.sh.
+    # NOTE the ref kind differs from minerl's: here 1.16.5-20210115 is a TAG.
+    curl -fsSL --retry 3 --max-time 600 -o "$MCPR_TGZ" \
+      "https://codeload.github.com/Hexeption/MCP-Reborn/tar.gz/refs/tags/1.16.5-20210115" \
+      || { echo "PROVISION-FAILED: MCP-Reborn tarball fetch"; exit 1; }
+    mkdir -p /tmp/_mcx && rm -rf /tmp/_mcx/* && tar xzf "$MCPR_TGZ" -C /tmp/_mcx
+    mkdir -p mc-build/minerl
+    mv /tmp/_mcx/MCP-Reborn-1.16.5-20210115 mc-build/minerl/MCP-Reborn \
+      || { echo "PROVISION-FAILED: MCP-Reborn tarball layout"; exit 1; }
+    test -f mc-build/minerl/MCP-Reborn/gradlew \
+      || { echo "PROVISION-FAILED: MCP-Reborn missing gradlew"; exit 1; }
+    # Neutralise the three lines that would clone (and the rm that would
+    # delete what we just staged). Everything after them — chmod, ./gradlew
+    # setup, the cleanup rm — must still run, so this is a surgical edit and
+    # NOT a rewrite of setup_mcp.sh.
+    SM=mc-build/scripts/setup_mcp.sh
+    sed -i -E 's|^[[:space:]]*rm -rf MCP-Reborn[[:space:]]*$|: # DEVAI: pre-staged from tarball|' "$SM"
+    sed -i -E 's|^[[:space:]]*git clone .*$|: # DEVAI: pre-staged from tarball|'                    "$SM"
+    sed -i -E 's|^[[:space:]]*git checkout .*$|: # DEVAI: tarball already at the ref|'              "$SM"
+    grep -qE "^[[:space:]]*git (clone|checkout)" mc-build/scripts/setup_mcp.sh \
+      && { echo "PROVISION-FAILED: setup_mcp.sh still contains a git clone/checkout"; exit 1; }
     (cd mc-build && bash scripts/setup_mcp.sh && bash scripts/patch_mcp.sh) \
         || { echo "PROVISION-FAILED: setup_mcp"; exit 1; }
     chmod +x "$MCP/gradlew"
@@ -324,9 +388,47 @@ print((c.get('symbolic_grounding') or {}).get('model') or '')
 " 2>/dev/null | tr -d '[:space:]')
 [ -n "$VLM_MODEL" ] || VLM_MODEL="qwen2.5vl:7b"
 echo "  config asks for VLM: $VLM_MODEL"
-ollama pull "$VLM_MODEL" || { echo "PROVISION-FAILED: vlm pull ($VLM_MODEL)"; exit 1; }
-ollama list | grep -q "${VLM_MODEL%%:*}" \
-  || { echo "PROVISION-FAILED: vlm missing after pull"; exit 1; }
+# A `-q<N>` SUFFIX IS LOCALLY CREATED, NOT PULLABLE (fixed 2026-09-02).
+# The registry has qwen2.5vl:3b and :7b but NOT :3b-q4 — measured, manifest
+# HTTP 200 / 200 / 404 respectively. `ollama pull qwen2.5vl:3b-q4` therefore
+# dies with "pull model manifest: file does not exist", which reads like a
+# network problem and is actually a naming one. The config comment beside
+# `symbolic_grounding.model` already documents the real recipe (pull the base,
+# then `ollama create ... -q q4_K_M`); this stage just never implemented it,
+# so setting the config to a quantized tag broke provisioning at the last
+# stage with every earlier stage green.
+case "$VLM_MODEL" in
+  *-q[0-9]*)
+    VLM_BASE="${VLM_MODEL%-q*}"          # qwen2.5vl:3b-q4 -> qwen2.5vl:3b
+    VLM_QUANT="q${VLM_MODEL##*-q}"       # ...            -> q4
+    # ollama wants a full method name; q4 is shorthand for q4_K_M.
+    case "$VLM_QUANT" in
+      q4) VLM_QUANT=q4_K_M ;;
+      q8) VLM_QUANT=q8_0 ;;
+    esac
+    echo "  '$VLM_MODEL' is a LOCAL quantization of '$VLM_BASE' ($VLM_QUANT)"
+    if ollama list 2>/dev/null | grep -q "^${VLM_MODEL}[[:space:]]"; then
+      echo "  already present, skipping"
+    else
+      ollama pull "$VLM_BASE" \
+        || { echo "PROVISION-FAILED: vlm base pull ($VLM_BASE)"; exit 1; }
+      printf 'FROM %s\n' "$VLM_BASE" > /tmp/Modelfile.vlm
+      ollama create "$VLM_MODEL" -f /tmp/Modelfile.vlm -q "$VLM_QUANT" \
+        || { echo "PROVISION-FAILED: vlm quantize ($VLM_MODEL from $VLM_BASE)"; exit 1; }
+    fi
+    ;;
+  *)
+    ollama pull "$VLM_MODEL" || { echo "PROVISION-FAILED: vlm pull ($VLM_MODEL)"; exit 1; }
+    ;;
+esac
+# Match the EXACT tag, not just the family. The old check grepped
+# "${VLM_MODEL%%:*}" (i.e. just "qwen2.5vl"), so any qwen2.5vl variant
+# satisfied it — including the wrong one, which is the same silent-drift
+# failure this stage's own header warns about.
+ollama list 2>/dev/null | grep -q "^${VLM_MODEL}[[:space:]]" \
+  || { echo "PROVISION-FAILED: vlm '$VLM_MODEL' missing after install"; \
+       echo "  have:"; ollama list; exit 1; }
+echo "  VLM ready: $VLM_MODEL"
 
 echo "=== STAGE 7: focused headless display (Xvfb :77 + openbox) ==="
 pgrep -f "Xvfb [:]77" >/dev/null || (nohup Xvfb :77 -screen 0 800x600x24 >/dev/null 2>&1 < /dev/null & sleep 2)

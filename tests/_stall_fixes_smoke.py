@@ -84,15 +84,39 @@ def main() -> None:
     assert 'info["gui_frac"]' in src, "GUI paralysis is not reported"
 
     # ---- 2. THE GROUND MUST NOT OUT-PAY THE GOAL ------------------------
+    # REWRITTEN 2026-09-02. This block used to assert the TIER LADDER
+    # (dirt/grass 0.15, leaves 0.3, everything-else 1.0). That ladder was
+    # deliberately deleted on 2026-08-08 by user directive and replaced with a
+    # WHITELIST — wood and ore pay, everything else pays exactly 0.0. See the
+    # `_break_reward` docstring in environments/minerl_env.py for the measured
+    # reason: with even a small tier on ground blocks, a bot placed directly in
+    # front of logs WITH an axe abandoned a started chop for snow and dirt,
+    # because an instant cheap break beats a delayed 20.0 under temporal
+    # discounting every single time.
+    #
+    # The test was left asserting the old ladder, so it had been failing — and
+    # since scripts/deploy_skybot.sh gates the pod launch on this suite, the
+    # deploy gate was RED and would have refused to launch. The contract below
+    # is the same protective intent (ground must never out-pay the goal),
+    # stated against the economy that actually ships.
     assert E._break_reward("oak_log") == 5.0, "log tier changed"
-    for ground in ("dirt", "grass_block", "gravel", "sand", "stone"):
-        assert E._break_reward(ground) == 0.15, (
-            f"{ground} still pays {E._break_reward(ground)} — digging "
-            f"out-pays chopping and the agent buries itself")
-    assert E._break_reward("oak_leaves") == 0.3, "leaf tier changed"
-    assert E._break_reward("grass") == 0.15, "trivial tier changed"
-    # a real solid block the agent must SEEK still pays the middle tier
-    assert E._break_reward("crafting_table") == 1.0
+    # ORES are the other genuinely goal-relevant family (mining progression).
+    assert E._break_reward("iron_ore") == 10.0, "ore tier changed"
+    assert E._break_reward("ancient_debris") == 10.0, "ancient_debris tier changed"
+    # EVERYTHING ELSE EARNS NO EXTRINSIC INCOME. Non-goal breaks keep their
+    # INTRINSIC novelty (first-of-type surprise, mastery-habituated); they just
+    # cannot be farmed for extrinsic reward.
+    for ground in ("dirt", "grass_block", "gravel", "sand", "stone",
+                   "oak_leaves", "grass", "crafting_table", "snow"):
+        assert E._break_reward(ground) == 0.0, (
+            f"{ground} pays {E._break_reward(ground)}, not 0.0 — the tier "
+            f"ladder is back, and digging will out-pay chopping again")
+    # NAMESPACE ROBUSTNESS is the other half of this contract: a namespaced
+    # stat key must resolve to the same tier as the bare name, or "minecraft.
+    # dirt" falls through to a default and becomes the best-paid reachable
+    # behaviour (this shipped once — see the docstring's 2026-08-02 note).
+    assert E._break_reward("minecraft.dirt") == 0.0, "namespaced ground escapes the whitelist"
+    assert E._break_reward("minecraft.oak_log") == 5.0, "namespaced log misses the log tier"
     # ...and the ground now sits BELOW the goal-discovery spike threshold,
     # so digging can no longer mint a goal
     assert E._break_reward("dirt") < 0.9
@@ -211,8 +235,10 @@ def main() -> None:
             f"the occlusion split silently read a constant 0")
 
     print("[stall-fixes-smoke] ALL PASS: GUI detected (menu yes, grass/night/"
-          "sky no) and swings into a menu no longer count; ground pays 0.15 "
-          "so digging cannot out-pay the 5.0 log; competence clamps at -2.0 "
+          "sky no) and swings into a menu no longer count; breaks are "
+          "WHITELISTED (log 5.0, ore 10.0, everything else exactly 0.0, "
+          "namespaced keys included) so digging cannot out-pay chopping; "
+          "competence clamps at -2.0 "
           f"(still gated, recovers in {n}) instead of needing ~134; fossil "
           "guard sits AT the mint site so the one-shot bank-derived latch "
           "repair cannot re-mint discovered_N/break_air; return "

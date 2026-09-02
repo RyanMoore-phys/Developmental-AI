@@ -23,6 +23,31 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# ---- SECRETS ---------------------------------------------------------------
+# Audited 2026-09-02: NOTHING matching these has ever been committed — every
+# blob in history was content-scanned and returned zero credential hits. This
+# block is purely to keep that true, because the cost of one accident (an SSH
+# key or a tailnet auth key in a public-ish history) is a rotation plus a
+# history rewrite, and the cost of these nine lines is nothing.
+#
+# The CI runner's secrets live OUTSIDE the repo on purpose — in the self-hosted
+# runner's own .env, never in a tracked file. See docs/CI_SETUP.md.
+.env
+.env.*
+*.pem
+*.key
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
+.netrc
+secrets.*
+*.p12
+*.pfx
+# runner working dirs, if anyone ever installs one inside the repo
+actions-runner/
+_work/
+
 # ---- LEARNED WEIGHTS -------------------------------------------------------
 # Regenerable, and enormous: a single flat-arch skill's policy.pt is ~115 MB
 # (three near-duplicate 49250-wide input layers). The pod bank alone is 3.4 GB

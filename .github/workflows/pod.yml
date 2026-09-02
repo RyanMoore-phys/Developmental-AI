@@ -1,0 +1,160 @@
+# Manual pod operations. Nothing here is triggered by a push.
+#
+# RUNS ON A SELF-HOSTED RUNNER — see the header of deploy.yml for why that
+# removes every secret from GitHub, and for the private-repo-only safety
+# precondition. All connection values come from the runner's own `.env`
+# (docs/CI_SETUP.md); none of them live in this repository or in GitHub.
+#
+#   status     read-only health report. Safe. Start here.
+#   connect    tailscale + socat bridge to the Paper server.
+#   launch     start training under the supervisor.
+#   stop       GRACEFUL stop via podlogs/STOP.
+#   provision  bootstrap a BARE box (40-60 min). Destructive — guarded below.
+#
+# WHY `stop` WRITES A FILE INSTEAD OF KILLING: the supervisor treats a killed
+# process as a crash and relaunches it. `touch podlogs/STOP` is the only stop
+# that stays stopped (CLAUDE.md §2).
+name: pod
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "what to do"
+        type: choice
+        options: [status, connect, launch, stop, provision]
+        default: status
+      timesteps:
+        description: "launch only: total timesteps"
+        default: "4000000"
+      confirm_provision:
+        description: "type PROVISION to allow the destructive provision action"
+        default: ""
+
+jobs:
+  pod:
+    runs-on: [self-hosted, skybot]
+    # provision runs a full MineRL gradle build.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # GUARD: provision does `rm -rf mc-build` and rebuilds MineRL from
+      # scratch. Run by mistake against a working pod it destroys an hour of
+      # build for nothing, so it needs an explicit typed confirmation.
+      - name: Guard the destructive action
+        if: ${{ github.event.inputs.action == 'provision' }}
+        run: |
+          if [ "${{ github.event.inputs.confirm_provision }}" != "PROVISION" ]; then
+            echo "::error::action=provision requires confirm_provision=PROVISION. It wipes mc-build and rebuilds MineRL (40-60 min)."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------- #
+      # provision is the ONE action that cannot use the tailnet: it runs
+      # against a bare box that is not on the tailnet yet — that is exactly
+      # what it sets up. It uses POD_SSH_HOST/POD_SSH_PORT and the key that
+      # already lives on the runner host (POD_SSH_KEYFILE), so no private key
+      # is ever uploaded to GitHub.
+      # ---------------------------------------------------------------- #
+      - name: Provision a bare pod
+        if: ${{ github.event.inputs.action == 'provision' }}
+        run: |
+          set -euo pipefail
+          : "${POD_SSH_HOST:?set POD_SSH_HOST in the runner .env}"
+          : "${POD_SSH_PORT:?set POD_SSH_PORT in the runner .env}"
+          KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
+          [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY on the runner host"; exit 1; }
+          # UserKnownHostsFile=/dev/null: providers reuse IPs across pods, so
+          # the host key changes and plain ssh refuses outright.
+          SSH="ssh -p $POD_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          rsync -rlptz -e "$SSH" \
+            developmental_ai configs scripts tests run_minecraft.py requirements.txt \
+            "root@$POD_SSH_HOST:/workspace/devai/"
+          # TS_AUTHKEY (runner .env) is consumed by provisioning stage 1c to
+          # join the tailnet AND enable Tailscale SSH, so the pod comes out of
+          # provisioning already reachable by every other action here.
+          $SSH "root@$POD_SSH_HOST" "cd /workspace/devai && TS_AUTHKEY='${TS_AUTHKEY:-}' \
+            nohup bash scripts/provision_pod.sh > podlogs/provision.log 2>&1 < /dev/null &
+            echo started"
+          echo "provisioning started; streaming stage markers"
+          for i in $(seq 1 110); do
+            sleep 60
+            OUT=$($SSH "root@$POD_SSH_HOST" 'grep -E "^=== STAGE|PROVISION-" /workspace/devai/podlogs/provision.log | tail -2' 2>/dev/null || true)
+            echo "[$i min] $OUT"
+            case "$OUT" in
+              *PROVISION-COMPLETE*) echo "provisioning finished"; exit 0 ;;
+              *PROVISION-FAILED*)   echo "::error::provisioning failed: $OUT"; exit 1 ;;
+            esac
+          done
+          echo "::error::provisioning did not finish within the budget"; exit 1
+
+      # ---------------------------------------------------------------- #
+      # Everything else goes over the tailnet the runner host is already on:
+      # no key, no OAuth, stable MagicDNS name.
+      # ---------------------------------------------------------------- #
+      - name: Preflight (non-provision actions)
+        if: ${{ github.event.inputs.action != 'provision' }}
+        run: |
+          set -euo pipefail
+          : "${POD_HOST:?set POD_HOST in the runner .env — see docs/CI_SETUP.md}"
+          command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
+          tailscale status >/dev/null 2>&1 || { echo "::error::runner host is not on the tailnet"; exit 1; }
+
+      - name: status
+        if: ${{ github.event.inputs.action == 'status' }}
+        run: |
+          tailscale ssh "root@${POD_HOST}" '
+            cd /workspace/devai 2>/dev/null || { echo "no /workspace/devai"; exit 0; }
+            echo "== run =="
+            pgrep -f "run_minecraft[.]py" >/dev/null && echo "training LIVE (pid $(cat podlogs/skybot_run.pid 2>/dev/null))" || echo "training not running"
+            echo "STOP file: $(test -f podlogs/STOP && echo PRESENT || echo absent)"
+            echo "== bridge =="
+            ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "socat bridge UP" || echo "socat bridge DOWN"
+            pgrep -x tailscaled >/dev/null && echo "tailscaled up" || echo "tailscaled DOWN"
+            echo "== gpu =="
+            nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
+            echo "== last log =="
+            tail -15 podlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log"'
+
+      - name: connect
+        if: ${{ github.event.inputs.action == 'connect' }}
+        run: |
+          set -euo pipefail
+          : "${MC_SERVER_TS_IP:?set MC_SERVER_TS_IP in the runner .env (Paper server tailnet IP)}"
+          tailscale ssh "root@${POD_HOST}" \
+            "cd /workspace/devai && bash scripts/connect_server.sh bridge ${MC_SERVER_TS_IP}"
+
+      - name: launch
+        if: ${{ github.event.inputs.action == 'launch' }}
+        env:
+          TS_STEPS: ${{ github.event.inputs.timesteps }}
+        run: |
+          set -euo pipefail
+          # launch_skybot.sh owns the pre-flight and REFUSES if the bridge or
+          # the server is down — a run started against a dead bridge strands
+          # the primary stream in a connect-fail rebuild loop.
+          tailscale ssh "root@${POD_HOST}" "
+            cd /workspace/devai
+            rm -f podlogs/STOP
+            setsid nohup bash scripts/supervise_skybot.sh ${TS_STEPS} \
+              > podlogs/supervisor.log 2>&1 < /dev/null &
+            sleep 25
+            tail -5 podlogs/supervisor.log
+            echo \"run pid: \$(cat podlogs/skybot_run.pid 2>/dev/null || echo none)\""
+
+      - name: stop
+        if: ${{ github.event.inputs.action == 'stop' }}
+        run: |
+          set -euo pipefail
+          # Graceful only. Never kill: the supervisor reads a kill as a crash
+          # and relaunches, which has stranded runs before.
+          tailscale ssh "root@${POD_HOST}" '
+            cd /workspace/devai
+            touch podlogs/STOP
+            echo "STOP written; the agent finishes its segment and exits."
+            for i in $(seq 1 30); do
+              pgrep -f "run_minecraft[.]py" >/dev/null || { echo "stopped"; exit 0; }
+              sleep 10
+            done
+            echo "still running after 5 min — it may be mid-segment; check status."'

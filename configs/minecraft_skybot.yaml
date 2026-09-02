@@ -254,8 +254,38 @@ world_model:
   stochastic_size: 48
   stochastic_classes: 48
   deterministic_size: 2048
-  encoder_hidden: 512
-  decoder_hidden: 512
+  # (5/5) 512 -> 768. THE WEAKEST OF THE FIVE, kept last on purpose.
+  # MEASURED COST, which is far below the estimate this shipped on: the
+  # world model goes 216 -> 260 MB fp32 (+132 MB with Adam), NOT the
+  # ~75 -> ~150 MB decoder growth predicted — because the decoder does not
+  # scale with this knob at all (see decoder_hidden below). What actually
+  # grew is the encoder (12.3 -> 16.5) and the RSSM's embed width
+  # (90.5 -> 109.4). It still invalidates world_model.pt outright. My reading is that this world model
+  # is DATA-starved, not capacity-starved — it has essentially never seen a
+  # log break — and change (1) tests that hypothesis far more cheaply.
+  # Included because it was asked for; FIRST THING TO REVERT if the WM block
+  # time regresses without a loss improvement.
+  # NOTE: this moves rssm.obs_dim, which the fovea head's input width is
+  # derived from — but that reads the LIVE object, never config
+  # (developmental_loop.py ~894), so it follows automatically. The
+  # symbolizer's head_arch guard will correctly report fovea_head=FRESH.
+  encoder_hidden: 768
+  # ---- decoder_hidden IS NOT READ BY ANYTHING (found 2026-09-01) --------
+  # Measured while landing this wave: raising it 512 -> 768 changed the
+  # decoder by exactly 0 bytes (75.2 MB before and after). Two reasons, both
+  # verifiable:
+  #   * nothing in the tree reads `world_model.decoder_hidden` — the loop
+  #     passes only `hidden_dim=wm_cfg["encoder_hidden"]` to WorldModel;
+  #   * CNNDecoder ACCEPTS a `hidden_dim` argument and never uses it in the
+  #     body — its size is set by latent_dim (the fc layer) and the
+  #     image_size channel ladder.
+  # Left at 768 for symmetry with encoder_hidden and flagged at boot, the
+  # same treatment policy.batch_size gets: a config key that does nothing
+  # must SAY it does nothing rather than imply a capacity that is not there.
+  # Making it real means giving CNNDecoder an actual fc stack — an
+  # architecture change with no evidence behind it, deliberately not done
+  # inside a sizing wave.
+  decoder_hidden: 768
   learning_rate: 0.0003
   # ---- DATA DIET 2026-08-23: SPAN, RATIO, HORIZON ----------------------
   # These four are RUNTIME dimensions, not parameter shapes, so unlike the
@@ -285,7 +315,27 @@ world_model:
   #    THE GOVERNOR IS THE EXISTING LOG LINE: `AsyncWM replay-ratio: N/M
   #    blocks run (skip X%)`. It reads 0.0% today; if raising this pushes it
   #    past ~10% the trainer has stopped keeping up and this went too far.
-  batch_size: 8
+  # ===== CAPACITY WAVE (2026-09-01) =====================================
+  # Five sizing changes landed together. They are together because there was
+  # nothing to invalidate: no pod, no live brain, and skill_bank.storage_dir
+  # was already repointed to an empty dir by the arch: rssm change. Two of
+  # them are checkpoint-breaking, so doing them NOW is free and doing them
+  # after a run would orphan accumulated state.
+  # ATTRIBUTION IS BOUGHT ON CRAFTER, not here — five capacity changes in one
+  # Minecraft run cannot be told apart, and each is a one-key ablation on
+  # configs/crafter.yaml, which is CPU-viable on a Mac Mini over a weekend.
+  # (1/5) 8 -> 16. A 54M-param world model updated on 8 sequences carries
+  # high gradient noise, and this model is the substrate for EVERYTHING:
+  # imagination, prospection, the policy's input under arch: rssm, and
+  # mastery's WM-fidelity ratio. Costs ~+1 GB of activations.
+  # FREE SIDE EFFECT, and it is the one that matters most here: the batch
+  # quotas are int(fraction x batch_size). At 8 that was int(0.15*8)=1 goal
+  # window and int(0.05*8)=0 terminal; at 16 it is 2 goal windows and still
+  # 0 terminal. Goal-prioritised replay DOUBLES — and that is the mechanism
+  # most starved of the rare log break the whole scoreboard turns on.
+  # REVERT IF: the AsyncWM `block ms/iter` line roughly doubles without a
+  # matching drop in wm loss.
+  batch_size: 16
   sequence_length: 32
   train_iters: 384
   # ---- ...OR LET THE MEASURED SKIP RATE SET IT (2026-09-01) ------------
@@ -352,10 +402,25 @@ world_model:
     # every stream: N streams each taking a fraction of the machine is an
     # N-times overshoot, and N is exactly what varies.
     max_ram_frac: 0.6
-    # Absolute GB cap on top of the fraction; 0 = fraction only. Set this on
-    # a shared cluster node whose cgroup limit is generous but whose memory
-    # is not ours alone.
-    hard_max_gb: 0
+    # Absolute GB cap on top of the fraction; 0 = fraction only.
+    #
+    # ---- 0 -> 16 (2026-09-02): A DECISION, NOT A SIDE EFFECT ------------
+    # At fraction-only the ceiling was whatever 60% of the box happened to
+    # be — 38 GB on a 64 GB node, i.e. ~772k transitions (~36 hours of
+    # experience), because 99.87% of every row is the 49,152-byte uint8
+    # frame. Nothing derived that from what the world model NEEDS; it was
+    # the machine size leaking into the learning setup.
+    #
+    # 16 GB = ~325k transitions = ~15 hours of history. Still large by any
+    # replay standard, and there is a real argument it should not be bigger:
+    # this is a LIFELONG, non-stationary stream, so half of a 36-hour buffer
+    # is behaviour the agent has since abandoned, and the WM spends capacity
+    # modelling a policy that no longer exists. Whether recency beats
+    # history here is genuinely unknown — which is exactly why the number
+    # should be a deliberate knob someone can move while watching `wm/loss`,
+    # not an accident of node RAM. The fraction still applies underneath, so
+    # a small node is still protected; on a big node THIS is the ceiling.
+    hard_max_gb: 16
   # 4. PERSIST THE MEMORY. The buffer had NO save/load path at all, so the
   #    supervisor's automatic crash-relaunch (and live Python exceptions have
   #    caused those) restarted world-model training from EMPTY. Written on the
@@ -502,7 +567,13 @@ curiosity:
   # is a nudge toward the door, not a punishment for opening one, and
   # crafting still earns its extrinsic tier inside the menu.
   gui_dwell_weight: 0.05
-  gui_dwell_steps: 200
+  # 200 -> 100 (2026-09-01, action_repeat 2 -> 4). STEP-denominated: Phi is
+  # -min(1, gui_run/steps), so at 200 steps x 4 ticks the dwell cost only
+  # saturated after 800 GAME TICKS — halving, in world time, the one gradient
+  # pulling the agent back out of a menu. The incident this term exists for
+  # ran 10,149 consecutive steps inside a wandering villager's trade screen.
+  # 100 restores the original ~400-tick meaning.
+  gui_dwell_steps: 100
   # BORING-VIEW BASE DISCOUNT (2026-08-16). Run of 2026-08-16, -90 clamp:
   # ICM/LP base +0.0147/step = 96% of the drive, paid for watching clouds
   # drift — the sky discount only ever covered the itemised novelty term,
@@ -650,28 +721,60 @@ curiosity:
   # validated without a live run. Raise to 4-8 when there is a pod to watch,
   # and check that `Curiosity (mean/step)` is unchanged — if it moves, this
   # is the first thing to revert.
-  # HELD AT 1 (2026-09-01), and this is a deliberate non-change.
-  # The analysis for raising it stands and is worth recording: at 1 this runs
-  # a full ICM forward+backward on a batch of TWO every env step — the worst
-  # gradient-to-kernel-launch ratio in the loop, on the acting thread, i.e.
-  # straight out of the step-rate budget. At 8 the optimizer would see 16
-  # rows, which is also a better gradient. It is not a reward change either:
-  # the LP prototype bank, bucket histories and running median/std all live
-  # in compute_intrinsic_reward, which runs every step regardless.
+  # HELD AT 1 — and as of 2026-09-02 this is SETTLED BY MEASUREMENT, not by
+  # caution. The pod run this comment used to ask for has now happened
+  # (RTX A4000, /tmp/inv_icm.py + /tmp/inv_lp.py). Both numbers:
   #
-  # BUT tests/_throughput_wave_smoke.py::A1f asserts this is 1, and says why:
-  # "K>1 is NOT identical (one Adam step on K*N samples != K steps on N) and
-  # cannot be validated without a live run. Ship at 1; raise it with a pod to
-  # watch." That is a self-explaining contract, and this session has no pod
-  # to watch. Flipping it here would be exactly the "quietly appending four
-  # lines of YAML" that CLAUDE.md §5 forbids.
+  #   SPEED   train_every=8 is a big win: 15.28 -> 2.59 ms per env step,
+  #           saving 12.7 ms/step, i.e. 83% of the ICM training cost. This
+  #           part of the old analysis was right, and it is the largest
+  #           single unpulled throughput lever in the loop.
+  #   REWARD  and it fails this comment's OWN revert test. Over 400 steps on
+  #           six recurring scenes, `Curiosity (mean/step)` measured
+  #           0.00251 at K=1 vs 0.00131 at K=8 — the intrinsic drive is
+  #           roughly HALVED (-47.9%). Not noise: the same collapse shows in
+  #           both halves of the run (first 0.00396->0.00229, last
+  #           0.00106->0.00032).
   #
-  # TO RAISE IT: start the pod, set this to 8, and watch
-  # `Curiosity (mean/step)` for three segments — unchanged means the batching
-  # is sound. `Phase timing: curiosity` (new this wave) now says what it
-  # would buy, which is the measurement that was missing when this knob was
-  # first staged. Update the assertion in that test at the same time, with
-  # the measured numbers.
+  # WHY THE OLD REASONING ABOVE WAS WRONG, since it reads convincingly:
+  # it argued this is "not a reward change" because the LP prototype bank and
+  # bucket histories live in compute_intrinsic_reward, which runs every step
+  # regardless. True, and irrelevant. Learning progress is not a function of
+  # the error, it is the DROP in that error between two visits to the same
+  # prototype — and the error only drops because train_step ran. Starving
+  # train_step 8x starves the exact quantity LP integrates. The bookkeeping
+  # does keep running every step; it just has 8x less progress to find.
+  # Measured parameter divergence confirms the two are not equivalent
+  # optimizers: after identical data, ||A-init||=1.87 vs ||B-init||=0.59,
+  # cosine between the two update directions 0.586 — K=8 moves a third as
+  # far, in a meaningfully different direction.
+  #
+  # SO: the 12.7 ms/step is real but it is NOT free, and paying for it in
+  # curiosity is the worst possible currency in this project — see CLAUDE.md
+  # §9, where every historical "win" was the agent finding a way to be paid
+  # for doing nothing.
+  #
+  # AND THE OBVIOUS RESCUE DOES NOT WORK. The first version of this note
+  # recommended "K=2 or K=4 with a compensating ICM lr raise". That was
+  # written before measuring it, and measuring it (inv_lp2.py, same pod,
+  # same session) killed it. Scaling lr by K does not restore the signal, it
+  # overshoots wildly and NON-MONOTONICALLY:
+  #     K=2 lr x1 -47.8%  | lr x2  +168.8%
+  #     K=4 lr x1 -75.3%  | lr x4   +79.5%
+  #     K=8 lr x1 -79.4%  | lr x8  +388.9%
+  # A curiosity mean 5x the baseline is not a rescue. LP is an error DROP,
+  # so an over-large step produces big drops that read as learning progress
+  # while being optimizer thrash — a curiosity farm sourced from instability
+  # rather than from the world getting more predictable. There is no K here
+  # that is merely "a bit cheaper"; every K trades the drive for compute at
+  # a rate this project cannot afford.
+  #
+  # CAVEAT ON THE MAGNITUDES, so nobody over-reads them: absolute LP means
+  # vary run-to-run (the probe's action stream is not seeded, so K=1 measured
+  # 0.00251 in one probe and 0.00139 in the next). The DIRECTION is robust —
+  # every K at unchanged lr lost 48-79% of the drive across both probes, and
+  # every lr-compensated K overshot. Treat the signs as established and the
+  # exact percentages as indicative.
   train_every: 1
   # METABOLIC EFFORT (2026-08-09): attack/use/jump steps cost this much
   # (intrinsic channel, ledger source "effort"). Observed live: sustained
@@ -822,9 +925,43 @@ curiosity:
   null_action: 0        # macro 0 = noop in TREECHOP_MACROS
   lp_abs_frac: 0.05
   lp_proto_thresh: 0.025
-  lp_max_protos: 512
+  # ---- 512 -> 4096 (2026-09-02) ---------------------------------------
+  # The ceiling on how many distinct SCENE PROTOTYPES learning progress can
+  # hold, and the real capacity lever for the exploration drive — more so
+  # than feature_dim, which was raised 256->512 the day before.
+  #
+  # WHY IT MATTERS. LP is the error DROP within a prototype's own 30-sample
+  # history. When the LRU evicts a prototype it drops that history with it
+  # (`_bucket_err.pop(old)` in learning_progress.py), so a scene the agent
+  # had already mastered comes back reading as brand new — the signal that
+  # decides what is interesting manufactures fake novelty out of its own
+  # forgetting. 512 prototypes is very few for Minecraft: day/night, biomes,
+  # varied terrain and self-dug holes all mint distinct pooled-pixel vectors,
+  # so the set churns constantly.
+  #
+  # COST: ~786 KB of HOST RAM (4096 x 48 dims x 4 B). Not VRAM. The per-step
+  # CPU cost is held flat by the prototype-matrix cache added alongside this
+  # (see _proto_arr) — without that cache this change would have been an 8x
+  # allocate-and-copy on the hot path every step, which is the opposite of
+  # what it is for.
+  # REVERT IF: `Phase timing: curiosity` rises materially, or the LP census
+  # shows the drive getting noisier rather than steadier.
+  lp_max_protos: 4096
   exploration_decay_rate: 0.02
-  feature_dim: 256
+  # (2/5) 256 -> 512. The highest value-per-byte change in the wave.
+  # This is the space the ENTIRE exploration drive is computed in: learning
+  # progress is literally error-reduction measured here, and the forward
+  # model has to make "did MY ACTION cause this change" recoverable from it.
+  # 256 dims to carry a 128px Minecraft scene is a narrow channel deciding
+  # what the agent finds interesting — and every failure in this project's
+  # history is the agent finding the wrong thing interesting (sky 96% of the
+  # drive, a menu 77% of income, dirt 85% of 2231 breaks).
+  # Costs ~5 -> ~20 MB. Invalidates nothing: the ICM is deliberately NOT in
+  # the resume set (_resume_smoke asserts `curiosity` is refused BY NAME so a
+  # config typo cannot resurrect a stale exploration drive).
+  # REVERT IF: `Curiosity (mean/step)` shifts by more than noise without a
+  # matching change in what the census says the drive is paid for.
+  feature_dim: 512
   hidden_dim: 256
   forward_loss_weight: 0.8
   inverse_loss_weight: 0.2
@@ -878,7 +1015,24 @@ symbolic_grounding:
   #   ollama create qwen2.5vl:7b-q4 -f /tmp/Modelfile -q q4_K_M
   # A startup probe logs the RESOLVED model and warns loudly if this tag is
   # missing, rather than silently labelling with a different sensor.
-  model: qwen2.5vl:7b-q4
+  #
+  # ---- 7b-q4 -> 3b-q4 (2026-09-02) -------------------------------------
+  # Same VRAM argument one size down: ~5.5 GB -> ~2.2 GB COMPUTED, not
+  # measured (no CUDA box in hand when this was written). This is a SECOND
+  # sensor change stacked on the first, so the same watch-list applies and
+  # matters more, not less: reliability_floor, min_labels, the
+  # degenerate-signal monitor, negative-evidence, and now also the boot-time
+  # smoke probe (probe_ollama_model, llm_module.py) that actually exercises
+  # the model rather than just checking the tag is present. Watch
+  # per-predicate agreement over the first few hundred labels; if it falls,
+  # revert the line below BEFORE suspecting anything else.
+  # Prompt is UNCHANGED on purpose — still the flat boolean list; a smaller
+  # model answering the same question is the whole experiment. Provision:
+  #   printf 'FROM qwen2.5vl:3b\n' > /tmp/Modelfile
+  #   ollama create qwen2.5vl:3b-q4 -f /tmp/Modelfile -q q4_K_M
+  # REVERT TARGET, one line away:
+  # model: qwen2.5vl:7b-q4
+  model: qwen2.5vl:3b-q4
   # Downscale the WHOLE-FRAME request to this longest side before the PNG
   # encode. 336 is qwen2.5vl's ViT tile size, so the model sees the tiling it
   # would have produced anyway and stops paying to re-tile pixels it was
@@ -893,6 +1047,11 @@ symbolic_grounding:
   # magnet the per-step, pose-dependent centring gradient every potential was
   # missing. Full-frame cadence halves (each channel labels every ~2x
   # interval); the anneal absorbs it.
+  # Re-run the boot smoke probe (llm_module.probe_ollama_model) every this
+  # many CONSECUTIVE failed generate calls, so a mid-run Ollama crash or
+  # restart is reported instead of silently producing zero labels at DEBUG
+  # for the rest of a multi-day run. 0 = never re-probe.
+  reprobe_after_failures: 5
   fovea: true
   fovea_frac: 0.4
   # FOVEA CADENCE (2026-08-08): fixed, NOT annealed. The anneal is driven by
@@ -946,6 +1105,41 @@ symbolic_grounding:
   anneal_agreement: 0.9
   hidden_dim: 256
   lr: 0.001
+  # ---- QUALITY OVER SPEED: THE SYMBOLIC LEARNER (2026-09-01) ----------
+  # ORDER MATTERS HERE. Before this, every VLM label produced ONE gradient
+  # step at batch size 1 and was then discarded. At interval 60 and ~3 agent
+  # steps/s that is a label every ~20 s — roughly 4-8k labels in a 24-hour
+  # run, to fit 29 binary predicates from a 4352-d latent. Adding capacity
+  # under that regime overfits; adding labels is what pays. So: replay
+  # first, then width, then the ensemble.
+  #
+  # 1. REPLAY. Keep every label and train minibatches over all of them. A
+  #    latent is 4352 float32 = 17.4 KB, so 50k labels is ~870 MB of HOST
+  #    RAM (not VRAM — batches move to the device on sample). This is the
+  #    single highest-value change in the block and it is nearly free.
+  replay_capacity: 50000
+  replay_batch: 64
+  # Gradient steps per member per new label. 8 turns ~6k labels/day into
+  # ~48k updates/day over the whole history instead of 6k over singletons.
+  # Raise for more quality per label; it costs GPU time, not memory.
+  replay_steps: 8
+  # 2. CAPACITY, now that labels are reused. 256 hidden / 3 layers was sized
+  #    when the head read 512-d encoder features; it now reads the 4352-d
+  #    RSSM latent, a 17:1 squeeze. 512/4 costs ~15 MB with Adam.
+  head_hidden: 512
+  head_layers: 4
+  # 3. ENSEMBLE. K independently initialised heads, each trained on its OWN
+  #    replay minibatches so they genuinely diverge. Spread across members is
+  #    epistemic uncertainty — the axis a single sigmoid does not have, and
+  #    the one that separates "confident" from "collapsed to a constant".
+  #    That distinction is exactly what was missing when llava's
+  #    tree_visible rode a stuck-true output to reliability 1.0 unopposed.
+  #    1 = off and byte-identical.
+  head_members: 5
+  # Do not assert a fact the ensemble does not agree on. 0.15 std across 5
+  # members is a loose gate (a genuinely known predicate sits near 0.02);
+  # tighten once `symbol disagreement` in the segment log has a baseline.
+  max_disagreement: 0.15
   fact_threshold: 0.7
   min_labels: 5
   reliability_floor: 0.35
@@ -1011,6 +1205,25 @@ policy:
   # orphaned, so skill_bank.storage_dir is versioned below. The old directory
   # is NEVER wiped — see CLAUDE.md section 3.
   arch: rssm
+  # ---- POLICY TRUNK WIDTH (2026-09-01) ---------------------------------
+  # Newly exposed; it was hardcoded at 256 in the loop. 256 was sized for
+  # arch: wm, where the actor read 512-d encoder features — a 2:1 squeeze.
+  # Under arch: rssm the input is 4352 (latent) + 17 (proprio) + 98
+  # (knowledge) = 4467, so one Linear now compresses 17:1 before the policy
+  # sees anything. That may well be too narrow to exploit the recurrent state
+  # the rssm change exists to deliver.
+  # (3/5) RAISED TO 512 (capacity wave, 2026-09-01). ~35 MB with Adam —
+  # less than the dead glue gate this session removed, so it comes out of
+  # headroom rather than out of the card.
+  # INVALIDATES EVERY STORED SKILL: actor/critic shapes move and
+  # load_state_dict's arch guard refuses them. skill_bank_mc_rssm is empty
+  # today, so this is free NOW and must never be done once skills exist.
+  # STILL HAS NO MEASUREMENT BEHIND IT — settle 256 vs 512 on a Crafter
+  # ablation; this ships on the argument that a 17:1 squeeze in one Linear
+  # is a worse default than a 9:1 one, not on evidence.
+  # REVERT IF: entropy collapses faster than at 256 (`Policy: entropy`,
+  # `max_prob`) — a wider trunk can overfit a small rollout.
+  hidden_dim: 512
   algorithm: PPO
   learning_rate: 0.0003
   n_steps: 1024
@@ -1035,8 +1248,18 @@ policy:
   # saving while on — deliberately: the first live run proves the carry is
   # correct, then set it false to collect the speedup. `Feat drift (max)`
   # prints per segment; ~0 means no async WM update landed between the two.
-  reuse_encoder_feats: true
-  verify_encoder_feats: true
+  # ---- BOTH FORCED FALSE BY arch: rssm (2026-09-01) -------------------
+  # The carry optimisation and its self-check are wm-only. Under arch: rssm
+  # the policy's input is the world model's LATENT, produced fresh from each
+  # env's own RSSM row every step and never carried across a step boundary —
+  # so there is nothing to carry and nothing to recompute (`_encode` refuses
+  # by design, because h is recurrent and is not a function of one frame).
+  # The loop already overrides these at construction and logs it; leaving
+  # them `true` here left the config ASSERTING A LIVE SELF-CHECK THAT IS NOT
+  # RUNNING, and `Feat drift (max)` would never print. Set them back to true
+  # only alongside arch: wm.
+  reuse_encoder_feats: false
+  verify_encoder_feats: false
   # 0.99 -> 0.995 (2026-09-01). ~100 -> ~200 decision horizon. Finding a
   # tree, aiming at the trunk and holding through the break is a
   # multi-hundred-step chain, so at 0.99 the approach that made a break
@@ -1410,7 +1633,12 @@ llm:
     # in sight. Still budgeted + pure-forward-only, so it cannot become a
     # parked income; budget refills on sighting and trickles via regen.
     seek_forward_nudge: 0.05
-    seek_nudge_budget: 200
+    # 200 -> 100 (2026-09-01, action_repeat 2 -> 4). Also STEP-denominated:
+    # left alone the search drive would last twice as long in world time.
+    # Halved together with seek_nudge_regen below so their RATIO is
+    # unchanged — that ratio is what makes search able to starve but never
+    # die, and it was bought by a measured 10h stall at nudge_left=0.
+    seek_nudge_budget: 100
     # NUDGE REGEN (2026-08-07): the budget refilled ONLY on a goal sighting,
     # so a bot that burned it without ever finding a tree lost its search
     # drive PERMANENTLY (measured: nudge_left=0 for 10h+, parked in a
@@ -1418,7 +1646,9 @@ llm:
     # many steps — search can starve but never die. 0 = off.
     # 500 -> 250 (2026-08-08): doubled sustain rate alongside the nudge
     # raise — search is now the intended idle behaviour.
-    seek_nudge_regen: 250
+    # 250 -> 125 (2026-09-01): halved with seek_nudge_budget above so one
+    # nudge still trickles back per the same amount of GAME TIME.
+    seek_nudge_regen: 125
     # STALE-LP DISCOUNT (2026-08-07): with ema_leak=0 an absent category's
     # LP freezes; measured 10h fossils (water/zombie/sheep ~0.4 vs global
     # 0.03) would grab the target on their first re-sighting with zero fresh
@@ -1561,6 +1791,49 @@ infra:
     # signal, and still strictly one-shot per set.
     depth_exponent: 2.0
     max_depth: 8
+  # ---- ANTICIPATION (2026-09-02, user-specified curve) -----------------
+  # Per grounded predicate: repeated SIGHTING without the associated caused
+  # effect builds a bounded anticipation level; the step the effect actually
+  # happens, the level is paid out (scaled by how long it had been building)
+  # and reset to zero; and the whole channel decays toward nothing as the
+  # agent gets independently better at producing that effect — reusing
+  # infra/stack.py's familiarity_curve, the SAME mastery clock
+  # category_boringness already uses, rather than a second one that could
+  # drift. Intrinsic channel ONLY (see infra/anticipation.py's docstring for
+  # why prim_extrinsic would train the world model on its own inference).
+  anticipation:
+    enabled: true
+    # THE "heavily guide when reward cannot be found" knob. Bounded from
+    # both sides by design, not by this number alone: the ramp/decay curve
+    # caps any single payout, and RewardMixer's return_ratio_cap already
+    # limits how much any intrinsic term can dominate once real extrinsic
+    # reward starts arriving. 0.5 is an honest starting weight, not a token
+    # one — raise it if the segment log's "Anticipation bonus" line shows it
+    # is inert against the rest of the intrinsic drive.
+    weight: 0.5
+    # a predicate counts as "seen" this step at or above this probability
+    sight_threshold: 0.5
+    # ANTI-FARM GATE: minimum steps between two counted sightings of the
+    # SAME predicate. Without this, continuous presence (staring) would
+    # inflate the anticipation level every step — exactly the sky/menu/
+    # trunk-holding farm shape this project has paid for three times.
+    # Sighting only counts on genuine RE-encounters, not on dwelling.
+    sight_throttle_steps: 50
+    # ceiling on the anticipation counter — bounded, never unbounded, so a
+    # predicate seen for days without its effect cannot pay an unbounded
+    # jackpot the one time it finally happens
+    wait_cap: 8
+    # EMA rate learning predicate<->effect association (contrastive against
+    # each predicate's own baseline presence, same formula family as the
+    # fovea association block in infra/stack.py)
+    assoc_beta: 0.01
+    # an association must clear this before it is eligible to pay. A
+    # predicate with no achievable correlate (sky_visible, grass_visible)
+    # never clears it and never pays — correct, not a bug: nothing "is
+    # gotten" from seeing the sky.
+    assoc_floor: 0.3
+    base_beta: 0.001
+    max_keys: 512
   empowerment_weight: 0.05
   empowerment_interval: 25
   stuck_patience: 3
@@ -1965,4 +2238,13 @@ prospection:
   weight: 0.5
   top_m: 4
   rollouts: 16
-  horizon: 15
+  # (4/5) 15 -> 24. At action_repeat 4 a horizon of 15 is 60 GAME TICKS —
+  # exactly one barehanded oak log. Prospection is "imagine before
+  # committing"; a horizon that barely spans the act it is evaluating cannot
+  # distinguish "this fells a log" from "this does nothing", which is the
+  # one discrimination the whole mechanism exists to make. 24 = 96 ticks
+  # gives real margin either side. Costs ROLLOUT COMPUTE, not memory — and
+  # the GPU sits at ~2% on the acting thread.
+  # REVERT IF: `Phase timing: act` rises materially (prospection runs in the
+  # decision path, so this is the line that would show it).
+  horizon: 24

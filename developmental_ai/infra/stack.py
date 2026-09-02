@@ -40,6 +40,21 @@ def _stable_cell_id(cell: Any) -> int:
     return zlib.crc32(str(cell).encode("utf-8", "replace")) & 0x7FFFFFFF
 
 
+def familiarity_curve(n: float, scale: float) -> float:
+    """The one mastery-decay clock in this codebase: 0 at n=0, -> 1 as n
+    grows, with `scale` the count at which familiarity crosses 0.5.
+
+    EXTRACTED 2026-09-02 (was inlined in category_boringness only). The
+    anticipation-reward module (infra/anticipation.py) needs the IDENTICAL
+    curve for its own mastery damping — "the VLM's reward decreases the more
+    SkyBot can get that reward on its own" is the same claim
+    category_boringness already makes about perceptual novelty, and a
+    second hand-written copy of this formula is how two mastery clocks
+    quietly drift apart under future tuning. Call this, don't reinline it.
+    """
+    return 1.0 - 1.0 / (1.0 + float(n) / max(1e-6, float(scale)))
+
+
 class InfraStack:
     """Bundle of general monitors with graceful per-piece degradation."""
 
@@ -356,7 +371,7 @@ class InfraStack:
             best = 0.0
             for key, a in evs.items():
                 n = self._event_counts.get(key, 0)
-                fam = 1.0 - 1.0 / (1.0 + n / float(habituation_scale))
+                fam = familiarity_curve(n, habituation_scale)
                 best = max(best, float(a) * fam)
             if best > 0.05:
                 out[cat] = min(1.0, best)

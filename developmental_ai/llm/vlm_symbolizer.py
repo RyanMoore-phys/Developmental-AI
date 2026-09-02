@@ -317,8 +317,94 @@ _REARM_MARGIN = 0.05
 FALSIFIABLE_PREDICATES = frozenset({
     "breakable_in_reach", "object_centered", "object_adjacent",
     "tree_visible",
+    # ---- SCORED AGAINST TELEMETRY SINCE 2026-09-01 -------------------
+    # The module docstring is candid that only 4 of 16 predicates were ever
+    # scored, and that the other 12 "sit at their prior forever and can never
+    # be retracted". These four are not approximations — the env emits their
+    # ground truth every single step, and it was simply never compared:
+    #   looking_up / looking_down  <- world["pitch"]
+    #   inventory_visible          <- world["gui_open"]
+    #   holding_tool               <- world["mainhand"] not in (none, air)
+    # See `observe_truth`. They are also a CALIBRATION PROBE: a VLM that
+    # cannot say which way it is looking is not one to trust on
+    # breakable_in_reach, and that is now visible before it poisons anything.
+    "looking_up", "looking_down", "inventory_visible", "holding_tool",
 })
 _UNFALSIFIABLE_RELIABILITY_CAP = 0.7
+
+# predicate -> callable(world_info) -> Optional[bool] ground truth.
+# None means "the world cannot answer right now"; only a definite answer
+# scores, so a missing telemetry field never counts as a miss.
+_TELEMETRY_TRUTH = {
+    "looking_up": lambda w: (None if w.get("pitch") is None
+                             else float(w["pitch"]) < -20.0),
+    "looking_down": lambda w: (None if w.get("pitch") is None
+                               else float(w["pitch"]) > 20.0),
+    "inventory_visible": lambda w: (None if w.get("gui_open") is None
+                                    else bool(w["gui_open"])),
+    "holding_tool": lambda w: (
+        None if w.get("mainhand") is None
+        else str(w["mainhand"]) not in ("none", "air", "")),
+}
+
+
+class LabelReplay:
+    """Ring buffer of (latent, target, mask) triples from VLM labels.
+
+    ---- THE SCARCEST RESOURCE IN THE SUBSYSTEM (2026-09-01) --------------
+    A VLM label costs ~1.5 s of shared-GPU inference and arrives roughly
+    every 20 s of wall clock. Before this existed, each one produced exactly
+    one batch-size-1 gradient step and was then thrown away. Keeping them
+    turns "4-8k labels a day" into "4-8k labels a day, each seen as often as
+    training can afford" — which is the difference between a head that has
+    seen 8k examples and one that has taken 8k steps.
+
+    ON HOST MEMORY, NOT VRAM, deliberately. A latent is 4352 float32 = 17.4
+    KB, so 50k labels is ~870 MB; that is affordable in RAM and would be a
+    third of the VRAM budget on a 12 GB card. Batches move to the device on
+    sample, which is a ~1 MB transfer for batch 64.
+
+    Stores the MASK alongside the target because VLM labels are partial: a
+    predicate the model declined to report must not teach the head a false
+    negative, and that distinction has to survive into the replay.
+    """
+
+    def __init__(self, capacity: int, dim: int, n_predicates: int):
+        self.capacity = max(0, int(capacity))
+        self.dim = int(dim)
+        self.n = int(n_predicates)
+        self._lat = None
+        self._tgt = None
+        self._msk = None
+        self._size = 0
+        self._pos = 0
+        if self.capacity > 0:
+            self._lat = torch.zeros(self.capacity, self.dim)
+            self._tgt = torch.zeros(self.capacity, self.n)
+            self._msk = torch.zeros(self.capacity, self.n)
+
+    def __len__(self) -> int:
+        return self._size
+
+    def add(self, latent: torch.Tensor, target: torch.Tensor,
+            mask: torch.Tensor) -> None:
+        if self.capacity <= 0:
+            return
+        i = self._pos
+        self._lat[i] = latent.detach().reshape(-1).float().cpu()
+        self._tgt[i] = target.detach().reshape(-1).float().cpu()
+        self._msk[i] = mask.detach().reshape(-1).float().cpu()
+        self._pos = (i + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device=None):
+        if self._size == 0:
+            return None, None, None
+        idx = torch.randint(0, self._size, (min(batch_size, self._size),))
+        lat, tgt, msk = self._lat[idx], self._tgt[idx], self._msk[idx]
+        if device is not None:
+            lat, tgt, msk = lat.to(device), tgt.to(device), msk.to(device)
+        return lat, tgt, msk
 
 
 class GroundedSymbolHead(nn.Module):
@@ -330,18 +416,71 @@ class GroundedSymbolHead(nn.Module):
     """
 
     def __init__(self, latent_dim: int, n_predicates: int = len(PREDICATES),
-                 hidden_dim: int = 256, lr: float = 1e-3):
+                 hidden_dim: int = 256, lr: float = 1e-3,
+                 n_layers: int = 3, n_members: int = 1):
         super().__init__()
         self.n_predicates = int(n_predicates)
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, self.n_predicates),
-        )
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        self.n_members = max(1, int(n_members))
+        self.n_layers = max(2, int(n_layers))
+
+        def _mlp():
+            layers = [nn.Linear(latent_dim, hidden_dim), nn.ELU()]
+            for _ in range(self.n_layers - 2):
+                layers += [nn.Linear(hidden_dim, hidden_dim), nn.ELU()]
+            layers += [nn.Linear(hidden_dim, self.n_predicates)]
+            return nn.Sequential(*layers)
+
+        # ---- ENSEMBLE (2026-09-01) ---------------------------------------
+        # K independently initialised MLPs. Members are trained on
+        # INDEPENDENTLY SAMPLED replay minibatches (see train_replay), so
+        # they genuinely diverge rather than being K copies of one trajectory.
+        #
+        # WHY: `fact_threshold` currently reads a single sigmoid as
+        # confidence, which cannot tell "the head is sure" from "the head has
+        # collapsed to a constant" — and this project has watched a predicate
+        # collapse to a stuck-true constant and ride to reliability 1.0
+        # unopposed (llava's tree_visible). Spread ACROSS members is
+        # epistemic uncertainty: a collapsed predicate shows near-constant
+        # output AND near-zero disagreement, which is distinguishable from
+        # genuine confidence by construction rather than by tuning.
+        #
+        # n_members=1 keeps the module arithmetically identical to the
+        # pre-2026-09-01 head (mean over one member is that member).
+        self.members = nn.ModuleList([_mlp() for _ in range(self.n_members)])
+        # One optimizer per member: a shared one would couple their updates
+        # through Adam's moment estimates and erode the diversity that makes
+        # the disagreement signal mean anything.
+        self.optimizers = [torch.optim.Adam(m.parameters(), lr=lr)
+                           for m in self.members]
+        # kept so existing code paths that reach for `.optimizer` still work
+        self.optimizer = self.optimizers[0]
+
+    @property
+    def net(self):
+        """Back-compat alias for the single-member case."""
+        return self.members[0]
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.net(latent)
+        """MEAN LOGITS across the ensemble (identity when n_members == 1)."""
+        if self.n_members == 1:
+            return self.members[0](latent)
+        return torch.stack([m(latent) for m in self.members], 0).mean(0)
+
+    def member_probs(self, latent: torch.Tensor) -> torch.Tensor:
+        """(K, B, P) per-member probabilities — the raw material for spread."""
+        with torch.no_grad():
+            return torch.stack(
+                [torch.sigmoid(m(latent)) for m in self.members], 0)
+
+    def disagreement(self, latent: torch.Tensor) -> torch.Tensor:
+        """(P,) std across members. 0 for a single member, by definition —
+        which is the honest answer: one head cannot disagree with itself, so
+        an ensemble of one supplies no uncertainty and the caller must not
+        pretend otherwise."""
+        if self.n_members == 1:
+            return torch.zeros(self.n_predicates)
+        p = self.member_probs(latent)              # (K, B, P)
+        return p.std(dim=0).mean(dim=0).cpu()      # (P,)
 
     def predict(self, latent: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -354,21 +493,65 @@ class GroundedSymbolHead(nn.Module):
         predicates the VLM did not report, so a partial label never teaches
         the head a false negative. `pos_weight` (per-predicate) upweights the
         POSITIVE term for rare classes — without it a predicate present in
-        ~9% of frames is best served by answering "no" forever."""
-        logits = self.forward(latent)
+        ~9% of frames is best served by answering "no" forever.
+
+        EVERY MEMBER trains on this sample (it is the one fresh label and all
+        of them should see it); diversity comes from the independently
+        sampled replay minibatches in train_replay, not from withholding new
+        evidence."""
+        total = 0.0
+        for m, opt in zip(self.members, self.optimizers):
+            loss = self._member_loss(m, latent, target, mask, pos_weight)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += float(loss.item())
+        return total / len(self.members)
+
+    def _member_loss(self, member, latent, target, mask, pos_weight):
+        logits = member(latent)
         loss_el = F.binary_cross_entropy_with_logits(
             logits, target, reduction="none",
             pos_weight=(pos_weight.reshape(1, -1).to(logits.device)
                         if pos_weight is not None else None))
         if mask is not None:
-            denom = mask.sum().clamp(min=1.0)
-            loss = (loss_el * mask).sum() / denom
-        else:
-            loss = loss_el.mean()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return float(loss.item())
+            return (loss_el * mask).sum() / mask.sum().clamp(min=1.0)
+        return loss_el.mean()
+
+    def train_replay(self, buf, batch_size: int, n_batches: int,
+                     pos_weight: Optional[torch.Tensor] = None,
+                     device=None) -> float:
+        """Train on minibatches drawn from a label REPLAY buffer.
+
+        ---- WHY THIS IS THE HIGHEST-VALUE CHANGE HERE (2026-09-01) --------
+        Before this, `_train_head` took ONE gradient step, at batch size 1,
+        on each VLM label and then discarded it. At `interval: 60` and ~3
+        agent steps/s that is a label every ~20 s — roughly 4-8k labels in a
+        24-hour run, and therefore 4-8k single-sample gradient steps, to fit
+        29 binary predicates from a 4352-d input. Labels are by far the
+        scarcest resource in this subsystem and they were being used once.
+        Adding head capacity under that regime would have overfit, not
+        improved anything, which is why this lands before the width change.
+
+        Each MEMBER draws its OWN minibatch. That is what makes the ensemble
+        an ensemble: identical batches in the same order would leave K heads
+        following nearly the same trajectory from different inits, and the
+        disagreement signal would understate real uncertainty.
+        """
+        if not buf or batch_size <= 0 or n_batches <= 0:
+            return 0.0
+        total, steps = 0.0, 0
+        for m, opt in zip(self.members, self.optimizers):
+            for _ in range(n_batches):
+                lat, tgt, msk = buf.sample(batch_size, device=device)
+                if lat is None:
+                    break
+                loss = self._member_loss(m, lat, tgt, msk, pos_weight)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total += float(loss.item()); steps += 1
+        return total / max(1, steps)
 
 
 class VLMSymbolizer:
@@ -414,8 +597,23 @@ class VLMSymbolizer:
         # Input width of the FOVEA head. Set this to the world model's
         # encoder width to put the head on crop features (see below).
         fovea_latent_dim: Optional[int] = None,
+        # None -> hidden_dim, so an unset config is byte-identical.
+        head_hidden: Optional[int] = None,
+        head_layers: int = 3,
+        head_members: int = 1,
+        replay_capacity: int = 0,
+        replay_batch: int = 64,
+        replay_steps: int = 0,
+        max_disagreement: float = 1.0,
+        reprobe_after_failures: int = 5,
     ):
         self.model = model
+        # See _ollama_scene_query: re-run the boot smoke probe every this
+        # many CONSECUTIVE failures, so a mid-run Ollama crash is reported
+        # instead of silently producing zero labels at DEBUG forever. 0 =
+        # off (never re-probe).
+        self.reprobe_after_failures = max(0, int(reprobe_after_failures))
+        self._consec_failures = 0
         self.base_interval = max(1, int(interval))
         self.interval = self.base_interval
         self.max_interval = max(self.base_interval, int(max_interval))
@@ -452,8 +650,17 @@ class VLMSymbolizer:
             if self._available else None)
         self._channel = _AsyncChannel(self._executor, True)
 
+        head_hidden = int(head_hidden or hidden_dim)
+        self.head_hidden = head_hidden      # part of the arch signature
         self.head = GroundedSymbolHead(
-            latent_dim, len(PREDICATES), hidden_dim, lr).to(self.device)
+            latent_dim, len(PREDICATES), head_hidden, lr,
+            n_layers=head_layers, n_members=head_members).to(self.device)
+        # See LabelReplay: labels are the scarce resource, not parameters.
+        self.replay = LabelReplay(replay_capacity, latent_dim, len(PREDICATES))
+        self.replay_batch = int(replay_batch)
+        self.replay_steps = int(replay_steps)
+        self.max_disagreement = float(max_disagreement)
+        self.last_disagreement: Dict[str, float] = {}
 
         # ---- FOVEA: a second, SEPARATE head over the small foveal
         # vocabulary. Separate on purpose: it never emits knowledge-graph
@@ -489,8 +696,13 @@ class VLMSymbolizer:
         self._fovea_lat_cache = None
         self._fovea_lat_step = -1
         self.fovea_head = (GroundedSymbolHead(
-            self.fovea_latent_dim, len(FOVEA_PREDICATES), hidden_dim, lr
+            self.fovea_latent_dim, len(FOVEA_PREDICATES), head_hidden, lr,
+            n_layers=head_layers, n_members=head_members
         ).to(self.device) if self.fovea_enabled else None)
+        self.fovea_replay = (
+            LabelReplay(replay_capacity, self.fovea_latent_dim,
+                        len(FOVEA_PREDICATES))
+            if self.fovea_enabled else None)
         self.fovea_label_counts = {p: 0 for p in FOVEA_PREDICATES}
         # POSITIVE sightings per foveal predicate (review 2026-08-09): the
         # label count says "the head was TAUGHT about this key", which is
@@ -558,9 +770,37 @@ class VLMSymbolizer:
                 model=self.model, prompt=_SCENE_PROMPT, images=[png_bytes],
                 format="json", keep_alive=-1,
                 options={"num_predict": 256, "temperature": 0.0})
-            return (resp.get("response") or "").strip()
+            txt = (resp.get("response") or "").strip()
+            self._consec_failures = 0
+            return txt
         except Exception as e:
             logger.debug("VLMSymbolizer query failed: %s", e)
+            # ---- MID-RUN FAILURE IS NOT JUST A BOOT-TIME QUESTION --------
+            # (2026-09-02) probe_ollama_model catches a bad pull or a dead
+            # server AT BOOT. It says nothing about Ollama crashing or being
+            # restarted six hours into a run — that failure mode looked
+            # identical to "the VLM is just being slow" until now: silent,
+            # at DEBUG, forever. After a real streak of failures (not one —
+            # a single dropped request is normal on a shared GPU) re-run the
+            # same smoke check that boot uses and warn at the same volume.
+            self._consec_failures = getattr(self, "_consec_failures", 0) + 1
+            # modulo, not ==: re-arms on its own during a prolonged outage
+            # instead of warning once and going quiet for the rest of the run
+            if (self.reprobe_after_failures > 0
+                    and self._consec_failures % self.reprobe_after_failures
+                    == 0):
+                try:
+                    from developmental_ai.llm.llm_module import (
+                        probe_ollama_model)
+                    probe_ollama_model(self.model)
+                except Exception:
+                    pass
+                logger.warning(
+                    "VLM: %d consecutive failed generate calls for %s — "
+                    "re-ran the smoke probe (see the line above). If it "
+                    "also failed, the server likely crashed or restarted "
+                    "mid-run; this channel is now producing zero labels.",
+                    self._consec_failures, self.model)
             return None
 
     @staticmethod
@@ -873,7 +1113,30 @@ class VLMSymbolizer:
             agree = float(((pred == target) * mask).sum() /
                           mask.sum().clamp(min=1.0))
         self._recent_agreement.append(agree)
-        self.last_head_loss = self.head.train_step(lat, target, mask)
+        # ---- CLASS IMBALANCE, MAIN HEAD (2026-09-01) --------------------
+        # The FOVEA head has been getting `pos_weight` since 2026-08-12, with
+        # a comment explaining exactly why: at a ~9-12% positive rate plain
+        # BCE is minimised by answering "no" forever, and the head duly
+        # learned to (agreement 0.876 vs 0.8757 for the trivial always-no
+        # head). The main head — 29 predicates, several of them far RARER
+        # than that (creeper_visible, tool_worn, water_visible) — was never
+        # given the same treatment, though `label_counts`/`pos_counts` were
+        # already being tracked for it. Same computation, same clamp.
+        pw = torch.ones(1, len(PREDICATES), device=self.device)
+        for _i, _p in enumerate(PREDICATES):
+            _n = int(self.label_counts.get(_p, 0))
+            _pos = int(self.pos_counts.get(_p, 0))
+            if _n > 0 and _pos > 0:
+                pw[0, _i] = min(20.0, max(1.0, (_n - _pos) / float(_pos)))
+        self.last_head_loss = self.head.train_step(
+            lat, target, mask, pos_weight=pw)
+        # KEEP THE LABEL. One step at batch size 1 was all a ~1.5 s VLM call
+        # ever bought; the replay lets every later update see it again.
+        self.replay.add(lat, target, mask)
+        if self.replay_steps > 0:
+            self.head.train_replay(
+                self.replay, self.replay_batch, self.replay_steps,
+                pos_weight=pw, device=self.device)
         self.total_head_steps += 1
         self._maybe_anneal()
 
@@ -911,6 +1174,14 @@ class VLMSymbolizer:
             if _n > 0 and _pos > 0:
                 pw[0, _i] = min(20.0, max(1.0, (_n - _pos) / float(_pos)))
         self.fovea_head.train_step(lat, target, mask, pos_weight=pw)
+        # Same replay treatment as the main head — the fovea channel labels
+        # twice as often but each label is still a 1.5 s VLM call.
+        if self.fovea_replay is not None:
+            self.fovea_replay.add(lat, target, mask)
+            if self.replay_steps > 0:
+                self.fovea_head.train_replay(
+                    self.fovea_replay, self.replay_batch, self.replay_steps,
+                    pos_weight=pw, device=self.device)
 
     def fovea_probs(self, latent: torch.Tensor) -> Optional[Dict[str, float]]:
         """Per-step P(object under my gaze) from the agent's own latent —
@@ -1052,6 +1323,54 @@ class VLMSymbolizer:
                 n += 1
         return n
 
+    def observe_truth(self, world_info: Dict, latent: torch.Tensor) -> int:
+        """Score the head against GROUND TRUTH the env already emits.
+
+        ---- CLOSING PART OF THE VERIFIER'S BLIND SPOT (2026-09-01) --------
+        The module docstring is honest that only 4 of 16 predicates are ever
+        scored, and that the rest can never be retracted however wrong they
+        are. But four of the unscored ones are not judgement calls at all —
+        `pitch`, `gui_open` and `mainhand` arrive every step and settle
+        looking_up / looking_down / inventory_visible / holding_tool exactly.
+
+        This scores the HEAD (not the VLM) because the head is what emits
+        facts. A predicate the head gets wrong about the agent's own body
+        loses reliability and stops asserting, which is the same mechanism
+        the block-break events already drive — just pointed at evidence that
+        was sitting unused.
+
+        Cheap and unconditional: one no-grad forward the caller already has a
+        latent for, four dict lookups. Returns how many predicates scored.
+        """
+        if not isinstance(world_info, dict) or not world_info:
+            return 0
+        try:
+            probs = self.head.predict(
+                latent.reshape(1, -1).to(self.device)).squeeze(0)
+        except Exception:
+            return 0
+        n = 0
+        for p, fn in _TELEMETRY_TRUTH.items():
+            i = PREDICATE_INDEX.get(p)
+            if i is None:
+                continue
+            try:
+                truth = fn(world_info)
+            except Exception:
+                truth = None
+            if truth is None:
+                continue          # the world cannot answer; never a miss
+            said = bool(float(probs[i]) >= 0.5)
+            self._update_reliability(p, said == bool(truth))
+            # These count as observations, so the min_labels gate opens for
+            # them on evidence rather than on VLM attention alone.
+            self.label_counts[p] = self.label_counts.get(p, 0) + 1
+            if truth:
+                self.pos_counts[p] = self.pos_counts.get(p, 0) + 1
+            self.telemetry_scored = getattr(self, "telemetry_scored", 0) + 1
+            n += 1
+        return n
+
     def _update_reliability(self, predicate: str, hit: bool,
                             alpha: float = 0.1) -> None:
         if predicate not in self.reliability:
@@ -1066,9 +1385,25 @@ class VLMSymbolizer:
         gated by both head confidence and the predicate's earned reliability,
         so a hallucination-prone predicate quietly stops emitting."""
         out: List[Tuple[str, str, str, float]] = []
-        probs = self.head.predict(
-            latent.reshape(1, -1).to(self.device)).squeeze(0)
+        _lat = latent.reshape(1, -1).to(self.device)
+        probs = self.head.predict(_lat).squeeze(0)
+        # ---- ENSEMBLE DISAGREEMENT AS A FACT GATE (2026-09-01) ----------
+        # `fact_threshold` reads ONE sigmoid, which cannot distinguish "the
+        # head is confident" from "the head has collapsed to a constant" —
+        # and a collapsed predicate riding to reliability 1.0 unopposed is
+        # the documented llava failure. Spread across independently trained
+        # members is the missing axis. All-ones when n_members == 1, so a
+        # single-head config is unchanged and honestly reports no
+        # uncertainty rather than a fabricated one.
+        _dis = (self.head.disagreement(_lat)
+                if self.head.n_members > 1 else None)
+        if _dis is not None:
+            self.last_disagreement = {
+                p: float(_dis[i]) for i, p in enumerate(PREDICATES)}
         for i, p in enumerate(PREDICATES):
+            if (_dis is not None
+                    and float(_dis[i]) > self.max_disagreement):
+                continue          # the ensemble does not agree: assert nothing
             if self.label_counts.get(p, 0) < self.min_labels:
                 continue          # never observed enough to assert anything
             rel = self.reliability.get(p, 0.0)
@@ -1131,6 +1466,16 @@ class VLMSymbolizer:
                            if self.fovea_head is not None else None),
             "fovea_latent_dim": int(self.fovea_latent_dim),
             "latent_dim": int(self.latent_dim),
+            # HEAD ARCHITECTURE SIGNATURE (2026-09-01). The head became an
+            # ensemble of configurable depth, so its state-dict KEYS moved
+            # (`net.0.weight` -> `members.0.0.weight`) and its shapes follow
+            # head_hidden/head_layers. The file's own note says torch copies
+            # matching tensors BEFORE raising on a mismatch — so an
+            # unguarded load leaves a half-restored hybrid, which for a
+            # perception system is the worst possible failure. Guarded the
+            # same way vocabulary and input width already are.
+            "head_arch": [int(self.head.n_members), int(self.head.n_layers),
+                          int(self.head_hidden)],
             "reliability": dict(self.reliability),
             "label_counts": dict(self.label_counts),
             "pos_counts": dict(self.pos_counts),
@@ -1160,13 +1505,19 @@ class VLMSymbolizer:
             # hybrid rather than a clean fresh head — the same trap already
             # guarded on the fovea head.
             _want_w = int(st.get("latent_dim", self.latent_dim))
+            _want_arch = list(st.get("head_arch") or [1, 3, self.head_hidden])
+            _live_arch = [int(self.head.n_members), int(self.head.n_layers),
+                          int(self.head_hidden)]
             if (list(st.get("predicates") or []) == list(PREDICATES)
-                    and _want_w == int(self.latent_dim)):
+                    and _want_w == int(self.latent_dim)
+                    and _want_arch == _live_arch):
                 self.head.load_state_dict(st["head"])
                 _head_ok = True
                 out.append("head")
             elif _want_w != int(self.latent_dim):
                 out.append(f"head=FRESH(latent {_want_w}->{self.latent_dim})")
+            elif _want_arch != _live_arch:
+                out.append(f"head=FRESH(arch {_want_arch}->{_live_arch})")
             else:
                 out.append("head=FRESH(vocab changed)")
             if (self.fovea_head is not None and st.get("fovea_head")

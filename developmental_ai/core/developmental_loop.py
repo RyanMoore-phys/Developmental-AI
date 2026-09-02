@@ -295,6 +295,12 @@ class DevelopmentalAI:
         self._lifelong = bool(
             self.config.get("lifelong", {}).get("enabled", False))
         self.image_size = env_cfg.get("image_size", 64)
+        # Game ticks per agent decision. Cached so anything whose MEANING is
+        # in game time (not decision count) can be expressed in ticks and
+        # stay invariant when this knob moves — it went 2 -> 4 on 2026-09-01
+        # and silently doubled the world-time span of every step-denominated
+        # window in the loop.
+        self.env_action_repeat = max(1, int(env_cfg.get("action_repeat", 1)))
         self.image_channels = 1 if env_cfg.get("grayscale", False) else 3
         # Live viewer: when enabled, force rgb_array rendering so env.render()
         # yields frames to stream. Config-gated, default off (existing runs
@@ -427,6 +433,13 @@ class DevelopmentalAI:
             stochastic_size=wm_cfg.get("stochastic_size", 32),
             stochastic_classes=wm_cfg.get("stochastic_classes", 32),
             deterministic_size=wm_cfg.get("deterministic_size", 512),
+            # NOTE: `world_model.decoder_hidden` is NOT passed, and cannot be
+            # — WorldModel has one `hidden_dim`, and CNNDecoder accepts a
+            # hidden_dim it never uses (its size comes from latent_dim and
+            # the image_size channel ladder). Measured 2026-09-01: raising
+            # decoder_hidden 512 -> 768 changed the decoder by 0 bytes. The
+            # key is flagged at boot rather than left to imply a capacity
+            # that does not exist — same treatment policy.batch_size gets.
             hidden_dim=wm_cfg.get("encoder_hidden", 256),
             learning_rate=wm_cfg.get("learning_rate", 1e-4),
             pixel_obs=self.pixel_obs,
@@ -601,8 +614,10 @@ class DevelopmentalAI:
         # snapshot refreshed every N steps instead: stable buckets between
         # refreshes, representation still allowed to improve at refresh.
         # 0 = live encoder (old behaviour).
-        self._nov_enc_refresh = int(_cur_cfg.get(
-            "novelty_encoder_refresh", 0))
+        # DECISIONS -> FRAMES (see _frames_per): compared against
+        # total_timesteps, which advances by num_envs per decision.
+        self._nov_enc_refresh = self._frames_per(int(_cur_cfg.get(
+            "novelty_encoder_refresh", 0)))
         self._nov_enc = None
         self._nov_enc_stamp = -1
         # MASTERY HABITUATION (2026-08-08, see _habituation_factor): scale
@@ -863,6 +878,21 @@ class DevelopmentalAI:
                 fovea_frac=sg_cfg.get("fovea_frac", 0.4),
                 fovea_interval=sg_cfg.get("fovea_interval", None),
                 input_max_side=int(sg_cfg.get("input_max_side", 0) or 0),
+                # ---- QUALITY OVER SPEED (2026-09-01) ------------------
+                # Labels are the scarce resource, not parameters: replay
+                # first, then capacity, then the ensemble that says when the
+                # head does not know. Defaults reproduce the old behaviour
+                # exactly (no replay, one member, hidden_dim, 3 layers).
+                head_hidden=sg_cfg.get("head_hidden"),
+                head_layers=int(sg_cfg.get("head_layers", 3)),
+                head_members=int(sg_cfg.get("head_members", 1)),
+                replay_capacity=int(sg_cfg.get("replay_capacity", 0)),
+                replay_batch=int(sg_cfg.get("replay_batch", 64)),
+                replay_steps=int(sg_cfg.get("replay_steps", 0)),
+                max_disagreement=float(
+                    sg_cfg.get("max_disagreement", 1.0)),
+                reprobe_after_failures=int(
+                    sg_cfg.get("reprobe_after_failures", 5)),
                 # CROP-CONSISTENT FOVEA (2026-08-12): put the fovea head on
                 # ENCODER FEATURES OF THE CROP rather than the whole-frame
                 # RSSM latent, so its input describes the same region its
@@ -969,6 +999,16 @@ class DevelopmentalAI:
             goal_embedding_dim=glue_cfg.get("goal_embedding_dim", 16),
             max_difficulty=10,
             device=self.device,
+            # ---- DON'T BUILD THE GATE ON PIXELS (2026-09-01) -------------
+            # Same flag that installs `_NullSymbolicDecoder`, for the same
+            # reason. The gate is sized off latent_dim, so at the RSSM's 4352
+            # it is ~154 MB of VRAM for a module that is in no optimizer,
+            # runs under no_grad, and feeds a decoder that returns []. Its
+            # job — letting symbolic knowledge modulate what the agent
+            # computes — is done by KnowledgeConditioner in the policy, at
+            # 1.7 MB, trained by the PPO loss, on a path that can actually
+            # change behaviour.
+            build_gate=not self._skip_perdim_symbolic,
             # Env-relative mastery competence band. Defaults (475/0) keep
             # CartPole behavior identical; negative-reward envs override these
             # (e.g. Acrobot: target=-100, floor=-500) so a strong negative
@@ -1258,7 +1298,14 @@ class DevelopmentalAI:
         self.policy = StandaloneActorCritic(
             obs_dim=self.obs_dim,
             action_dim=self.meta_action_dim,
-            hidden_dim=256,
+            # ---- WAS HARDCODED (2026-09-01) ------------------------------
+            # 256 was chosen when arch='wm' fed the actor 512-d encoder
+            # features — a 2:1 squeeze into the trunk. arch='rssm' made the
+            # input 4352 + 17 proprio + 98 knowledge = 4467, i.e. a 17:1
+            # compression through one Linear, and nobody revisited it. Left
+            # at 256 so this change is a no-op; raised only with a
+            # measurement behind it (Crafter is where that is cheap).
+            hidden_dim=int(pol_cfg.get("hidden_dim", 256)),
             continuous=not self.is_discrete,
             learning_rate=pol_cfg.get("learning_rate", 3e-4),
             gamma=pol_cfg.get("gamma", 0.99),
@@ -1321,6 +1368,22 @@ class DevelopmentalAI:
                 and pol_cfg.get("rollout_uint8",
                                 wm_cfg.get("obs_uint8", True))),
         )
+        # A CONFIG KEY THAT DOES NOTHING MUST SAY SO — second instance
+        # (2026-09-01). `world_model.decoder_hidden` is read by nothing in the
+        # tree, and CNNDecoder ignores the hidden_dim it is handed anyway.
+        # Found by MEASURING a capacity change rather than trusting it:
+        # raising it 512 -> 768 moved the decoder by exactly 0 bytes.
+        if (wm_cfg.get("decoder_hidden") is not None
+                and int(wm_cfg["decoder_hidden"])
+                != int(wm_cfg.get("encoder_hidden", 256))):
+            logger.warning(
+                "world_model.decoder_hidden=%s is NOT read by anything (it "
+                "never has been) — WorldModel takes ONE hidden_dim, sourced "
+                "from encoder_hidden=%s, and CNNDecoder's size comes from "
+                "latent_dim + the image_size channel ladder. Raising it "
+                "changes no parameters. Set encoder_hidden to size the "
+                "world model.",
+                wm_cfg["decoder_hidden"], wm_cfg.get("encoder_hidden", 256))
         # A CONFIG KEY THAT DOES NOTHING MUST SAY SO. `policy.batch_size` has
         # been present and unread since the first config; silence made it look
         # honoured. See minibatch_size above for why it is not simply adopted.
@@ -1490,7 +1553,18 @@ class DevelopmentalAI:
                 _ob, _n_envs, dict(
                     opt_cfg,
                     spike_threshold=self.config.get("goals", {}).get(
-                        "spike_threshold", 0.9)),
+                        "spike_threshold", 0.9),
+                    # DECISIONS -> FRAMES (see _frames_per): probation
+                    # compares `_last_inv_t` against the timestep handed to
+                    # act(), which is total_timesteps — so at num_envs 2 a
+                    # gated slot was re-offered twice as often as the config
+                    # said. Scaled here rather than by giving the executor a
+                    # different clock: `_start_event` and `_close` are handed
+                    # their t from different call sites, and mixing time
+                    # bases between them would corrupt every recorded option
+                    # duration.
+                    gate_retry_after=self._frames_per(
+                        int(opt_cfg.get("gate_retry_after", 3000)))),
                 gamma=pol_cfg.get("gamma", 0.99))
             logger.info("Skills-as-options ACTIVE: head %d = %d primitives "
                         "+ %d slots", self.meta_action_dim, self.action_dim,
@@ -1862,6 +1936,41 @@ class DevelopmentalAI:
                            "back to pure learning-progress ranking", _e)
             self.consequence = None
 
+        # ---- ANTICIPATION (2026-09-02) -----------------------------------
+        # Rise-and-reset intrinsic reward for a grounded predicate: builds
+        # while the agent keeps SEEING something it hasn't yet produced the
+        # effect of, pays out and resets the moment it does, and the whole
+        # channel decays toward zero as the agent gets independently better
+        # at producing that effect (infra/anticipation.py; same persistence
+        # and "never in prim_extrinsic" discipline as ConsequenceMap above).
+        self.anticipation = None
+        try:
+            _an_cfg = dict((self.config.get("infra", {}) or {}).get(
+                "anticipation", {}) or {})
+            if _an_cfg.get("enabled", False):
+                from developmental_ai.infra.anticipation import (
+                    AnticipationMap)
+                self.anticipation = AnticipationMap(_an_cfg)
+                _anp = os.path.join(
+                    str((self.config.get("infra", {}) or {}).get(
+                        "log_dir", "podlogs")), "anticipation_state.json")
+                self._anticipation_path = _anp
+                if self.anticipation.load(_anp):
+                    logger.info(
+                        "anticipation: restored banked evidence from %s — "
+                        "a fresh map would erase every predicate<->effect "
+                        "association already earned this run", _anp)
+                logger.info(
+                    "ANTICIPATION REWARD ACTIVE: weight=%.2f, wait_cap=%d, "
+                    "sight_throttle=%d steps",
+                    float(_an_cfg.get("weight", 0.5)),
+                    int(_an_cfg.get("wait_cap", 8)),
+                    int(_an_cfg.get("sight_throttle_steps", 50)))
+        except Exception as _e:
+            logger.warning("anticipation map unavailable (%s) — no "
+                           "anticipation shaping this run", _e)
+            self.anticipation = None
+
         self.infra = None
         try:
             from developmental_ai.infra.stack import InfraStack
@@ -2116,12 +2225,25 @@ class DevelopmentalAI:
 
         def _load_glue(m):
             _ki = self.glue.knowledge_integrator
-            if not isinstance(m, dict) or "gnn" not in m or "gate" not in m:
+            if not isinstance(m, dict) or "gnn" not in m:
                 raise RuntimeError(
-                    f"glue_layer.pt is not the expected "
-                    f"{{'gnn','gate'}} dict (got {type(m).__name__})")
+                    f"glue_layer.pt is not the expected dict with a 'gnn' "
+                    f"key (got {type(m).__name__})")
             _ki.gnn.load_state_dict(m["gnn"])
-            _ki.gate.load_state_dict(m["gate"])
+            # The gate is absent on the pixel path (build_gate=False, see
+            # KnowledgeIntegrator). A checkpoint written before 2026-09-01
+            # still carries one; skipping it is correct rather than lossy,
+            # because that module was never trained — it is frozen at its
+            # random init, so a "restored" gate and a fresh one are the same
+            # distribution. Refuse only the genuine mismatch: a live gate
+            # with no saved weights to put in it.
+            if _ki.gate is not None:
+                if "gate" not in m:
+                    raise RuntimeError(
+                        "glue_layer.pt has no 'gate' but this run built one "
+                        "(non-pixel obs) — refusing to leave it fresh while "
+                        "reporting a successful restore")
+                _ki.gate.load_state_dict(m["gate"])
 
         def _load_perception(m):
             if self.symbolizer is None:
@@ -3975,6 +4097,23 @@ class DevelopmentalAI:
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
             _pt = self._phase_mark("env", _pt)
+            # ---- SET HERE, NOT IN THE COVERAGE BLOCK (2026-09-01) ----
+            # `_boring_view_factor()` reads `_last_world_info["pitch"]`, and
+            # it is called from the ICM base discount — which runs EARLIER in
+            # this body than the coverage block that used to assign it. So a
+            # term scaling up to 85% of the base drive was computed from the
+            # PREVIOUS decision's pitch, and action_repeat 2 -> 4 doubled that
+            # staleness from 2 game ticks to 4. Assigned immediately after the
+            # env results land, which is the first moment it is knowable.
+            # ALSO ADDED TO THE EPISODIC BODY, which never set it at all: it
+            # was reading whatever the last lifelong segment left behind.
+            # ...the FULL info too: ticks-to-break lives at top level, not
+            # under "world", and reading the wrong dict would silently print
+            # nothing — which is how a measurement quietly becomes a
+            # non-measurement (this has happened repeatedly here).
+            if step_infos:
+                self._last_world_info = (step_infos[0] or {}).get("world") or {}
+                self._last_env_info = step_infos[0] or {}
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -4339,6 +4478,12 @@ class DevelopmentalAI:
                 # assignment per step, only read at L3 segments)
                 self._advisor_frame = _frame
                 self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
+                # SCORE THE HEAD AGAINST TELEMETRY (2026-09-01). pitch,
+                # gui_open and mainhand settle four predicates exactly, every
+                # step, and were never compared — see observe_truth. This is
+                # the half of the verifier that does not need the VLM.
+                self.symbolizer.observe_truth(
+                    (prim_info.get("world") or {}), _lat0)
                 _labels = self.symbolizer.collect()
                 if _labels is not None and self.infra is not None:
                     self.infra.beat("vlm_label", self.total_timesteps)
@@ -4949,6 +5094,23 @@ class DevelopmentalAI:
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
             _pt = self._phase_mark("env", _pt)
+            # ---- SET HERE, NOT IN THE COVERAGE BLOCK (2026-09-01) ----
+            # `_boring_view_factor()` reads `_last_world_info["pitch"]`, and
+            # it is called from the ICM base discount — which runs EARLIER in
+            # this body than the coverage block that used to assign it. So a
+            # term scaling up to 85% of the base drive was computed from the
+            # PREVIOUS decision's pitch, and action_repeat 2 -> 4 doubled that
+            # staleness from 2 game ticks to 4. Assigned immediately after the
+            # env results land, which is the first moment it is knowable.
+            # ALSO ADDED TO THE EPISODIC BODY, which never set it at all: it
+            # was reading whatever the last lifelong segment left behind.
+            # ...the FULL info too: ticks-to-break lives at top level, not
+            # under "world", and reading the wrong dict would silently print
+            # nothing — which is how a measurement quietly becomes a
+            # non-measurement (this has happened repeatedly here).
+            if step_infos:
+                self._last_world_info = (step_infos[0] or {}).get("world") or {}
+                self._last_env_info = step_infos[0] or {}
             # per-env newly-broken block this step (highest tier wins:
             # log > solid > plant, mirroring the tiered break reward, so the
             # naming picks the block that actually spiked the reward)
@@ -5352,14 +5514,6 @@ class DevelopmentalAI:
             # pays ~0, new ground pays ~1, and revisiting decays as 1/sqrt(n).
             # Also intrinsic-only => never a replay label.
             _cw = float(self._coverage_weight)
-            if step_infos:
-                # keep the latest primary world-info for the segment log line
-                self._last_world_info = (step_infos[0] or {}).get("world") or {}
-                # ...and the FULL info: ticks-to-break lives at top level, not
-                # under "world", and reading the wrong dict would silently
-                # print nothing — which is how a measurement quietly becomes
-                # a non-measurement (this has happened repeatedly here).
-                self._last_env_info = step_infos[0] or {}
 
             # ---- #7: NOTHING PAID FOR GETTING WITHIN REACH -------------
             # The stall fix zeroed instinct/approach/align/aim because they
@@ -5505,10 +5659,16 @@ class DevelopmentalAI:
                 # terrain. Fourth instance of MANUFACTURED NOVELTY (sky
                 # views, pillar views, placement views, now tunnel cells):
                 # novelty created by modifying the world is not discovery.
+                # EXPRESSED IN GAME TICKS (2026-09-01). This was 40 STEPS,
+                # which at action_repeat 2 meant 80 ticks — but the claim it
+                # makes ("this cell was dug out a moment ago, so reaching it
+                # is not discovery") is about world time, not decision count,
+                # so at repeat 4 it silently covered 160 ticks. 160 // repeat
+                # keeps the original 80-tick window whatever the knob says.
                 if (_cov > 0.0 and self.total_timesteps
                         - getattr(self, "_last_excav_step", -10**9)
-                        < 40 * max(1, int(getattr(self, "_num_envs", 1)
-                                          or 1))):
+                        < (160 // self.env_action_repeat) * max(
+                            1, int(getattr(self, "_num_envs", 1) or 1))):
                     self._cov_suppressed = getattr(
                         self, "_cov_suppressed", 0) + 1
                     _cov = 0.0
@@ -5730,6 +5890,12 @@ class DevelopmentalAI:
                 # assignment per step, only read at L3 segments)
                 self._advisor_frame = _frame
                 self.symbolizer.maybe_label(_frame, _lat0, self._symbol_clock)
+                # SCORE THE HEAD AGAINST TELEMETRY (2026-09-01). pitch,
+                # gui_open and mainhand settle four predicates exactly, every
+                # step, and were never compared — see observe_truth. This is
+                # the half of the verifier that does not need the VLM.
+                self.symbolizer.observe_truth(
+                    (prim_info.get("world") or {}), _lat0)
                 _labels = self.symbolizer.collect()
                 if _labels is not None and self.infra is not None:
                     self.infra.beat("vlm_label", self.total_timesteps)
@@ -6157,6 +6323,30 @@ class DevelopmentalAI:
                     # let go. Same reason the vision scaffold re-adopts its
                     # phi with no delta at a boundary.
                     self._sc_phi.pop(e_i, None)
+                    if e_i == 0:
+                        # STREAM 0'S POTENTIALS ARE PLAIN SCALARS, not rows
+                        # in `_sc_phi`, so the pop above misses them entirely
+                        # — the same boundary bug the line above fixes for
+                        # scouts, left in place for the one stream that
+                        # matters most. Re-adopt with NO delta: 0.0 for the
+                        # two progress potentials, and the None sentinel each
+                        # cost potential already uses to mean "first sample,
+                        # charge nothing" (see _pitch_level_phi / the gui
+                        # dwell block). Without this the first step of a new
+                        # life collects a phantom refund for a swing streak
+                        # that only ended because the client rebuilt.
+                        self._persist_phi = 0.0
+                        self._reach_phi = 0.0
+                        self._pitch_level_phi = None
+                        self._gui_run = 0
+                        self._gui_dwell_phi = None
+                        # Same class, one dict over: mine_* counters restart
+                        # at 0 in a new world, so a stale high-water mark
+                        # makes `v > prev` never fire and habituation
+                        # silently stops damping. Latent on MineRL (the
+                        # adapter emits the typed `events` stream, so the
+                        # legacy branch never runs) — wrong anywhere else.
+                        self._habit_prev.clear()
                     self._mine_by_env.pop(e_i, None)
                     self._new_break_by_env.pop(e_i, None)
                     if hasattr(self, "_loginv_by_env"):
@@ -6247,9 +6437,14 @@ class DevelopmentalAI:
                     self.broadcaster.last_selection = None
                 if self._use_async_wm and self._wm_cadence_hits:
                     _skip = 1.0 - self._wm_blocks_run / self._wm_cadence_hits
+                    _bms = float(getattr(self, "_wm_block_ms", 0.0))
+                    _bit = int(getattr(self, "_wm_block_iters", 0) or 0)
                     print(f"  AsyncWM replay-ratio: {self._wm_blocks_run}"
                           f"/{self._wm_cadence_hits} blocks run "
-                          f"(skip {_skip:.1%})", flush=True)
+                          f"(skip {_skip:.1%})"
+                          + (f" | block {_bms:.0f} ms / {_bit} iters "
+                             f"({_bms / max(1, _bit):.1f} ms/iter)"
+                             if _bit else ""), flush=True)
                     # ---- train_iters FROM MEASURED SKIP (2026-09-01) ------
                     # `train_iters: 384` is a NOMINAL figure. With the async
                     # trainer's skip-if-busy, the ratio the GPU actually
@@ -6470,6 +6665,16 @@ class DevelopmentalAI:
             metrics = {}
             batch = None
 
+            # ---- HOW LONG A BLOCK ACTUALLY TAKES (2026-09-01) ------------
+            # The replay buffer became block-storage this wave so long runs
+            # stop dying on memory. Block indexing is on this exact path
+            # (batch_size x train_iters gathers per block), so the change
+            # could have paid for the memory fix with throughput — the thing
+            # the wave existed to improve. Timed, not assumed: if ms/iter
+            # rises against the pre-growth run, the fix is FEWER, LARGER
+            # blocks (raise world_model.buffer_growth.block_transitions),
+            # and the knob already exists.
+            _t_wm = time.perf_counter()
             if self._use_async_replay:
                 # Prefetch all batches for this call on a background thread so
                 # sampling overlaps with the (CPU/GPU-bound) gradient steps.
@@ -6489,6 +6694,8 @@ class DevelopmentalAI:
                         terminal_fraction=terminal_fraction,
                     )
                     metrics = _do_train(batch)
+            self._wm_block_ms = 1000.0 * (time.perf_counter() - _t_wm)
+            self._wm_block_iters = int(train_iters)
 
             # Train the symbolic decoder on the last batch (same lock: the
             # sd heads are read on the main thread every step via the glue)
@@ -7519,14 +7726,15 @@ class DevelopmentalAI:
                 os.path.join(checkpoint_dir, "symbolic_decoder.pt"),
             )
 
-        # Save glue layer (GNN + gate)
-        torch.save(
-            {
-                "gnn": self.glue.knowledge_integrator.gnn.state_dict(),
-                "gate": self.glue.knowledge_integrator.gate.state_dict(),
-            },
-            os.path.join(checkpoint_dir, "glue_layer.pt"),
-        )
+        # Save glue layer (GNN + gate). The gate is absent on the pixel path
+        # (build_gate=False) — omit the key rather than writing a null, so an
+        # older loader sees a payload it can refuse cleanly instead of one it
+        # would silently half-restore.
+        _ki_save = {"gnn": self.glue.knowledge_integrator.gnn.state_dict()}
+        if self.glue.knowledge_integrator.gate is not None:
+            _ki_save["gate"] = (
+                self.glue.knowledge_integrator.gate.state_dict())
+        torch.save(_ki_save, os.path.join(checkpoint_dir, "glue_layer.pt"))
 
         # Save dream actor-critic
         torch.save(
@@ -7585,6 +7793,17 @@ class DevelopmentalAI:
                                               "podlogs/consequence_state.json"))
         except Exception as _e:
             logger.warning("consequence checkpoint failed: %s", _e)
+
+        # ANTICIPATION state: same "restart amnesia recreates the bootstrap
+        # problem" argument as consequence above, and it matters MORE here
+        # because this channel PAYS (consequence's deficit only ranks).
+        try:
+            if self.anticipation is not None:
+                self.anticipation.save(getattr(
+                    self, "_anticipation_path",
+                    "podlogs/anticipation_state.json"))
+        except Exception as _e:
+            logger.warning("anticipation checkpoint failed: %s", _e)
 
         logger.debug(f"Checkpoint saved to {checkpoint_dir}")
 
@@ -8239,7 +8458,11 @@ class DevelopmentalAI:
         # fresh from that env's own RSSM row this step, so the failure modes
         # the carry machinery below guards against (a stale frame after a
         # world rebuild, a wrong env index) cannot arise.
-        if getattr(self.policy, "arch", "") == "rssm":
+        # getattr on SELF too, not just on the policy: this helper is called
+        # with test doubles that carry only the carry-state fields (see
+        # _throughput_wave_smoke::A2), and `self.policy` does not exist on
+        # them. A missing policy means "not rssm", which is the old path.
+        if getattr(getattr(self, "policy", None), "arch", "") == "rssm":
             _lat = getattr(self, "_act_latent", None)
             if _lat is None or int(_lat.shape[0]) != int(n):
                 return None
@@ -8298,6 +8521,35 @@ class DevelopmentalAI:
     # allocation beyond one dict. Reset by _log_progress each segment.
     _PHASES = ("act", "env", "goals", "curiosity", "world", "vlm", "store",
                "ppo")
+
+    def _frames_per(self, decisions: int) -> int:
+        """Convert a threshold expressed in DECISIONS into env FRAMES.
+
+        ---- TWO CLOCKS, ONE COUNTER (2026-09-01) -------------------------
+        `total_timesteps` advances by `n` per loop iteration — it counts env
+        frames across the whole fleet, which is what heartbeats, the census
+        and "how much experience exists" all correctly mean.
+
+        But several schedules are about how much the POLICY has been through,
+        not how many frames the fleet collected, and they were compared
+        against `total_timesteps` anyway: the novelty encoder snapshot
+        (`novelty_encoder_refresh`), the unstuck advisor's rate limit
+        (`advisor_min_gap`), and option probation (`gate_retry_after`). At
+        num_envs 2 each of those fired twice as often as its config said, and
+        `num_envs` is precisely the knob that will move on a cluster — so the
+        error scales with the fleet rather than staying a fixed factor.
+
+        Multiplying the THRESHOLD keeps the config value meaning what it
+        reads as ("this many decisions") without mixing clocks inside the
+        objects that consume it — an option's `_start_event` t and its
+        `_close` t come from different call sites, and giving them different
+        time bases would corrupt every recorded option duration.
+
+        NOT affected, checked rather than assumed: `lp_stale_tau` counts
+        per-category ABSENT OBSERVATIONS (`_cat_absent`), incremented once
+        per scaffold step, so it was already in decision units.
+        """
+        return int(decisions) * max(1, int(getattr(self, "_num_envs", 1) or 1))
 
     def _phase_mark(self, name: str, t0: float) -> float:
         """Add elapsed wall clock to phase `name`; return a fresh timestamp.
@@ -8429,7 +8681,10 @@ class DevelopmentalAI:
 
             adv = UnstuckAdvisor(
                 _q,
-                min_gap=int(_icfg.get("advisor_min_gap", 4096)),
+                # DECISIONS -> FRAMES: `advise` is called with
+                # total_timesteps (see _frames_per).
+                min_gap=self._frames_per(
+                    int(_icfg.get("advisor_min_gap", 4096))),
                 log_dir=str(_icfg.get("log_dir", "podlogs")))
             self._unstuck_advisor = adv
         _cats = (list(getattr(self.vision_scaffold, "target_categories",
@@ -9019,6 +9274,11 @@ class DevelopmentalAI:
                 pos = (float(wi["x"]), float(wi.get("y", 0.0)),
                        float(wi["z"]))
             ev = (info or {}).get("events") or []
+            # Computed ONCE, reused by both infra.on_step below AND
+            # anticipation (2026-09-02) — was being built inline at the
+            # on_step call only; a second caller needing it would otherwise
+            # have to either duplicate the call or read a stale copy.
+            _evc = self._event_count_map(info) if ev else None
             # excavation stamp for the coverage discovery-gate: breaking or
             # placing marks the near future's "new cells" as manufactured
             if any(k in ("break", "place") for k, _ in ev):
@@ -9180,6 +9440,44 @@ class DevelopmentalAI:
                         logger.info(
                             "POSSESSION FRONTIER: first time holding %s",
                             self.consequence._key(_inv))
+            # ---- ANTICIPATION (2026-09-02) --------------------------------
+            # Called EVERY step (not just when ev is non-empty): the
+            # "sighting" half has to accumulate on ordinary presence, and
+            # only the "payout" half needs an event. Placed here rather than
+            # inside _magnet_step_shaping specifically because THIS method
+            # already has `ev` and `_evc` as fresh locals from the exact
+            # same step — no cache-on-self, no risk of the one-step
+            # staleness that _last_world_info was found to have earlier.
+            #
+            # The probs come from a SEPARATE small forward through the
+            # grounding head (~2ms measured for a 5-member 512-hidden
+            # ensemble): _magnet_step_shaping already has this same head's
+            # output as `_op`, but it and this method are not called from
+            # the same place in every stepping body, so recomputing here is
+            # the correctness-over-cheapness choice — the alternative
+            # (threading `_op` across methods via `self`) is exactly the
+            # cache-staleness class of bug this comment is deliberately
+            # avoiding.
+            if self.anticipation is not None:
+                try:
+                    with self._wm_param_lock, torch.no_grad():
+                        _ant_latent = self.world_model.rssm.get_latent(
+                            rssm_state)[0:1]
+                    _ant_probs, _, _ = self._grounded_object_probs(
+                        _ant_latent)
+                    _ant_pay = self.anticipation.observe(
+                        _ant_probs, ev, _evc, self._habituation_scale,
+                        self.total_timesteps)
+                    if _ant_pay:
+                        _extra += _ant_pay
+                        self.infra.record_reward("anticipation", _ant_pay)
+                        self._anticip_sum = getattr(
+                            self, "_anticip_sum", 0.0) + _ant_pay
+                        self._anticip_payouts = getattr(
+                            self, "_anticip_payouts", 0) + 1
+                    self._anticip_n = getattr(self, "_anticip_n", 0) + 1
+                except Exception as _ae:
+                    logger.debug("anticipation step failed: %s", _ae)
             # ---- METABOLIC EFFORT COST (2026-08-09) ----------------------
             # Effortful actions (the adapter's "effort" contract field) cost
             # a small constant. Observed live: sustained attack at CLOUDS —
@@ -9206,7 +9504,7 @@ class DevelopmentalAI:
                 # seen, not on trained (review 2026-08-09)
                 fovea_counts=getattr(self, "_last_fovea_pos", None),
                 step_reward=float(step_income) + float(_extra),
-                event_counts=(self._event_count_map(info) if ev else None))
+                event_counts=_evc)
             return _extra
         except Exception:
             return 0.0
@@ -9227,16 +9525,34 @@ class DevelopmentalAI:
         worse failure than a small batch, so the rule here is: a scout is
         paid by exactly those terms that are COMPUTABLE PER STREAM from that
         stream's own step_info, and by nothing else.
-          included: env reward, curiosity, persistence, GUI-dwell cost,
-                    gaze-level cost, and the GUI intrinsic zeroing
-          omitted:  the vision magnet and the infra/empowerment shaping —
-                    both are VLM/fovea-backed and primary-only, because
-                    exactly one stream renders frames for the VLM
-        The omission is real and is logged (`magnet` in the income census is
-        stream 0's alone), so the divergence is a number someone can look at
-        rather than an assumption. Making it zero would mean running the VLM
-        on every client, which is the throughput the fovea work already
-        measured as unaffordable.
+
+          included: env reward, base curiosity (ICM/LP), persistence,
+                    GUI-dwell cost, gaze-level cost, GUI intrinsic zeroing
+          omitted:  the vision magnet, infra/empowerment shaping,
+                    habituation damping, imagination curiosity, symbol
+                    novelty, symbol centring, view novelty, territory
+                    coverage, the reach potential, the gaze-bucket bonus
+
+        THE OMISSION LIST IS LONG AND THIS DOCSTRING PREVIOUSLY NAMED TWO OF
+        IT (corrected 2026-09-01). The point of writing it down is to make
+        "one policy, two reward functions" auditable; a list that understates
+        the gap fourfold does the opposite. Every omitted term is
+        primary-only for one of two reasons: it needs the VLM/fovea (magnet,
+        symbol novelty/centring, reach), or it rides on single-stream shaping
+        state the loop keeps for env 0 alone (habituation, imagination,
+        coverage, gaze bucket, infra).
+
+        WHAT THAT MEANS IN PRACTICE: a scout's reward is close to raw
+        curiosity plus the env's own reward, while the primary's is heavily
+        shaped. Rows from both go into one update, so the shaped and unshaped
+        views of the same policy are being averaged. That is still better
+        than discarding half the fleet's experience — but it is a real cost,
+        and it is why `magnet` in the income census is labelled stream 0's
+        alone. Closing it fully would mean running the VLM on every client,
+        which the fovea work already measured as unaffordable; closing it
+        PARTLY is cheap and is the obvious next move — habituation is
+        computable from `step_infos[e]` and is the one omitted term that
+        needs nothing this method does not already have.
 
         Potentials are kept PER STREAM (`_sc_phi`) and reset on that
         stream's death — a potential carried across a world boundary pays a
@@ -9312,6 +9628,31 @@ class DevelopmentalAI:
         if self.infra is not None:
             self.infra.signal_observe(_op)
             _excl = self.infra.degenerate_signals() or None
+        # ---- IS THERE A TREE IN VIEW? (2026-09-01) -----------------------
+        # THE leading indicator for the CLAUDE.md section 9 scoreboard.
+        # Everything the goal needs — aim, swing, hold — is conditional on a
+        # trunk being on screen, and nothing in the segment log ever said
+        # whether one was. Without it "still no logs" and "never saw a
+        # trunk" are the same reading, which is exactly the ambiguity that
+        # let 399 breaks / 1 log stand unexplained.
+        #
+        # REPORTED WITH ITS TRUST STATE, not as a bare number. An untrained
+        # head sits at sigmoid ~0.5, so a mean of 0.5 means "no
+        # information", NOT "half the time" — the label count is what tells
+        # the two apart. `DEGENERATE` means the signal-health monitor has
+        # excluded it from steering, which is the llava tree_visible failure
+        # recurring and would make every other figure on the line moot.
+        # Lives here rather than in the step loops because this method is
+        # the ONE magnet invocation shared by all three bodies (see the
+        # docstring), so it cannot drift between them.
+        _tp = float((_op or {}).get("tree_visible", 0.0))
+        self._tree_sum = getattr(self, "_tree_sum", 0.0) + _tp
+        self._tree_n = getattr(self, "_tree_n", 0) + 1
+        if _tp >= 0.5:
+            self._tree_hi = getattr(self, "_tree_hi", 0) + 1
+        self._tree_rel = float((_rel or {}).get("tree_visible", 0.0))
+        self._tree_lab = int((_lab or {}).get("tree_visible", 0))
+        self._tree_degen = bool(_excl and "tree_visible" in _excl)
         # SOCIAL PRESENCE (2026-08-09): is the other player under the gaze?
         # Drives joint attention in the scaffold and stamps the last-seen
         # step the demonstration detector (in _infra_step) checks against.
@@ -9621,6 +9962,44 @@ class DevelopmentalAI:
             print(f"  Curiosity magnet: w={vs['weight']:.4f}, "
                   f"target={vs['target']}, "
                   f"global_lp={vs['global_lp']:.4f} | {_cat}")
+            # THE GOAL'S LEADING INDICATOR (2026-09-01). Read `labels` first:
+            # below symbolic_grounding.min_labels the head is untrained and
+            # the percentage is noise, not a sighting rate. DEGENERATE means
+            # the sensor has collapsed and the q4 VLM is the first thing to
+            # revert. A healthy trunk-seeking run shows this RISING while
+            # logs are still 0 — that is the state in which the chop fixes
+            # (repeat 4, macro-12 at 40 ticks, the RSSM policy) are actually
+            # under test rather than untested.
+            _tn = int(getattr(self, "_tree_n", 0) or 0)
+            if _tn:
+                print(f"  Tree in view: "
+                      f"{100.0 * getattr(self, '_tree_hi', 0) / _tn:.1f}% of "
+                      f"steps (mean p="
+                      f"{getattr(self, '_tree_sum', 0.0) / _tn:.3f}, "
+                      f"reliability={getattr(self, '_tree_rel', 0.0):.2f}, "
+                      f"labels={getattr(self, '_tree_lab', 0)}"
+                      + (", DEGENERATE — excluded from steering"
+                         if getattr(self, "_tree_degen", False) else "")
+                      + ")")
+                self._tree_sum, self._tree_n, self._tree_hi = 0.0, 0, 0
+            # ANTICIPATION (2026-09-02): mean/step is the intrinsic drive it
+            # actually contributed; payouts is how often the rise-then-reset
+            # cycle actually completed this segment (0 for a long stretch
+            # means either nothing is associated yet or nothing is being
+            # achieved — the lifetime `self.anticipation.total_payouts` in
+            # the saved state file distinguishes cold-start from stalled).
+            _an_n = int(getattr(self, "_anticip_n", 0) or 0)
+            if _an_n:
+                _an_mean = getattr(self, "_anticip_sum", 0.0) / _an_n
+                print(f"  Anticipation bonus: mean "
+                      f"{_an_mean:+.5f}/step | "
+                      f"{getattr(self, '_anticip_payouts', 0)} payouts this "
+                      f"segment | lifetime "
+                      f"{getattr(self.anticipation, 'total_payouts', 0)} "
+                      f"payouts, {getattr(self.anticipation, 'total_paid', 0.0):.2f} total")
+                self._anticip_sum = 0.0
+                self._anticip_n = 0
+                self._anticip_payouts = 0
             # OBSERVABILITY (2026-07-25): w=0 has THREE distinct causes and the
             # line above cannot tell them apart — the 19h zero-reward stall was
             # the cold-start BUDGET latching, which was invisible here. Print
@@ -9712,10 +10091,19 @@ class DevelopmentalAI:
                 _wl = int(_ovc.get("with_learned", 0))
                 _ls = int(_ovc.get("learned_offered_sum", 0))
                 _pr = int(_ovc.get("probation", 0))
+                # Scout option-steps whose reward could not be attributed to
+                # any storable decision (2026-09-01). 0 is the proof that
+                # scout SMDP rows are being kept; anything climbing means a
+                # runtime is accumulating a return that _close() discards,
+                # and that is the next thing to look at.
+                _srd = int(_ovc.get("scout_rows_dropped", 0))
                 if _d:
                     print(f"  Option offers: {_wo}/{_d} decisions had a slot "
                           f"offered ({100.0*_wo/_d:.1f}%), picked {_pk} "
                           f"({100.0*_pk/max(1,_wo):.2f}% of offered)"
+                          + (f"  <-- {_srd} scout option-steps DROPPED "
+                             f"(reward accumulated, no decision to store it "
+                             f"against)" if _srd else "")
                           + ("  <-- OFFERED BUT NEVER CHOSEN: meta-policy "
                              "collapse, not a gate problem"
                              if _wo > 200 and _pk == 0 else ""))
@@ -9966,11 +10354,36 @@ class DevelopmentalAI:
                                       f"{_er} gradient pass(es). Options "
                                       f"consume rows: one option row spans "
                                       f"tau env steps.")
+                        # THE ALARMS THIS WAVE ADDED AND NEVER PRINTED
+                        # (2026-09-01). adv_clipped_frac / value_clamped_frac
+                        # / nonfinite_skip / last_update_forced were all
+                        # computed and surfaced nowhere — the "correct
+                        # mechanism nobody calls" failure this file documents
+                        # three times over (the gui_open guard, _viewer_push,
+                        # the felt-reach sense). The two genuine alarms print
+                        # ONLY when non-zero, so a healthy segment reads as
+                        # before plus one adv_clip= field:
+                        #   V-CLAMPED   -> the symlog critic is diverging and
+                        #                  symexp is being bounded; the run
+                        #                  is on its way to inf without it
+                        #   UPDATE SKIPPED -> a whole rollout was dropped for
+                        #                  non-finite advantages
+                        _vcf = float(_pp.get("value_clamped_frac", 0.0) or 0.0)
                         print(f"  PPO forensics: raw_adv_std={_ras:.2e} "
                               f"(|adv|={_pp.get('raw_adv_absmean', 0.0):.2e}) "
                               f"| obs_spread={_osp:.4f} | max_prob={_mxp:.3f} "
                               f"| rows={_pp.get('rows', 0)} "
-                              f"updates={_pp.get('n_updates', 0)}")
+                              f"updates={_pp.get('n_updates', 0)}"
+                              f" | adv_clip="
+                              f"{_pp.get('adv_clipped_frac', 0.0):.1%}"
+                              + (f" | V-CLAMPED {_vcf:.2%} <-- critic "
+                                 f"diverging" if _vcf else "")
+                              + (" | UPDATE SKIPPED (non-finite advantages)"
+                                 if _pp.get("nonfinite_skip") else "")
+                              + (" | forced (row/env-step ceiling)"
+                                 if getattr(self.policy,
+                                            "last_update_forced", False)
+                                 else ""))
                         # Say which cause the numbers actually support, rather
                         # than leaving three hypotheses to argue about.
                         if _ras == _ras and _ras < 1e-4:
@@ -10290,9 +10703,50 @@ class DevelopmentalAI:
             print(f"  Dream policy:     actor_loss={metrics.get('dream_actor_loss', 0):.4f}, "
                   f"critic_loss={metrics.get('dream_critic_loss', 0):.4f}, "
                   f"returns={metrics.get('dream_returns_mean', 0):.2f}")
+        elif getattr(self, "dream_augment_active", False):
+            # ---- THE DISTILL PATH WAS INVISIBLE (2026-09-02) -------------
+            # This branch used to be `elif self.dream_enabled:` printing
+            # "warmup (0 episodes remaining)" FOREVER, because the only
+            # other branch tests `dream_training_active` — the CONTROL flag,
+            # which is permanently False at `dream_training.control: false`.
+            # Meanwhile `dream_augment_active` flips True once
+            # `_episodes_this_env >= dream_activate_after` (2), and that
+            # counter increments once per SEGMENT in lifelong mode — so
+            # distillation has been pulling the live PPO actor toward the
+            # dream actor at distill_weight 1.0 every segment from segment 3
+            # on, while the log said it had not started. Worse than silence:
+            # it read as "not yet running" for the entire run.
+            #
+            # `eff_weight` is the number that answers "does this subsystem
+            # matter at all": distill_weight x (1 - solve_ema) x trust_ema.
+            # Near zero means the dream actor is being ignored no matter its
+            # capacity — which is the reading that decides whether raising
+            # dream_training.hidden_dim could ever help, and the reason that
+            # capacity question is deliberately NOT being answered by
+            # guesswork.
+            _dw = metrics.get("dream_distill_eff_weight")
+            if _dw is None:
+                _dq = self.training_metrics.get("dream_distill_eff_weight")
+                _dw = float(_dq[-1]) if _dq else 0.0
+            _dg = metrics.get("dream_distill_gate_frac")
+            if _dg is None:
+                _gq = self.training_metrics.get("dream_distill_gate_frac")
+                _dg = float(_gq[-1]) if _gq else 0.0
+            print(f"  Dream distill:    eff_weight={float(_dw):.4f} "
+                  f"(distill_weight x (1-solve_ema) x trust_ema) | "
+                  f"value-gate pass {float(_dg):.1%} | "
+                  f"loss={metrics.get('dream_distill_loss', 0.0):.4f}"
+                  + ("   <-- INERT: the dream actor is being ignored; its "
+                     "capacity cannot be the limiting factor"
+                     if float(_dw) < 1e-3 else ""))
         elif self.dream_enabled:
-            remaining = max(0, self.dream_warmup - self.total_episodes)
-            print(f"  Dream policy:     warmup ({remaining} episodes remaining)")
+            # Genuinely still in warmup. Gated on the AUGMENT path's own
+            # counter, not dream_warmup/total_episodes — using the wrong one
+            # is what let this claim "warmup" indefinitely above.
+            remaining = max(0, int(self.dream_activate_after)
+                            - int(getattr(self, "_episodes_this_env", 0)))
+            print(f"  Dream policy:     warmup ({remaining} segments "
+                  f"remaining before distillation activates)")
         # Pixel observation mode
         if self.pixel_obs:
             print(f"  Observation mode: pixel ({self.image_channels}x{self.image_size}x{self.image_size})")

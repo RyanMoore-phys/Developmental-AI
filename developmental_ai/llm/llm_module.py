@@ -24,6 +24,8 @@ import concurrent.futures
 import json
 import logging
 import os
+import struct
+import zlib
 from typing import Dict, List, Optional, Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -149,7 +151,29 @@ def _check_ollama_server() -> bool:
         return False
 
 
-def probe_ollama_model(model: str) -> bool:
+def _synthetic_probe_png(size: int = 64) -> bytes:
+    """A tiny solid-gray grayscale PNG, built with stdlib `zlib`+`struct` only.
+
+    No numpy/imageio dependency here (importing vlm_symbolizer for its
+    encoder would be a backwards, circular import — it already imports FROM
+    this module). 64x64 rather than 1x1: some ViT-tiling vision models choke
+    on degenerate image sizes below their patch size, and the point of this
+    probe is to catch exactly that class of failure, not paper over it with
+    an input real usage would never send.
+    """
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+    row = bytes([0] + [128] * size)            # filter=none, mid-gray pixels
+    raw = row * size
+    idat = _chunk(b"IDAT", zlib.compress(raw, 6))
+    iend = _chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+def probe_ollama_model(model: str, deep: bool = True) -> bool:
     """Is `model` actually present on the Ollama server? Log what we found.
 
     ---- WHY THIS IS LOUD AND DOES NOT FALL BACK (2026-09-01) -------------
@@ -165,6 +189,18 @@ def probe_ollama_model(model: str) -> bool:
     and return False. The caller decides; nothing is substituted here.
     Returns True when unverifiable (no ollama lib / server down) so this can
     never itself become the thing that stops a run.
+
+    ---- STAGE 2, `deep=True` (2026-09-02) --------------------------------
+    Tag PRESENCE is not the same claim as "the model actually runs" — a q4
+    import can be truncated, a vision head can be missing from a GGUF
+    conversion, or the server can OOM on load. All three pass stage 1 and
+    then produce ten hours of silent zero-label runs, discovered only when
+    someone asks "why are there no facts". Stage 2 sends one real generate
+    call with a synthetic image through the exact code path production
+    uses, before a single frame of the run depends on it. Failure here is
+    just as loud as a missing tag and still never raises — the run must
+    survive a broken VLM exactly as it survives a slow one; this just makes
+    sure the survival is a MEASURED degradation, not a silent one.
     """
     if not OLLAMA_AVAILABLE:
         return True
@@ -180,18 +216,43 @@ def probe_ollama_model(model: str) -> bool:
     except Exception as e:
         logger.info("ollama model probe unavailable (%s) — continuing", e)
         return True
-    if model in names:
-        logger.info("VLM resolved: %s (present on the Ollama server)", model)
+    if model not in names:
+        logger.warning(
+            "VLM MODEL NOT FOUND: %r is not on the Ollama server. "
+            "Available: %s. The labeller is a SENSOR — a missing tag means "
+            "either a stall on first use or a different model answering, "
+            "and neither is visible later except as strange predicates. "
+            "Build it with:\n"
+            "  printf 'FROM qwen2.5vl:7b\\n' > /tmp/Modelfile && "
+            "ollama create %s -f /tmp/Modelfile -q q4_K_M",
+            model, sorted(names) or "(none)", model)
+        return False
+    logger.info("VLM resolved: %s (present on the Ollama server)", model)
+    if not deep:
         return True
-    logger.warning(
-        "VLM MODEL NOT FOUND: %r is not on the Ollama server. Available: %s. "
-        "The labeller is a SENSOR — a missing tag means either a stall on "
-        "first use or a different model answering, and neither is visible "
-        "later except as strange predicates. Build it with:\n"
-        "  printf 'FROM qwen2.5vl:7b\\n' > /tmp/Modelfile && "
-        "ollama create %s -f /tmp/Modelfile -q q4_K_M",
-        model, sorted(names) or "(none)", model)
-    return False
+    try:
+        client = _get_ollama_client()
+        if client is None:
+            return True             # unverifiable, not unhealthy
+        resp = client.generate(
+            model=model, prompt='Return {"ok": true} as JSON, nothing else.',
+            images=[_synthetic_probe_png()], format="json", keep_alive=-1,
+            options={"num_predict": 32, "temperature": 0.0})
+        txt = (resp.get("response") or "").strip()
+        json.loads(txt)            # must parse; content is not checked
+        logger.info("VLM smoke check passed: %s answered a real generate "
+                    "call with valid JSON", model)
+        return True
+    except Exception as e:
+        logger.warning(
+            "VLM SMOKE CHECK FAILED for %s: %s. The tag is present but a "
+            "real generate call did not return valid JSON — this is "
+            "usually a truncated import, a missing vision head, or the "
+            "server rejecting the request, and none of those show up in "
+            "`ollama list`. The run continues (min_labels keeps a silent "
+            "VLM safe), but expect zero grounded facts until this is fixed.",
+            model, e)
+        return False
 
 
 class LLMPerception:

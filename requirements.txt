@@ -44,6 +44,19 @@ Pillow>=10.0.0             # Image resizing for CNN observations (optional)
 # deferred inside crafter_env.py so MiniGrid-only setups can skip it):
 crafter>=1.8.0
 
+# --- Running the TEST SUITE (2026-09-02) ------------------------------------
+# The smokes are standalone __main__ scripts and several construct a real
+# DevelopmentalAI, so they need the env packages even when the run you care
+# about does not:
+#   _gpu_device_smoke            -> minigrid  (listed OPTIONAL above, but the
+#                                   suite hard-requires it — make_env imports
+#                                   it unconditionally for MiniGrid configs)
+#   _options_smoke,
+#   _scouts_in_ppo_live_smoke    -> crafter   (already a hard dep above)
+# On a fresh box: `pip install -r requirements.txt && pip install minigrid`.
+# Both surface as ModuleNotFoundError, which reads exactly like a code
+# failure and cost a diagnostic cycle on the A4000 pod.
+
 # --- Utilities ---
 pyyaml>=6.0                # Configuration file parsing
 tqdm>=4.65.0               # Progress bars

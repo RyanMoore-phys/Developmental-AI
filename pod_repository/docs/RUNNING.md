@@ -1,23 +1,30 @@
 # Running a training run
 
-All commands assume the connection shorthand:
+All commands assume the connection shorthand. **No literal host/port here
+(2026-09-02):** both change on every pod rebuild, so a written-down address is
+stale immediately — and a stale address reads exactly like a dead run.
 
 ```bash
-SSH="ssh root@<redacted-host> -p 22681 -i ~/.ssh/skybot_ed25519 \
+export POD_HOST=<current-pod-ip>      # RunPod dashboard -> Connect
+export POD_PORT=<current-ssh-port>
+SSH="ssh root@$POD_HOST -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 # NOTE: zsh will NOT run a command stored in a variable ($SSH ...). Either paste
 # the full ssh line, or wrap it in a shell function. (Known gotcha.)
 ```
 
+Once the pod is on the tailnet, prefer the stable name and skip the key:
+`tailscale ssh root@<pod-magicdns-name>`.
+
 ## 1. Sync code from the Mac
 
-From the parent repo dir (`/Users/rimac/Desktop/Developmental AI`):
+From the parent repo dir:
 
 ```bash
-rsync -rlptz -e "ssh -p 22681 -i ~/.ssh/skybot_ed25519 \
+rsync -rlptz -e "ssh -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   developmental_ai configs scripts run_minecraft.py \
-  root@<redacted-host>:/workspace/devai/
+  root@"$POD_HOST":/workspace/devai/
 ```
 
 ## 2. Launch
