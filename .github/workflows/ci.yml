@@ -87,10 +87,18 @@ jobs:
           # CPU build: the default index pulls ~2.5 GB of CUDA wheels a CPU
           # runner can never use. Same 2.6.0 as the pod's 2.6.0+cu124.
           pip install -q "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+          # NO crafter, NO minigrid (removed 2026-09-02). They are OTHER
+          # training environments (configs/crafter.yaml, minigrid_doorkey.yaml)
+          # and have nothing to do with deploying SkyBot to a Minecraft
+          # server. They were here only because the core set included
+          # _options_smoke, which builds a Crafter env — so a Crafter
+          # dependency leaked into a Minecraft deployment gate. crafter also
+          # depends on legacy `gym`, which resolves badly alongside gymnasium.
+          # The suite list below is now SkyBot-only and needs neither.
           pip install -q "numpy==2.2.6" "gymnasium==1.3.0" "PyYAML==6.0.3" \
                         "pillow==12.3.0" "scipy==1.15.3" "matplotlib==3.10.9" \
                         "tqdm==4.70.0" "imageio==2.37.4" "psutil==7.2.2" \
-                        scikit-learn crafter minigrid
+                        scikit-learn
 
       - name: Environment report
         run: |
@@ -103,9 +111,14 @@ jobs:
           # Guard the MIRROR, not a guessed value: these must match the pod.
           assert numpy.__version__ == "2.2.6", f"numpy drifted to {numpy.__version__}"
           assert torch.__version__.startswith("2.6.0"), f"torch drifted to {torch.__version__}"
-          import crafter, minigrid
-          print("crafter + minigrid import OK")
           PY
+          # FULL RESOLVE, printed every run. The failing suites pass on the pod
+          # (Linux, py3.10, torch 2.6.0, numpy 2.2.6) both on GPU and with
+          # CUDA hidden, so device and those three versions are all ruled out.
+          # Whatever differs is in here — most likely a transitive dep pulled
+          # in by crafter/minigrid that the pod's venv_mc does not have.
+          echo "----- pip freeze -----"
+          pip freeze
 
       - name: Run smoke suite
         env:
@@ -116,6 +129,11 @@ jobs:
           if [ "$SUITE" = "full" ]; then
             mapfile -t TESTS < <(ls tests/_*_smoke.py)
           else
+            # SKYBOT-ONLY. This pipeline exists to deploy SkyBot to a
+            # Minecraft server, so the gate is the suites that bear on that.
+            # Every one below was VERIFIED to pass on the pod's own venv_mc —
+            # Linux, python 3.10, torch 2.6.0, numpy 2.2.6, no crafter, no
+            # minigrid, CUDA hidden — i.e. this exact dependency set.
             TESTS=(
               # the four scripts/deploy_skybot.sh gates the pod launch on
               tests/_reward_fixes_smoke.py
@@ -126,30 +144,90 @@ jobs:
               tests/_no_scripted_skills_smoke.py
               tests/_gui_farm_smoke.py
               tests/_throughput_wave_smoke.py
-              tests/_options_smoke.py
               tests/_data_diet_smoke.py
               tests/_capacity_wave_smoke.py
               tests/_anticipation_smoke.py
               tests/_learning_rate_wave_smoke.py
+              # RE-ADDED 2026-09-02 after the arch:rssm bind path was built.
+              # This suite is the one that caught it: it mints a skill through
+              # the real bank and binds it, so it fails if the encoded-family
+              # plumbing regresses. Keep it in the gate.
+              tests/_skybot_boot_smoke.py
             )
+            # DELIBERATELY EXCLUDED, each for a reason:
+            #   _options_smoke     builds a Crafter env — wrong environment
+            #                      for this pipeline, and the sole reason
+            #                      crafter/minigrid were ever installed here.
+            #   _remote_server_smoke, _minerl_smoke
+            #                      import `minerl`, which needs Java + the
+            #                      built MCP-Reborn tree. Pod-only by nature;
+            #                      deploy_skybot.sh runs the pod-side gate.
+            # (_skybot_boot_smoke was excluded while arch:rssm binding was
+            #  broken; it is back in the list above now that it is built.)
           fi
           echo "running ${#TESTS[@]} suite(s)"
+          mkdir -p /tmp/suite_logs
           FAILED=()
           for t in "${TESTS[@]}"; do
             [ -f "$t" ] || { echo "SKIP (missing): $t"; continue; }
+            LOG="/tmp/suite_logs/$(basename "$t").log"
             printf '::group::%s\n' "$t"
             # Per-test timeout so one hang cannot eat the whole job budget.
-            if timeout 600 python "$t"; then
+            # Output is TEE'd: visible in the group, and kept for the failure
+            # report below.
+            timeout 600 python "$t" 2>&1 | tee "$LOG"
+            # PIPESTATUS[0] is python's exit code; $? would be tee's, which is
+            # always 0 and would mark every suite as passing.
+            RC=${PIPESTATUS[0]}
+            echo '::endgroup::'
+            if [ "${RC:-1}" -eq 0 ]; then
               echo "PASS $t"
             else
-              echo "FAIL $t (exit $?)"
+              echo "FAIL $t (exit $RC)"
               FAILED+=("$t")
             fi
-            echo '::endgroup::'
           done
+
           echo "==================== SUMMARY ===================="
-          if [ ${#FAILED[@]} -gt 0 ]; then
-            printf 'FAILED: %s\n' "${FAILED[@]}"
-            exit 1
+          if [ ${#FAILED[@]} -eq 0 ]; then
+            echo "all ${#TESTS[@]} suite(s) passed"
+            exit 0
           fi
-          echo "all ${#TESTS[@]} suite(s) passed"
+
+          # PRINT FAILURES OUTSIDE THE GROUPS (added 2026-09-02).
+          # The first version wrapped every suite in ::group:: and printed only
+          # a list of names in the summary. Groups render COLLAPSED, so a
+          # failing run showed 12 filenames and no traceback — the log
+          # contained the answer and nobody could see it. Three debugging
+          # rounds were spent guessing at causes that measurement then refuted.
+          # A CI that hides the error is not a diagnostic tool.
+          echo ""
+          echo "############### FAILURE DETAIL ###############"
+          for t in "${FAILED[@]}"; do
+            LOG="/tmp/suite_logs/$(basename "$t").log"
+            echo ""
+            echo "=================================================="
+            echo "### $t"
+            echo "=================================================="
+            tail -40 "$LOG" 2>/dev/null || echo "(no log captured)"
+            # One-line annotation so the cause shows on the run's summary page
+            # without opening the log at all.
+            REASON=$(grep -aoE "(ModuleNotFoundError|ImportError|AssertionError|RuntimeError|TypeError|AttributeError|ValueError|FileNotFoundError|OSError)[^\"]{0,160}" "$LOG" 2>/dev/null | tail -1)
+            echo "::error file=$t::${REASON:-failed, see FAILURE DETAIL in the log}"
+          done
+
+          {
+            echo "### Failed suites"
+            for t in "${FAILED[@]}"; do
+              LOG="/tmp/suite_logs/$(basename "$t").log"
+              echo "<details><summary>$t</summary>"
+              echo ""
+              echo '```'
+              tail -40 "$LOG" 2>/dev/null
+              echo '```'
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          printf 'FAILED: %s\n' "${FAILED[@]}"
+          exit 1

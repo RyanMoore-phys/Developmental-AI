@@ -62,6 +62,17 @@ def main() -> None:
         a._frozen_limit = 5              # small for the test
         a._frozen_count = 0
         a._prev_pov_digest = None
+        # BOOT GRACE, STUBBED OFF (added 2026-09-02). This helper bypasses
+        # __init__ via object.__new__, so every attribute the detector reads
+        # must be stubbed HERE — and the 2026-08-05 grace-period fix added two
+        # that were not, so this suite failed with
+        #   AttributeError: no attribute '_frozen_grace'
+        # against perfectly good production code. Grace is set to 0 rather
+        # than the real 600 because this test exercises the FREEZE DETECTOR,
+        # not the boot window; at 600 every call would return early and the
+        # assertions below would test nothing while still passing.
+        a._frozen_grace = 0
+        a._steps_since_reset = 0
         a._motion_macros = frozenset(
             i for i, m in enumerate(TREECHOP_MACROS)
             if "camera" in m or "forward" in m or "back" in m)

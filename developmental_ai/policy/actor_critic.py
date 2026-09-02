@@ -1793,6 +1793,26 @@ class StandaloneActorCritic:
             sd["encoder"] = self._shared_encoder.state_dict()
             sd["arch"] = "wm"
             sd["enc_dim"] = int(self.enc_dim)
+        elif self.arch == "rssm":
+            # RSSM POLICIES MUST MARK THEMSELVES (fix 2026-09-02).
+            # arch="rssm" has no `self.encoder` (it reads RSSM latents) and is
+            # not "wm", so it fell through BOTH branches above and produced a
+            # state dict with no `arch` key at all. Two failures followed, both
+            # silent until something tried to use a skill:
+            #   * load_state_dict defaults a missing marker to "flat", so
+            #     "flat" != "rssm" raised `policy arch mismatch` — an rssm
+            #     policy could not even reload its OWN weights;
+            #   * skill_bank.save_skill derives arch from this marker, so every
+            #     minted skill was registered arch='flat', and _bind reads the
+            #     registry and refuses the skill. With arch: rssm live that
+            #     disables skills-as-options entirely, with no error at mint
+            #     time — the skill banks fine and is simply never invokable.
+            # NOTE no encoder snapshot, unlike "wm": an rssm skill reads the
+            # LIVE world model's latents, so there is nothing self-contained to
+            # store. That makes it dependent on a world model that keeps
+            # training — a real property of this arch, not an oversight.
+            sd["arch"] = "rssm"
+            sd["enc_dim"] = int(self.enc_dim)
         return sd
 
     def load_state_dict(self, state_dict: Dict) -> None:

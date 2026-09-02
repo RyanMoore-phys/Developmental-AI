@@ -322,7 +322,15 @@ class SkillOptionBank:
         # A conv sd fed to adapt_actor_sd would die on the kdim sanity check
         # (in_dim ~354 vs obs_dim 49152), but by accident, with a misleading
         # message. Detect the family by its own marker instead.
-        if "encoder" in sd:
+        # ENCODED FAMILY = conv | wm | rssm. All three read FEATURES rather
+        # than raw pixels, so they share the encoded bind path. The family
+        # test cannot be `"encoder" in sd` any more (2026-09-02): arch="rssm"
+        # reads the LIVE world model's latents and therefore ships no encoder
+        # snapshot, so it fell through to the flat adapter, which computed
+        # kdim = in_dim - obs_dim = 363 - 49152 and refused every rssm skill
+        # with "unexplainable input_dim". Mint succeeded, binding never did —
+        # skills-as-options was silently off. Test the arch MARKER instead.
+        if "encoder" in sd or sd.get("arch") == "rssm":
             return self._bind_conv(slot, sk, sd)
         # the skill's OWN primitive count decides the head slice — see
         # adapt_actor_sd. getattr: legacy Skill objects may lack the field.
@@ -511,8 +519,12 @@ class SkillOptionBank:
             # weights into the wrong module and refuse the skill.
             "arch": str(sd.get("arch") or getattr(sk, "arch", None) or "conv"),
             "actor_sd": {k: v.to(self.dtype) for k, v in actor_sd.items()},
-            "encoder_sd": {k: v.to(self.dtype)
-                           for k, v in sd["encoder"].items()},
+            # None for arch="rssm": it reads the LIVE world model's latents,
+            # so there is no encoder to snapshot. _materialize must therefore
+            # branch on has-encoder, not on is-encoded.
+            "encoder_sd": ({k: v.to(self.dtype)
+                            for k, v in sd["encoder"].items()}
+                           if isinstance(sd.get("encoder"), dict) else None),
             "p_own": int(p_own),
             "head_dim": head_dim,
             "slot_map": slot_map,
@@ -653,8 +665,14 @@ class SkillOptionBank:
         # pixels, so everything downstream (head width, conditioner input
         # width) is identical; only the encoder MODULE differs.
         _arch = b.get("arch")
-        is_conv = _arch in ("conv", "wm")
-        if is_conv:
+        # IS-ENCODED vs HAS-ENCODER are different questions (2026-09-02).
+        # All three encoded archs read features, so head width and the
+        # conditioner's input width follow enc_dim for all of them. Only
+        # conv/wm own an encoder MODULE to rebuild; rssm's features arrive
+        # from the live world model via `feats`, so it must not try.
+        is_conv = _arch in ("conv", "wm", "rssm")
+        has_encoder = _arch in ("conv", "wm")
+        if has_encoder:
             # conv skills rebuild at their FULL stored head width — the slot
             # rows are the composition interface, sliced off only by MASKING
             # at sample time, never by truncation at build time.
@@ -673,10 +691,18 @@ class SkillOptionBank:
             enc.to(self.device).eval()
             for p in enc.parameters():
                 p.requires_grad_(False)
+        else:
+            enc = None
+        # HEAD WIDTH FOLLOWS IS-ENCODED, NOT HAS-ENCODER. Every encoded skill
+        # (conv|wm|rssm) rebuilds at its FULL stored head — the option-slot
+        # rows above p_own are the composition interface, sliced off by
+        # MASKING at sample time, never by truncation at build time. Only the
+        # flat legacy family truncates. Building rssm at p_own would silently
+        # drop those rows and disable skill-invokes-skill for it.
+        if is_conv:
             actor = ActorNetwork(b["in_dim"], int(b["head_dim"]),
                                  b["hidden"], continuous=False)
         else:
-            enc = None
             actor = ActorNetwork(b["in_dim"], int(b.get("p_own") or self.P),
                                  b["hidden"], continuous=False)
         actor.load_state_dict(
@@ -801,7 +827,8 @@ class SkillOptionBank:
     def skill_action(self, slot: int, obs: np.ndarray,
                      head_mask: Optional[np.ndarray] = None,
                      env: int = 0,
-                     proprio: Optional[np.ndarray] = None) -> int:
+                     proprio: Optional[np.ndarray] = None,
+                     feats: Optional[np.ndarray] = None) -> int:
         """One SAMPLED action from the slot's frozen skill policy.
 
         Flat legacy skills return a primitive by construction (their heads
@@ -815,7 +842,26 @@ class SkillOptionBank:
         actor, cond, enc, _delta = self._materialize(slot)
         obs_t = torch.from_numpy(
             np.asarray(obs, dtype=np.float32)).reshape(1, -1).to(self.device)
-        feats = enc(obs_t) if enc is not None else obs_t
+        # WHERE FEATURES COME FROM, per family (2026-09-02):
+        #   conv|wm  the skill's OWN snapshotted encoder, applied to obs
+        #   rssm     the LIVE world model's latent, passed in as `feats`
+        #   flat     raw obs
+        # rssm MUST NOT fall back to obs_t: the actor was trained on a
+        # ~4352-wide latent and obs is 49152 raw pixels, so the matmul would
+        # either raise or — if widths ever coincided — feed the skill noise
+        # shaped like perception. Refuse loudly instead; a skill that cannot
+        # see must not act.
+        if b.get("arch") == "rssm":
+            if feats is None:
+                raise SlotRefused(
+                    f"rssm skill in slot {slot} got no latent: skill_action "
+                    f"needs feats= from the world model, and obs are pixels")
+            feats_t = torch.as_tensor(
+                np.asarray(feats, dtype=np.float32)
+            ).reshape(1, -1).to(self.device)
+        else:
+            feats_t = enc(obs_t) if enc is not None else obs_t
+        feats = feats_t
         # ---- PROPRIOCEPTION (fix 2026-08-01, caught by the boot test) ----
         # The policy input is [features, PROPRIO, gated_knowledge] — the
         # conditioner gate deliberately reads perception only, so proprio sits
@@ -1278,9 +1324,17 @@ class OptionExecutor:
                 _pr = (proprio_per_env[e_i]
                        if (proprio_per_env is not None
                            and e_i < len(proprio_per_env)) else None)
+                # LATENT FOR arch="rssm" skills. `act` already receives
+                # feats_per_env for the meta-policy; the option stack was the
+                # one consumer that never got it, which is the same omission
+                # the proprio note above records. Without it an rssm skill
+                # raises SlotRefused on every invocation.
+                _ft = (feats_per_env[e_i]
+                       if (feats_per_env is not None
+                           and e_i < len(feats_per_env)) else None)
                 actions.append(
                     self._stack_action(e_i, obs_list[e_i], timestep,
-                                       proprio=_pr))
+                                       proprio=_pr, feats=_ft))
         assert all(0 <= a < P for a in actions), actions
         return actions
 
@@ -1336,7 +1390,8 @@ class OptionExecutor:
         return m
 
     def _stack_action(self, e_i: int, obs: np.ndarray, timestep: int,
-                      proprio: Optional[np.ndarray] = None) -> int:
+                      proprio: Optional[np.ndarray] = None,
+                      feats: Optional[np.ndarray] = None) -> int:
         """Resolve one PRIMITIVE from this env's option stack, pushing nested
         frames when a conv skill invokes a child. Bounded by construction:
         each hop either returns a primitive or increases depth, and the mask
@@ -1353,19 +1408,43 @@ class OptionExecutor:
                     continue
                 self._close(e_i, root, timestep, "unbound")
                 return 0
+            # AN rssm SKILL WITHOUT A LATENT CANNOT ACT (2026-09-02).
+            # Its actor was trained on world-model latents; obs are raw
+            # pixels. Close the option the same way an unbound slot is closed
+            # rather than raising: skill_action's own guard would propagate
+            # out of act() — nothing on this path catches SlotRefused — and
+            # kill the run over a missing optional argument. Degrading to the
+            # meta-policy is recoverable; a crash mid-segment is not.
+            if b.get("arch") == "rssm" and feats is None:
+                self.rssm_no_latent = getattr(self, "rssm_no_latent", 0) + 1
+                logger.warning(
+                    "option slot %d (%s) is arch=rssm but no latent was "
+                    "supplied — closing the option. The caller must pass "
+                    "feats_per_env; without it this skill can never run.",
+                    frame.slot, b.get("skill_id"))
+                if stack:
+                    self._pop_frame(e_i, timestep, "no_latent")
+                    continue
+                self._close(e_i, root, timestep, "no_latent")
+                return 0
             depth = 1 + len(stack)
             stack_ids = {root.skill_id} | {f.skill_id for f in stack}
             # ENCODED FAMILY (conv|wm) keeps its FULL head, so it needs the
             # child mask to nest. Omitting "wm" here would have silently
             # disabled skill-invokes-skill for every skill minted under the
             # shared-perception arch.
-            if b.get("arch") in ("conv", "wm"):
+            # "rssm" ADDED 2026-09-02 — it keeps its full head exactly like
+            # conv/wm, so omitting it here would silently disable
+            # skill-invokes-skill for every rssm skill, which is precisely
+            # the failure this comment already records for "wm".
+            if b.get("arch") in ("conv", "wm", "rssm"):
                 mask = self._child_mask(b, stack_ids, depth)
                 a = self.bank.skill_action(frame.slot, obs, head_mask=mask,
-                                           env=e_i, proprio=proprio)
+                                           env=e_i, proprio=proprio,
+                                           feats=feats)
             else:
                 a = self.bank.skill_action(frame.slot, obs, env=e_i,
-                                           proprio=proprio)
+                                           proprio=proprio, feats=feats)
             p_own = int(b.get("p_own") or self.bank.P)
             if a < p_own:
                 return int(a)
