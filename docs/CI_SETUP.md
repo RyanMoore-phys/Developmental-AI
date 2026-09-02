@@ -1,86 +1,88 @@
-# CI setup — self-hosted runner, zero secrets in GitHub
+# CI setup — self-hosted runner, no GitHub secrets, no branch protection
 
-**The property this design buys:** no credential is ever committed, and no
-credential is ever stored in GitHub Secrets either. Every value the pipeline
-needs lives in one file on the runner host, outside the repository.
+**What this design gives you:** no credential is committed, none is stored in
+GitHub Secrets, and nothing depends on a repo setting your plan may not offer.
+This is a single-maintainer private repo and the pipeline is built for that,
+not for a team.
 
 Audited 2026-09-02: the content of **every blob in this repo's history** was
-scanned and returned **zero** credential hits. The setup below is what keeps
-that true.
+scanned and returned **zero** credential hits.
 
 ---
 
-## Why self-hosted removes the secrets, rather than just moving them
+## Why there are no secrets to store
 
-A GitHub-hosted runner is a fresh box that knows nothing, so it must be *given*
-credentials — a tailnet OAuth client to reach the pod, and an SSH key to
-bootstrap a bare one. Both would have to be uploaded to GitHub Secrets.
+A GitHub-hosted runner is a blank box that must be *given* credentials. A
+runner on your own machine already has them:
 
-A self-hosted runner on a machine you already use has both already:
-
-| Needed | GitHub-hosted | Self-hosted |
+| Needed | Hosted runner | Self-hosted (this design) |
 |---|---|---|
-| Reach the pod over the tailnet | `TS_OAUTH_CLIENT_ID` + `TS_OAUTH_SECRET` | host is already on the tailnet — **nothing** |
-| SSH into a bare pod to provision | `POD_SSH_KEY` (private key upload) | `~/.ssh/skybot_ed25519` already on disk — **nothing** |
-| Know which pod / server | repo variables | runner `.env` — local file |
+| SSH to the pod | private key uploaded to GitHub Secrets | `~/.ssh/skybot_ed25519`, already on disk |
+| Reach the pod | tailnet OAuth client | the machine can already reach it |
+| Which pod / server | repo variables | runner `.env`, a local file |
 
-So the only secret-shaped value left is `TS_AUTHKEY`, used once per pod
-rebuild, and it lives in the runner's local `.env` too.
+`deploy.yml` and `pod.yml` reference **zero** `secrets.*` — verified.
 
----
+## Why there is no branch protection
+
+Review-before-merge needs a second person. There isn't one. The production
+gates live in the workflows instead, and work on any plan:
+
+- automatic deploys require `ci` to have passed
+  (`workflow_run.conclusion == 'success'`); `workflow_dispatch` bypasses it on
+  purpose — you are the reviewer;
+- the deploy checkout is **pinned to the exact commit CI validated**
+  (`workflow_run.head_sha`), so a commit landing mid-CI cannot slip out
+  untested;
+- a live training run is never implicitly stopped or restarted.
 
 ## ⚠️ Precondition: PRIVATE repositories only
 
-A self-hosted runner must never serve a public repo. On a public repo anyone
-can fork it, open a pull request, and have your runner execute their code **as
-your user, on your machine**. This repo is private; if that ever changes,
-deregister the runner *first*.
+A self-hosted runner must never serve a public repo — anyone could fork, open
+a PR, and execute arbitrary code as your user on your machine. If this repo
+ever goes public, deregister the runner first.
 
 ---
 
 ## 1. Install the runner
 
-GitHub → repo → **Settings → Actions → Runners → New self-hosted runner**, pick
-your OS, and follow the generated commands. Install it **outside** the repo
-(e.g. `~/actions-runner`) so its working directories can never be committed —
-`.gitignore` also blocks `actions-runner/` and `_work/` as a second line of
-defence.
+GitHub → repo → **Settings → Actions → Runners → New self-hosted runner**.
+Install it **outside** the repo (e.g. `~/actions-runner`) so its working
+directories can never be committed; `.gitignore` also blocks `actions-runner/`
+and `_work/` as a second line of defence.
 
-When it asks for labels, add **`skybot`**. The workflows target
-`[self-hosted, skybot]`, so the label is what routes jobs to the right box.
-That matters later when a node joins: label the node `skybot` too and jobs
-follow it with no workflow edit.
+**Give it the label `skybot`.** Both workflows target `[self-hosted, skybot]`,
+so the label is what routes jobs. When a node joins later, label it `skybot`
+too and jobs follow with no workflow edit.
 
 Run it as a service so it survives reboots:
 
 ```bash
 cd ~/actions-runner
-./svc.sh install     # macOS/Linux
-./svc.sh start
+./svc.sh install && ./svc.sh start
 ```
 
-## 2. Put the connection values in the runner's `.env`
+## 2. Put connection values in the runner's `.env`
 
-The runner reads `.env` from its own root directory and applies it to every
-job. **This file is never committed — it is not in the repo at all.**
+The runner reads `.env` from its own root and applies it to every job. **This
+file is never committed — it is not in the repo at all.**
 
 ```bash
 cat > ~/actions-runner/.env <<'EOF'
-# Pod on the tailnet — stable across rebuilds, unlike an IP.
-POD_HOST=devai-pod-2
+# --- required ---
+POD_HOST=<redacted-host>          # pod IP (ssh transport, the default)
+POD_SSH_PORT=19983               # ROTATES on every pod restart — see below
+POD_SSH_KEYFILE=/Users/rimac/.ssh/skybot_ed25519
 
-# The Paper server's tailnet IP, for the socat bridge.
-MC_SERVER_TS_IP=100.64.0.11
+# --- required for `pod.yml action=connect` ---
+MC_SERVER_TS_IP=100.64.0.11    # the Paper server's tailnet IP
 
-# Bootstrap-only: reaching a BARE pod that is not on the tailnet yet.
-# Both change on every pod rebuild — this file is the one place to update.
-POD_SSH_HOST=<current-pod-ip>
-POD_SSH_PORT=<current-ssh-port>
-POD_SSH_KEYFILE=/Users/<you>/.ssh/skybot_ed25519
-
-# Ephemeral, pre-authorised, tag:devai auth key. Used once per pod rebuild so
-# provisioning can join the tailnet without a browser click.
-TS_AUTHKEY=tskey-auth-...
+# --- optional ---
+# DEPLOY_TRANSPORT=tailscale     # use Tailscale SSH instead of ssh; needs the
+                                 # ACL rule in section 4, and POD_HOST becomes
+                                 # the MagicDNS name (e.g. devai-pod-2)
+# TS_AUTHKEY=tskey-auth-...      # lets `provision` join a fresh pod to the
+                                 # tailnet without a browser click
 EOF
 chmod 600 ~/actions-runner/.env
 ```
@@ -88,76 +90,90 @@ chmod 600 ~/actions-runner/.env
 Restart the runner after editing (`./svc.sh stop && ./svc.sh start`) — `.env`
 is read at service start.
 
-**Updating after a pod rebuild is a one-file edit:** `POD_SSH_HOST`,
-`POD_SSH_PORT`, and a fresh `TS_AUTHKEY`. Nothing in the repo changes.
+### The one thing you must keep updated
 
-## 3. Tailnet ACL (one-time, in the Tailscale admin console)
+**`POD_SSH_PORT` changes every time the pod restarts** (22655 → 22681 → 34276
+→ 19983 → …). When a job fails at the preflight step with an ssh error, this
+is almost always why. Update `.env`, restart the runner, re-run.
 
-```json
-"tagOwners": {
-  "tag:devai": ["autogroup:admin"]
-},
-"ssh": [
-  {
-    "action": "accept",
-    "src":    ["autogroup:member"],
-    "dst":    ["tag:devai"],
-    "users":  ["root"]
-  }
-]
+This is the single reason to consider the tailscale transport later: a MagicDNS
+name is stable across rebuilds, so nothing needs updating. It costs one ACL
+rule (section 4). The ssh default was chosen because it works **today**, with
+zero extra configuration.
+
+## 3. Verify, in this order
+
+```bash
+# 1. runner shows "Idle" under Settings -> Actions -> Runners
+# 2. transport works, straight from the runner host:
+POD_HOST=... POD_SSH_PORT=... bash scripts/pod_exec.sh 'hostname'
+# 3. read-only workflow:  Actions -> pod -> Run workflow -> action=status
+# 4. then deploy, then connect, then launch.
 ```
 
-Use **`accept`**, not `check`. `check` requires interactive browser re-auth,
-which in CI does not fail — it **hangs** until the job times out.
+Do **not** test `action=provision` against a working pod: it does
+`rm -rf mc-build` and rebuilds MineRL (40–60 min). It is guarded behind typing
+`PROVISION`, which is a guard on your *pod*, not a branch policy.
 
-`autogroup:member` covers the runner host because it is your own device. If
-you later run the runner on a tagged machine, add that tag to `src`.
+## 4. Optional — Tailscale SSH transport
 
-Enable Tailscale SSH on the pod (once per pod):
+Only if you want to stop updating `POD_SSH_PORT`. On the pod, once:
 
 ```bash
 tailscale set --ssh=true
 ```
 
+Then in the Tailscale admin console:
+
+```json
+"ssh": [
+  { "action": "accept", "src": ["autogroup:member"], "dst": ["tag:devai"], "users": ["root"] }
+]
+```
+
+Use **`accept`**, not `check` — `check` requires interactive browser re-auth,
+which in CI does not fail, it **hangs** until timeout.
+
 Verified 2026-09-02: with `--ssh` on but no ACL rule, an inbound attempt
 reaches the pod and tailscaled replies *"tailnet policy does not permit you to
 SSH to this node"*. That message means the transport works and only policy is
-missing — it is the expected state before step 3, not a failure.
-
-## 4. Turn on GitHub secret scanning
-
-Settings → **Code security** → enable **Secret scanning** and **Push
-protection**. Push protection blocks a credential at `git push` instead of
-after it is already in history. Nothing to migrate — history is clean.
+missing — the expected state before adding the rule.
 
 ---
 
-## Verify, in this order
+## Keeping CI honest
 
-```bash
-# 1. runner is online:  Settings -> Actions -> Runners shows "Idle"
-# 2. transport works, from the runner host:
-tailscale ssh root@$POD_HOST 'hostname'
-# 3. read-only workflow first:
-#    Actions -> pod -> Run workflow -> action=status
-# 4. then connect, then launch.
+`ci.yml` pins versions **read off the running pod**, not guessed:
+
+```
+python 3.10 · torch 2.6.0 · numpy 2.2.6 · gymnasium 1.3.0
 ```
 
-Do **not** test `action=provision` against a working pod: it does
-`rm -rf mc-build` and rebuilds MineRL (40–60 min). It is guarded behind typing
-`PROVISION`, and that guard exists for this reason.
+This matters: the first version installed unpinned latest and 6 of 12 suites
+failed while all 12 passed locally — one stack mismatch, not six bugs. The
+second attempt pinned `numpy<2` on the assumption numpy 2 was the culprit;
+the pod actually runs numpy **2.2.6**, and the failing suites were then re-run
+*on the pod* against it and all passed. Guessing was wrong twice; reading the
+versions off production was right.
+
+**When you upgrade the pod, update these pins in the same change.** Re-read
+them with:
+
+```bash
+bash scripts/pod_exec.sh 'cd /workspace/devai && ./venv_mc/bin/pip list'
+```
+
+A CI that tests a stack the pod does not run is worse than no CI — it reports
+green for a configuration nobody deploys.
 
 ---
 
-## What is still stored where
+## What is stored where
 
 | Value | Where | In git? | In GitHub? |
 |---|---|---|---|
-| `POD_HOST`, `MC_SERVER_TS_IP` | runner `.env` | no | no |
-| `POD_SSH_HOST`, `POD_SSH_PORT` | runner `.env` | no | no |
+| `POD_HOST`, `POD_SSH_PORT` | runner `.env` | no | no |
 | SSH private key | `~/.ssh/` on the runner host | no | no |
-| `TS_AUTHKEY` | runner `.env` | no | no |
+| `MC_SERVER_TS_IP` | runner `.env` | no | no |
+| `TS_AUTHKEY` (optional) | runner `.env` | no | no |
 | `CI_RUNS_ON` (optional) | repo variable | no | yes — non-secret |
-
-The only thing this design puts in GitHub is an optional non-secret variable
-choosing which runner executes the test gate.

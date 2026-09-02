@@ -1,37 +1,43 @@
-# Sync code to the live pod after `ci` passes on main. DOES NOT LAUNCH.
+# Sync code to the pod. Runs automatically after `ci` succeeds, and can be run
+# by hand at any time from any branch.
 #
-# RUNS ON A SELF-HOSTED RUNNER, and that choice removes secrets from GitHub
-# entirely (2026-09-02):
-#   * the runner host is ALREADY on the tailnet, so there is no OAuth client
-#     and no tailscale action — no TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET;
-#   * the runner host already holds ~/.ssh/skybot_ed25519, so no POD_SSH_KEY;
-#   * connection values come from the runner's own `.env`, which lives outside
-#     this repository and is never committed.
-# Net result: this pipeline stores NOTHING in GitHub Secrets. See
-# docs/CI_SETUP.md.
+# NO BRANCH PROTECTION IS ASSUMED (2026-09-02). This is a single-maintainer
+# private repo; requiring review-before-merge would be ceremony with nobody to
+# perform it, and branch protection is not available on every plan anyway. The
+# real production gates are in THIS FILE and do not depend on any repo setting:
+#   * automatic runs require ci to have passed (workflow_dispatch bypasses it
+#     deliberately — you are the reviewer);
+#   * the checkout is pinned to the exact commit ci validated;
+#   * a live training run is never stopped or restarted implicitly.
+#
+# TRANSPORT defaults to plain SSH, NOT tailscale. The self-hosted runner is
+# the maintainer's own machine: it already holds ~/.ssh/skybot_ed25519 and can
+# reach the pod's public endpoint, so nothing extra needs configuring. Set
+# DEPLOY_TRANSPORT=tailscale in the runner's .env to switch — that path needs a
+# tailnet ACL rule (docs/CI_SETUP.md) and is strictly optional.
 #
 # SAFETY PRECONDITION: a self-hosted runner must only ever serve a PRIVATE
-# repo. On a public repo any fork could open a PR and execute arbitrary code
-# as the runner user, on your machine. If this repo is ever made public,
-# deregister the runner first.
-#
-# WHY workflow_run AND NOT `needs:`: `needs` only orders jobs inside ONE
-# workflow. Gating one workflow on another requires workflow_run plus an
-# explicit conclusion check, or this fires even when ci FAILED.
-#
-# WHY IT NEVER LAUNCHES: a push must not restart live training. The brain is
-# accumulated developmental memory and a restart costs its continuity, so
-# starting a run stays a deliberate act — see pod.yml.
+# repo. On a public repo any fork could open a PR and run arbitrary code as
+# the runner user, on your machine.
 name: deploy
 
 on:
   workflow_run:
     workflows: ["ci"]
     types: [completed]
-    branches: [main]
+    # No `branches:` filter — deploy follows whatever branch you work on.
   workflow_dispatch:
+    inputs:
+      launch:
+        description: "also START training after syncing (default: no)"
+        type: boolean
+        default: false
+      allow_stop_live:
+        description: "proceed even if training is LIVE (it will be stopped)"
+        type: boolean
+        default: false
 
-# Two pushes must not race a half-synced tree onto the pod. cancel-in-progress
+# Two runs must not race a half-synced tree onto one pod. cancel-in-progress
 # is FALSE on purpose: cancelling mid-rsync would leave exactly that.
 concurrency:
   group: deploy-pod
@@ -45,35 +51,70 @@ jobs:
     runs-on: [self-hosted, skybot]
     timeout-minutes: 30
     steps:
+      # PIN TO THE COMMIT CI ACTUALLY TESTED. On a `workflow_run` event
+      # GITHUB_SHA is the tip of the default branch, not the commit that
+      # triggered the passing run — so a bare checkout can ship code CI never
+      # saw. The `|| github.sha` fallback covers workflow_dispatch.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      # POD_HOST comes from the runner's .env (see docs/CI_SETUP.md).
-      # Deliberately NOT `${{ vars.POD_HOST }}`: if that variable were unset,
-      # the expression expands to an empty string and would SHADOW the value
-      # the runner supplied, failing in a way that looks like a missing pod.
-      - name: Preflight — tailnet reachable and pod answering
+      - name: Report exactly what is being deployed
+        run: |
+          echo "commit:    $(git rev-parse HEAD)"
+          echo "subject:   $(git log -1 --pretty=%s)"
+          echo "trigger:   ${{ github.event_name }}"
+          echo "transport: ${DEPLOY_TRANSPORT:-ssh}"
+          echo "launch:    ${{ github.event.inputs.launch || 'false' }}"
+
+      - name: Preflight — can we reach the pod at all?
         run: |
           set -euo pipefail
-          : "${POD_HOST:?POD_HOST not set. Put it in the runner's .env — see docs/CI_SETUP.md}"
-          command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
-          tailscale status >/dev/null 2>&1 || { echo "::error::runner host is not connected to the tailnet"; exit 1; }
-          # Fail HERE with a clear message rather than deep inside rsync. If
-          # this HANGS instead of failing, the tailnet ACL ssh rule is almost
-          # certainly action "check" (interactive re-auth) rather than "accept".
-          tailscale ssh "root@${POD_HOST}" 'echo "pod: $(hostname)"' \
-            || { echo "::error::Tailscale SSH to ${POD_HOST} failed. Check the ACL grants this host -> tag:devai as root with action=accept, and that the pod ran 'tailscale set --ssh=true'."; exit 1; }
+          T="${DEPLOY_TRANSPORT:-ssh}"
+          if [ "$T" = "tailscale" ]; then
+            : "${POD_HOST:?POD_HOST not set in the runner .env}"
+            command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
+            # If this HANGS rather than fails, the tailnet ACL ssh rule is
+            # action "check" (interactive re-auth) instead of "accept".
+            tailscale ssh "root@${POD_HOST}" 'echo "pod: $(hostname)"' \
+              || { echo "::error::Tailscale SSH to ${POD_HOST} failed — see docs/CI_SETUP.md"; exit 1; }
+          else
+            : "${POD_HOST:?POD_HOST not set in the runner .env (pod IP for ssh transport)}"
+            : "${POD_SSH_PORT:?POD_SSH_PORT not set in the runner .env}"
+            KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
+            [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY on the runner host"; exit 1; }
+            ssh -p "$POD_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
+                "root@$POD_HOST" 'echo "pod: $(hostname)"' \
+              || { echo "::error::ssh to $POD_HOST:$POD_SSH_PORT failed. The pod's SSH port rotates on every restart — update POD_SSH_PORT in the runner .env."; exit 1; }
+          fi
 
-      - name: Sync code + pod-side smoke tests (no launch)
+      - name: Sync code + pod-side smoke tests
         env:
-          DEPLOY_TRANSPORT: tailscale
-          DEPLOY_LAUNCH: "0"
-        run: bash scripts/deploy_skybot.sh
-
-      - name: Confirm nothing was started
+          # deploy_skybot.sh reads these; POD_HOST/POD_SSH_PORT/POD_SSH_KEYFILE
+          # come from the runner .env and are NOT redefined here (an unset
+          # `${{ vars.X }}` would expand to "" and shadow them).
+          DEPLOY_LAUNCH: ${{ github.event.inputs.launch == 'true' && '1' || '0' }}
+          DEPLOY_ALLOW_STOP_LIVE: ${{ github.event.inputs.allow_stop_live == 'true' && '1' || '0' }}
         run: |
-          tailscale ssh "root@${POD_HOST}" '
-            cd /workspace/devai 2>/dev/null || exit 0
-            if pgrep -f "run_minecraft[.]py" >/dev/null; then
-              echo "::error::a training run is live after a no-launch deploy"; exit 1
-            fi
-            echo "confirmed idle; STOP file: $(test -f podlogs/STOP && echo present || echo absent)"'
+          set -euo pipefail
+          bash scripts/deploy_skybot.sh "${POD_SSH_PORT:-22}"
+
+      - name: Report final pod state
+        run: |
+          T="${DEPLOY_TRANSPORT:-ssh}"
+          CMD='cd /workspace/devai 2>/dev/null || exit 0
+               R="run_min""ecraft"
+               if pgrep -f "$R[.]py" >/dev/null; then
+                 echo "training LIVE (pid $(cat podlogs/skybot_run.pid 2>/dev/null))"
+               else
+                 echo "training not running"
+               fi
+               echo "STOP file: $(test -f podlogs/STOP && echo present || echo absent)"'
+          if [ "$T" = "tailscale" ]; then
+            tailscale ssh "root@${POD_HOST}" "$CMD"
+          else
+            ssh -p "$POD_SSH_PORT" -i "${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}" \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              "root@$POD_HOST" "$CMD"
+          fi

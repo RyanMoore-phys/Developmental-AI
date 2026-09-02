@@ -58,6 +58,28 @@ fi
 echo "==> target root@$HOST:$PORT via $TRANSPORT (launch=$LAUNCH)"
 $SSH_CMD "root@$HOST" 'echo "    pod reachable: $(hostname)"'
 
+# NO-LAUNCH MUST ALSO MEAN NO-STOP (2026-09-02). The stop below runs
+# UNCONDITIONALLY and the DEPLOY_LAUNCH=0 early-exit is ~50 lines further
+# down, so a sync-only deploy would STOP live training and then never restart
+# it — strictly worse than restarting, and it would have fired automatically
+# on every push to main once deploy.yml was wired up. DEPLOY_LAUNCH=0 means
+# "I am not starting anything", and killing a run is never part of that
+# intent. Refuse instead, and make the human decide.
+if [ "$LAUNCH" != "1" ]; then
+  _live=$($SSH_CMD "root@$HOST" 'pgrep -f "run_min""ecraft[.]py" | wc -l' 2>/dev/null | tr -d '[:space:]')
+  if [ "${_live:-0}" != "0" ]; then
+    if [ "${DEPLOY_ALLOW_STOP_LIVE:-0}" = "1" ]; then
+      echo "==> WARNING: training is LIVE and DEPLOY_ALLOW_STOP_LIVE=1 — stopping it and NOT restarting"
+    else
+      echo "REFUSED: training is LIVE on $HOST and DEPLOY_LAUNCH=0."
+      echo "  Syncing now would stop the run and leave it stopped."
+      echo "  Stop it deliberately first (pod.yml action=stop, or touch podlogs/STOP),"
+      echo "  or re-run with DEPLOY_ALLOW_STOP_LIVE=1 if that is really what you want."
+      exit 1
+    fi
+  fi
+fi
+
 echo "==> stopping any live run (a second run would fight for the clients)"
 # STOP-FILE FIRST so the supervisor treats this as deliberate, not a crash,
 # and does not immediately relaunch the old code underneath us.

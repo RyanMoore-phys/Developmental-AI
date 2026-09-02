@@ -61,17 +61,51 @@ jobs:
       # a missing one surfaces as ModuleNotFoundError that reads like a code
       # failure. That already cost a diagnostic cycle on the A4000 pod, which
       # is why requirements.txt carries a note about it.
-      - name: Install dependencies
+      # VERSIONS MIRROR THE POD, MEASURED FROM IT (2026-09-02).
+      # The first version of this step installed UNPINNED latest and 6 of the
+      # 12 core suites failed while all 12 passed locally — not six bugs, one
+      # stack mismatch. requirements.txt specifies only FLOORS
+      # (`torch>=2.0.0`, `numpy>=1.24.0`), so a fresh resolve pulls whatever
+      # shipped this week and CI tests a configuration that exists nowhere.
+      #
+      # THE VERSIONS BELOW WERE READ OFF THE RUNNING POD (`pip list` in
+      # venv_mc), NOT GUESSED. That distinction cost a wrong fix: the first
+      # attempt pinned `numpy<2` on the assumption that numpy 2 was the
+      # culprit. The pod actually runs numpy 2.2.6, and the failing suites
+      # were then re-run ON the pod against it — all passed. So numpy 2 is
+      # production, and `numpy<2` would have made CI green for a stack that
+      # never ships. torch is the real difference: the pod is on 2.6.0 while
+      # an unpinned install pulls something far newer.
+      #
+      # WHEN YOU BUMP THE POD, BUMP THESE IN THE SAME CHANGE — a CI that
+      # tests a stack the pod does not run is worse than no CI, because it
+      # reports green for a configuration nobody deploys. Re-read them with:
+      #   ssh <pod> 'cd /workspace/devai && ./venv_mc/bin/pip list'
+      - name: Install dependencies (mirrors the pod's venv_mc)
         run: |
           python -m pip install -q --upgrade pip wheel setuptools
-          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -q numpy pyyaml gymnasium pillow scipy scikit-learn \
-                        matplotlib tqdm imageio crafter minigrid
+          # CPU build: the default index pulls ~2.5 GB of CUDA wheels a CPU
+          # runner can never use. Same 2.6.0 as the pod's 2.6.0+cu124.
+          pip install -q "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install -q "numpy==2.2.6" "gymnasium==1.3.0" "PyYAML==6.0.3" \
+                        "pillow==12.3.0" "scipy==1.15.3" "matplotlib==3.10.9" \
+                        "tqdm==4.70.0" "imageio==2.37.4" "psutil==7.2.2" \
+                        scikit-learn crafter minigrid
 
       - name: Environment report
         run: |
-          python -c "import torch, numpy; print('torch', torch.__version__, '| numpy', numpy.__version__)"
-          python -c "import crafter, minigrid; print('crafter + minigrid import OK')"
+          python - <<'PY'
+          import sys, torch, numpy, gymnasium
+          print("python   ", ".".join(map(str, sys.version_info[:3])))
+          print("torch    ", torch.__version__)
+          print("numpy    ", numpy.__version__)
+          print("gymnasium", gymnasium.__version__)
+          # Guard the MIRROR, not a guessed value: these must match the pod.
+          assert numpy.__version__ == "2.2.6", f"numpy drifted to {numpy.__version__}"
+          assert torch.__version__.startswith("2.6.0"), f"torch drifted to {torch.__version__}"
+          import crafter, minigrid
+          print("crafter + minigrid import OK")
+          PY
 
       - name: Run smoke suite
         env:
