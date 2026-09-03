@@ -153,6 +153,12 @@ jobs:
               # the real bank and binds it, so it fails if the encoded-family
               # plumbing regresses. Keep it in the gate.
               tests/_skybot_boot_smoke.py
+              # The live tracker. In the gate because its failure mode is
+              # "looks healthy, stores nothing" — a green dashboard gets read
+              # as evidence, so the contracts that keep it honest (one
+              # ledger.segment() consumer, seq never rewinds) must be enforced
+              # on every push, not checked once.
+              tests/_metrics_sink_smoke.py
             )
             # DELIBERATELY EXCLUDED, each for a reason:
             #   _options_smoke     builds a Crafter env — wrong environment

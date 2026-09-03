@@ -1,0 +1,11 @@
+apiVersion: 1
+
+# Read-only view over the ingested SQLite. The raw JSONL beside it remains the
+# system of record — this file can be deleted and rebuilt at any time.
+datasources:
+  - name: SkyBot
+    type: frser-sqlite-datasource
+    uid: skybot-sqlite
+    isDefault: true
+    jsonData:
+      path: /data/skybot.db

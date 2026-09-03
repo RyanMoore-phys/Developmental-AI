@@ -70,6 +70,11 @@ class InfraStack:
         self.gates = None
         self.invariants = None
         self.ledger = None
+        # Last income statement, stashed by segment_report() because
+        # RewardLedger.segment() is a CONSUMING read (see the note there).
+        # Empty dict, not None, so a consumer can .get() it before the first
+        # segment without a None-check at every call site.
+        self.last_ledger_segment: dict = {}
         self.farm = None
         self.signals = None
         self.drift = None
@@ -515,6 +520,14 @@ class InfraStack:
                 for src, amt in dict(ctx["ledger_sources"]).items():
                     self.ledger.record(str(src), float(amt))
                 seg = self.ledger.segment()
+                # STASHED FOR THE METRICS SINK — DO NOT CALL segment() AGAIN.
+                # `RewardLedger.segment()` CLOSES and RESETS the segment; it is
+                # a consuming read. A second caller (the metrics sink wanting
+                # the same income statement) would get an EMPTY statement and
+                # destroy this one, so the reward-provenance panel would show
+                # nothing while the log still looked healthy. One call, one
+                # stash, every consumer reads the stash.
+                self.last_ledger_segment = dict(seg)
                 shares = ", ".join(
                     f"{k}={v:.0%}" for k, v in sorted(
                         seg.get("shares", {}).items(),

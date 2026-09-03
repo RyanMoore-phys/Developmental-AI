@@ -1,0 +1,98 @@
+# SkyBot live tracker — collector + dashboard.
+#
+# RUNS ON THE CI-RUNNER MINI, not the Paper server box. CLAUDE.md §6 records
+# the server mini as the system's bottleneck (4 MineRL clients -> 0 segments in
+# 17 minutes); Grafana plus an ingester on 2 cores would compete with the
+# Paper tick thread, and a laggy tick costs agent actions directly.
+#
+#   cp monitor.env.example .env && edit          # .env, NOT monitor.env —
+#   docker compose up -d --build                 # ${...} interpolation only
+#                                                # reads a file named .env
+#
+# THE RAW JSONL IS THE SYSTEM OF RECORD. skybot.db is a view: delete it, and
+# `docker compose restart ingest` rebuilds it identically from the log.
+services:
+
+  # 1. Pull the pod's metrics here, live + complete. See the script header for
+  #    why it runs BOTH a tail and a periodic rsync.
+  collector:
+    image: alpine:3.20
+    container_name: skybot-collector
+    restart: unless-stopped
+    env_file: [.env]
+    command: >
+      sh -c "apk add --no-cache openssh-client rsync bash coreutils >/dev/null
+             && bash /opt/collect_metrics.sh"
+    volumes:
+      - ./collect_metrics.sh:/opt/collect_metrics.sh:ro
+      - ${POD_SSH_KEY_HOST_PATH:?set POD_SSH_KEY_HOST_PATH in docker/monitor/.env}:/root/.ssh/skybot_ed25519:ro
+      - metrics_data:/data
+    environment:
+      POD_SSH_KEYFILE: /root/.ssh/skybot_ed25519
+      OUT_DIR: /data
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+
+  # 2. Independent server-side truth. Thin on purpose — see server_poll.py.
+  server_poll:
+    image: python:3.11-alpine
+    container_name: skybot-server-poll
+    restart: unless-stopped
+    env_file: [.env]
+    command: python /opt/server_poll.py
+    volumes:
+      - ./server_poll.py:/opt/server_poll.py:ro
+      - metrics_data:/data
+    environment:
+      SERVER_PATH: /data/server.jsonl
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 128M}
+
+  # 3. JSONL -> SQLite. Idempotent on `seq`, so re-running over the whole file
+  #    is safe and is how you rebuild after a bad ingest.
+  ingest:
+    image: python:3.11-alpine
+    container_name: skybot-ingest
+    restart: unless-stopped
+    command: python /opt/ingest.py
+    volumes:
+      - ./ingest.py:/opt/ingest.py:ro
+      - metrics_data:/data
+    environment:
+      DB_PATH: /data/skybot.db
+      METRICS_PATH: /data/metrics.jsonl
+      SERVER_PATH: /data/server.jsonl
+      POLL_SECONDS: "10"
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: skybot-grafana
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      # The SQLite datasource is a community plugin; without this Grafana
+      # starts fine and every panel is empty, which reads like "no data" when
+      # it is actually "no datasource".
+      GF_INSTALL_PLUGINS: frser-sqlite-datasource
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-skybot}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - metrics_data:/data:ro
+      - grafana_data:/var/lib/grafana
+    depends_on: [ingest]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M}
+
+volumes:
+  # Shared so the collector writes, ingest reads, Grafana reads the DB.
+  # A named volume rather than a bind mount: this is the durable artifact and
+  # it should not depend on a host path that might be moved.
+  metrics_data:
+  grafana_data:

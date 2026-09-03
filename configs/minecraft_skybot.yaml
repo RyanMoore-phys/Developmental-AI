@@ -2236,6 +2236,32 @@ lifelong:
     min_idle_episodes: 8      # goal-horizon windows a slot must be idle to evict
     recall_threshold: 0.8     # cosine cue-match to page a dormant behaviour in
 
+# ---- LIVE METRICS TRACKER (2026-09-03) -------------------------------------
+# One structured JSON record per segment, so the run can be watched on a
+# dashboard instead of by reading prose in a log. Measures nothing new — it
+# serialises what the segment log already computes, including the reward
+# LEDGER's income statement (per-source shares + hhi), which is the only way
+# to see a farm forming before it dominates.
+#
+# WHY fsync: the first live run died deterministically after 4 hours, and the
+# most interesting record is always the last one before a crash. flush() alone
+# survives a process death but not a host death; fsync costs a few ms against
+# a segment that takes minutes. Set false only if a run is throughput-bound
+# and you have decided to trade the guarantee away.
+#
+# WHY ROTATION: podlogs/ollama.log reached 29 MB unattended in this project.
+# The tracker must not become the thing that fills the pod's disk.
+#
+# The collector on the mini tails this file and dedupes on `seq`; see
+# scripts/collect_metrics.sh. The raw JSONL is the system of record — the
+# SQLite the dashboard reads is a rebuildable view over it.
+metrics:
+  enabled: true
+  path: podlogs/metrics.jsonl
+  max_bytes: 67108864        # 64 MB per file
+  keep: 5                    # ~320 MB worst case, bounded
+  fsync: true
+
 # ---- Acting-while-learning: WM consolidation on a background thread ----
 # (the bot never freezes at wm_train_every; PPO stays synchronous)
 async_wm:

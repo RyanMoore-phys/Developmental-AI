@@ -1971,6 +1971,26 @@ class DevelopmentalAI:
                            "anticipation shaping this run", _e)
             self.anticipation = None
 
+        # ---- live metrics tracker (structured, durable) --------------------
+        # Off unless configured. Built BEFORE the infra stack so a failure
+        # here cannot leave `infra` half-constructed, and wrapped because a
+        # monitoring sink must never prevent the agent from starting.
+        self._run_started_at = time.time()
+        self._metrics_sink = None
+        try:
+            _mcfg = dict(self.config.get("metrics", {}) or {})
+            if _mcfg.get("enabled"):
+                from developmental_ai.infra.metrics_sink import MetricsSink
+                self._metrics_sink = MetricsSink(_mcfg)
+                logger.info(
+                    "metrics tracker ON -> %s (fsync=%s, rotate at %.0f MB, "
+                    "keep %d) | resuming at seq %d",
+                    self._metrics_sink.path, self._metrics_sink.fsync,
+                    self._metrics_sink.max_bytes / 1e6,
+                    self._metrics_sink.keep, self._metrics_sink.seq)
+        except Exception as exc:
+            logger.warning("metrics tracker unavailable: %r", exc)
+
         self.infra = None
         try:
             from developmental_ai.infra.stack import InfraStack
@@ -2733,6 +2753,15 @@ class DevelopmentalAI:
             for key, value in episode_metrics.items():
                 if key in self.training_metrics:
                     self.training_metrics[key].append(value)
+
+            # ---- STRUCTURED METRICS: ONE EMISSION SITE ----------------------
+            # Placed here because ALL THREE stepping bodies converge on this
+            # line — lifelong, parallel and single-episode. Emitting inside
+            # them instead would be the duplicated-body drift CLAUDE.md §4.2
+            # names: an edit that lands in one body and not the others is
+            # silent, it just stops applying live. tests/_metrics_sink_smoke.py
+            # asserts this call appears exactly ONCE in this file.
+            self._emit_metrics(episode_metrics)
 
             self.total_episodes += 1
             self._episodes_this_env += 1
@@ -7611,6 +7640,107 @@ class DevelopmentalAI:
             )
         except Exception:
             pass
+
+    def _emit_metrics(self, episode_metrics: Dict[str, Any]) -> None:
+        """Write one structured record per segment for the live tracker.
+
+        MEASURES NOTHING NEW. Every value here is already computed for the
+        segment log; this only serialises it so a dashboard can read it and a
+        pod death cannot take it. Called from exactly one site (see §4.2 note
+        there) and asserted as such by tests/_metrics_sink_smoke.py.
+
+        Defensive throughout: a monitoring path must never be able to kill the
+        run it monitors, so every read is a .get()/getattr() and the whole
+        body is wrapped. A missing field is an absent key, never an exception.
+        """
+        sink = getattr(self, "_metrics_sink", None)
+        if sink is None:
+            return
+        try:
+            em = dict(episode_metrics or {})
+            rec: Dict[str, Any] = {
+                "total_timesteps": int(getattr(self, "total_timesteps", 0)),
+                "episode": int(getattr(self, "total_episodes", 0)),
+                "uptime_s": round(time.time() - getattr(
+                    self, "_run_started_at", time.time()), 1),
+            }
+
+            # ---- reward provenance: READ THE STASH, never call segment() ----
+            # RewardLedger.segment() is a consuming read already performed in
+            # infra/stack.py. Calling it here would return an empty statement
+            # and destroy the real one.
+            _led = dict(getattr(self.infra, "last_ledger_segment", {}) or {}) \
+                if getattr(self, "infra", None) is not None else {}
+            rec["reward_total"] = _led.get("total")
+            rec["reward_shares"] = _led.get("shares") or {}
+            rec["reward_hhi"] = _led.get("hhi")
+            rec["reward_alarms"] = _led.get("alarms") or []
+
+            # ---- reward channels, straight from the segment ----
+            for k in ("episode_reward", "intrinsic_reward", "curiosity",
+                      "avg_episode_reward", "episode_length",
+                      "world_model_loss", "policy_entropy",
+                      "elapsed_time_seconds"):
+                if k in em:
+                    rec[k] = em[k]
+
+            # ---- THE SCOREBOARD ----
+            # STRING KEYS ONLY: a display bug once printed integer keys here
+            # (they were action indices), so "2 breaks | top: [(3, 570)]" read
+            # as 570 of block-type 3. Accept only names, so a mis-wired dict
+            # shows as empty rather than as confident nonsense.
+            _wi = getattr(self, "_last_world_info", None) or {}
+            bbt = {k: int(v) for k, v in
+                   (_wi.get("breaks_by_type") or {}).items()
+                   if isinstance(k, str)}
+            rec["breaks_by_type"] = bbt
+            rec["breaks_total"] = sum(bbt.values())
+            _logs = sum(v for k, v in bbt.items() if "log" in k)
+            rec["logs"] = _logs
+            # The number this project is actually judged on: 399 breaks -> 1
+            # log, historically. None (not 0) when no log has ever dropped,
+            # so "no data" is distinguishable from "infinitely bad".
+            rec["breaks_per_log"] = (
+                round(rec["breaks_total"] / _logs, 1) if _logs else None)
+
+            _cbt = {k: int(v) for k, v in
+                    (_wi.get("crafts_by_type") or {}).items()
+                    if isinstance(k, str)}
+            rec["crafts_by_type"] = _cbt
+            rec["crafts_total"] = sum(_cbt.values())
+
+            _nb = [r for r in (_wi.get("runs_nobreak") or [])
+                   if isinstance(r, (int, float))]
+            if _nb:
+                rec["attack_run_max"] = max(_nb)
+                rec["attack_run_mean"] = round(sum(_nb) / len(_nb), 2)
+                rec["attack_runs"] = len(_nb)
+
+            # ---- skills: minted vs actually invoked ----
+            # The competence gate once froze at 16 skills / 0 invocations
+            # FOREVER, invisible for days. Both numbers, side by side.
+            ob = getattr(self, "skill_option_bank", None) or getattr(
+                getattr(self, "option_executor", None), "bank", None)
+            if ob is not None:
+                rec["skills_bound"] = sum(
+                    1 for s in (getattr(ob, "slots", None) or []) if s)
+                rec["skills_refused"] = len(getattr(ob, "refused", {}) or {})
+                rec["skill_disk_loads"] = getattr(ob, "disk_loads", None)
+                rec["cond_live"] = getattr(ob, "cond_live", None)
+                rec["cond_load_failures"] = getattr(
+                    ob, "cond_load_failures", None)
+                rec["rssm_no_latent"] = getattr(ob, "rssm_no_latent", 0)
+            sb = getattr(self, "skill_bank", None)
+            if sb is not None:
+                try:
+                    rec["skills_minted"] = len(sb.list_skills())
+                except Exception:
+                    pass
+
+            sink.write(rec)
+        except Exception as exc:                       # pragma: no cover
+            # Never let the tracker take the run down with it.
+            logger.debug("metrics emit failed: %r", exc)
 
     def _save_checkpoint(self) -> None:
         """Save all component states to disk.
