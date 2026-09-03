@@ -270,7 +270,13 @@ def test_boot_mint_bind_invoke_practise_persist():
         from developmental_ai.skill_bank import skill_delta as sdelta
         _stored = torch.load(sk.policy_path, map_location="cpu")
         enc = _stored.get("encoder")
-        if arch == "rssm":
+        # READ THE ARCH FROM THE WEIGHTS, NOT FROM AN OUTER SCOPE.
+        # This said `arch`, which is a local of _build() — not of this
+        # function — so it raised NameError. The stored marker is the right
+        # source anyway: it is what section 7 is inspecting, and what
+        # save_skill and load_state_dict both key on.
+        _arch = str(_stored.get("arch") or getattr(sk, "arch", "") or "flat")
+        if _arch == "rssm":
             # AN rssm SKILL MUST NOT CARRY AN ENCODER (2026-09-02).
             # conv/wm snapshot theirs so a frozen skill keeps seeing what it
             # saw when competent. rssm reads the LIVE world model's latent,
@@ -291,7 +297,7 @@ def test_boot_mint_bind_invoke_practise_persist():
             # Checked before is_delta(), which would otherwise be handed None
             # and fail with something less informative than the real problem.
             assert enc is not None, (
-                f"arch={arch!r} skill stored no encoder — conv/wm snapshot "
+                f"arch={_arch!r} skill stored no encoder — conv/wm snapshot "
                 f"theirs so a frozen skill keeps seeing what it saw")
             if sdelta.is_delta(enc):
                 assert os.path.exists(

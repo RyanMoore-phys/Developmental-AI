@@ -1031,8 +1031,20 @@ symbolic_grounding:
   #   printf 'FROM qwen2.5vl:3b\n' > /tmp/Modelfile
   #   ollama create qwen2.5vl:3b-q4 -f /tmp/Modelfile -q q4_K_M
   # REVERT TARGET, one line away:
-  # model: qwen2.5vl:7b-q4
-  model: qwen2.5vl:3b-q4
+  # model: qwen2.5vl:7b
+  #
+  # NO `-q4` SUFFIX — THE REGISTRY TAG IS ALREADY QUANTIZED (fix 2026-09-02).
+  # This said `qwen2.5vl:3b-q4`, on the assumption that ollama ships an F16
+  # base you quantize locally (the recipe in the comment above). Measured on
+  # the pod, that is wrong twice over:
+  #   * there is no `3b-q4` tag to pull — manifest 404;
+  #   * building one fails anyway:
+  #       Error: quantization is only supported for F16, BF16 and F32 models
+  #     because `qwen2.5vl:3b` REPORTS quantization Q4_K_M already
+  #     (3.8B params, 3.2 GB). It is the q4 build; there is nothing to convert.
+  # So the plain tag IS the small quantized VLM this was reaching for, and
+  # provisioning now completes instead of failing at the last stage.
+  model: qwen2.5vl:3b
   # Downscale the WHOLE-FRAME request to this longest side before the PNG
   # encode. 336 is qwen2.5vl's ViT tile size, so the model sees the tiling it
   # would have produced anyway and stops paying to re-tile pixels it was

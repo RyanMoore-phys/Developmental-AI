@@ -413,8 +413,18 @@ case "$VLM_MODEL" in
       ollama pull "$VLM_BASE" \
         || { echo "PROVISION-FAILED: vlm base pull ($VLM_BASE)"; exit 1; }
       printf 'FROM %s\n' "$VLM_BASE" > /tmp/Modelfile.vlm
-      ollama create "$VLM_MODEL" -f /tmp/Modelfile.vlm -q "$VLM_QUANT" \
-        || { echo "PROVISION-FAILED: vlm quantize ($VLM_MODEL from $VLM_BASE)"; exit 1; }
+      if ! ollama create "$VLM_MODEL" -f /tmp/Modelfile.vlm -q "$VLM_QUANT"; then
+        # ALREADY-QUANTIZED BASES ARE THE COMMON CASE (measured 2026-09-02).
+        # ollama refuses with "quantization is only supported for F16, BF16
+        # and F32 models" because the registry tag is ALREADY Q4_K_M — e.g.
+        # qwen2.5vl:3b reports Q4_K_M at 3.2 GB. There is nothing to convert,
+        # so alias the requested name onto the base rather than failing the
+        # whole provision at the last stage over a naming convention.
+        echo "  '$VLM_BASE' cannot be re-quantized (already quantized?) —"
+        echo "  aliasing $VLM_MODEL -> $VLM_BASE instead"
+        ollama cp "$VLM_BASE" "$VLM_MODEL" \
+          || { echo "PROVISION-FAILED: vlm alias ($VLM_MODEL from $VLM_BASE)"; exit 1; }
+      fi
     fi
     ;;
   *)

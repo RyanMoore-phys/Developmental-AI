@@ -1,0 +1,66 @@
+# Containerised CI runner for the headless Mac mini.
+#
+#   cd docker/runner
+#   cp runner.env.example runner.env     # then edit it
+#   docker compose up -d --build
+#
+# AUTO-START ON BOOT is `restart: unless-stopped` plus a Docker daemon that
+# starts at boot (`sudo systemctl enable docker`). Together those bring the
+# runner back after a reboot or a power cut with no human step. Note
+# `unless-stopped` rather than `always`: if you deliberately `docker compose
+# stop` the runner, it should STAY stopped across a reboot.
+services:
+  runner:
+    build:
+      context: .
+      args:
+        # Mac mini (Intel) -> x64. An Apple-Silicon host running Linux -> arm64.
+        TARGETARCH: x64
+    container_name: skybot-runner
+    restart: unless-stopped
+    # THE FILE MUST BE NAMED `.env`, NOT `runner.env` (fix 2026-09-02).
+    # Two different mechanisms are at play and only one of them reads
+    # `env_file`:
+    #   * `env_file:`  -> variables INSIDE the container, at run time
+    #   * `${VAR}`     -> interpolated into THIS YAML at PARSE time, and it
+    #                     reads ONLY the shell environment or a file literally
+    #                     called `.env` in this directory
+    # The volume mount below uses `${POD_SSH_KEY_HOST_PATH}`, so with the
+    # values in `runner.env` Compose never saw it and every command — even
+    # `down -v` — failed with "required variable is missing" while the value
+    # sat right there in the file. Naming it `.env` makes one file serve both.
+    # (`.env` is already gitignored.)
+    env_file: [.env]
+
+    # ---- ROOM FOR EVERYTHING ELSE ON THE BOX --------------------------
+    # These jobs are ssh + rsync + a poll loop: near-idle in steady state.
+    # The cap is a BOUND ON A RUNAWAY, not a sizing estimate — it exists so a
+    # misbehaving job cannot starve Grafana or a storage daemon on the same
+    # mini. Raise `cpus` only if you later run the test suite here (you do
+    # not today: ci.yml runs on GitHub-hosted ubuntu-latest).
+    #
+    # `deploy.resources` is honoured by `docker compose up` in Compose v2.
+    # On the old v1 python client it is IGNORED — use the commented
+    # `cpus:`/`mem_limit:` below instead, and verify with `docker stats`.
+    deploy:
+      resources:
+        limits:       {cpus: "2.0", memory: 4G}
+        reservations: {cpus: "0.5", memory: 1G}
+    # cpus: 2.0
+    # mem_limit: 4g
+
+    volumes:
+      # The pod SSH key, READ-ONLY. This is why the pipeline needs no GitHub
+      # secret at all: the credential stays on this host and is mounted in.
+      - ${POD_SSH_KEY_HOST_PATH:?set POD_SSH_KEY_HOST_PATH in docker/runner/.env (the file MUST be named .env — see the env_file note above)}:/home/runner/.ssh/skybot_ed25519:ro
+      # Persist registration + checkouts so a restart does not re-register or
+      # re-clone. The entrypoint checks for .runner and skips config.sh.
+      - runner_work:/home/runner/_work
+      - runner_cfg:/home/runner/.runner.d
+
+    # No ports published: the runner makes only OUTBOUND connections (to
+    # GitHub, and to the pod over ssh). Nothing needs to reach in.
+
+volumes:
+  runner_work:
+  runner_cfg:

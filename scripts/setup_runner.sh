@@ -27,10 +27,12 @@ RUNNER_NAME="${RUNNER_NAME:-skybot-$(hostname -s)}"
 # with no error — GitHub simply never finds a matching runner.
 LABELS="skybot"
 
-case "$(uname -m)" in
-  arm64)  ARCH="osx-arm64" ;;
-  x86_64) ARCH="osx-x64" ;;
-  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+case "$(uname -s)/$(uname -m)" in
+  Darwin/arm64)   ARCH="osx-arm64" ;;
+  Darwin/x86_64)  ARCH="osx-x64" ;;
+  Linux/x86_64)   ARCH="linux-x64" ;;
+  Linux/aarch64)  ARCH="linux-arm64" ;;
+  *) echo "unsupported platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
 esac
 TARBALL="actions-runner-${ARCH}-${RUNNER_VERSION}.tar.gz"
 URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}"
