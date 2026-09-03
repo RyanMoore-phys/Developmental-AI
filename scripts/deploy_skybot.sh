@@ -50,7 +50,16 @@ else
   KEY="${POD_SSH_KEY:-$HOME/.ssh/skybot_ed25519}"
   # UserKnownHostsFile=/dev/null is REQUIRED: RunPod reuses IPs across pods, so
   # the host key changes and plain ssh refuses with a HOST KEY CHANGED error.
-  SSH_OPTS="-p $PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+  # BatchMode=yes IS LOAD-BEARING IN CI (added 2026-09-02).
+  # ConnectTimeout only bounds the TCP connect, NOT authentication. Without
+  # BatchMode, a rejected key makes ssh fall back to keyboard-interactive and
+  # BLOCK forever on a password prompt no CI job can answer — the job dies at
+  # its timeout-minutes with the step still showing "in progress" and no error
+  # anywhere. With it, ssh exits immediately: "Permission denied (publickey)".
+  # ServerAlive* covers the other half: the pod-side smoke tests run for
+  # minutes over one connection, and a silently dropped link would hang just
+  # as long.
+  SSH_OPTS="-p $PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
   SSH_CMD="ssh $SSH_OPTS"
   RSH="ssh $SSH_OPTS"
 fi

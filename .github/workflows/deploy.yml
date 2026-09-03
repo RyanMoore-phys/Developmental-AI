@@ -89,7 +89,13 @@ jobs:
               || { echo "::error::ssh to $POD_HOST:$POD_SSH_PORT failed. The pod's SSH port rotates on every restart — update POD_SSH_PORT in the runner .env."; exit 1; }
           fi
 
+      # STEP-LEVEL TIMEOUT (added 2026-09-02). A hang here used to run until
+      # the 30-minute JOB timeout, and GitHub marks the job failed while the
+      # step still shows "in progress" with no error printed — the worst
+      # possible diagnostic. 12 minutes is generous for rsync + four pod-side
+      # smoke suites; anything longer is a hang, not slow work.
       - name: Sync code + pod-side smoke tests
+        timeout-minutes: 12
         env:
           # deploy_skybot.sh reads these; POD_HOST/POD_SSH_PORT/POD_SSH_KEYFILE
           # come from the runner .env and are NOT redefined here (an unset

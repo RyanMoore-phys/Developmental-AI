@@ -39,8 +39,29 @@ if [ -n "${GITHUB_PAT:-}" ]; then
   if [ -z "$RUNNER_TOKEN" ]; then
     echo "entrypoint: could not mint a token. GitHub said:" >&2
     printf '%s\n' "$_resp" | head -5 >&2
-    echo "  -> check GITHUB_PAT is a fine-grained PAT for ${OWNER_REPO}" >&2
-    echo "     with Administration: Read and write, and is not expired." >&2
+    # 401 AND 403 MEAN DIFFERENT THINGS and sending someone to check the
+    # wrong one wastes real time (it did, 2026-09-02):
+    #   401 Bad credentials  -> the TOKEN STRING is wrong. Permissions are
+    #                           irrelevant. Usually truncated when typed by
+    #                           hand, wrapped in quotes in .env, or carrying a
+    #                           trailing \r from an editor.
+    #   403 Forbidden        -> the token is VALID but lacks the permission.
+    case "$_resp" in
+      *"Bad credentials"*|*'"status": "401"'*)
+        echo "  -> 401 BAD CREDENTIALS: the token STRING is wrong, not its" >&2
+        echo "     permissions. Check it is un-truncated (~93 chars), has no" >&2
+        echo "     surrounding quotes in .env, and no trailing whitespace/CR:" >&2
+        echo "       grep '^GITHUB_PAT=' .env | cat -A | cut -c1-40" >&2
+        ;;
+      *"Resource not accessible"*|*'"status": "403"'*)
+        echo "  -> 403 FORBIDDEN: the token is valid but under-scoped. It" >&2
+        echo "     needs Administration: Read and write on ${OWNER_REPO}." >&2
+        ;;
+      *)
+        echo "  -> check GITHUB_PAT is a fine-grained PAT for ${OWNER_REPO}" >&2
+        echo "     with Administration: Read and write, and is not expired." >&2
+        ;;
+    esac
     exit 1
   fi
   echo "entrypoint: token minted OK"

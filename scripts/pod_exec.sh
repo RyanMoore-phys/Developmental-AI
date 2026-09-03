@@ -35,4 +35,7 @@ KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
 # the host key changes and plain ssh refuses with HOST KEY CHANGED.
 exec ssh -p "$POD_SSH_PORT" -i "$KEY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectTimeout=20 "root@${POD_HOST}" "$@"
+  -o ConnectTimeout=20 \
+  -o BatchMode=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+  "root@${POD_HOST}" "$@"
