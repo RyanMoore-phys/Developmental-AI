@@ -199,13 +199,25 @@ def test_boot_mint_bind_invoke_practise_persist():
             "input widths do not partition the actor's input — the old "
             "subtraction bug, where kdim absorbed proprio's slots")
 
+        # FEATURES PER FAMILY, COMPUTED ONCE (2026-09-02).
+        # conv/wm own a snapshotted encoder and encode `obs`; arch="rssm" has
+        # NO encoder module — `_materialize` returns enc=None because its
+        # features are the live world model's latent — so calling enc() here
+        # raised `'NoneType' object is not callable`.
+        # Computing the block ONCE also strengthens the assertion below: the
+        # two _logits calls then differ in proprio and nothing else, which is
+        # exactly the property being tested.
+        torch.manual_seed(0)
+        if enc is not None:
+            _feat = enc(torch.from_numpy(obs).reshape(1, -1))
+        else:
+            _feat = torch.rand(1, int(b["enc_dim"]), dtype=torch.float32)
+
         def _logits(pr):
-            torch.manual_seed(0)
-            f = enc(torch.from_numpy(obs).reshape(1, -1))
             p = torch.as_tensor(pr, dtype=torch.float32).reshape(1, -1)
-            tail = cond(f, torch.from_numpy(b["ctx"]).reshape(1, -1))
+            tail = cond(_feat, torch.from_numpy(b["ctx"]).reshape(1, -1))
             return actor.action_head(actor.shared(
-                torch.cat([f, p, tail], dim=-1)))
+                torch.cat([_feat, p, tail], dim=-1)))
 
         starving = np.zeros(b["proprio_dim"], dtype=np.float32)
         fed = np.ones(b["proprio_dim"], dtype=np.float32)
@@ -213,7 +225,7 @@ def test_boot_mint_bind_invoke_practise_persist():
             "body state does not change the skill's action distribution — "
             "proprio is being ignored")
 
-        f0 = enc(torch.from_numpy(obs).reshape(1, -1))
+        f0 = _feat
         t_real = cond(f0, torch.from_numpy(b["ctx"]).reshape(1, -1))
         assert float(t_real.abs().sum()) > 0.0, (
             "the knowledge gate emits all zeros — conditioning is inert")
@@ -256,13 +268,37 @@ def test_boot_mint_bind_invoke_practise_persist():
 
         # ---- 7. delta storage round-trips through the same path ---------
         from developmental_ai.skill_bank import skill_delta as sdelta
-        enc = torch.load(sk.policy_path, map_location="cpu").get("encoder")
-        assert enc is not None
-        if sdelta.is_delta(enc):
-            assert os.path.exists(os.path.join(tmp, SkillBank.BASE_ENCODER_FILE))
-            print("  7. encoder stored as a DELTA against the bank base ok")
+        _stored = torch.load(sk.policy_path, map_location="cpu")
+        enc = _stored.get("encoder")
+        if arch == "rssm":
+            # AN rssm SKILL MUST NOT CARRY AN ENCODER (2026-09-02).
+            # conv/wm snapshot theirs so a frozen skill keeps seeing what it
+            # saw when competent. rssm reads the LIVE world model's latent,
+            # so there is nothing self-contained to store — and storing one
+            # would resurrect the ~115 MB-per-skill problem arch v3 killed.
+            # Assert the absence rather than skipping: "no encoder" is the
+            # contract here, not an untested case.
+            assert enc is None, (
+                "an rssm skill stored an encoder — it reads live world-model "
+                "latents and must stay small")
+            assert _stored.get("arch") == "rssm", (
+                f"stored arch={_stored.get('arch')!r}, not 'rssm' — the "
+                f"marker is what save_skill and load_state_dict both key on")
+            print("  7. rssm skill correctly carries NO encoder "
+                  f"({os.path.getsize(sk.policy_path)/1e6:.2f} MB) ok")
         else:
-            print("  7. encoder stored in full (no base yet) — ok")
+            # conv/wm keep the original contract: they MUST carry an encoder.
+            # Checked before is_delta(), which would otherwise be handed None
+            # and fail with something less informative than the real problem.
+            assert enc is not None, (
+                f"arch={arch!r} skill stored no encoder — conv/wm snapshot "
+                f"theirs so a frozen skill keeps seeing what it saw")
+            if sdelta.is_delta(enc):
+                assert os.path.exists(
+                    os.path.join(tmp, SkillBank.BASE_ENCODER_FILE))
+                print("  7. encoder stored as a DELTA against the bank base ok")
+            else:
+                print("  7. encoder stored in full (no base yet) — ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
