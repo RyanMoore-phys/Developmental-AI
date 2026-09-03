@@ -54,9 +54,25 @@ _work/
 # of files that are 0.82-0.995 cosine-identical to each other. Git is the
 # wrong tool; GitHub LFS gives 1 GB free, which one skill would nearly fill.
 pod_repository/data/
-skill_bank_data/
-skill_bank_mc_curiosity/
-skill_bank*/
+# ANCHORED WITH A LEADING SLASH — DO NOT REMOVE IT (fix 2026-09-02).
+# These were unanchored (`skill_bank*/`), and a gitignore pattern with no
+# leading slash matches at EVERY depth. So `skill_bank*/` also matched
+# `developmental_ai/skill_bank/` — the SOURCE PACKAGE — and all six of its
+# .py files were silently never committed.
+#
+# It hid for a long time because it is invisible everywhere except a clean
+# checkout: the dev Mac has the files on disk, and the pod is rsynced by path
+# rather than cloned, so both work. Only CI, which has nothing but `git
+# checkout`, failed — with `ModuleNotFoundError: No module named
+# 'developmental_ai.skill_bank'` on every suite that imports DevelopmentalAI.
+# That was misdiagnosed three times as a dependency/version problem.
+#
+# The leading slash pins each pattern to the repo ROOT, which is where the
+# real weight directories live (./skill_bank_data, ./skill_bank_doorkey).
+/skill_bank_data/
+/skill_bank_mc_curiosity/
+/skill_bank_doorkey/
+/skill_bank*/
 *.pt
 *.pth
 *.ckpt
