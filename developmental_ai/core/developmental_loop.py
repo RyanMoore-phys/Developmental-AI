@@ -1442,7 +1442,7 @@ class DevelopmentalAI:
                     # shared-perception width as absent, i.e. a diagnostic
                     # that lies about the thing it exists to show.
                     self.policy.enc_dim
-                    if self.policy.arch in ("conv", "wm") else "-",
+                    if self.policy.arch in ("conv", "wm", "rssm") else "-",
                     _npar / 1e6, self.obs_dim, self.meta_action_dim)
 
         # PPO updates on accumulated rollouts (~n_steps), NOT one short episode.
@@ -7123,8 +7123,13 @@ class DevelopmentalAI:
         _pa = getattr(self.policy, "arch", "flat")
         out: Dict[str, Any] = {
             "arch": _pa,
+            # "rssm" belongs here too (2026-09-02): it reads features, so it
+            # HAS an enc_dim, and _bind_conv refuses a zero one. It only
+            # survived because the bind path can recover the value from the
+            # state dict — a warning-logged fallback, not the intended route,
+            # and exactly the "un-invocable skill" this comment warns about.
             "enc_dim": (int(getattr(self.policy, "enc_dim", 0))
-                        if _pa in ("conv", "wm") else 0),
+                        if _pa in ("conv", "wm", "rssm") else 0),
             "head_dim": int(getattr(self, "meta_action_dim",
                                     self.action_dim)),
         }

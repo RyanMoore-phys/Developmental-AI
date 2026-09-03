@@ -157,12 +157,21 @@ def test_boot_mint_bind_invoke_practise_persist():
         slot = ob.slot_of_skill(sid)
         assert slot is not None, f"skill refused at bind: {ob.refused}"
         obs = np.random.rand(obs_dim).astype(np.float32)
-        acts = {ob.skill_action(slot, obs, env=0) for _ in range(24)}
+        b = ob.slots[slot]
+        # arch="rssm" READS THE LIVE WORLD MODEL, so the caller supplies the
+        # latent (2026-09-02). conv/wm carry their own snapshotted encoder and
+        # need only pixels; rssm has no encoder to apply, and skill_action
+        # REFUSES rather than quietly feeding it 49152 raw pixels in place of
+        # a ~256-wide latent. Width comes from the bound slot, not a constant,
+        # so this cannot drift from whatever the mint recorded.
+        _feats = (np.random.rand(int(b["enc_dim"])).astype(np.float32)
+                  if b.get("arch") == "rssm" else None)
+        acts = {ob.skill_action(slot, obs, env=0, feats=_feats)
+                for _ in range(24)}
         assert acts, "bound skill produced no action"
         assert max(acts) < P + K
         # the encoded family keeps its FULL head, so nesting is reachable
-        b = ob.slots[slot]
-        assert b["arch"] in ("conv", "wm"), b["arch"]
+        assert b["arch"] in ("conv", "wm", "rssm"), b["arch"]
         assert int(b["head_dim"]) == P + K, (
             "stored head was truncated — skill-invokes-skill is dead")
         print(f"  4. bind + act ok (slot {slot}, head {b['head_dim']}, "

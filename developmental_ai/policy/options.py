@@ -913,9 +913,14 @@ class SkillOptionBank:
                 logits = logits.masked_fill(~m, -1e9)
             else:  # never crash a run on a stale mask; fall back to prims
                 logits = logits[:, :int(b.get("p_own") or self.P)]
-        elif b.get("arch") in ("conv", "wm"):
+        elif b.get("arch") in ("conv", "wm", "rssm"):
             # no mask supplied (e.g. a caller predating nesting): an encoded-
-            # family skill must still never emit a raw slot row
+            # family skill must still never emit a raw slot row.
+            # "rssm" added 2026-09-02 — it keeps its full head like conv/wm,
+            # so omitting it here let an unmasked call sample an option-slot
+            # row and return it as if it were a primitive. That is the
+            # 10->12 widening postmortem's failure mode exactly: slot logits
+            # becoming buttons.
             logits = logits[:, :int(b.get("p_own") or self.P)]
         a = int(torch.distributions.Categorical(logits=logits).sample())
         # PRACTICE CAPTURE: remember what this skill saw and did, so a
