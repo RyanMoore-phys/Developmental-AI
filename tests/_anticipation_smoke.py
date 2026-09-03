@@ -31,6 +31,7 @@ WHY THE PAYOUT IS IN `intrinsic`, NEVER `prim_extrinsic`
     directly to `intrinsic[0]`.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.abspath(
@@ -248,7 +249,22 @@ def test_vlm_downsize_and_reprobe_config():
     import yaml
     c = yaml.safe_load(open(os.path.join(
         "configs", "minecraft_skybot.yaml")))["symbolic_grounding"]
-    assert c["model"] == "qwen2.5vl:3b-q4", c["model"]
+    # NO `-q<N>` SUFFIX (fix 2026-09-02). This pinned "qwen2.5vl:3b-q4",
+    # which broke provisioning at its LAST stage, twice:
+    #   * `ollama pull qwen2.5vl:3b-q4` -> manifest 404; no such tag exists;
+    #   * building it locally fails too —
+    #       Error: quantization is only supported for F16, BF16 and F32 models
+    #     because `qwen2.5vl:3b` ALREADY reports Q4_K_M (3.8B params, 3.2 GB).
+    # The plain tag IS the small quantized VLM, so the suffix bought nothing
+    # and cost a failed provision. Asserted as a PROPERTY, not a literal, so
+    # the trap cannot be re-introduced under a different size.
+    assert not re.search(r"-q\d", str(c["model"])), (
+        f"model={c['model']!r} carries a -q<N> suffix. Registry tags are "
+        f"already quantized and cannot be re-quantized; provisioning fails "
+        f"at the VLM stage. Use the plain tag.")
+    # qwen2.5vl is the PROVEN sensor: llava:7b answered tree_visible=true on
+    # every patch, which is what made the vision magnet useless for weeks.
+    assert str(c["model"]).startswith("qwen2.5vl:"), c["model"]
     assert int(c.get("reprobe_after_failures", 0)) > 0
     print(f"  12. symbolic_grounding.model={c['model']}, "
           f"reprobe_after_failures={c['reprobe_after_failures']}")

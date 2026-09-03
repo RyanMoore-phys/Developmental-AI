@@ -55,12 +55,20 @@ services:
       - ${POD_SSH_KEY_HOST_PATH:?set POD_SSH_KEY_HOST_PATH in docker/runner/.env (the file MUST be named .env — see the env_file note above)}:/home/runner/.ssh/skybot_ed25519:ro
       # Persist registration + checkouts so a restart does not re-register or
       # re-clone. The entrypoint checks for .runner and skips config.sh.
+      # Persists job checkouts across a container restart. The image creates
+      # this path as `runner` so the volume inherits that ownership — see the
+      # Dockerfile note; without it every job dies on _work/_tool permissions.
       - runner_work:/home/runner/_work
-      - runner_cfg:/home/runner/.runner.d
+      # NO runner_cfg VOLUME. There was one here mounted at
+      # /home/runner/.runner.d — a path the runner never uses. Registration
+      # lives in /home/runner/.runner, a FILE directly in the home dir, so the
+      # mount persisted nothing and the comment claiming otherwise was wrong.
+      # Registration therefore survives `restart` but NOT `down -v`, which is
+      # correct: `down -v` is the documented full reset and needs a fresh
+      # token anyway.
 
     # No ports published: the runner makes only OUTBOUND connections (to
     # GitHub, and to the pod over ssh). Nothing needs to reach in.
 
 volumes:
   runner_work:
-  runner_cfg:

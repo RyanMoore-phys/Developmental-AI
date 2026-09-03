@@ -37,6 +37,18 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER runner
+# _work MUST EXIST IN THE IMAGE, OWNED BY runner (fix 2026-09-02).
+# docker-compose mounts a NAMED VOLUME at /home/runner/_work. Docker creates a
+# named volume's mountpoint as ROOT unless the path already exists in the
+# image — in which case it seeds the volume with that directory's content AND
+# ownership. Without this line the runner (which runs as `runner`, by its own
+# refusal to run as root) hits:
+#     System.UnauthorizedAccessException: Access to the path
+#     '/home/runner/_work/_tool' is denied
+# and only at the moment a JOB runs — registration and "Listening for Jobs"
+# both succeed, so the container looks healthy right up until the first job.
+RUN mkdir -p /home/runner/_work
+
 # StrictHostKeyChecking=no + /dev/null known_hosts: pod providers reuse IPs
 # across pods, so the host key changes and plain ssh refuses outright. This is
 # the same setting scripts/deploy_skybot.sh documents.
