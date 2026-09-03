@@ -164,10 +164,22 @@ def test_boot_mint_bind_invoke_practise_persist():
         # REFUSES rather than quietly feeding it 49152 raw pixels in place of
         # a ~256-wide latent. Width comes from the bound slot, not a constant,
         # so this cannot drift from whatever the mint recorded.
-        _feats = (np.random.rand(int(b["enc_dim"])).astype(np.float32)
-                  if b.get("arch") == "rssm" else None)
-        acts = {ob.skill_action(slot, obs, env=0, feats=_feats)
+        # PASS A TORCH TENSOR, WHICH IS WHAT PRODUCTION SENDS (fix 2026-09-03).
+        # This used a numpy array, and that gap cost a live run: skill_action
+        # converted via np.asarray(), which raises on a CUDA tensor —
+        #   TypeError: can't convert cuda:0 device type tensor to numpy
+        # The real caller passes the world model's RSSM latent, i.e. a torch
+        # tensor on the training device. A test that feeds the one type the
+        # system never produces proves nothing about the path it guards.
+        # BOTH types are exercised below: tensor first (production), then
+        # numpy (still accepted, so an offline/eval caller keeps working).
+        _feats_t = torch.rand(int(b["enc_dim"]), dtype=torch.float32)
+        acts = {ob.skill_action(slot, obs, env=0, feats=_feats_t)
                 for _ in range(24)}
+        _np_act = ob.skill_action(
+            slot, obs, env=0,
+            feats=np.random.rand(int(b["enc_dim"])).astype(np.float32))
+        assert isinstance(_np_act, int), "numpy feats must still be accepted"
         assert acts, "bound skill produced no action"
         assert max(acts) < P + K
         # the encoded family keeps its FULL head, so nesting is reachable

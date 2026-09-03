@@ -856,9 +856,23 @@ class SkillOptionBank:
                 raise SlotRefused(
                     f"rssm skill in slot {slot} got no latent: skill_action "
                     f"needs feats= from the world model, and obs are pixels")
-            feats_t = torch.as_tensor(
-                np.asarray(feats, dtype=np.float32)
-            ).reshape(1, -1).to(self.device)
+            # NEVER ROUTE A TENSOR THROUGH numpy HERE (fix 2026-09-03).
+            # In production `feats` is the LIVE RSSM latent — a torch tensor
+            # on cuda:0 — and np.asarray() on a CUDA tensor raises
+            #   TypeError: can't convert cuda:0 device type tensor to numpy
+            # This killed the first live run after 4 hours: skill_action only
+            # runs once a skill has been minted AND invoked, so the crash
+            # waited for the first invocation, then repeated deterministically
+            # until the supervisor gave up (3 identical faults).
+            # It survived the boot test because that test passed a NUMPY array
+            # for feats — the one type production never sends.
+            if isinstance(feats, torch.Tensor):
+                feats_t = feats.detach().to(
+                    device=self.device, dtype=torch.float32).reshape(1, -1)
+            else:
+                feats_t = torch.as_tensor(
+                    np.asarray(feats, dtype=np.float32)
+                ).reshape(1, -1).to(self.device)
         else:
             feats_t = enc(obs_t) if enc is not None else obs_t
         feats = feats_t
