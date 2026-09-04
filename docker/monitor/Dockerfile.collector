@@ -1,0 +1,31 @@
+# Collector image: ssh + rsync + bash, baked in.
+#
+# WHY AN IMAGE INSTEAD OF `apk add` AT RUNTIME (fix 2026-09-04).
+# The first version ran the install inline from compose:
+#     command: >
+#       sh -c "apk add --no-cache openssh-client rsync bash ... && bash ..."
+# That crash-looped with `sh: syntax error: unexpected "&&"` — a YAML folded
+# scalar plus Compose's own argument splitting does not reliably preserve the
+# quoting around a `sh -c` string. Three containers looked healthy and the
+# dashboard was simply empty, because the ONE container that fetches the data
+# was restarting every few seconds.
+#
+# Baking the packages in also removes a second failure mode: a runtime
+# `apk add` needs working internet on EVERY restart, so a reboot during an
+# ISP blip would silently leave the collector down.
+FROM alpine:3.20
+
+RUN apk add --no-cache openssh-client rsync bash coreutils
+
+# StrictHostKeyChecking=no + /dev/null known_hosts: pod providers reuse IPs
+# across pods, so the host key changes and plain ssh refuses outright.
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh \
+    && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  BatchMode yes\n  ConnectTimeout 20\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n' \
+       > /root/.ssh/config \
+    && chmod 600 /root/.ssh/config
+
+COPY collect_metrics.sh /opt/collect_metrics.sh
+RUN chmod +x /opt/collect_metrics.sh
+
+# Exec form: no shell involved, so there is no quoting to get wrong.
+ENTRYPOINT ["/bin/bash", "/opt/collect_metrics.sh"]

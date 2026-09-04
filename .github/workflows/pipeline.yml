@@ -20,6 +20,18 @@
 # labels and target those instead, or jobs will land on whichever is free.
 name: pipeline
 
+# A SCHEDULED RUN LOOKS EMPTY, AND THAT IS THE DESIGN — but it read as broken.
+# On a `schedule` event the `inputs` context is empty, so every `if: inputs.X`
+# is false and deploy/connect/launch are SKIPPED; only preflight and report
+# run. That is the safety property (cron cannot deploy or start training), but
+# three grey boxes with no explanation looks like a failure. The run title now
+# says which it is.
+run-name: >-
+  ${{ github.event_name == 'schedule'
+      && 'pipeline · daily health check (deploy/connect/launch skipped by design)'
+      || format('pipeline · deploy={0} connect={1} LAUNCH={2} · by @{3}',
+                inputs.deploy, inputs.connect, inputs.launch, github.actor) }}
+
 on:
   workflow_dispatch:
     inputs:

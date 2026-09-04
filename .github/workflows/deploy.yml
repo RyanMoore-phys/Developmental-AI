@@ -21,6 +21,18 @@
 # the runner user, on your machine.
 name: deploy
 
+# Which commit went to the pod, and whether it was auto (after ci) or manual.
+# `workflow_run` runs carry the triggering branch/sha in their own payload —
+# github.ref_name would say the DEFAULT branch, which is not necessarily what
+# was deployed.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('deploy · manual · {0}{1} · by @{2}', github.ref_name,
+                inputs.launch && ' · WILL LAUNCH' || '', github.actor)
+      || format('deploy · after ci · {0}@{1}',
+                github.event.workflow_run.head_branch,
+                github.event.workflow_run.head_sha) }}
+
 on:
   workflow_run:
     workflows: ["ci"]

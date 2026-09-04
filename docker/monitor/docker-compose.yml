@@ -16,14 +16,20 @@ services:
   # 1. Pull the pod's metrics here, live + complete. See the script header for
   #    why it runs BOTH a tail and a periodic rsync.
   collector:
-    image: alpine:3.20
+    # BUILT, not `image: alpine` + a runtime install. The inline
+    # `sh -c "apk add ... && bash ..."` crash-looped with
+    #   sh: syntax error: unexpected "&&"
+    # because a YAML folded scalar plus Compose's argument splitting does not
+    # preserve the quoting. See Dockerfile.collector.
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
     container_name: skybot-collector
     restart: unless-stopped
     env_file: [.env]
-    command: >
-      sh -c "apk add --no-cache openssh-client rsync bash coreutils >/dev/null
-             && bash /opt/collect_metrics.sh"
     volumes:
+      # The script is baked into the image; mounting it too means an edit on
+      # the host takes effect on restart without a rebuild.
       - ./collect_metrics.sh:/opt/collect_metrics.sh:ro
       - ${POD_SSH_KEY_HOST_PATH:?set POD_SSH_KEY_HOST_PATH in docker/monitor/.env}:/root/.ssh/skybot_ed25519:ro
       - metrics_data:/data
@@ -64,6 +70,7 @@ services:
       DB_PATH: /data/skybot.db
       METRICS_PATH: /data/metrics.jsonl
       SERVER_PATH: /data/server.jsonl
+      HEARTBEAT_PATH: /data/heartbeat.jsonl
       POLL_SECONDS: "10"
     deploy:
       resources:

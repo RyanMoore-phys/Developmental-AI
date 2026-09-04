@@ -20,6 +20,13 @@
 # repo. On a public repo any fork could run arbitrary code as the runner user.
 name: pod
 
+# The run list showed five identical rows called "pod" with no way to tell a
+# read-only `status` from a `launch` or a destructive `provision`. run-name is
+# evaluated per run, so the action (and the timestep budget, which is the only
+# other thing that changes what a launch DOES) goes in the title.
+run-name: >-
+  pod · ${{ inputs.action }}${{ inputs.action == 'launch' && format(' · {0} steps', inputs.timesteps) || '' }} · by @${{ github.actor }}
+
 on:
   workflow_dispatch:
     inputs:

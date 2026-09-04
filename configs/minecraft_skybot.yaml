@@ -2261,6 +2261,22 @@ metrics:
   max_bytes: 67108864        # 64 MB per file
   keep: 5                    # ~320 MB worst case, bounded
   fsync: true
+  # ---- LIVE HEARTBEAT (2026-09-04) ----------------------------------------
+  # The segment record above is emitted once per SEGMENT — ~7 minutes at
+  # segment_len 1024 x action_repeat 4 — which is far too coarse to watch a
+  # run live. Shortening segment_len is NOT the answer: it is PPO's batch and
+  # GAE horizon, so it would change TRAINING to improve a dashboard.
+  # This is a second, deliberately thin feed on a wall-clock throttle: running
+  # totals only (steps, steps/s, breaks, logs, attack_run, gpu). Separate file
+  # and separate table, so the two cadences never mix in one series and a
+  # heartbeat is never mistaken for a per-segment observation.
+  # 0 disables it.
+  heartbeat_seconds: 15
+  heartbeat_path: podlogs/heartbeat.jsonl
+  # No fsync: a lost heartbeat costs one dashboard point, whereas a lost
+  # segment record loses the only account of that segment. Different data,
+  # different durability.
+  heartbeat_fsync: false
 
 # ---- Acting-while-learning: WM consolidation on a background thread ----
 # (the bot never freezes at wm_train_every; PPO stays synchronous)

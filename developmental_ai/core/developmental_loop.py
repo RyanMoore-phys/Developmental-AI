@@ -1977,11 +1977,37 @@ class DevelopmentalAI:
         # monitoring sink must never prevent the agent from starting.
         self._run_started_at = time.time()
         self._metrics_sink = None
+        self._heartbeat_sink = None
+        self._hb_every_s = 0.0
+        self._hb_last = 0.0
+        self._hb_last_steps = 0
         try:
             _mcfg = dict(self.config.get("metrics", {}) or {})
             if _mcfg.get("enabled"):
                 from developmental_ai.infra.metrics_sink import MetricsSink
                 self._metrics_sink = MetricsSink(_mcfg)
+                # ---- HEARTBEAT: a fast, CHEAP second feed -------------------
+                # The segment record is emitted once per segment — ~7 minutes
+                # at 1024 steps x action_repeat 4 — which is far too coarse to
+                # watch a run live. Shortening segment_len is NOT the fix: it
+                # is PPO's batch and GAE horizon, so it would change training
+                # to improve a dashboard.
+                # This is a separate, deliberately thin record on a wall-clock
+                # throttle. Separate FILE and TABLE so the two cadences never
+                # mix in one series, and so a heartbeat can never be mistaken
+                # for a segment observation.
+                _hb = float(_mcfg.get("heartbeat_seconds", 15) or 0)
+                if _hb > 0:
+                    _hcfg = dict(_mcfg)
+                    _hcfg["path"] = _mcfg.get(
+                        "heartbeat_path", "podlogs/heartbeat.jsonl")
+                    # fsync EVERY 15s would be gratuitous — a lost heartbeat
+                    # costs one dashboard point, unlike a lost segment record.
+                    _hcfg["fsync"] = bool(_mcfg.get("heartbeat_fsync", False))
+                    self._heartbeat_sink = MetricsSink(_hcfg)
+                    self._hb_every_s = _hb
+                    logger.info("metrics heartbeat every %.0fs -> %s",
+                                _hb, self._heartbeat_sink.path)
                 logger.info(
                     "metrics tracker ON -> %s (fsync=%s, rotate at %.0f MB, "
                     "keep %d) | resuming at seq %d",
@@ -7656,6 +7682,60 @@ class DevelopmentalAI:
         except Exception:
             pass
 
+    def _emit_heartbeat(self) -> None:
+        """A thin live record, at most once every `heartbeat_seconds`.
+
+        DELIBERATELY CHEAP. This runs on the per-step path, so it must cost
+        almost nothing when it is not writing: one attribute read and one
+        float compare. Everything it reports is either already computed or a
+        dict lookup — no nvidia-smi (a subprocess per heartbeat would be
+        absurd), no state_dict walks, no locks.
+
+        NOT A SUBSTITUTE FOR THE SEGMENT RECORD. It carries running totals so
+        a dashboard can show movement between segments; the segment record
+        remains the authoritative per-segment observation, and the two live in
+        separate files and separate tables so they can never be confused for
+        one another in a query.
+        """
+        sink = self._heartbeat_sink
+        if sink is None or self._hb_every_s <= 0:
+            return
+        try:
+            now = time.time()
+            if now - self._hb_last < self._hb_every_s:
+                return
+            steps = int(getattr(self, "total_timesteps", 0))
+            dt = max(1e-6, now - self._hb_last) if self._hb_last else 0.0
+            sps = ((steps - self._hb_last_steps) / dt) if dt else None
+            self._hb_last, self._hb_last_steps = now, steps
+
+            _wi = getattr(self, "_last_env_info", None) or {}
+            bbt = {k: int(v) for k, v in
+                   (_wi.get("breaks_by_type") or {}).items()
+                   if isinstance(k, str)}
+            _logs = sum(v for k, v in bbt.items() if "log" in k)
+            rec = {
+                "total_timesteps": steps,
+                "uptime_s": round(now - getattr(
+                    self, "_run_started_at", now), 1),
+                "steps_per_s": round(sps, 2) if sps else None,
+                "breaks_total": sum(bbt.values()),
+                "logs": _logs,
+                "attack_run": _wi.get("attack_run"),
+                "episodes": int(getattr(self, "total_episodes", 0)),
+            }
+            # torch's own allocator counter — a cheap read, unlike shelling
+            # out to nvidia-smi on the hot path.
+            try:
+                if torch.cuda.is_available():
+                    rec["gpu_mem_mb"] = round(
+                        torch.cuda.memory_allocated() / 1e6, 1)
+            except Exception:
+                pass
+            sink.write(rec)
+        except Exception:                              # pragma: no cover
+            pass          # a heartbeat must never disturb the step loop
+
     def _emit_metrics(self, episode_metrics: Dict[str, Any]) -> None:
         """Write one structured record per segment for the live tracker.
 
@@ -7694,17 +7774,49 @@ class DevelopmentalAI:
             # ---- reward channels, straight from the segment ----
             for k in ("episode_reward", "intrinsic_reward", "curiosity",
                       "avg_episode_reward", "episode_length",
-                      "world_model_loss", "policy_entropy",
                       "elapsed_time_seconds"):
                 if k in em:
                     rec[k] = em[k]
+
+            # ---- LEARNING SIGNALS LIVE IN training_metrics, NOT HERE --------
+            # (fix 2026-09-04) These were read from `episode_metrics` and were
+            # therefore None in every record — the "Learning signals" panel was
+            # empty for the whole first run. `_collect_segment` does not return
+            # them; they are appended to `self.training_metrics` deques from
+            # several places (the PPO update, the WM train step), so the latest
+            # value is the tail of the deque. Same access pattern _log_progress
+            # already uses: list(self.training_metrics[k])[-1].
+            _tm = getattr(self, "training_metrics", None) or {}
+            for k in ("policy_entropy", "world_model_loss", "kl_divergence",
+                      "symbolic_decoder_loss", "symbolic_decoder_accuracy",
+                      "inverse_dynamics_loss", "dream_distill_eff_weight",
+                      "glue_mastery_score", "glue_kg_density"):
+                try:
+                    _dq = _tm.get(k)
+                    if _dq:
+                        rec[k] = list(_dq)[-1]
+                except Exception:
+                    pass
 
             # ---- THE SCOREBOARD ----
             # STRING KEYS ONLY: a display bug once printed integer keys here
             # (they were action indices), so "2 breaks | top: [(3, 570)]" read
             # as 570 of block-type 3. Accept only names, so a mis-wired dict
             # shows as empty rather than as confident nonsense.
-            _wi = getattr(self, "_last_world_info", None) or {}
+            # `_last_env_info`, NOT `_last_world_info` (fix 2026-09-04).
+            # Both attributes exist and are assigned on the same lines
+            # (4160/5157), which is exactly why the wrong one went unnoticed:
+            #   _last_env_info   = step_infos[0]            <- has breaks_by_type
+            #   _last_world_info = step_infos[0]["world"]   <- does NOT
+            # Reading the world sub-dict returned {} forever, so the tracker
+            # reported breaks_total=0 for an entire run while the segment log
+            # printed "blocks broken: 2642 total, 8 logs" from the SAME step
+            # info. A metric that reads zero is indistinguishable from an agent
+            # doing nothing — which is the conclusion it very nearly produced.
+            # This is the counter-you-have-not-validated trap in CLAUDE.md §5,
+            # and the validation is: these numbers must match the
+            # `blocks broken:` line in _log_progress, which reads _last_env_info.
+            _wi = getattr(self, "_last_env_info", None) or {}
             bbt = {k: int(v) for k, v in
                    (_wi.get("breaks_by_type") or {}).items()
                    if isinstance(k, str)}
@@ -9409,6 +9521,15 @@ class DevelopmentalAI:
         EMPOWERMENT shaping delta to add to intrinsic (0.0 when off).
         step_income = everything the learner is being paid this step
         (intrinsic + shaped extrinsic) — the quantity a farm farms."""
+        # ---- LIVE HEARTBEAT (throttled, cheap, never raises) ---------------
+        # BEFORE the `infra is None` guard on purpose: the tracker must not
+        # switch itself off because an unrelated subsystem is disabled.
+        # Placed in _infra_step because it is the ONE per-step function shared
+        # by both waking bodies — the same dedup rationale as the docstring
+        # above, and the reason a per-step concern is never written twice.
+        # Cost is a wall-clock compare on the common path; the write happens
+        # roughly once every heartbeat_seconds, not once per step.
+        self._emit_heartbeat()
         if self.infra is None:
             return 0.0
         try:

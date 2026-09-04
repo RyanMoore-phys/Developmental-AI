@@ -32,6 +32,7 @@ import time
 DB = os.environ.get("DB_PATH", "/data/skybot.db")
 SRC = os.environ.get("METRICS_PATH", "/data/metrics.jsonl")
 SERVER_SRC = os.environ.get("SERVER_PATH", "/data/server.jsonl")
+HB_SRC = os.environ.get("HEARTBEAT_PATH", "/data/heartbeat.jsonl")
 POLL = float(os.environ.get("POLL_SECONDS", "10"))
 
 # Scalar columns worth having as real columns (Grafana graphs them directly).
@@ -50,6 +51,14 @@ SCALARS = [
     ("skills_bound", "INTEGER"), ("skills_minted", "INTEGER"),
     ("skills_refused", "INTEGER"), ("rssm_no_latent", "INTEGER"),
     ("cond_live", "INTEGER"), ("cond_load_failures", "INTEGER"),
+    # Learning signals. These come from training_metrics deques, not from the
+    # segment dict — see the note in _emit_metrics. Listed as real columns so
+    # Grafana can graph them; without this they fall into `extra` as JSON and
+    # the "Learning signals" panel has nothing to plot.
+    ("kl_divergence", "REAL"), ("symbolic_decoder_loss", "REAL"),
+    ("symbolic_decoder_accuracy", "REAL"), ("inverse_dynamics_loss", "REAL"),
+    ("dream_distill_eff_weight", "REAL"), ("glue_mastery_score", "REAL"),
+    ("glue_kg_density", "REAL"),
 ]
 JSON_COLS = ["reward_shares", "reward_alarms", "breaks_by_type",
              "crafts_by_type"]
@@ -70,6 +79,37 @@ def connect() -> sqlite3.Connection:
     cx.execute("CREATE TABLE IF NOT EXISTS server ("
                "wall_time REAL PRIMARY KEY, players_online INTEGER, "
                "max_players INTEGER, version TEXT)")
+    # SEPARATE TABLE from `segments`, not a `kind` column on it. The two feeds
+    # have different cadences (~15s vs ~7min) and different meanings: a
+    # heartbeat is a running total sampled mid-segment, a segment row is a
+    # closed observation. Mixing them would make every segment query need a
+    # filter, and one forgotten filter would silently average the two.
+    cx.execute("CREATE TABLE IF NOT EXISTS heartbeat ("
+               "seq INTEGER PRIMARY KEY, wall_time REAL, "
+               "total_timesteps INTEGER, uptime_s REAL, steps_per_s REAL, "
+               "breaks_total INTEGER, logs INTEGER, attack_run REAL, "
+               "episodes INTEGER, gpu_mem_mb REAL)")
+
+    # ---- ADD-ONLY MIGRATION -------------------------------------------
+    # `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a DB
+    # created before a column was added keeps the OLD shape and every insert
+    # then fails with "table segments has no column named ...". The tracker
+    # would go quiet with the containers still healthy — the exact
+    # looks-alive-stores-nothing failure this whole design guards against.
+    #
+    # Metrics are append-only and every column is nullable, so adding is
+    # always safe. Nothing is ever dropped or renamed here: a removed field
+    # simply stops being written, and old rows keep their history.
+    have = {r[1] for r in cx.execute("PRAGMA table_info(segments)")}
+    # `extra` belongs in this list too — it is a real column the INSERT names.
+    # Omitting it made the migration add 34 columns and then fail every insert
+    # with "table segments has no column named extra": the DB looked migrated
+    # and stored nothing new.
+    for name, typ in (SCALARS + [(n, "TEXT") for n in JSON_COLS]
+                      + [("extra", "TEXT")]):
+        if name not in have:
+            cx.execute(f"ALTER TABLE segments ADD COLUMN {name} {typ}")
+            print(f"migrate: added column {name} {typ}", flush=True)
     cx.commit()
     return cx
 
@@ -135,12 +175,42 @@ def ingest_server(cx: sqlite3.Connection, path: str) -> int:
     return len(rows)
 
 
+HB_COLS = ["seq", "wall_time", "total_timesteps", "uptime_s", "steps_per_s",
+           "breaks_total", "logs", "attack_run", "episodes", "gpu_mem_mb"]
+
+
+def ingest_heartbeat(cx: sqlite3.Connection, path: str) -> int:
+    """Same idempotent-on-seq contract as segments, different table."""
+    if not os.path.exists(path):
+        return 0
+    sql = (f"INSERT OR IGNORE INTO heartbeat ({','.join(HB_COLS)}) "
+           f"VALUES ({','.join('?' * len(HB_COLS))})")
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue                      # torn tail line; next pass gets it
+            if isinstance(r, dict) and "seq" in r:
+                rows.append([r.get(c) for c in HB_COLS])
+    if rows:
+        cur = cx.executemany(sql, rows)
+        cx.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return 0
+
+
 def main() -> None:
     cx = connect()
     once = "--once" in sys.argv
     while True:
         try:
             a = ingest_segments(cx, SRC)
+            ingest_heartbeat(cx, HB_SRC)
             ingest_server(cx, SERVER_SRC)
             total = cx.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
             if a:

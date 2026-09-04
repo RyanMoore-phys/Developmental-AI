@@ -25,6 +25,9 @@ KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
 OUT_DIR="${OUT_DIR:-/data}"
 REMOTE_PATH="${REMOTE_PATH:-/workspace/devai/podlogs/metrics.jsonl}"
 RSYNC_EVERY="${RSYNC_EVERY:-300}"
+# How often to pull the fast heartbeat feed. 30s keeps the
+# dashboard live without a second persistent ssh connection.
+HB_EVERY="${HB_EVERY:-30}"
 OUT="$OUT_DIR/metrics.jsonl"
 
 # BatchMode=yes is load-bearing: without it a rejected key drops ssh into an
@@ -58,9 +61,35 @@ backfill() {
   rm -f "$OUT_DIR/.backfill.jsonl"
 }
 
-echo "collector: pod=${POD_HOST}:${POD_SSH_PORT} -> ${OUT}"
+# The HEARTBEAT is a second, faster feed (~15s vs ~7min for segments). It is
+# pulled by rsync only, not tailed: at 15s intervals a 5-minute backfill is
+# already fine granularity for a dashboard, and a second persistent ssh tail
+# would double the connection count for very little gain.
+HB_REMOTE="${HB_REMOTE_PATH:-/workspace/devai/podlogs/heartbeat.jsonl}"
+HB_OUT="$OUT_DIR/heartbeat.jsonl"
+touch "$HB_OUT"
+
+backfill_hb() {
+  rsync -a -e "ssh ${SSH_OPTS[*]}" \
+    "root@${POD_HOST}:${HB_REMOTE}" "$OUT_DIR/.hb.jsonl" 2>/dev/null || return 0
+  cat "$HB_OUT" "$OUT_DIR/.hb.jsonl" 2>/dev/null \
+    | awk 'match($0, /"seq":[0-9]+/) {
+             s = substr($0, RSTART+6, RLENGTH-6)
+             if (!(s in seen)) { seen[s] = 1; print }
+           }' \
+    | sort -t: -k2 -n > "$OUT_DIR/.hb_merged.jsonl" 2>/dev/null
+  [ -s "$OUT_DIR/.hb_merged.jsonl" ] && mv "$OUT_DIR/.hb_merged.jsonl" "$HB_OUT"
+  rm -f "$OUT_DIR/.hb.jsonl"
+}
+
+echo "collector: pod=${POD_HOST}:${POD_SSH_PORT} -> ${OUT} (+ heartbeat)"
 backfill
+backfill_hb
 LAST_RSYNC=$(date +%s)
+# SEPARATE clock from LAST_RSYNC. Sharing it made the heartbeat condition
+# true on every 10s pass for the whole 300s segment-backfill window, so it
+# rsynced 3x more often than configured.
+LAST_HB=$(date +%s)
 
 while true; do
   # `tail -F` (capital) follows across ROTATION — the pod rotates this file at
@@ -73,6 +102,12 @@ while true; do
   while kill -0 "$TAIL_PID" 2>/dev/null; do
     sleep 10
     NOW=$(date +%s)
+    if [ $((NOW - LAST_HB)) -ge "$HB_EVERY" ]; then
+      # Heartbeat pulled on a SHORTER interval than the segment backfill —
+      # it is the live feed, and its whole point is granularity.
+      backfill_hb
+      LAST_HB=$NOW
+    fi
     if [ $((NOW - LAST_RSYNC)) -ge "$RSYNC_EVERY" ]; then
       backfill
       LAST_RSYNC=$NOW
@@ -82,6 +117,7 @@ while true; do
   wait "$TAIL_PID" 2>/dev/null
   echo "collector: tail exited, backfilling then reconnecting in 10s"
   backfill
-  LAST_RSYNC=$(date +%s)
+  backfill_hb
+  LAST_RSYNC=$(date +%s); LAST_HB=$LAST_RSYNC
   sleep 10
 done

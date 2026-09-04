@@ -1,25 +1,93 @@
 {
   "uid": "skybot-live",
-  "title": "SkyBot — live",
+  "title": "SkyBot \u2014 live",
   "timezone": "browser",
   "refresh": "30s",
-  "time": { "from": "now-24h", "to": "now" },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "panels": [
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "LIVE (~15s): steps/s, breaks, logs",
+      "description": "The heartbeat feed \u2014 a thin record written every ~15s from the per-step hook, so the run is watchable between segments. Segment records stay the authoritative per-segment observation; this is running totals sampled mid-segment. Separate table, so the two cadences never mix in one series.",
+      "gridPos": {
+        "h": 6,
+        "w": 16,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, steps_per_s, breaks_total, logs, attack_run FROM heartbeat ORDER BY wall_time"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Steps/s (live)",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "rawQueryText": "SELECT steps_per_s FROM heartbeat ORDER BY wall_time DESC LIMIT 1"
+        }
+      ]
+    },
     {
       "id": 1,
       "type": "stat",
-      "title": "BREAKS PER LOG  (the scoreboard — history is 399:1)",
-      "description": "Blocks broken per log obtained. This, not reward, is whether SkyBot is learning the thing it exists to learn. CLAUDE.md §9: 'the reward number has been wrong every single time.' Null means no log has ever dropped.",
-      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "title": "BREAKS PER LOG  (the scoreboard \u2014 history is 399:1)",
+      "description": "Blocks broken per log obtained. This, not reward, is whether SkyBot is learning the thing it exists to learn. CLAUDE.md \u00a79: 'the reward number has been wrong every single time.' Null means no log has ever dropped.",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "orange", "value": 50 },
-              { "color": "red", "value": 200 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
             ]
           }
         }
@@ -37,17 +105,35 @@
       "type": "stat",
       "title": "Reward concentration (HHI)",
       "description": "Herfindahl index over reward sources. 1.0 = one source owns all income, which is what every historical farm looked like: sky 96% of drive, a menu 77% of income. Rising HHI is the early warning.",
-      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 6
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "fieldConfig": {
         "defaults": {
-          "max": 1, "min": 0,
+          "max": 1,
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "orange", "value": 0.6 },
-              { "color": "red", "value": 0.8 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.6
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
             ]
           }
         }
@@ -65,8 +151,16 @@
       "type": "stat",
       "title": "Players online (expect num_envs)",
       "description": "Independent server-side truth. On an offline-mode server SkyBot1 is a DIFFERENT player from SkyBot, so a missing whitelist entry shows here as a persistent 1 while the agent's own logs look healthy. -1 means the server was unreachable.",
-      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 6
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
@@ -79,14 +173,24 @@
       "id": 4,
       "type": "timeseries",
       "title": "Where the reward comes from (top sources, share of gross)",
-      "description": "The reward ledger's income statement. Shares are over ABSOLUTE amounts, so a source moving a lot of reward in either direction shows up. Source names were READ OFF THE LIVE RUN (symbols/magnet_seek/gaze/novelty/effort), not guessed — the first version named sources that do not exist and every series was empty. If a new source appears, add a json_extract line; the raw map is in reward_shares so nothing is lost meanwhile. First live reading: symbols 62%, magnet_seek 28%, gaze 3%, novelty 3%, effort 1%, hhi 0.46.",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "description": "The reward ledger's income statement. Shares are over ABSOLUTE amounts, so a source moving a lot of reward in either direction shows up. Source names were READ OFF THE LIVE RUN (symbols/magnet_seek/gaze/novelty/effort), not guessed \u2014 the first version named sources that do not exist and every series was empty. If a new source appears, add a json_extract line; the raw map is in reward_shares so nothing is lost meanwhile. First live reading: symbols 62%, magnet_seek 28%, gaze 3%, novelty 3%, effort 1%, hhi 0.46.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "time series",
-          "timeColumns": ["time"],
+          "timeColumns": [
+            "time"
+          ],
           "rawQueryText": "SELECT wall_time AS time, json_extract(reward_shares,'$.symbols') AS symbols, json_extract(reward_shares,'$.magnet_seek') AS magnet_seek, json_extract(reward_shares,'$.gaze') AS gaze, json_extract(reward_shares,'$.novelty') AS novelty, json_extract(reward_shares,'$.effort') AS effort, json_extract(reward_shares,'$.log_break') AS log_break FROM segments ORDER BY wall_time"
         }
       ]
@@ -95,13 +199,23 @@
       "id": 5,
       "type": "timeseries",
       "title": "Breaks vs logs (cumulative)",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "time series",
-          "timeColumns": ["time"],
+          "timeColumns": [
+            "time"
+          ],
           "rawQueryText": "SELECT wall_time AS time, breaks_total, logs FROM segments ORDER BY wall_time"
         }
       ]
@@ -110,13 +224,21 @@
       "id": 6,
       "type": "table",
       "title": "Blocks broken by type (latest)",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
-          "rawQueryText": "SELECT key AS block, value AS broken FROM segments, json_each(segments.breaks_by_type) WHERE seq = (SELECT MAX(seq) FROM segments) ORDER BY value DESC"
+          "rawQueryText": "SELECT je.key AS block, CAST(je.value AS INTEGER) AS broken FROM segments s, json_each(s.breaks_by_type) je WHERE s.seq = (SELECT MAX(seq) FROM segments WHERE breaks_by_type IS NOT NULL AND breaks_by_type != '{}') ORDER BY broken DESC"
         }
       ]
     },
@@ -124,13 +246,21 @@
       "id": 7,
       "type": "table",
       "title": "Crafts by item (latest)",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "table",
-          "rawQueryText": "SELECT key AS item, value AS crafted FROM segments, json_each(segments.crafts_by_type) WHERE seq = (SELECT MAX(seq) FROM segments) ORDER BY value DESC"
+          "rawQueryText": "SELECT je.key AS item, CAST(je.value AS INTEGER) AS crafted FROM segments s, json_each(s.crafts_by_type) je WHERE s.seq = (SELECT MAX(seq) FROM segments WHERE crafts_by_type IS NOT NULL AND crafts_by_type != '{}') ORDER BY crafted DESC"
         }
       ]
     },
@@ -139,13 +269,23 @@
       "type": "timeseries",
       "title": "Skills: minted vs bound vs refused",
       "description": "The competence gate once froze at 16 skills / 0 invocations FOREVER, invisible for days. Minted rising while bound stays flat is that failure returning.",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "time series",
-          "timeColumns": ["time"],
+          "timeColumns": [
+            "time"
+          ],
           "rawQueryText": "SELECT wall_time AS time, skills_minted, skills_bound, skills_refused, rssm_no_latent FROM segments ORDER BY wall_time"
         }
       ]
@@ -153,30 +293,51 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "Learning signals (entropy, curiosity, WM loss)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "title": "Learning signals (entropy, WM loss, KL, intrinsic)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "time series",
-          "timeColumns": ["time"],
-          "rawQueryText": "SELECT wall_time AS time, policy_entropy, curiosity, world_model_loss FROM segments ORDER BY wall_time"
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, policy_entropy, world_model_loss, kl_divergence, intrinsic_reward, symbolic_decoder_accuracy FROM segments ORDER BY wall_time"
         }
-      ]
+      ],
+      "description": "Read from training_metrics, not from the segment dict. The first version queried policy_entropy/curiosity/world_model_loss out of episode_metrics, where none of them exist, so the panel was empty for a whole run. `curiosity` is not emitted at all \u2014 intrinsic_reward is the real signal."
     },
     {
       "id": 10,
       "type": "timeseries",
       "title": "Reward + attack behaviour",
       "description": "attack_run_max is how long it holds attack without a break. 96% of option activity once went into holding attack on an unreachable trunk, producing 0 logs.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
           "queryType": "time series",
-          "timeColumns": ["time"],
+          "timeColumns": [
+            "time"
+          ],
           "rawQueryText": "SELECT wall_time AS time, episode_reward, intrinsic_reward, attack_run_max, attack_run_mean FROM segments ORDER BY wall_time"
         }
       ]
