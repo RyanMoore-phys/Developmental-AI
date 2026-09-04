@@ -79,7 +79,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Where the reward comes from (top sources, share of gross)",
-      "description": "The reward ledger's income statement. Shares are over ABSOLUTE amounts, so a source moving a lot of reward in either direction shows up.",
+      "description": "The reward ledger's income statement. Shares are over ABSOLUTE amounts, so a source moving a lot of reward in either direction shows up. Source names were READ OFF THE LIVE RUN (symbols/magnet_seek/gaze/novelty/effort), not guessed — the first version named sources that do not exist and every series was empty. If a new source appears, add a json_extract line; the raw map is in reward_shares so nothing is lost meanwhile. First live reading: symbols 62%, magnet_seek 28%, gaze 3%, novelty 3%, effort 1%, hhi 0.46.",
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "skybot-sqlite" },
       "targets": [
@@ -87,7 +87,7 @@
           "refId": "A",
           "queryType": "time series",
           "timeColumns": ["time"],
-          "rawQueryText": "SELECT wall_time AS time, json_extract(reward_shares,'$.curiosity') AS curiosity, json_extract(reward_shares,'$.log_break') AS log_break, json_extract(reward_shares,'$.anticipation') AS anticipation, json_extract(reward_shares,'$.magnet') AS magnet, json_extract(reward_shares,'$.effort') AS effort FROM segments ORDER BY wall_time"
+          "rawQueryText": "SELECT wall_time AS time, json_extract(reward_shares,'$.symbols') AS symbols, json_extract(reward_shares,'$.magnet_seek') AS magnet_seek, json_extract(reward_shares,'$.gaze') AS gaze, json_extract(reward_shares,'$.novelty') AS novelty, json_extract(reward_shares,'$.effort') AS effort, json_extract(reward_shares,'$.log_break') AS log_break FROM segments ORDER BY wall_time"
         }
       ]
     },

@@ -2754,15 +2754,6 @@ class DevelopmentalAI:
                 if key in self.training_metrics:
                     self.training_metrics[key].append(value)
 
-            # ---- STRUCTURED METRICS: ONE EMISSION SITE ----------------------
-            # Placed here because ALL THREE stepping bodies converge on this
-            # line — lifelong, parallel and single-episode. Emitting inside
-            # them instead would be the duplicated-body drift CLAUDE.md §4.2
-            # names: an edit that lands in one body and not the others is
-            # silent, it just stops applying live. tests/_metrics_sink_smoke.py
-            # asserts this call appears exactly ONCE in this file.
-            self._emit_metrics(episode_metrics)
-
             self.total_episodes += 1
             self._episodes_this_env += 1
 
@@ -3237,6 +3228,30 @@ class DevelopmentalAI:
             # ---- Logging ----
             if verbose >= 1 and self.total_episodes % log_interval == 0:
                 self._log_progress()
+
+            # ---- STRUCTURED METRICS: ONE EMISSION SITE ----------------------
+            # AFTER _log_progress, and that ordering is load-bearing.
+            # The reward ledger's income statement is produced inside
+            # InfraStack.segment(), which _log_progress calls — and
+            # RewardLedger.segment() is a CONSUMING read, so the sink reads
+            # the stash rather than calling it again. Emitting BEFORE this
+            # point (as the first version did) meant every record carried the
+            # PREVIOUS segment's provenance and the first carried none at all:
+            # measured live, seq=1 had reward_total=None while the log printed
+            # `infra/ledger: total=+30.98 hhi=0.46 | symbols=62%...`.
+            #
+            # UNCONDITIONAL on purpose. It sits outside the `if verbose` gate
+            # so metrics do not silently stop when logging is turned down —
+            # a tracker that disappears with a verbosity flag is exactly the
+            # kind of invisible degradation this project keeps paying for.
+            # (With the shipped verbose=1/log_interval=1 the stash is fresh
+            # every segment; if logging is ever throttled the record carries
+            # the last statement produced, which is still true, just older.)
+            #
+            # Placed at the point where all three stepping bodies have already
+            # converged, so it cannot drift between duplicated bodies (§4.2).
+            # tests/_metrics_sink_smoke.py asserts this appears exactly ONCE.
+            self._emit_metrics(episode_metrics)
 
             # ---- Checkpointing ----
             # MONOTONE INTERVAL, not a modulo window (fix 2026-08-01, audit
