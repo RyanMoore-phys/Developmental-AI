@@ -165,26 +165,113 @@ class EmpowermentPotential:
     level can be farmed by sitting still.
     """
 
-    def __init__(self, decay: float = 0.999) -> None:
+    def __init__(self, decay: float = 0.999, mode: str = "relative",
+                 baseline_beta: float = 0.002, spread_k: float = 6.0) -> None:
+        """
+        ``mode="running_max"`` is the original: phi = score / decaying max.
+        ``mode="relative"`` (default since 2026-09-04) centres phi on a SLOW
+        baseline so that "better than usual" pays. See :meth:`update`.
+
+        ``baseline_beta`` is the EMA rate for that baseline. 0.002 means the
+        "usual" is an average over roughly the last ~500 readings; at the
+        shipped ``empowerment_interval: 25`` that is ~12,500 env steps, so it
+        adapts over hours, not seconds. Deliberately slow: the baseline must
+        track a genuinely changed environment (a new biome, a different game)
+        WITHOUT chasing the moment-to-moment score, because chasing it is
+        exactly what flattened the old normaliser.
+        """
         self._decay = float(decay)
         self._running_max = 0.0
+        self._mode = str(mode)
+        self._beta = float(baseline_beta)
+        self._mu: float = 0.0            # slow "usual" empowerment
+        self._mad: float = 0.0           # slow mean-absolute-deviation (scale)
+        self._k = float(spread_k)
+        self._n = 0
 
     def update(self, score: float) -> float:
-        """Fold in a new score; return phi = score / running_max ∈ [0,1].
+        """Fold in a new score; return phi ∈ [0,1].
 
-        The first update returns 1.0 by construction (the score is its
-        own maximum).  Non-finite or negative inputs — the 0.0 error
-        sentinel's pathological cousins — are clamped to 0.0 so a single
-        NaN can never poison the running max for the rest of the run.
+        WHY THE DEFAULT CHANGED (2026-09-04, measured on a live run).
+        The original returns ``score / running_max`` where
+        ``running_max = max(running_max*decay, score)`` — the score RE-RAISES
+        its own denominator every update. So while empowerment is steady,
+        ``running_max == score`` and phi is pinned at 1.0 by construction.
+        Measured live: score 0.43 with phi 0.97-1.00 across the whole run, and
+        the loop rewards ``phi' - phi``, so a potential at its ceiling paid
+        almost nothing — empowerment was 0.7% of all income.
+        That made it a TRAP DETECTOR (phi falls when options are lost, and
+        recovering pays it back) but never an ACQUISITION drive: there was no
+        gradient for gaining options, only for not losing them.
+
+        ``relative`` mode centres phi on a slow baseline instead:
+
+            phi = 0.5 + 0.5 * (score - mu) / (k * mad)
+
+        so phi is 0.5 at "usual", rises above when the agent reaches a
+        genuinely more open state, and falls below when it is closing options
+        off. Headroom exists in BOTH directions, which is what a telescoping
+        potential needs to reward improvement.
+
+        It remains a POTENTIAL, so the policy-invariance argument is
+        unchanged: no absolute level is farmable by sitting still, because
+        only the delta pays and returning to a state returns the potential.
+
+        `mu`/`mad` adapt slowly (see ``baseline_beta``), so a changed
+        environment re-centres what "usual" means rather than leaving the term
+        permanently saturated — the property that lets this work in a
+        different biome, or a different game, with no retuning.
+
+        NO LATCH. The old decay existed because a single early outlier could
+        pin `running_max` forever (the guard-becomes-latch failure, four
+        occurrences). `mu` and `mad` are EMAs with no max operator, so no
+        single reading can pin them; an outlier is absorbed and forgotten at
+        the baseline rate. `running_max` is still maintained in this mode so
+        `mode` can be switched back without a cold start.
         """
         if not isinstance(score, (int, float)) or score != score \
                 or score in (float("inf"), float("-inf")) or score < 0.0:
             score = 0.0
-        self._running_max = max(self._running_max * self._decay,
-                                float(score))
-        if self._running_max <= 0.0:
-            # All-zero history (probe erroring, or a genuinely degenerate
-            # model): phi is constant, so the telescoping delta is 0 and
-            # the shaping term is inert rather than divide-by-zero dead.
-            return 1.0
-        return min(1.0, float(score) / self._running_max)
+        score = float(score)
+        self._running_max = max(self._running_max * self._decay, score)
+
+        if self._mode != "relative":
+            if self._running_max <= 0.0:
+                # All-zero history (probe erroring, or a genuinely degenerate
+                # model): phi is constant, so the telescoping delta is 0 and
+                # the shaping term is inert rather than divide-by-zero dead.
+                return 1.0
+            return min(1.0, score / self._running_max)
+
+        # ---- relative mode ------------------------------------------------
+        self._n += 1
+        if self._n == 1:
+            # First reading defines "usual"; phi starts NEUTRAL at 0.5, not
+            # 1.0. Starting at the ceiling would hand the first few steps a
+            # large free negative delta as it settled.
+            self._mu = score
+            self._mad = 0.0
+            return 0.5
+        _dev = abs(score - self._mu)
+        self._mu += self._beta * (score - self._mu)
+        self._mad += self._beta * (_dev - self._mad)
+        # SPREAD_K CALIBRATED, NOT GUESSED (2026-09-04). Swept against the
+        # scores measured live on the pod (0.337-0.443) plus realistic jitter,
+        # scoring each k by how well a genuine improvement (0.43 -> 0.55)
+        # stands out from step-to-step noise:
+        #     k=2  33% of readings railed at 0/1, signal:noise 0.92x
+        #     k=3  25%                            1.22x
+        #     k=4  20%                            1.47x
+        #     k=6  12%                            1.92x   <- chosen
+        #     k=8   8%                            1.82x
+        # At k=2 the real improvement was INDISTINGUISHABLE from noise (<1x) —
+        # a tighter scale looks more responsive and is strictly worse, because
+        # a telescoping potential that swings on noise adds reward variance
+        # carrying no information. k=6 keeps phi off the rails most of the
+        # time while still using its range for genuinely unusual states.
+        _scale = self._k * self._mad
+        if _scale <= 1e-9:
+            # No variation seen yet (or a genuinely constant score): report
+            # neutral rather than dividing by ~0 and producing a huge delta.
+            return 0.5
+        return max(0.0, min(1.0, 0.5 + 0.5 * (score - self._mu) / _scale))

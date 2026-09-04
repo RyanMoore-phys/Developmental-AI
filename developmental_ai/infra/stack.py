@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import zlib
@@ -76,6 +77,10 @@ class InfraStack:
         # segment without a None-check at every call site.
         self.last_ledger_segment: dict = {}
         self.farm = None
+        # Neutral until the first on_step. on_step has an early `return`
+        # path, so this must exist from construction or the reward assembly
+        # would read a missing attribute on the very first tick.
+        self.last_loop_damp: float = 1.0
         self.signals = None
         self.drift = None
         self.stuck = None
@@ -85,6 +90,22 @@ class InfraStack:
         self._empowerment_fn = None
         self._empowerment_pot = None
         self.empowerment_weight = float(cfg.get("empowerment_weight", 0.0))
+        # ---- APPROACH-A-REMEMBERED-PLACE (2026-09-04) --------------------
+        # infra/episodic has been recording `sighting:tree_visible @(14,13)`
+        # for the whole project and driving NOTHING. See approach_shaping().
+        _ap = cfg.get("approach", {}) or {}
+        self.approach_weight = float(_ap.get("weight", 0.0))
+        self.approach_kind = str(_ap.get("kind", "sighting"))
+        self.approach_radius = float(_ap.get("radius", 64.0))
+        # Per-step cap on the paid delta. A respawn/teleport moves the agent
+        # tens of blocks in one tick; without this the jump would be paid as
+        # if it had been walked, which is a farm the agent can trigger by
+        # dying. Also bounds the discontinuity when the nearest target
+        # changes identity (that case re-adopts and pays 0 — see below).
+        self.approach_max_delta = float(_ap.get("max_step_delta", 1.5))
+        self.last_approach_reward: float = 0.0
+        self._appr_prev_d: Optional[float] = None
+        self._appr_target = None        # identity of the record being approached
         self.empowerment_interval = int(cfg.get("empowerment_interval", 25))
         self._emp_phi_prev: Optional[float] = None
         self._emp_last_step = -1
@@ -234,7 +255,11 @@ class InfraStack:
         from developmental_ai.infra.empowerment import (
             EmpowermentPotential, empowerment_score)
         self._empowerment_fn = empowerment_score
-        self._empowerment_pot = EmpowermentPotential()
+        self._empowerment_pot = EmpowermentPotential(
+            mode=str(self._cfg.get("empowerment_mode", "relative")),
+            baseline_beta=float(
+                self._cfg.get("empowerment_baseline_beta", 0.002)),
+            spread_k=float(self._cfg.get("empowerment_spread_k", 6.0)))
         return self._empowerment_fn
 
     # ---- hot-path hooks (each guarded, each contained) --------------------
@@ -285,8 +310,23 @@ class InfraStack:
             if self.drift is not None:
                 self.drift.update(int(action))
             if self.farm is not None and cell is not None:
-                self.farm.step(_stable_cell_id(cell), int(action),
+                _cid = _stable_cell_id(cell)
+                self.farm.step(_cid, int(action),
                                float(step_reward), int(step))
+                # Published for the reward assembly to apply to SHAPING
+                # income (see BehaviouralLoopDetector.loop_damp). Read AFTER
+                # step() so the damp reflects the lap just closed; the farm
+                # detector was pure observation until 2026-09-04 and named a
+                # 2,213-lap farm that nothing acted on.
+                self.last_loop_damp = self.farm.loop_damp(_cid)
+            else:
+                self.last_loop_damp = 1.0
+            # Computed AFTER the episodic record below would be ideal, but
+            # the record for THIS step must not be the thing we approach —
+            # a sighting logged at the agent's own position would read as
+            # distance 0 and pay the full closing delta for standing still.
+            # Using the memory as of the previous step avoids that entirely.
+            self._approach_step(position)
             if self.affordance is not None:
                 # the affordance map is CAUSED-effect statistics only:
                 # observed_change is by definition NOT this body's doing,
@@ -381,6 +421,90 @@ class InfraStack:
             if best > 0.05:
                 out[cat] = min(1.0, best)
         return out
+
+    def approach_reset(self) -> None:
+        """Drop the approach reference (call at an episode boundary).
+
+        Re-adopting rather than carrying the old distance across a reset is
+        the same discipline the vision scaffold uses when a GUI closes: the
+        first step after a discontinuity must not collect a windfall for a
+        move the agent did not make.
+        """
+        self._appr_prev_d = None
+        self._appr_target = None
+        self.last_approach_reward = 0.0
+
+    def _approach_step(self, position) -> None:
+        """Update `last_approach_reward` — approach-a-remembered-place.
+
+        WHY THIS EXISTS. `EpisodicEventMemory` has been recording sightings
+        with coordinates (`sighting:tree_visible @(14,13)`) since the infra
+        wave, and nothing has ever consumed them. The agent could therefore
+        only pursue what was ON SCREEN: look away and the tree stopped
+        existing. That is the gap curiosity cannot close by itself — once a
+        category is familiar, learning progress retires it, and the agent
+        stops seeking the very thing it has learned to recognise.
+
+        Φ = -(horizontal distance to the nearest remembered instance).
+
+        PLAIN DIFFERENCE, γ=1 — NOT the textbook `w(γΦ' − Φ)` (CLAUDE.md
+        §4.3). With Φ < 0 the telescoping form pays `−w(1−γ)Φ` every step Φ
+        is merely HELD, which is a wage for standing still; that shipped once
+        and the log read `Gaze level: +0.00014/step` — the agent was being
+        paid to stare at a clamp. Here the difference form pays exactly
+        `w * (d_prev − d_now)`: positive for closing in, negative for walking
+        away, and **exactly 0.0 while stationary**, which is asserted in the
+        smoke test rather than assumed.
+
+        TARGET IDENTITY. Paying on the distance to "whatever is nearest"
+        would hand out a windfall the moment a nearer sighting is recorded,
+        since d would drop without the agent moving. So the target is pinned
+        by identity; when it changes, the reference is re-adopted and that
+        step pays 0.
+
+        DOMAIN-AGNOSTIC. No block names, no Minecraft vocabulary — a `kind`
+        string, coordinates the adapter supplies, and euclidean distance.
+        Runs unchanged anywhere the env reports a position.
+        """
+        if self.approach_weight <= 0.0 or self.episodic is None \
+                or position is None:
+            self.last_approach_reward = 0.0
+            return
+        try:
+            recs = self.episodic.near(position, self.approach_radius,
+                                      kind=self.approach_kind)
+            best_d, best_id = None, None
+            qx, qz = float(position[0]), float(position[2])
+            for rec in recs:
+                pos = rec.get("position")
+                if pos is None:
+                    continue
+                d = math.hypot(pos[0] - qx, pos[2] - qz)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best_id = (rec.get("kind"), rec.get("subtype"),
+                               round(float(pos[0]), 2), round(float(pos[2]), 2))
+            if best_d is None:
+                # Nothing remembered in range: no gradient to offer. Drop the
+                # reference so returning to a known area re-adopts instead of
+                # paying for the gap.
+                self.approach_reset()
+                return
+            if self._appr_prev_d is None or best_id != self._appr_target:
+                # adopt (or re-adopt on a target switch) WITHOUT paying
+                self._appr_prev_d, self._appr_target = best_d, best_id
+                self.last_approach_reward = 0.0
+                return
+            delta = self._appr_prev_d - best_d      # + = closed the gap
+            if delta > self.approach_max_delta:
+                delta = self.approach_max_delta
+            elif delta < -self.approach_max_delta:
+                delta = -self.approach_max_delta
+            self._appr_prev_d = best_d
+            self.last_approach_reward = self.approach_weight * float(delta)
+        except Exception as exc:  # noqa: BLE001 — shaping must never crash
+            logger.warning("approach_shaping failed: %r", exc)
+            self.approach_reset()
 
     def empowerment_shaping(self, world_model, rssm_state, action_dim: int,
                             step: int, gamma: float, wm_lock=None) -> float:

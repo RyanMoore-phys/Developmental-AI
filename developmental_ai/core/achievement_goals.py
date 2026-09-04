@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import os
 from collections import defaultdict, deque
@@ -999,11 +1000,25 @@ class DiscoveredAchievementGoals(AchievementGoalBroadcast):
     Never reads info['achievements'] — grading is external."""
 
     def __init__(self, spike_threshold: float = 0.9, pool: int = 192,
-                 match_cosine: float = 0.8, **kw):
+                 match_cosine: float = 0.8, spike_mode: str = "relative",
+                 spike_frac: float = 0.5, spike_decay: float = 0.9999, **kw):
+        """
+        ``spike_mode="absolute"`` is the original: an unlock event requires
+        ``env.reward_history[-1] >= spike_threshold`` (0.9).
+
+        ``spike_mode="relative"`` (default since 2026-09-04) requires
+        ``r >= spike_frac * running_max_positive_reward`` instead. See
+        :meth:`update` — 0.9 is an achievement-environment constant and does
+        not survive contact with a different reward scale.
+        """
         super().__init__(**kw)
         self.spike_threshold = float(spike_threshold)
         self.pool = int(pool)
         self.match_cosine = float(match_cosine)
+        self.spike_mode = str(spike_mode)
+        self.spike_frac = min(1.0, max(0.0, float(spike_frac)))
+        self.spike_decay = min(1.0, max(0.0, float(spike_decay)))
+        self._rmax = 0.0                # decaying running max positive reward
         # SLOT-ALIGNED: _signatures[slot] is the ACTIVE working slot's cluster
         # signature (None for a freed/empty slot). Paged-out signatures live in
         # the LongTermStore as recall cues, not here. In the fixed-cap path
@@ -1012,9 +1027,13 @@ class DiscoveredAchievementGoals(AchievementGoalBroadcast):
         self._disc_next = 0             # monotonic id for new discovered slots
 
     def _extra_state(self) -> Dict:
+        # _rmax is persisted: without it a restart resets the bar to 0, and
+        # the FIRST positive reward after boot would be a "spike" by
+        # definition — minting a goal for whatever happened to pay first.
         return {"signatures": [None if s is None else np.asarray(s).tolist()
                                for s in self._signatures],
-                "disc_next": int(self._disc_next)}
+                "disc_next": int(self._disc_next),
+                "rmax": float(self._rmax)}
 
     def _load_extra_state(self, d: Dict) -> None:
         # Restoring signatures is what makes slot->behaviour identity real:
@@ -1024,6 +1043,10 @@ class DiscoveredAchievementGoals(AchievementGoalBroadcast):
             None if sig is None else np.asarray(sig, dtype=np.float32)
             for sig in d.get("signatures", [])][:self.max_slots]
         self._disc_next = int(d.get("disc_next", len(self._signatures)))
+        try:
+            self._rmax = max(0.0, float(d.get("rmax", 0.0)))
+        except (TypeError, ValueError):
+            self._rmax = 0.0
 
     def _set_slot_signature(self, slot: int, sig) -> None:
         while len(self._signatures) <= slot:
@@ -1058,12 +1081,65 @@ class DiscoveredAchievementGoals(AchievementGoalBroadcast):
         k = d.size // self.pool
         return d[: k * self.pool].reshape(self.pool, k).mean(axis=1)
 
+    def _is_spike(self, r: float) -> bool:
+        """Is this step's env reward an unlock event?
+
+        WHY THIS CHANGED (2026-09-04, measured on a live run).
+        Goal discovery required ``reward_history[-1] >= 0.9``. That constant
+        comes from achievement environments, where an unlock literally pays
+        1.0. Minecraft does not pay in those units: extrinsic env reward
+        appears in about 1 segment in 39, and 3,699 block breaks produced 9
+        logs. So the test was, in practice, never true — and the goal set
+        froze at **3 active / 0 dormant / 3 total known** for the whole run,
+        with the working-set pager reporting `paged out=0, recalled=0`
+        because it never had anything to page. An agent that is supposed to
+        develop open-endedly had a fixed curriculum of three.
+
+        A spike should mean "unusually large FOR THIS ENVIRONMENT", not
+        "bigger than 0.9". So the bar is a fraction of the largest positive
+        reward actually seen, tracked with a decaying running max:
+
+            spike  <=>  r > 0  AND  r >= spike_frac * rmax
+
+        In an achievement env rmax converges to 1.0 and the bar returns to
+        ~0.5, so a 1.0 unlock still spikes and ordinary noise still does not
+        — behaviour there is unchanged in practice. In Minecraft the bar
+        tracks whatever a real event pays, so breaking a block can finally
+        register as an event. This is the same absolute→relative correction
+        made to EmpowermentPotential, for the same reason: a hard constant
+        cannot serve a system whose whole claim is cross-game transfer.
+
+        WHY THIS IS NOT THE JUNK-GOAL FACTORY AGAIN. That incident produced
+        48/48 ungrounded slots and 0/51 mastered, and the fix was NOT this
+        threshold — it was requiring a behaviour to recur across DISTINCT
+        EPISODES before a skill is minted ("one spike is evidence something
+        happened, not evidence of a skill"). That rule is untouched, and it
+        is what stands between a discovered goal and a minted skill. Lowering
+        this bar creates goal *candidates*; earning a skill still costs the
+        same repeated evidence. The obs-delta norm check below also still
+        rejects events with no perceptual consequence.
+
+        NO LATCH. `rmax` DECAYS (spike_decay), so one freak reward cannot pin
+        the bar high forever — the failure mode of the old running-max
+        empowerment normaliser, and of the competence gate frozen at -5.68.
+        If the reward scale falls, the bar follows it down within
+        ~1/(1-decay) steps with no human intervention.
+        """
+        if not math.isfinite(r) or r <= 0.0:
+            return False
+        if self.spike_mode != "relative":
+            return r >= self.spike_threshold
+        self._rmax = max(self._rmax * self.spike_decay, r)
+        if self._rmax <= 0.0:
+            return False
+        return r >= self.spike_frac * self._rmax
+
     def update(self, env, stream: int = 0, effect_key=None) -> None:
         rh = getattr(env, "reward_history", None)
         oh = getattr(env, "obs_history", None)
         if not rh or oh is None or len(oh) < 2:
             return
-        if rh[-1] < self.spike_threshold:
+        if not self._is_spike(float(rh[-1])):
             return
         sig = self._pooled_delta(oh[-2], oh[-1])
         norm = np.linalg.norm(sig)
@@ -1229,5 +1305,11 @@ def make_goal_broadcast(goal_cfg: Dict) -> AchievementGoalBroadcast:
         return DiscoveredAchievementGoals(
             spike_threshold=float(goal_cfg.get("spike_threshold", 0.9)),
             match_cosine=float(goal_cfg.get("match_cosine", 0.8)),
+            # Relative by default: 0.9 is an achievement-env constant and
+            # was never reachable in Minecraft, freezing the goal set at 3.
+            # Set spike_mode: absolute to restore the old behaviour exactly.
+            spike_mode=str(goal_cfg.get("spike_mode", "relative")),
+            spike_frac=float(goal_cfg.get("spike_frac", 0.5)),
+            spike_decay=float(goal_cfg.get("spike_decay", 0.9999)),
             **kw)
     return GivenAchievementGoals(**kw)

@@ -1848,6 +1848,73 @@ infra:
     max_keys: 512
   empowerment_weight: 0.05
   empowerment_interval: 25
+  # ---- APPROACH A REMEMBERED PLACE (2026-09-04) --------------------------
+  # WHY: infra/episodic has been recording `sighting:tree_visible @(14,13)`
+  # since the infra wave and driving NOTHING. The agent could only pursue
+  # what was on screen — look away and the tree ceased to exist. Curiosity
+  # cannot close that gap by itself: once a category is familiar, learning
+  # progress retires it and the agent stops seeking the very thing it has
+  # just learned to recognise.
+  #
+  # Phi = -(horizontal distance to the nearest remembered sighting), paid as
+  # a PLAIN DIFFERENCE (gamma=1, CLAUDE.md 4.3) so it pays exactly 0.0 while
+  # standing still. The telescoping form would pay a wage for holding a
+  # distance — that shipped once and read `Gaze level: +0.00014/step`.
+  #
+  # WEIGHT IS DELIBERATELY SMALL. This is a nudge toward remembered places,
+  # not an income stream: at 0.02 a full 64-block approach is worth ~1.3
+  # total, spread over the whole walk, and walking away costs the same. It
+  # is capped per step so a respawn or teleport cannot be cashed in, and the
+  # target is pinned by identity so a newly-recorded nearer sighting cannot
+  # hand out a windfall for standing still.
+  #
+  # DOMAIN-AGNOSTIC: a `kind` string plus coordinates. No block names. Runs
+  # unchanged in any env whose adapter reports a position.
+  approach:
+    weight: 0.02
+    kind: sighting
+    radius: 64.0
+    max_step_delta: 1.5
+  # ---- EMPOWERMENT AS AN ACQUISITION DRIVE (2026-09-04) -------------------
+  # WHY: measured live, empowerment was 0.7% of all income while `symbols`
+  # took 66% — the agent was paid to RECOGNISE and almost never to ACT
+  # (extrinsic_env appeared in 1 segment of 39; 3,699 breaks -> 9 logs).
+  #
+  # The cause was NOT the weight. The old potential was
+  #     phi = score / max(running_max*decay, score)
+  # in which the score RE-RAISES its own denominator, so a steady score pins
+  # phi at 1.0 by construction. Measured: score 0.43, phi 0.97-1.00 for the
+  # whole run. The loop rewards phi'-phi, so a potential at its ceiling pays
+  # ~nothing. That made empowerment a TRAP DETECTOR (it only speaks when
+  # options are LOST) and never a drive to GAIN them.
+  #
+  # `relative` centres phi on a slow baseline, so "better than usual" pays
+  # and there is headroom in BOTH directions. It remains a potential, so
+  # policy-invariance and no-farm-by-oscillating are unchanged.
+  #
+  # SLOW ON PURPOSE: baseline_beta 0.002 averages ~500 readings, and at
+  # interval 25 that is ~12,500 env steps — hours, not seconds. The baseline
+  # must re-centre when the ENVIRONMENT genuinely changes (a new biome, a
+  # different game) without chasing the moment-to-moment score, because
+  # chasing it is exactly what flattened the old normaliser.
+  #
+  # THE WEIGHT IS DELIBERATELY UNCHANGED at 0.05. The shape change alone
+  # makes the mean |delta| ~2.7x larger (0.086 -> 0.236 on live-derived
+  # scores), so raising the weight in the same change would confound two
+  # effects and risk a new farm. Measure first: empowerment share should
+  # rise AND breaks_per_log should fall from 411:1. A share rise alone is a
+  # farm, not progress.
+  #
+  # REVERT: empowerment_mode: running_max (restores the old behaviour
+  # exactly; the running max is still maintained in relative mode, so the
+  # switch needs no cold start).
+  empowerment_mode: relative
+  empowerment_baseline_beta: 0.002
+  # Width of the phi band in mean-absolute-deviations. CALIBRATED against
+  # live scores, not guessed: at k=2 a genuine improvement was
+  # INDISTINGUISHABLE from step noise (0.92x signal:noise); k=6 gives 1.92x
+  # with phi off the rails ~88% of the time. Sweep table in empowerment.py.
+  empowerment_spread_k: 6.0
   stuck_patience: 3
   stuck_cooldown: 6
   farm_income_alarm: 0.02

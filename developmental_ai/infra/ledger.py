@@ -216,11 +216,17 @@ class FarmDetector:
     """
 
     def __init__(self, revisit_horizon: int = 400, min_loops: int = 6,
-                 income_alarm: float = 0.02, max_cells: int = 20000):
+                 income_alarm: float = 0.02, max_cells: int = 20000,
+                 damp_floor: float = 0.25, damp_rate: float = 0.15,
+                 absence_decay: float = 0.5):
         self.revisit_horizon = max(1, int(revisit_horizon))
         self.min_loops = max(1, int(min_loops))
         self.income_alarm = float(income_alarm)
         self.max_cells = max(1, int(max_cells))
+        # Damping (2026-09-04): the detector used to only rank. See loop_damp.
+        self.damp_floor = min(1.0, max(0.0, float(damp_floor)))
+        self.damp_rate = max(0.0, float(damp_rate))
+        self.absence_decay = min(1.0, max(0.0, float(absence_decay)))
         # Running cumulative reward: loop income is a difference of two
         # readings of this counter, so per-cell storage stays O(1) no matter
         # how long the loop is.
@@ -273,6 +279,24 @@ class FarmDetector:
                               else (1.0 - _EMA_BETA) * rec[3]
                               + _EMA_BETA * rate)
                     self._absorb_actions(rec[4], then, step)
+                elif span > self.revisit_horizon:
+                    # ---- THE ESCAPE PATH (§4.1) --------------------------
+                    # The agent stayed AWAY from this cell for longer than a
+                    # loop horizon, so whatever was circling here has
+                    # stopped. Decay the evidence: lap count and income EMA
+                    # both shrink, and loop_damp() rises back toward 1.0.
+                    # Without this branch `loops` only ever increases and the
+                    # damp would be a one-way latch — the failure this repo
+                    # has now hit nine times (competence gate frozen at
+                    # -5.68; the magnet's cold-start BUDGET latch; the
+                    # degenerate-signal gate that counted labels). The
+                    # re-open condition is stated plainly because "a human
+                    # notices" would make it a latch: LEAVE THE CELL FOR
+                    # MORE THAN revisit_horizon STEPS. That is an action the
+                    # agent can take, and repeating it restores full value.
+                    rec[2] = int(rec[2] * self.absence_decay)
+                    if rec[3] is not None:
+                        rec[3] *= self.absence_decay
                 rec[0], rec[1] = step, self._cum
                 self._cells.move_to_end(cell)
             else:
@@ -286,6 +310,52 @@ class FarmDetector:
             self._note_error(repr(exc))
 
     # -- reporting ---------------------------------------------------------
+
+    def loop_damp(self, cell: int) -> float:
+        """Multiplier in [damp_floor, 1.0] for SHAPING income in ``cell``.
+
+        WHY (2026-09-04). This detector named a live farm — 2,213 laps in one
+        cell at +0.026/step, others at +0.092/step — and nothing consumed it.
+        Detection without response is how this project lost 96% of its drive
+        to sky-staring, 77% of its income to a villager menu, and 96% of
+        option activity to holding attack against an unreachable trunk. §9 is
+        a list of farms that were visible and unopposed.
+
+        WHAT IT DOES. A cell only qualifies once it has closed >= min_loops
+        laps AND its smoothed loop income is still above income_alarm. Under
+        potential-based shaping the shaping terms telescope to zero over any
+        closed loop, so sustained positive loop income is the signature of
+        either real repeated progress or a farm. The damp then falls as
+        1/(1 + damp_rate * excess_laps) to a FLOOR of damp_floor, so a farm
+        is made progressively less profitable but never worthless — a hard
+        zero would also erase genuine repeated achievement, which we cannot
+        distinguish here and must not silently destroy.
+
+        THE DAMP IS NOT A LATCH. It is a pure function of the lap count and
+        income EMA, both of which decay in `step()` whenever the agent stays
+        away longer than revisit_horizon. Leaving the farm restores its
+        value; there is no state a human has to reset.
+
+        WHAT IT MUST NOT TOUCH. Callers apply this to SHAPING income only.
+        Extrinsic environment reward stays honest: an agent that actually
+        chops a log in a cell it happens to have circled must still be paid
+        in full, or the damp becomes a new way to be wrong about the
+        scoreboard. Domain-agnostic — cells are opaque ints.
+        """
+        try:
+            rec = self._cells.get(int(cell))
+            if rec is None:
+                return 1.0
+            loops, ema = rec[2], rec[3]
+            if (loops < self.min_loops or ema is None
+                    or ema <= self.income_alarm):
+                return 1.0
+            excess = loops - self.min_loops + 1
+            damp = 1.0 / (1.0 + self.damp_rate * float(excess))
+            return max(self.damp_floor, min(1.0, damp))
+        except Exception as exc:  # noqa: BLE001 — shaping must never crash
+            self._note_error(repr(exc))
+            return 1.0
 
     def segment_report(self) -> List[str]:
         """Lines for cells looping >= min_loops with EMA income > alarm.

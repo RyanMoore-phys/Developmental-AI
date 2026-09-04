@@ -2128,6 +2128,11 @@ class DevelopmentalAI:
             "dream_critic_loss": deque(maxlen=100),
             "dream_returns_mean": deque(maxlen=100),
             "inverse_dynamics_loss": deque(maxlen=100),
+            # The stage controller's SPINE (it drives every stage transition
+            # via prediction_error) and, until 2026-09-04, never recorded
+            # anywhere a human could read. Added alongside the WM-loss
+            # telemetry fix so the signal the curriculum turns on is visible.
+            "reconstruction_error": deque(maxlen=100),
         }
 
         # ---- SELECTIVE RESUME (2026-08-03) -------------------------------
@@ -3006,21 +3011,15 @@ class DevelopmentalAI:
                               else self._train_world_model())
                 if self._lifelong:
                     self._wm_metrics_fresh = False
-                self.training_metrics["world_model_loss"].append(
-                    wm_metrics.get("total", 0)
-                )
-                self.training_metrics["kl_divergence"].append(
-                    wm_metrics.get("kl", 0)
-                )
-                self.training_metrics["symbolic_decoder_loss"].append(
-                    wm_metrics.get("symbolic_decoder_loss", 0)
-                )
-                self.training_metrics["symbolic_decoder_accuracy"].append(
-                    wm_metrics.get("symbolic_decoder_accuracy", 0)
-                )
-                self.training_metrics["inverse_dynamics_loss"].append(
-                    wm_metrics.get("inverse", 0)
-                )
+                # producer site 3 of 3: non-lifelong, where _train_world_model
+                # was just called inline above. In lifelong mode the metrics
+                # were already recorded at their producer (trainer thread or
+                # the synchronous branch), so recording again here would
+                # double-count. The glue/stage-controller consumption below
+                # deliberately STAYS on the consume-once path: re-feeding a
+                # stale reconstruction value would flatten its error slope.
+                if not self._lifelong:
+                    self._record_wm_telemetry(wm_metrics)
                 # Feed training signals to glue layer
                 self.glue.record_training_signals(
                     kl_value=wm_metrics.get("kl"),
@@ -3383,6 +3382,11 @@ class DevelopmentalAI:
         # across the env reset. See VisionScaffold.reset().
         if self.vision_scaffold is not None:
             self.vision_scaffold.reset()
+        if self.infra is not None:
+            # Re-adopt the approach reference at the boundary: carrying the
+            # old distance across a world change would pay (or charge) for a
+            # move the agent never made. Same discipline the scaffold uses.
+            self.infra.approach_reset()
         done = False
         episode_reward = 0.0
         episode_intrinsic = 0.0
@@ -3947,6 +3951,11 @@ class DevelopmentalAI:
         # shapes the primary stream, same as the single-env path).
         if not use_dream_actor and self.vision_scaffold is not None:
             self.vision_scaffold.reset()
+        if self.infra is not None:
+            # Re-adopt the approach reference at the boundary: carrying the
+            # old distance across a world change would pay (or charge) for a
+            # move the agent never made. Same discipline the scaffold uses.
+            self.infra.approach_reset()
         if self.symbolizer is not None:
             self._prev_mine.clear()   # counts restart at 0 in a fresh world
         # per-env break high-water also restarts (new world every reset)
@@ -4490,7 +4499,43 @@ class DevelopmentalAI:
                     self.vision_scaffold._phi_prev = None
                     self.vision_scaffold._seek_prob_prev = None
                 elif _sr:
+                    # ---- FARM DAMPING (2026-09-04) -----------------------
+                    # infra/farm named a live farm — 2,213 laps in one cell
+                    # at +0.026/step — and NOTHING consumed it. Detection
+                    # without response is how 77% of income once went to a
+                    # villager menu and 96% of drive to the sky.
+                    # SHAPING ONLY. rewards[0] is real environment income and
+                    # is never damped: an agent that actually breaks a block
+                    # in a cell it happens to have circled must still be paid
+                    # in full, or this becomes a new way to be wrong about
+                    # the scoreboard (§9).
+                    # Not a latch — the multiplier is a pure function of lap
+                    # count and income EMA, both of which decay once the
+                    # agent stays away longer than revisit_horizon. See
+                    # BehaviouralLoopDetector.loop_damp.
+                    _damp = 1.0
+                    if self.infra is not None:
+                        _damp = float(getattr(
+                            self.infra, "last_loop_damp", 1.0) or 1.0)
+                    _sr = _sr * _damp
                     prim_extrinsic = rewards[0] + _sr
+                # ---- APPROACH A REMEMBERED PLACE (2026-09-04) -----------
+                # infra/episodic has recorded `sighting:tree_visible @(x,z)`
+                # for the whole project and driven NOTHING, so the agent
+                # could only pursue what was ON SCREEN — look away and the
+                # tree stopped existing. See InfraStack._approach_step.
+                # PLAIN DIFFERENCE (§4.3): pays w*(d_prev - d_now), which is
+                # exactly 0.0 while stationary. The telescoping form would
+                # pay a wage for holding still (`Gaze level: +0.00014/step`).
+                # prim_EXTRINSIC, before the gui zeroing line (§4.4), and
+                # not paid at all while occluded — inside a menu the agent
+                # cannot walk, so anything paid there is paying for
+                # blindness (the villager incident, 77% of income).
+                if not _gui_now2 and self.infra is not None:
+                    _ar = float(getattr(
+                        self.infra, "last_approach_reward", 0.0) or 0.0)
+                    if _ar:
+                        prim_extrinsic = prim_extrinsic + _ar
                 # ---- GETTING OUT MUST PAY -------------------------------
                 # Zeroing income inside a menu removes the FARM but leaves
                 # no gradient toward the exit — and it did something worse:
@@ -4923,6 +4968,11 @@ class DevelopmentalAI:
         # shapes the primary stream, same as the single-env path).
         if not use_dream_actor and self.vision_scaffold is not None:
             self.vision_scaffold.reset()
+        if self.infra is not None:
+            # Re-adopt the approach reference at the boundary: carrying the
+            # old distance across a world change would pay (or charge) for a
+            # move the agent never made. Same discipline the scaffold uses.
+            self.infra.approach_reset()
         if self.symbolizer is not None:
             self._prev_mine.clear()   # counts restart at 0 in a fresh world
         # per-env break high-water also restarts (new world every reset)
@@ -5901,7 +5951,43 @@ class DevelopmentalAI:
                     self.vision_scaffold._phi_prev = None
                     self.vision_scaffold._seek_prob_prev = None
                 elif _sr:
+                    # ---- FARM DAMPING (2026-09-04) -----------------------
+                    # infra/farm named a live farm — 2,213 laps in one cell
+                    # at +0.026/step — and NOTHING consumed it. Detection
+                    # without response is how 77% of income once went to a
+                    # villager menu and 96% of drive to the sky.
+                    # SHAPING ONLY. rewards[0] is real environment income and
+                    # is never damped: an agent that actually breaks a block
+                    # in a cell it happens to have circled must still be paid
+                    # in full, or this becomes a new way to be wrong about
+                    # the scoreboard (§9).
+                    # Not a latch — the multiplier is a pure function of lap
+                    # count and income EMA, both of which decay once the
+                    # agent stays away longer than revisit_horizon. See
+                    # BehaviouralLoopDetector.loop_damp.
+                    _damp = 1.0
+                    if self.infra is not None:
+                        _damp = float(getattr(
+                            self.infra, "last_loop_damp", 1.0) or 1.0)
+                    _sr = _sr * _damp
                     prim_extrinsic = rewards[0] + _sr
+                # ---- APPROACH A REMEMBERED PLACE (2026-09-04) -----------
+                # infra/episodic has recorded `sighting:tree_visible @(x,z)`
+                # for the whole project and driven NOTHING, so the agent
+                # could only pursue what was ON SCREEN — look away and the
+                # tree stopped existing. See InfraStack._approach_step.
+                # PLAIN DIFFERENCE (§4.3): pays w*(d_prev - d_now), which is
+                # exactly 0.0 while stationary. The telescoping form would
+                # pay a wage for holding still (`Gaze level: +0.00014/step`).
+                # prim_EXTRINSIC, before the gui zeroing line (§4.4), and
+                # not paid at all while occluded — inside a menu the agent
+                # cannot walk, so anything paid there is paying for
+                # blindness (the villager incident, 77% of income).
+                if not _gui_now2 and self.infra is not None:
+                    _ar = float(getattr(
+                        self.infra, "last_approach_reward", 0.0) or 0.0)
+                    if _ar:
+                        prim_extrinsic = prim_extrinsic + _ar
                 # ---- GETTING OUT MUST PAY -------------------------------
                 # Zeroing income inside a menu removes the FARM but leaves
                 # no gradient toward the exit — and it did something worse:
@@ -6494,6 +6580,8 @@ class DevelopmentalAI:
                 else:
                     self._last_wm_metrics = self._train_world_model()
                     self._wm_metrics_fresh = True
+                    # producer site 2 of 3: lifelong, synchronous trainer
+                    self._record_wm_telemetry(self._last_wm_metrics)
             self._ll.goal_steps += 1
             if (self._ll.goal_steps >= goal_horizon
                     and self.broadcaster is not None):
@@ -6658,6 +6746,67 @@ class DevelopmentalAI:
     # -----------------------------------------------------------------------
     # World model training
     # -----------------------------------------------------------------------
+
+    # Mapping VERIFIED against rssm.compute_loss's returned dict
+    # {total, reconstruction, kl, reward, continue, inverse} and against
+    # symbolic_decoder.train_step's keys — read, not assumed. Four counters
+    # shipped broken this week from guessed names hidden by a bare `except`.
+    _WM_TELEMETRY = (
+        ("world_model_loss", "total"),
+        ("kl_divergence", "kl"),
+        ("reconstruction_error", "reconstruction"),
+        ("inverse_dynamics_loss", "inverse"),
+        ("symbolic_decoder_loss", "symbolic_decoder_loss"),
+        ("symbolic_decoder_accuracy", "symbolic_decoder_accuracy"),
+    )
+
+    def _record_wm_telemetry(self, m: Optional[Dict[str, float]]) -> None:
+        """Record world-model losses for the logs/metrics sink.
+
+        WHY THIS EXISTS (2026-09-04). Telemetry used to be appended by the
+        SEGMENT CONSUMER in run(), which reads the losses through a
+        consume-once relay (_wm_metrics_box -> _last_wm_metrics ->
+        _wm_metrics_fresh). That relay exists for the stage controller, which
+        must never see the same reconstruction value twice or its error slope
+        flattens. But the main thread only checks the box inside
+        `wm_steps >= wm_train_every AND _use_async_wm` — one instant every 250
+        steps — while a training block takes ~71.6s against a ~73.5s cadence.
+        The gate routinely missed, `_wm_metrics_fresh` was cleared by whoever
+        did see it, and the deque stayed EMPTY.
+
+        MEASURED CONSEQUENCE: `_log_progress` printed its `.get(..., 0)`
+        default — `WM loss: 0.0000` in 24 of 24 readings — and the metrics
+        sink emitted None, while the trainer was demonstrably running 32/32
+        blocks over a 150k-transition buffer. A learning world model was
+        indistinguishable from a dead one, and the dream, prospection, the
+        policy's latents and empowerment all sit downstream of it.
+
+        Telemetry must not ride on a relay whose job is something else. This
+        is called at each of the three sites where metrics are PRODUCED —
+        async trainer thread, lifelong-synchronous, and non-lifelong — so
+        there is exactly one writer per producer and no double counting.
+        Safe from the trainer thread: deque.append is atomic under the GIL.
+        """
+        if not m:
+            return
+        for _key, _mkey in self._WM_TELEMETRY:
+            _v = m.get(_mkey)
+            if _v is None:
+                continue
+            try:
+                _v = float(_v)
+            except (TypeError, ValueError):
+                continue
+            if _v != _v:                      # NaN: recording it would make
+                continue                      # every downstream mean NaN
+            # setdefault, NOT direct indexing: training_metrics is a plain
+            # dict literal, so a key added to _WM_TELEMETRY without being
+            # declared there would raise KeyError ON THE TRAINER THREAD,
+            # where the traceback is invisible and the effect is a silently
+            # dead trainer. Every key above is declared; this makes the
+            # failure mode impossible rather than merely absent today.
+            self.training_metrics.setdefault(
+                _key, deque(maxlen=100)).append(_v)
 
     def _train_world_model(self) -> Dict[str, float]:
         """
@@ -6834,6 +6983,11 @@ class DevelopmentalAI:
                         # atomic ref-swap under the GIL; the main thread
                         # copies the reference into _last_wm_metrics
                         self._wm_metrics_box = m
+                        # producer site 1 of 3: async trainer thread. Recorded
+                        # HERE, at the source, rather than downstream of the
+                        # consume-once box — see _record_wm_telemetry for the
+                        # measured failure this fixes.
+                        self._record_wm_telemetry(m)
                 except Exception:
                     # a crashed consolidation must log loudly and keep the
                     # trainer alive for the next ticket — never kill the run
@@ -7788,6 +7942,11 @@ class DevelopmentalAI:
             # already uses: list(self.training_metrics[k])[-1].
             _tm = getattr(self, "training_metrics", None) or {}
             for k in ("policy_entropy", "world_model_loss", "kl_divergence",
+                      # reconstruction_error is the stage controller's SPINE:
+                      # every curriculum transition is driven by its slope.
+                      # It was never emitted, so "why has the stage not
+                      # advanced?" was unanswerable from the dashboard.
+                      "reconstruction_error",
                       "symbolic_decoder_loss", "symbolic_decoder_accuracy",
                       "inverse_dynamics_loss", "dream_distill_eff_weight",
                       "glue_mastery_score", "glue_kg_density"):
@@ -7795,6 +7954,20 @@ class DevelopmentalAI:
                     _dq = _tm.get(k)
                     if _dq:
                         rec[k] = list(_dq)[-1]
+                except Exception:
+                    pass
+
+            # Imagination: emit boredom and the probe count alongside the
+            # bonus. Without boredom, a 0.0 bonus on the dashboard cannot be
+            # told apart from a broken path — see the note in _log_progress.
+            _ic = getattr(self, "imagination_curiosity", None)
+            if _ic is not None:
+                try:
+                    _is = _ic.stats
+                    rec["imagination_bonus"] = float(_is.get("bonus", 0.0))
+                    rec["imagination_boredom"] = float(
+                        _is.get("boredom", 0.0))
+                    rec["imagination_probes"] = int(_is.get("probes", 0))
                 except Exception:
                     pass
 
@@ -7859,10 +8032,21 @@ class DevelopmentalAI:
                 rec["rssm_no_latent"] = getattr(ob, "rssm_no_latent", 0)
             sb = getattr(self, "skill_bank", None)
             if sb is not None:
+                # `get_stats()`, NOT `list_skills()` (fix 2026-09-04).
+                # SkillBank has no list_skills — the call raised AttributeError
+                # every segment and a bare `except: pass` swallowed it, so
+                # `skills_minted` was simply ABSENT from every record and the
+                # panel had nothing to plot. A silent except around a metric is
+                # how a tracker ends up looking alive while storing nothing;
+                # the failure is now logged rather than discarded.
                 try:
-                    rec["skills_minted"] = len(sb.list_skills())
-                except Exception:
-                    pass
+                    _st = sb.get_stats() or {}
+                    rec["skills_minted"] = int(_st.get("total_skills", 0))
+                    rec["skills_mastered"] = int(_st.get("mastered_skills", 0))
+                    rec["skills_composite"] = int(_st.get("composite_skills", 0))
+                    rec["avg_success_rate"] = _st.get("avg_success_rate")
+                except Exception as exc:
+                    logger.debug("skill stats unavailable: %r", exc)
 
             sink.write(rec)
         except Exception as exc:                       # pragma: no cover
@@ -10134,18 +10318,62 @@ class DevelopmentalAI:
               f"   (this ep: {_last_r:.2f})")
         print(f"  Episode length:   {metrics.get('episode_length', 0):.0f}")
         print(f"  Intrinsic reward: {metrics.get('intrinsic_reward', 0):.4f}")
-        print(f"  WM loss:          {metrics.get('world_model_loss', 0):.4f}")
+        # `n=` is not decoration: a bare 0.0000 could mean "converged" or
+        # "no data", and for 24 consecutive readings it silently meant the
+        # latter while the trainer ran 32/32 blocks. The sample count makes
+        # an empty deque impossible to mistake for a trained model.
+        _wmq = self.training_metrics.get('world_model_loss') or ()
+        print(f"  WM loss:          {metrics.get('world_model_loss', 0):.4f}"
+              f"  (n={len(_wmq)}, recon="
+              f"{metrics.get('reconstruction_error', 0):.4f})")
         print(f"  KL divergence:    {metrics.get('kl_divergence', 0):.4f}")
         print(f"  Policy loss:      {metrics.get('policy_loss', 0):.4f}")
         print(f"  Curiosity loss:   {metrics.get('curiosity_loss', 0):.4f}")
-        print(f"  New facts/ep:     {metrics.get('new_facts', 0):.1f}")
+        # NOT-APPLICABLE IS NOT ZERO (2026-09-04). On pixel observations
+        # `_skip_perdim_symbolic` is True, so `_extract_and_store_facts` is
+        # never called and `symbolic_decoder` is a _NullSymbolicDecoder that
+        # returns []. Both counters are therefore structurally 0 for SkyBot —
+        # by design, since per-obs-dimension "facts" about individual pixels
+        # are meaningless. But printing 0.0 made the knowledge graph look
+        # DEAD, and cost a session's investigation chasing a stall that was
+        # a correct gate. On pixels the KG is fed by the VLM symbolizer, and
+        # `KG density` below is the number that actually means something.
+        if self._skip_perdim_symbolic:
+            print("  New facts/ep:     n/a (pixel obs: per-dim symbolic off; "
+                  "see KG density)")
+        else:
+            print(f"  New facts/ep:     {metrics.get('new_facts', 0):.1f}")
         sd_stats = self.symbolic_decoder.stats
         print(f"  Sym decoder:      loss={metrics.get('symbolic_decoder_loss', 0):.4f}, "
               f"acc={metrics.get('symbolic_decoder_accuracy', 0):.1%}, "
               f"conf={sd_stats['symbolic_decoder_confidence']:.2f}")
         if self.world_model.inverse_dynamics_enabled:
             print(f"  Inverse dynamics: loss={metrics.get('inverse_dynamics_loss', 0):.4f}")
-        print(f"  SD facts/ep:      {metrics.get('symbolic_decoder_facts', 0):.1f}")
+        # ---- WHY IS IMAGINATION ZERO? (2026-09-04) -------------------------
+        # `imagination +0.0000/step` in the reward census read like a dead
+        # subsystem. It is not: the bonus is scaled by
+        #   boredom = 1 - min(1, global_lp / lp_reference)
+        # and returns EARLY at boredom <= 0, so while external curiosity is
+        # still teaching, contributing nothing is the designed behaviour —
+        # this drive exists to take over WHEN learning progress dies, which
+        # on a persistent server it eventually will. A zero with no context
+        # is indistinguishable from a broken path, and this project has now
+        # lost time twice to exactly that (WM loss 0.0000; New facts/ep 0.0).
+        # So print the reason next to the number: probes counts whether the
+        # path RAN, boredom explains why it paid what it paid.
+        _ic = getattr(self, "imagination_curiosity", None)
+        if _ic is not None and getattr(_ic, "enabled", False):
+            _is = _ic.stats
+            print(f"  Imagination:      bonus={_is.get('bonus', 0.0):.4f}, "
+                  f"boredom={_is.get('boredom', 0.0):.3f}, "
+                  f"probes={_is.get('probes', 0)} "
+                  f"(boredom 0 = external curiosity still teaching, "
+                  f"so 0 bonus is CORRECT here)")
+        if self._skip_perdim_symbolic:
+            print("  SD facts/ep:      n/a (_NullSymbolicDecoder on pixels)")
+        else:
+            print(f"  SD facts/ep:      "
+                  f"{metrics.get('symbolic_decoder_facts', 0):.1f}")
         print(f"  Knowledge graph:  {kg_stats['num_facts']} facts, "
               f"{kg_stats['num_entities']} entities, "
               f"{kg_stats['num_action_rules']} rules")

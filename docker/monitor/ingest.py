@@ -59,6 +59,8 @@ SCALARS = [
     ("symbolic_decoder_accuracy", "REAL"), ("inverse_dynamics_loss", "REAL"),
     ("dream_distill_eff_weight", "REAL"), ("glue_mastery_score", "REAL"),
     ("glue_kg_density", "REAL"),
+    ("skills_mastered", "INTEGER"), ("skills_composite", "INTEGER"),
+    ("avg_success_rate", "REAL"),
 ]
 JSON_COLS = ["reward_shares", "reward_alarms", "breaks_by_type",
              "crafts_by_type"]

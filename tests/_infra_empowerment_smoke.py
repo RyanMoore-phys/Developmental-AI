@@ -97,16 +97,83 @@ def test_exception_containment():
 
 
 def test_potential_normalisation():
-    p = EmpowermentPotential(decay=0.999)
+    """The ORIGINAL running_max contract — still exact, now opt-in.
+
+    Kept verbatim as a regression witness: `mode="running_max"` must remain
+    byte-identical so `empowerment_mode: running_max` is a true revert, not an
+    approximation of the old behaviour.
+    """
+    p = EmpowermentPotential(decay=0.999, mode="running_max")
     assert p.update(0.5) == 1.0            # first call: its own max
     phis = [p.update(s) for s in (0.6, 0.7, 0.8)]
     assert all(phi <= 1.0 for phi in phis), phis
     low = p.update(0.4)
     assert low < 1.0, low                  # smaller than running max
     assert abs(low - 0.4 / (0.8 * 0.999)) < 1e-9, low
-    print(f"[infra-empowerment] 3. potential: first=1.0, monotone "
+    print(f"[infra-empowerment] 3. running_max potential UNCHANGED: first=1.0, "
           f"phis<=1 {['%.3f' % x for x in phis]}, later-smaller "
           f"phi={low:.3f}<1")
+
+
+def test_relative_potential_is_an_acquisition_drive():
+    """The DEFAULT mode (2026-09-04): "better than usual" must actually pay.
+
+    WHY THIS CONTRACT EXISTS. Under running_max, phi = score/max(...) where the
+    score re-raises its own denominator, so a STEADY score pins phi at 1.0 by
+    construction. Measured live: score 0.43, phi 0.97-1.00 for a whole run, and
+    since the loop rewards phi'-phi, empowerment paid 0.7% of income while
+    `symbols` took 66%. It detected traps and could not reward GAINING options.
+
+    The three properties below are the whole point of the change, and the
+    fourth is the one that must NOT be lost.
+    """
+    steady = [0.43, 0.44, 0.42, 0.43, 0.44, 0.42] * 60
+
+    # 1. neutral centre, not a pinned ceiling — headroom in BOTH directions
+    p = EmpowermentPotential()
+    assert p.update(0.43) == 0.5, "first reading must be NEUTRAL, not 1.0"
+    for s in steady:
+        p.update(s)
+    mid = p.update(0.43)
+    assert 0.2 < mid < 0.8, f"phi at 'usual' should sit mid-range, got {mid}"
+
+    # 2. better than usual PAYS, and pays far more than it used to
+    better = p.update(0.55)
+    gain = better - mid
+    p_old = EmpowermentPotential(mode="running_max")
+    for s in steady:
+        p_old.update(s)
+    old_mid = p_old.update(0.43)
+    old_gain = p_old.update(0.55) - old_mid
+    assert gain > 0.0, f"an improvement must pay, got {gain}"
+    assert gain > old_gain, (
+        f"relative mode must reward improvement MORE than running_max "
+        f"({gain:.4f} vs {old_gain:.4f}) — otherwise the change bought nothing")
+
+    # 3. the baseline re-centres when the ENVIRONMENT changes (slowly)
+    p2 = EmpowermentPotential()
+    for s in steady:
+        p2.update(s)
+    mu_before = p2._mu
+    for _ in range(600):
+        p2.update(0.70)                    # a genuinely richer environment
+    assert p2._mu > mu_before + 0.1, (
+        f"'usual' must track a changed environment: {mu_before:.3f} -> "
+        f"{p2._mu:.3f}. Without this, phi saturates in a new biome/game and "
+        f"the drive dies exactly where it is most needed.")
+
+    # 4. AND A TRAP MUST STILL HURT — the property the module was built for
+    #    (agent parked in a self-dug pit; six hours on a self-built column).
+    p3 = EmpowermentPotential()
+    for s in steady:
+        p3.update(s)
+    a = p3.update(0.43)
+    trapped = p3.update(0.05)
+    assert trapped < a, "losing options must still lower phi"
+    print(f"[infra-empowerment] 3b. relative potential: 'usual' phi={mid:.3f} "
+          f"(not pinned at 1.0); improvement pays {gain:+.3f} vs {old_gain:+.3f} "
+          f"under running_max; baseline re-centres {mu_before:.2f}->{p2._mu:.2f}; "
+          f"trap still drops phi {a:.3f}->{trapped:.3f}")
 
 
 def test_signature_flexibility():
@@ -120,6 +187,8 @@ def test_signature_flexibility():
 
 if __name__ == "__main__":
     for fn in (test_free_vs_trapped, test_exception_containment,
-               test_potential_normalisation, test_signature_flexibility):
+               test_potential_normalisation,
+               test_relative_potential_is_an_acquisition_drive,
+               test_signature_flexibility):
         fn()
     print("[infra-empowerment] ALL PASS")
