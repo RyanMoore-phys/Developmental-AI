@@ -144,11 +144,76 @@ def test_emitted_attribute_names_exist():
           f"assigned or getattr-guarded ({len(guarded)} guarded)")
 
 
+def test_swallowed_world_model_failure_is_loud():
+    """A silent `except` held the entire developmental ladder down.
+
+    MEASURED 2026-09-04: `_train_world_model` hit its ValueError handler on
+    every block for 158,000 steps while logging at DEBUG — below the pod's
+    level, so it printed nothing. Downstream: no reconstruction error -> the
+    stage controller stuck at `explore` with WM-error=inf -> IMAGINE
+    unreachable -> the dream never ran -> no goal unlocks -> nothing minted.
+    It also defeated the diagnosis: grepping for the message returned 0 hits,
+    which reads as "not taken" but meant "not printed".
+    """
+    m = re.search(r"except ValueError as e:(.{0,2000}?)return \{\}", LOOP,
+                  re.S)
+    assert m, "the _train_world_model ValueError handler was not found"
+    # Strip comments first: the handler's own note explains that it USED to
+    # be logger.debug, and a naive substring check trips on that sentence.
+    body = "\n".join(ln for ln in m.group(1).splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "logger.debug" not in body, (
+        "the world-model failure is logged at DEBUG again — it will be "
+        "invisible on the pod, exactly as it was for 158k steps")
+    assert "logger.warning" in body, "must log at warning or above"
+    assert "exc_info=True" in body, (
+        "without exc_info the traceback is lost, and 'training never started' "
+        "(sample_sequences) cannot be told from 'metrics discarded after "
+        "training' (observe_sequence) — opposite bugs, opposite fixes")
+    # the no-exception empty-dict case returns the SAME value and must differ
+    assert "produced NO metrics without" in LOOP, (
+        "an empty metrics dict with no exception is indistinguishable from "
+        "the raise path at the call site (`if m:`); it must say which it is")
+    print("[counters] 6. world-model failures log at WARNING with exc_info; "
+          "the silent empty-dict path is reported separately")
+
+
+def test_inf_is_not_printed_as_a_measurement():
+    """`WM-error=inf` meant 'zero samples', and read as a large number."""
+    assert "WM-error=n/a" in LOOP, (
+        "_level() returns inf when error_history is EMPTY; printing it as a "
+        "float made 'blind' look like 'bad'. It was the ONLY value of "
+        "WM-error in the entire live log.")
+    assert "_stage_blind_segments" in LOOP, (
+        "the log should say HOW LONG the controller has had no samples")
+    assert "n={_n_err}" in LOOP, "the real branch must show its sample count"
+    print("[counters] 7. WM-error prints n/a + blind-segment count when the "
+          "stage controller has no samples, never inf-as-a-number")
+
+
+def test_gate_predicates_are_not_instantaneous_samples():
+    """A false alarm trains the reader to ignore the latch channel."""
+    m = re.search(r'"magnet_weight",(.{0,700}?)max_closed', LOOP, re.S)
+    assert m, "magnet_weight gate not found"
+    body = m.group(1)
+    assert "_mag_paid" in body, (
+        "this gate alarmed GATE OVERDUE for 71,680 steps while magnet_seek "
+        "paid 61% of all income — it sampled an instantaneous per-step "
+        "weight once per segment. It must also require that the channel "
+        "actually paid nothing.")
+    assert "and _mag_paid == 0.0" in body
+    print("[counters] 8. magnet_weight gate needs BOTH w==0 and zero segment "
+          "income before it claims to be closed")
+
+
 if __name__ == "__main__":
     for fn in (test_emitted_attribute_names_exist,
                test_training_metric_keys_are_declared,
                test_wm_telemetry_maps_to_real_world_model_keys,
                test_no_bare_except_around_metric_reads,
-               test_not_applicable_is_not_zero):
+               test_not_applicable_is_not_zero,
+               test_swallowed_world_model_failure_is_loud,
+               test_inf_is_not_printed_as_a_measurement,
+               test_gate_predicates_are_not_instantaneous_samples):
         fn()
     print("[counters] ALL PASS")

@@ -4250,13 +4250,39 @@ class DevelopmentalAI:
                 # signature clustering handles that spike correctly).
                 if not hasattr(self, "_loginv_by_env"):
                     self._loginv_by_env = {}
-                try:
-                    _lg = int(_ach.get("log", 0))
-                except (TypeError, ValueError):
-                    _lg = 0
+                # ---- MISSING IS NOT ZERO (fix 2026-09-04) ----------------
+                # MEASURED: the live run reported log_pickup=1547 against
+                # NINE logs ever broken. Those cannot both be true, and the
+                # counter was the liar.
+                # CAUSE: `_ach` is `_inf.get("achievements", {}) or {}`, so
+                # on any step whose info lacks that dict (or lacks the "log"
+                # key) `_ach.get("log", 0)` returned 0 — indistinguishable
+                # from "the agent is carrying zero logs". Carrying 3 logs
+                # through a single dropped observation therefore reads
+                # 3 -> 0 -> 3, and the recovery is counted as a PICKUP. With
+                # an intermittent key that manufactures hundreds of pickups
+                # out of one real one, which is exactly the 1547-vs-9 gap.
+                # This is the counter class CLAUDE.md §5 warns about by name
+                # (`places` listing iron_axe: 2281) — and it is not cosmetic:
+                # log_pickup is a GROUNDED EFFECT KEY, so every phantom
+                # pickup fed a real goal slot and a real reward event.
+                # An absent reading is UNKNOWN. Skip the comparison and do
+                # not overwrite the last KNOWN count, so a dropped frame is
+                # simply not evidence rather than being evidence of a gain.
+                _lg = None
+                if isinstance(_ach, dict) and "log" in _ach:
+                    try:
+                        _lg = max(0, int(_ach["log"]))
+                    except (TypeError, ValueError):
+                        _lg = None
                 _lg_prev = self._loginv_by_env.get(_e)
-                self._loginv_by_env[_e] = _lg
-                if (_lg_prev is not None and _lg > _lg_prev
+                if _lg is not None:
+                    self._loginv_by_env[_e] = _lg
+                else:
+                    self._loginv_unknown = getattr(
+                        self, "_loginv_unknown", 0) + 1
+                if (_lg is not None and _lg_prev is not None
+                        and _lg > _lg_prev
                         and (_best is None or "log" not in _best)):
                     # STABLE PICKUP KEY (2026-07-25) — was `_best = None`.
                     # Refusing to mis-ground a pickup was right, but None
@@ -5288,13 +5314,39 @@ class DevelopmentalAI:
                 # signature clustering handles that spike correctly).
                 if not hasattr(self, "_loginv_by_env"):
                     self._loginv_by_env = {}
-                try:
-                    _lg = int(_ach.get("log", 0))
-                except (TypeError, ValueError):
-                    _lg = 0
+                # ---- MISSING IS NOT ZERO (fix 2026-09-04) ----------------
+                # MEASURED: the live run reported log_pickup=1547 against
+                # NINE logs ever broken. Those cannot both be true, and the
+                # counter was the liar.
+                # CAUSE: `_ach` is `_inf.get("achievements", {}) or {}`, so
+                # on any step whose info lacks that dict (or lacks the "log"
+                # key) `_ach.get("log", 0)` returned 0 — indistinguishable
+                # from "the agent is carrying zero logs". Carrying 3 logs
+                # through a single dropped observation therefore reads
+                # 3 -> 0 -> 3, and the recovery is counted as a PICKUP. With
+                # an intermittent key that manufactures hundreds of pickups
+                # out of one real one, which is exactly the 1547-vs-9 gap.
+                # This is the counter class CLAUDE.md §5 warns about by name
+                # (`places` listing iron_axe: 2281) — and it is not cosmetic:
+                # log_pickup is a GROUNDED EFFECT KEY, so every phantom
+                # pickup fed a real goal slot and a real reward event.
+                # An absent reading is UNKNOWN. Skip the comparison and do
+                # not overwrite the last KNOWN count, so a dropped frame is
+                # simply not evidence rather than being evidence of a gain.
+                _lg = None
+                if isinstance(_ach, dict) and "log" in _ach:
+                    try:
+                        _lg = max(0, int(_ach["log"]))
+                    except (TypeError, ValueError):
+                        _lg = None
                 _lg_prev = self._loginv_by_env.get(_e)
-                self._loginv_by_env[_e] = _lg
-                if (_lg_prev is not None and _lg > _lg_prev
+                if _lg is not None:
+                    self._loginv_by_env[_e] = _lg
+                else:
+                    self._loginv_unknown = getattr(
+                        self, "_loginv_unknown", 0) + 1
+                if (_lg is not None and _lg_prev is not None
+                        and _lg > _lg_prev
                         and (_best is None or "log" not in _best)):
                     # STABLE PICKUP KEY (2026-07-25) — was `_best = None`.
                     # Refusing to mis-ground a pickup was right, but None
@@ -6932,10 +6984,54 @@ class DevelopmentalAI:
                 )
             metrics.update(sd_metrics)
 
+            # An empty dict here means the gradient loop above never executed
+            # its body — train_iters <= 0, or the sampler yielded nothing —
+            # and returns EXACTLY what the exception path returns. Those are
+            # different failures and the caller (`if m:`) cannot tell them
+            # apart, so say which one this is. Without this, "no metrics" has
+            # two silent causes and diagnosing it means guessing.
+            if not metrics:
+                self._wm_empty_count = getattr(self, "_wm_empty_count", 0) + 1
+                if (self._wm_empty_count <= 3
+                        or self._wm_empty_count % 50 == 0):
+                    logger.warning(
+                        "World model block produced NO metrics without "
+                        "raising (block #%d): train_iters=%d, batch=%s. The "
+                        "gradient loop body never ran — this is not the "
+                        "exception path.",
+                        self._wm_empty_count, int(train_iters),
+                        "None" if batch is None else "present")
             return metrics
 
         except ValueError as e:
-            logger.debug(f"World model training skipped: {e}")
+            # ---- THIS WAS logger.debug UNTIL 2026-09-04 --------------------
+            # MEASURED: 158,000 steps, 9 hours, and this handler fired on
+            # EVERY block while emitting nothing a human could see, because
+            # debug is below the pod's log level. Downstream, the entire
+            # developmental engine was blocked by it and said so in a way
+            # that read like data rather than absence:
+            #   stage: explore (WM-error=inf, slope=-inf)   <- the ONLY
+            #   value of WM-error in the whole log
+            # With no reconstruction error the stage controller can never
+            # leave `explore`, so IMAGINE is unreachable, so the dream never
+            # runs ("Dream policy: warmup (0 segments remaining)" forever),
+            # so no goals unlock, so nothing is minted. One silent `except`
+            # at DEBUG held the whole ladder down.
+            # It also cost a diagnosis: grepping the log for this message
+            # returned 0 hits, which was read as "this path is not taken"
+            # when it actually meant "this path is not printed".
+            # A swallowed exception must be LOUD. exc_info names the raising
+            # call, which is the one thing needed to tell "training never
+            # started" (sample_sequences) apart from "training ran and its
+            # metrics were then discarded" (observe_sequence, after the
+            # gradient steps) — opposite bugs with opposite fixes.
+            self._wm_skip_count = getattr(self, "_wm_skip_count", 0) + 1
+            if self._wm_skip_count <= 3 or self._wm_skip_count % 50 == 0:
+                logger.warning(
+                    "World model training SKIPPED (block #%d): %s — no "
+                    "reconstruction error this block, so the stage "
+                    "controller stays blind and the dream cannot activate.",
+                    self._wm_skip_count, e, exc_info=True)
             return {}
 
     def _get_bg_sampler(self, batch_size: int, seq_len: int, prioritized: bool):
@@ -10433,9 +10529,32 @@ class DevelopmentalAI:
         print(f"  Exploration ratio: {curiosity_stats['exploration_ratio']:.3f}")
         print(f"  Reward weights:   intrinsic={self.reward_mixer.weights['intrinsic']:.3f}, "
               f"extrinsic={self.reward_mixer.weights['extrinsic']:.3f}")
-        print(f"  Dev stage:        {self.stage_controller.stage} "
-              f"(WM-error={self.stage_controller._level():.4f}, "
-              f"slope={self.stage_controller._slope():.5f})")
+        # `inf` here is NOT a measurement — DevelopmentalStageController._level
+        # returns float("inf") when error_history is EMPTY, i.e. the controller
+        # has never been given a reconstruction error at all. Printed as a
+        # number it read like a very large error; in the live log
+        # `WM-error=inf` was the ONLY value ever recorded across 158k steps,
+        # and it silently meant "blind", not "bad". While it is inf the
+        # controller can never leave `explore`, so IMAGINE is unreachable and
+        # the dream never runs. Say that in words, and say for how long — a
+        # system that cannot distinguish "no data" from "a number" has now
+        # cost three separate investigations (WM loss 0.0000; New facts/ep
+        # 0.0; this).
+        _lvl = self.stage_controller._level()
+        _n_err = len(getattr(self.stage_controller, "error_history", ()) or ())
+        if _n_err == 0 or not np.isfinite(_lvl):
+            self._stage_blind_segments = getattr(
+                self, "_stage_blind_segments", 0) + 1
+            print(f"  Dev stage:        {self.stage_controller.stage} "
+                  f"(WM-error=n/a — NO world-model samples for "
+                  f"{self._stage_blind_segments} segments; the stage cannot "
+                  f"advance and the dream cannot activate until "
+                  f"_train_world_model returns metrics)")
+        else:
+            self._stage_blind_segments = 0
+            print(f"  Dev stage:        {self.stage_controller.stage} "
+                  f"(WM-error={_lvl:.4f}, n={_n_err}, "
+                  f"slope={self.stage_controller._slope():.5f})")
         if self._lifelong and self._ll is not None:
             # ||h||: THE stability signal for the continuous stream. If it
             # settles into a band (not monotonic growth over hours) the
@@ -11274,11 +11393,34 @@ class DevelopmentalAI:
                     reason="budget exhausted",
                     reopen="goal sighting or trickle regen",
                     max_closed=30000)
+                # ---- GATE PREDICATE FIXED (2026-09-04) -------------------
+                # This alarmed for 71,680 steps ("GATE OVERDUE:
+                # 'magnet_weight' closed for 71680 steps, max 60000") while
+                # magnet_seek was simultaneously paying 61% of ALL income
+                # (5.97/segment, up 17x over the run). Both cannot be true.
+                # CAUSE: `weight` is an INSTANTANEOUS value — vision_scaffold
+                # recomputes self._w every step and it falls to 0.0 on any
+                # "engaged-then-quiet" step. Sampling it once per segment and
+                # calling that "closed for the whole segment" is a counter
+                # that was never validated (CLAUDE.md §5: the `places`
+                # counter lesson — iron_axe: 2281).
+                # A false alarm is worse than no alarm: it trains the reader
+                # to ignore the one channel that reports real latches, and
+                # this repo has had NINE of those.
+                # A gate is closed only if the magnet was inactive AND
+                # actually paid nothing across the segment. The ledger share
+                # may be one segment stale (it is stashed in
+                # InfraStack.segment); that is immaterial against a
+                # 60,000-step budget.
+                _mag_paid = float((dict(getattr(
+                    self.infra, "last_ledger_segment", {}) or {}).get(
+                        "shares") or {}).get("magnet_seek", 0.0) or 0.0)
                 self.infra.gate_state(
                     "magnet_weight",
-                    closed=(float(_vs_i.get("weight", 1.0) or 0.0) == 0.0),
+                    closed=(float(_vs_i.get("weight", 1.0) or 0.0) == 0.0
+                            and _mag_paid == 0.0),
                     step=self.total_timesteps,
-                    reason="w=0 (no target / faded)",
+                    reason="w=0 AND no magnet income this segment",
                     reopen="curiosity re-arm or cold-start candidate",
                     max_closed=60000)
                 _ovc = {}

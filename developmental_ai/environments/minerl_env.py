@@ -1151,11 +1151,23 @@ class MineRLEnvAdapter(gym.Env):
         return out
 
     @staticmethod
-    def _inv_counts(raw_obs) -> Dict[str, int]:
-        """Per-item inventory counts (bare names), for placement detection."""
+    def _inv_counts(raw_obs) -> Optional[Dict[str, int]]:
+        """Per-item inventory counts (bare names), for placement detection.
+
+        Returns **None when the inventory could not be read**, and `{}` only
+        for a genuinely empty inventory. Those are different facts and this
+        function used to conflate them: it returned `{}` on any exception, and
+        an empty dict is also the correct answer for a barehanded agent — the
+        NORMAL starting state here. The caller could not tell "I now carry
+        nothing" from "I could not see", so a malformed frame during a `use`
+        press credited the entire inventory as placed. That is how `places`
+        reached `iron_axe: 2281` and `acacia_door: 3004` for items that
+        cannot be placed at all (CLAUDE.md §5 cites this counter by name).
+        """
+        if not isinstance(raw_obs, dict) or "inventory" not in raw_obs:
+            return None
         try:
-            inv = raw_obs.get("inventory", {}) if isinstance(raw_obs, dict) \
-                else {}
+            inv = raw_obs["inventory"]
             out = {}
             for k, v in inv.items():
                 c = int(np.asarray(v).flatten()[0])
@@ -1163,7 +1175,7 @@ class MineRLEnvAdapter(gym.Env):
                     out[str(k).split(".")[-1]] = c
             return out
         except Exception:
-            return {}
+            return None
 
     @staticmethod
     def _count_logs(raw_obs) -> int:
@@ -1843,19 +1855,72 @@ class MineRLEnvAdapter(gym.Env):
             pass
         _inv_now = self._inv_counts(obs)
         _placed_now: list = []
-        if _use_act:
+        # ---- MISSING IS NOT ZERO (fix 2026-09-04) ------------------------
+        # CLAUDE.md §5 names this counter as garbage by example: `places`
+        # listed `iron_axe: 2281` and `acacia_door: 3004` — an iron axe
+        # cannot be placed at all, so the heuristic was measuring noise, and
+        # a session built an argument on it before anyone checked.
+        # THE MECHANISM: `_inv_counts` keeps only items with count > 0 AND
+        # returns {} on ANY exception. So a single dropped or malformed
+        # inventory frame makes every carried item look like it went to
+        # zero; on a step that happens to hold `use`, the whole inventory is
+        # credited as placed — a 64-stack scores +64. Repeat over a long run
+        # and you get 2,281 "placed" axes.
+        # NOT COSMETIC: this also sets `_last_placed_item`, which is how
+        # mainhand is derived in this fork (there is no equip action and
+        # `equipped_items` is dead in MineRL 1.0). A phantom placement
+        # therefore corrupts the agent's belief about what it is holding.
+        # THREE GENERAL RULES, no item vocabulary:
+        #   1. An UNREADABLE frame (_inv_counts -> None) is not an emptied
+        #      inventory. `{}` still means genuinely empty, which is the
+        #      normal barehanded state and must stay usable.
+        #   2. One `use` press places AT MOST ONE block, so a per-step
+        #      decrease of more than 1 is not a placement.
+        #   3. An item vanishing entirely is ambiguous (placed the last one,
+        #      or the key flickered), so require it to stay absent for two
+        #      consecutive readings before crediting it.
+        _inv_dropped = _inv_now is None
+        if not hasattr(self, "_inv_gone_pending"):
+            self._inv_gone_pending: Dict[str, int] = {}
+        if _use_act and not _inv_dropped:
             for _it, _pc in self._inv_prev_counts.items():
+                _present = _it in _inv_now
                 _dd = int(_pc) - int(_inv_now.get(_it, 0))
-                if _dd > 0:
-                    self._places_by_type[_it] = (
-                        self._places_by_type.get(_it, 0) + _dd)
-                    _placed_now.append(_it)
-                    # A `use` that consumed this item PROVES it was in the
-                    # selected slot at that moment. Nothing here can change
-                    # the selected slot, so it stays there while any remains.
-                    self._last_placed_item = str(_it)
-                    self._save_break_memory()
-        self._inv_prev_counts = _inv_now
+                if _dd <= 0:
+                    self._inv_gone_pending.pop(_it, None)
+                    continue
+                if _dd > 1:
+                    # rule 2: one use cannot place a stack
+                    self._inv_gone_pending.pop(_it, None)
+                    continue
+                if not _present:
+                    # rule 3: confirm the disappearance on a second reading
+                    if self._inv_gone_pending.get(_it, 0) < 1:
+                        self._inv_gone_pending[_it] = 1
+                        continue
+                self._inv_gone_pending.pop(_it, None)
+                self._places_by_type[_it] = (
+                    self._places_by_type.get(_it, 0) + _dd)
+                _placed_now.append(_it)
+                # A `use` that consumed this item PROVES it was in the
+                # selected slot at that moment. Nothing here can change
+                # the selected slot, so it stays there while any remains.
+                self._last_placed_item = str(_it)
+                self._save_break_memory()
+        if not _inv_dropped:
+            # An item awaiting confirmation must SURVIVE in the previous
+            # counts, or the next reading has nothing to compare against and
+            # the pending placement can never be confirmed — the genuine
+            # "placed my last one" case would then be lost forever, trading
+            # one silent counter for another.
+            _next_prev = dict(_inv_now)
+            for _pit in self._inv_gone_pending:
+                if _pit not in _next_prev and _pit in self._inv_prev_counts:
+                    _next_prev[_pit] = self._inv_prev_counts[_pit]
+            self._inv_prev_counts = _next_prev
+        else:
+            self._inv_dropped_frames = getattr(
+                self, "_inv_dropped_frames", 0) + 1
         info["placed_now"] = _placed_now
         info["places_by_type"] = dict(self._places_by_type)
         # ---- #5: AN HONEST SWING COUNTER (2026-08-02) --------------------
