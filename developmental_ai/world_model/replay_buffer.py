@@ -160,7 +160,38 @@ class BlockArray:
         if b.size == 0:
             return
         value = np.asarray(value, dtype=self.dtype)
-        bcast = value.shape != b.shape + self.row_shape
+        # ---- BROADCAST ONCE, UP FRONT (fix 2026-09-04) -------------------
+        # This container stands in for a plain ndarray, so it must honour
+        # ndarray broadcasting. It did not, and the failure was expensive.
+        #
+        # `update_priorities` does the textbook thing:
+        #     idx = starts[:, None] + arange(seq_len)          # (n_seq, L)
+        #     priorities[idx] = errors[:, None]                # (n_seq, 1)
+        # which numpy broadcasts across each sequence's window. Here `_split`
+        # flattens the index, so the MULTI-BLOCK branch below did
+        # `value[m]` with a (n_seq, 1) value against a 1-D mask of the
+        # elements landing in that block — shapes that cannot align:
+        #     ValueError: shape mismatch: value array of shape (8,1) could
+        #     not be broadcast to indexing result of shape (32,)
+        #
+        # It only triggers when a sampled window SPANS TWO BLOCKS, so it
+        # appeared when the buffer became block storage and was invisible
+        # before. The single-block fast path above happened to work, which
+        # is why this survived review.
+        #
+        # WHAT IT COST (measured live, 2026-09-04). The raise propagated out
+        # of `_train_world_model`'s `for _ in range(train_iters)` loop into
+        # its ValueError handler, which returned {}. So every block ran
+        # exactly ONE gradient step instead of `train_iters` (384), and its
+        # metrics were discarded. Downstream: the stage controller never
+        # received a reconstruction error, sat at `WM-error=inf` for the
+        # life of the project, IMAGINE stayed unreachable, and the dream
+        # never ran. One shape bug in a container, throttling the world
+        # model 384x and blinding the curriculum.
+        _target = b.shape + self.row_shape
+        if value.shape != _target:
+            # Raises if genuinely incompatible — a real error, not silenced.
+            value = np.broadcast_to(value, _target)
         # Same single-block fast path as __getitem__ — this is the
         # update_priorities scatter, which runs once per training iteration.
         _b0 = int(b.flat[0])
@@ -169,7 +200,9 @@ class BlockArray:
             return
         for bi in np.unique(b):
             m = (b == bi)
-            self._blocks[int(bi)][o[m]] = value if bcast else value[m]
+            # value is now element-aligned with b, so the mask applies to
+            # both — no `bcast` special case can go wrong.
+            self._blocks[int(bi)][o[m]] = value[m]
 
     def any(self) -> bool:
         return any(bool(b.any()) for b in self._blocks)

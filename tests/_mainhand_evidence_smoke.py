@@ -122,9 +122,25 @@ def test_wiring_pins():
     # the writer must sit inside the `use`-gated placement branch, or it
     # would claim a hand from any inventory decrease (drops, deaths)
     w = src.index("self._last_placed_item = str(_it)")
-    g = src.index("if _use_act:")
+    # PIN LOOSENED IN TEXT, NOT IN CONTRACT (2026-09-04). This used to pin
+    # the exact string `if _use_act:`. The guard was later STRENGTHENED to
+    #     if _use_act and not _inv_dropped:
+    # after `places` was found crediting a whole inventory as placed on any
+    # unreadable frame (iron_axe: 2281 for an item that cannot be placed) —
+    # which also corrupted `_last_placed_item`, i.e. the very field this file
+    # defends. The exact-text pin failed on a change that made the guard
+    # tighter, so it is matched by prefix now; the ordering assertion below
+    # is the actual contract and is unchanged.
+    g = src.index("if _use_act")
     assert g < w, "placement evidence must be gated on a `use` action"
-    print("  6. writer gated on `use`; reader wired; fields present")
+    _guard = src[g:src.index("\n", g)]
+    assert "_use_act" in _guard, _guard
+    assert "not _inv_dropped" in _guard, (
+        f"the unreadable-frame guard is gone from `{_guard.strip()}` — an "
+        f"undetected dropped observation reinstates the phantom placements "
+        f"that corrupt the mainhand belief this file exists to protect")
+    print(f"  6. writer gated on `{_guard.strip()}`; reader wired; "
+          f"fields present")
 
 
 if __name__ == "__main__":

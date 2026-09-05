@@ -29,12 +29,16 @@ name: pipeline
 run-name: >-
   ${{ github.event_name == 'schedule'
       && 'pipeline · daily health check (deploy/connect/launch skipped by design)'
-      || format('pipeline · deploy={0} connect={1} LAUNCH={2} · by @{3}',
-                inputs.deploy, inputs.connect, inputs.launch, github.actor) }}
+      || format('pipeline · stop={0} deploy={1} connect={2} LAUNCH={3} · by @{4}',
+                inputs.stop, inputs.deploy, inputs.connect, inputs.launch, github.actor) }}
 
 on:
   workflow_dispatch:
     inputs:
+      stop:
+        description: "STOP a live run first, and WAIT for it to exit (needed before deploy)"
+        type: boolean
+        default: true
       deploy:
         description: "sync code to the pod (runs pod-side smoke tests)"
         type: boolean
@@ -94,13 +98,55 @@ jobs:
           echo "$OUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
+  # THE MISSING STAGE (2026-09-04). `deploy` REFUSES while training is live,
+  # and nothing in this pipeline could stop it — so the only route was a
+  # separate `pod` run, whose stop reported GREEN on timeout while the agent
+  # was still going. The result was a hand-run loop: stop -> deploy fails ->
+  # stop again -> deploy with allow_stop_live. That is a missing edge in the
+  # graph, not user error, and `needs:` is exactly the thing that fixes it.
+  #
+  # Skipping this stage (stop=false) does NOT skip its ordering: `deploy`
+  # still waits for the job to resolve, so unchecking it cannot race.
+  stop:
     needs: preflight
-    if: ${{ !cancelled() && inputs.deploy && needs.preflight.result == 'success' }}
+    if: ${{ !cancelled() && inputs.stop && needs.preflight.result == 'success' }}
+    runs-on: self-hosted
+    # 25 > the 20-minute wait inside the script, so the script's own honest
+    # timeout message is what you see rather than a bare job kill.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stop training and WAIT for the process to exit
+        run: |
+          set -euo pipefail
+          # Run unconditionally rather than trusting preflight's reading:
+          # the script exits immediately when nothing is running, and both
+          # launch paths `rm -f podlogs/STOP` before starting, so a STOP file
+          # written against an idle pod cannot strand the next launch.
+          # Gating on a prior job's probe would only reintroduce a stale read.
+          bash scripts/pod_stop_wait.sh 1200
+
+  deploy:
+    # `stop` is in `needs` even when unchecked: a skipped job still resolves,
+    # so deploy can never start while a stop is in flight.
+    needs: [preflight, stop]
+    if: ${{ !cancelled() && inputs.deploy && needs.preflight.result == 'success'
+            && needs.stop.result != 'failure' }}
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Refuse to deploy onto a live run
+        # deploy_skybot.sh already refuses, but it does so from inside a long
+        # script. Failing here says WHICH stage and WHY in one line, and
+        # names the fix instead of leaving you to guess at flags.
+        run: |
+          set -euo pipefail
+          if bash scripts/pod_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
+            echo "::error::training is STILL LIVE. Re-run this pipeline with stop=true (it waits up to 20 min for a real exit). Do not reach for allow_stop_live unless you intend to discard the current segment."
+            exit 1
+          fi
+          echo "pod is idle — safe to sync"
       - name: Sync + pod-side smoke tests
         env:
           # Never launches from here — that is the `launch` job's decision.
@@ -108,16 +154,18 @@ jobs:
         run: |
           set -euo pipefail
           echo "deploying $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
-          # deploy_skybot.sh REFUSES if training is live and LAUNCH=0, because
-          # syncing would stop the run and never restart it. Stop deliberately
-          # first (pod.yml action=stop) if that is what you want.
           bash scripts/deploy_skybot.sh "${POD_SSH_PORT:-22}"
 
   connect:
-    needs: [preflight, deploy]
+    needs: [preflight, stop, deploy]
+    # `stop` must not have FAILED. Without this, a stop that times out
+    # skips deploy, and "deploy skipped" reads as permission to carry on —
+    # so connect/launch would proceed against a pod still running the OLD
+    # code. A failed stop must stop the whole chain, not just one edge.
     if: >
       !cancelled() && inputs.connect &&
       needs.preflight.result == 'success' &&
+      needs.stop.result != 'failure' &&
       (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
     runs-on: self-hosted
     timeout-minutes: 15
@@ -131,10 +179,11 @@ jobs:
             "cd /workspace/devai && bash scripts/connect_server.sh bridge ${MC_SERVER_TS_IP}"
 
   launch:
-    needs: [preflight, deploy, connect]
+    needs: [preflight, stop, deploy, connect]
     if: >
       !cancelled() && inputs.launch &&
       needs.preflight.result == 'success' &&
+      needs.stop.result != 'failure' &&
       (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') &&
       (needs.connect.result == 'success' || needs.connect.result == 'skipped')
     runs-on: self-hosted
@@ -143,10 +192,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Refuse to restart a live run
-        if: ${{ needs.preflight.outputs.training_live == 'true' }}
+        # RE-PROBED, not read from preflight (2026-09-04). preflight runs
+        # BEFORE the stop stage, so its `training_live` is stale by the time
+        # we get here: after a successful stop -> deploy, the stale `true`
+        # would refuse the launch and break the very stop->deploy->launch
+        # chain this pipeline exists to provide. Ask the pod now.
         run: |
-          echo "::error::training is already LIVE. Relaunching would cost the run's continuity. Stop it deliberately first (pod.yml action=stop)."
-          exit 1
+          set -euo pipefail
+          if bash scripts/pod_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
+            echo "::error::training is already LIVE. Relaunching would cost the run's continuity. Re-run with stop=true, which waits for a real exit."
+            exit 1
+          fi
+          echo "pod is idle — safe to launch"
 
       - name: Start training
         env:
@@ -184,7 +241,7 @@ jobs:
             tail -5 "$L"'
 
   report:
-    needs: [preflight, deploy, connect, launch]
+    needs: [preflight, stop, deploy, connect, launch]
     if: always()
     runs-on: self-hosted
     timeout-minutes: 10

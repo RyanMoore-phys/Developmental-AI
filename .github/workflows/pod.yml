@@ -116,20 +116,18 @@ jobs:
 
       - name: stop
         if: ${{ github.event.inputs.action == 'stop' }}
+        # Graceful only. Never kill: the supervisor reads a kill as a crash
+        # and relaunches, which has stranded runs before.
+        #
+        # This used to inline a 5-minute wait that ended in a bare `echo`, so
+        # a timeout — with training STILL LIVE — exited 0 and showed a green
+        # check. Five minutes was also less than a normal shutdown (segment
+        # ~5 min + replay-buffer save ~8.5 min, both measured), so it timed
+        # out on healthy stops and lied about it every time. See
+        # scripts/pod_stop_wait.sh for the full account.
         run: |
           set -euo pipefail
-          # Graceful only. Never kill: the supervisor reads a kill as a crash
-          # and relaunches, which has stranded runs before.
-          bash scripts/pod_exec.sh '
-            cd /workspace/devai
-            R="run_min""ecraft"
-            touch podlogs/STOP
-            echo "STOP written; the agent finishes its segment and exits."
-            for i in $(seq 1 30); do
-              pgrep -f "$R[.]py" >/dev/null || { echo "stopped"; exit 0; }
-              sleep 10
-            done
-            echo "still running after 5 min — it may be mid-segment; check status."'
+          bash scripts/pod_stop_wait.sh 1200
 
       # ---------------------------------------------------------------- #
       # provision needs rsync as well as exec, so it builds its own ssh line
