@@ -86,7 +86,7 @@ jobs:
             echo "== gpu =="
             nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
             echo "== host (THE TRAINING BOX, not node1) =="
-            # node1's node-exporter watches NODE1. Nothing has ever watched
+            # The node-exporter on node1 watches NODE1. Nothing has ever watched
             # THIS machine, which is the one with 16 GB and a 256 GB NVMe
             # holding every byte of brain state. These three lines are the
             # whole diagnosis for "a client died and could not come back".
@@ -96,7 +96,7 @@ jobs:
             echo "== stream health =="
             # THE SILENT FAILURE: a stream whose rebuild is exhausted is
             # ZERO-FILLED and the run continues -- steps accumulate, the
-            # dashboard looks healthy, and half the world model's input is
+            # dashboard looks healthy, and half of what the world model sees is
             # blank frames. Nothing else surfaces this.
             # `grep -c` EXITS 1 ON ZERO MATCHES, so a bare `|| echo` prints
             # BOTH the count and the fallback -- "0" followed by "(no run
