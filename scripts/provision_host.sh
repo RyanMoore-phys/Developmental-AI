@@ -59,12 +59,32 @@ echo "=== STAGE 1b: VirtualGL (GPU headless GL via EGL) ==="
 # blit target — VGL renders on the GPU and the app reads pixels off-screen.
 if ! which vglrun >/dev/null 2>&1; then
   VGL_DEB=/tmp/virtualgl_3.1.1_amd64.deb
-  # Prefer the byte-exact cached .deb (reproducible); fall back to SourceForge.
+  # SOURCEFORGE WENT 404 (measured 2026-09-22) and took provisioning with it:
+  #   wget -qO ... sourceforge.net/projects/virtualgl/files/3.1.1/... -> 404
+  # GitHub releases serves the same artifact and answers 200, so it is now the
+  # PRIMARY and SourceForge the fallback -- the reverse of before. The cached
+  # copy is kept first for reproducibility, but note it is almost never present:
+  # deploy_skybot.sh rsyncs only developmental_ai/configs/scripts/tests, so
+  # host_repository/ does NOT reach the training host. Treat it as a local-run
+  # convenience, not a mirror you can rely on.
+  # -L IS LOAD-BEARING on both: each redirects to a CDN, and without it you get
+  # a 0-byte file and a dpkg error instead of a download error.
+  VGL_URLS="https://github.com/VirtualGL/virtualgl/releases/download/3.1.1/virtualgl_3.1.1_amd64.deb
+https://sourceforge.net/projects/virtualgl/files/3.1.1/virtualgl_3.1.1_amd64.deb/download"
   if [ -f host_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb ]; then
     cp host_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb "$VGL_DEB"
   else
-    wget -qO "$VGL_DEB" "https://sourceforge.net/projects/virtualgl/files/3.1.1/virtualgl_3.1.1_amd64.deb/download" \
-      || { echo "PROVISION-FAILED: virtualgl download"; exit 1; }
+    _got=0
+    for _u in $VGL_URLS; do
+      echo "  trying $_u"
+      if curl -fsSL --max-time 180 -o "$VGL_DEB" "$_u" && [ -s "$VGL_DEB" ]; then
+        # A CDN error page is a 200 with HTML in it. Verify it is really a .deb
+        # (ar archive, magic "!<arch>") or we fail later inside dpkg instead.
+        if head -c 7 "$VGL_DEB" | grep -q "!<arch>"; then _got=1; break; fi
+        echo "  -> not a .deb ($(head -c 60 "$VGL_DEB" | tr -d '\0' | tr '\n' ' '))"
+      fi
+    done
+    [ "$_got" = "1" ] || { echo "PROVISION-FAILED: virtualgl download (all mirrors)"; exit 1; }
   fi
   $SUDO apt-get install -y -q "$VGL_DEB" || $SUDO dpkg -i "$VGL_DEB" \
     || { echo "PROVISION-FAILED: virtualgl install"; exit 1; }

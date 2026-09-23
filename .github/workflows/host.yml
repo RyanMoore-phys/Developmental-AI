@@ -142,7 +142,16 @@ jobs:
           KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
           [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY"; exit 1; }
           SSH="ssh -p $MAIN_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
-          $SSH "${MAIN_USER:-root}@$MAIN_HOST" 'mkdir -p /workspace/devai/runlogs'
+          # SUDO-AWARE: / is not writable by a non-root MAIN_USER, and on a
+          # fresh host /workspace does not exist at all (RunPod mounted it for
+          # free; an owned box does not). Create it, then hand it to the login
+          # user so the rsync below can write into it.
+          $SSH "${MAIN_USER:-root}@$MAIN_HOST" '
+            if [ "$(id -u)" -eq 0 ]; then S=""; else S="sudo"; fi
+            $S mkdir -p /workspace/devai/runlogs
+            [ -n "$S" ] && $S chown -R "$(id -u):$(id -g)" /workspace
+            [ -w /workspace/devai ] || { echo "NOT WRITABLE by $(whoami)"; exit 1; }
+            df -h /workspace/devai | tail -1'
           rsync -rlptz -e "$SSH" \
             developmental_ai configs scripts tests run_minecraft.py requirements.txt \
             "${MAIN_USER:-root}@$MAIN_HOST:/workspace/devai/"

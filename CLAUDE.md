@@ -257,6 +257,16 @@ system.
   re-opens every mastered block tier at full worth. On restore, `mv podlogs
   runlogs` FIRST. This was safe to do now only because `main` was unprovisioned
   and the old pod was already off — there was no live state to orphan.
+- **`workflow_run` RUNS THE WORKFLOW FILE FROM THE DEFAULT BRANCH (2026-09-22).**
+  `deploy.yml` triggers on `workflow_run: workflows: ["ci"]`, so GitHub executes
+  **`main`'s copy of `deploy.yml`**, never the branch you pushed. Its
+  `actions/checkout` still pins the CODE to the triggering sha — so you get the
+  new scripts running under the OLD workflow, which is a genuinely confusing
+  split. It cost a red deploy right after the `POD_*`->`MAIN_*` rename: `main`
+  still demanded `POD_HOST`, and the error text was the pre-rename wording,
+  which is the tell. **Editing `deploy.yml` on a feature branch does nothing
+  until it lands on the default branch.** The stopgap is putting BOTH old and
+  new names in the runner `.env`; the fix is merging the workflow to `main`.
 - **The runner lives on `node1`, a DIFFERENT machine from the training host.**
   `node1` runs the self-hosted Actions runner and holds the only `.env`; `main`
   (192.168.1.10) is the box everything deploys to. Its `hostname` really does
