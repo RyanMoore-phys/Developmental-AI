@@ -1195,18 +1195,28 @@ class MineRLEnvAdapter(gym.Env):
                 _d = (float(_yw) - float(_pyw) + 180.0) % 360.0 - 180.0
                 out["yaw_delta"] = float(_d)
             self._prev_yaw = None if _yw is None else float(_yw)
-            self._dr.step(out["move_fwd"], out["move_lat"], _yw)
-            out["dr_x"], out["dr_z"] = self._dr.x, self._dr.z
+            # ---- getattr, LIKE `_prev_xz` ABOVE (fixed 2026-09-20) -------
+            # This method is called on LIGHTWEIGHT PROBES — a SimpleNamespace
+            # carrying only the fields a test cares about — which is exactly
+            # why the `_prev_xz` read a few lines up is defensive. The dead
+            # reckoner was added with a bare `self._dr` and broke every such
+            # caller with an AttributeError. These senses are optional; a
+            # caller that has no body integrator simply gets no dr_* fields.
+            _dr = getattr(self, "_dr", None)
+            if _dr is not None:
+                _dr.step(out["move_fwd"], out["move_lat"], _yw)
+                out["dr_x"], out["dr_z"] = _dr.x, _dr.z
             self._prev_xz = (float(x), float(z))
             _py = getattr(self, "_prev_y", None)
             _ynow = float(out.get("ypos", 0.0) or 0.0)
             out["move_dy"] = 0.0 if _py is None else (_ynow - _py)
             # FALL DISTANCE: a player knows they are falling and roughly how
             # far. Accumulates while descending, zeroes the moment it stops.
-            _fall = getattr(self, "_fall_dist", 0.0)
-            self._fall_dist = (_fall - out["move_dy"]
-                               if out["move_dy"] < -1e-3 else 0.0)
-            out["fall_dist"] = float(self._fall_dist)
+            _fall = getattr(self, "_fall_dist", 0.0) or 0.0
+            _fall = (_fall - out["move_dy"]
+                     if out["move_dy"] < -1e-3 else 0.0)
+            self._fall_dist = _fall
+            out["fall_dist"] = float(_fall)
             self._prev_y = _ynow
             out["y"] = _ynow
         # WHAT IS IN HAND — decides the chop-completion question (see
