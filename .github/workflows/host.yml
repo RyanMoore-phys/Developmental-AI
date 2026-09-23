@@ -85,6 +85,31 @@ jobs:
             pgrep -x tailscaled >/dev/null && echo "tailscaled up" || echo "tailscaled DOWN"
             echo "== gpu =="
             nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
+            echo "== host (THE TRAINING BOX, not node1) =="
+            # node1's node-exporter watches NODE1. Nothing has ever watched
+            # THIS machine, which is the one with 16 GB and a 256 GB NVMe
+            # holding every byte of brain state. These three lines are the
+            # whole diagnosis for "a client died and could not come back".
+            free -m | awk "/^Mem:/{printf \"    RAM  %s used / %s total, %s avail\\n\",\$3,\$2,\$7} /^Swap:/{printf \"    SWAP %s / %s\\n\",\$3,\$2}"
+            df -h /workspace/devai | tail -1 | awk "{printf \"    DISK %s used of %s (%s)\\n\",\$3,\$2,\$5}"
+            echo "    java clients: $(pgrep -cx java)  (want 2)"
+            echo "== stream health =="
+            # THE SILENT FAILURE: a stream whose rebuild is exhausted is
+            # ZERO-FILLED and the run continues -- steps accumulate, the
+            # dashboard looks healthy, and half the world model's input is
+            # blank frames. Nothing else surfaces this.
+            # `grep -c` EXITS 1 ON ZERO MATCHES, so a bare `|| echo` prints
+            # BOTH the count and the fallback -- "0" followed by "(no run
+            # log)" when the log is present and simply clean. Brace-group the
+            # grep so the fallback belongs to it, not to the whole pipeline.
+            if [ -f runlogs/minecraft_skybot_run.log ]; then
+              { grep -cE "zero-filling stream" runlogs/minecraft_skybot_run.log || true; } \
+                | sed "s/^/    zero-filled stream events: /"
+            else
+              echo "    (no run log)"
+            fi
+            grep -E "zero-filling stream|rebuild exhausted|reset exceeded" \
+              runlogs/minecraft_skybot_run.log 2>/dev/null | tail -5 | sed "s/^/    /" || true
             echo "== last log =="
             tail -15 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"
             # SUPERVISOR LOG TOO (added 2026-09-23). "supervisor: 1 proc" +
