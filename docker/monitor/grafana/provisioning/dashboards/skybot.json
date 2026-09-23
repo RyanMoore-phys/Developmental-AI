@@ -341,6 +341,110 @@
           "rawQueryText": "SELECT wall_time AS time, episode_reward, intrinsic_reward, attack_run_max, attack_run_mean FROM segments ORDER BY wall_time"
         }
       ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "GPU \u2014 VRAM by consumer (8 GB card)",
+      "description": "Device-level, from nvidia-smi on the training host. train_mb is the MineRL/torch process; ollama_mb is the VLM. These two compete for one 8 GB card. Buckets do not sum to mem_used_mb: ~100-200 MB of CUDA context belongs to no process.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, train_mb, ollama_mb, other_mb, vram_used_mb, vram_total_mb FROM host ORDER BY wall_time"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "GPU \u2014 utilisation / temp / power",
+      "description": "util_pct near 100 with a low step rate means the GPU is the bottleneck; util_pct low with a low step rate means it is not.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, util_pct, temp_c, power_w FROM host ORDER BY wall_time"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "THE TRADE: VLM VRAM vs step rate",
+      "description": "The question this whole feed exists to answer. CLAUDE.md records fovea_interval 12 costing 28% of the step rate; this shows that trade live instead of inferring it. Joined on the nearest 30s bucket because the two feeds have independent cadences (~15s each, unsynchronised).",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT g.t AS time, g.ollama_mb, g.train_mb, h.sps FROM (SELECT CAST(wall_time/30 AS INT)*30 AS t, AVG(ollama_mb) ollama_mb, AVG(train_mb) train_mb  FROM host GROUP BY t) g LEFT JOIN (SELECT CAST(wall_time/30 AS INT)*30 AS t, AVG(steps_per_s) sps  FROM heartbeat GROUP BY t) h ON h.t=g.t ORDER BY g.t"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "HOST \u2014 disk % and RAM (the two silent killers)",
+      "description": "Disk: 256 GB single NVMe, no redundancy, and ALL brain state lives there (world_model.pt, skill bank, break memory) with nothing backed up. RAM: 16 GB, and CLAUDE.md records real RSS exceeding hard_max_gb ALWAYS -- a '2 GB' buffer ceiling measured 3.70 GB. An OOM-kill here is indistinguishable from a crash loop unless you can see this.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, disk_pct, mem_used_mb, mem_avail_mb, swap_used_mb FROM host ORDER BY wall_time"
+        }
+      ]
     }
   ]
 }

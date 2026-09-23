@@ -33,6 +33,7 @@ DB = os.environ.get("DB_PATH", "/data/skybot.db")
 SRC = os.environ.get("METRICS_PATH", "/data/metrics.jsonl")
 SERVER_SRC = os.environ.get("SERVER_PATH", "/data/server.jsonl")
 HB_SRC = os.environ.get("HEARTBEAT_PATH", "/data/heartbeat.jsonl")
+HOST_SRC = os.environ.get("HOST_PATH", "/data/host.jsonl")
 POLL = float(os.environ.get("POLL_SECONDS", "10"))
 
 # Scalar columns worth having as real columns (Grafana graphs them directly).
@@ -91,6 +92,20 @@ def connect() -> sqlite3.Connection:
                "total_timesteps INTEGER, uptime_s REAL, steps_per_s REAL, "
                "breaks_total INTEGER, logs INTEGER, attack_run REAL, "
                "episodes INTEGER, gpu_mem_mb REAL)")
+    # DEVICE-level GPU, distinct from heartbeat.gpu_mem_mb which is the
+    # TRAINING PROCESS'S torch allocator only. Keeping them in separate tables
+    # is deliberate: they answer different questions ("how much did we
+    # allocate" vs "how much of the card is gone, and to whom"), they disagree
+    # by design, and a single column would invite averaging the two.
+    # wall_time is the PK, not seq: this feed is written once, locally, by a
+    # single poller -- there is no tail+rsync duplication for seq to dedupe.
+    cx.execute("CREATE TABLE IF NOT EXISTS host ("
+               "wall_time REAL PRIMARY KEY, vram_used_mb REAL, "
+               "vram_total_mb REAL, util_pct REAL, temp_c REAL, power_w REAL, "
+               "ollama_mb REAL, train_mb REAL, other_mb REAL, "
+               "disk_used_mb REAL, disk_total_mb REAL, disk_pct REAL, "
+               "mem_total_mb REAL, mem_used_mb REAL, mem_avail_mb REAL, "
+               "swap_total_mb REAL, swap_used_mb REAL)")
 
     # ---- ADD-ONLY MIGRATION -------------------------------------------
     # `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a DB
@@ -206,6 +221,49 @@ def ingest_heartbeat(cx: sqlite3.Connection, path: str) -> int:
     return 0
 
 
+HOST_COLS = ["wall_time", "vram_used_mb", "vram_total_mb", "util_pct",
+             "temp_c", "power_w", "ollama_mb", "train_mb", "other_mb",
+             "disk_used_mb", "disk_total_mb", "disk_pct",
+             "mem_total_mb", "mem_used_mb", "mem_avail_mb",
+             "swap_total_mb", "swap_used_mb"]
+
+
+def ingest_host(cx: sqlite3.Connection, path: str) -> int:
+    """Device + host health samples. Idempotent on wall_time.
+
+    NOTE ON THE BUCKETS: ollama_mb + train_mb + other_mb does NOT equal
+    mem_used_mb, and that is not a bug. `--query-compute-apps` attributes
+    memory to PROCESSES; the CUDA context/driver overhead belongs to no
+    process and is typically 100-200 MB. Treat the buckets as a breakdown of
+    attributable memory, and mem_used_mb as the number that matters for
+    "am I about to OOM on an 8 GB card".
+
+    disk_* and mem_*/swap_* are the OTHER two ways this box dies: a full
+    256 GB NVMe (brain state lives only there) and a 16 GB OOM.
+    """
+    if not os.path.exists(path):
+        return 0
+    sql = (f"INSERT OR IGNORE INTO host ({','.join(HOST_COLS)}) "
+           f"VALUES ({','.join('?' * len(HOST_COLS))})")
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue                      # torn tail line; next pass gets it
+            if isinstance(r, dict) and "wall_time" in r:
+                rows.append([r.get(c) for c in HOST_COLS])
+    if rows:
+        cur = cx.executemany(sql, rows)
+        cx.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return 0
+
+
 def main() -> None:
     cx = connect()
     once = "--once" in sys.argv
@@ -214,6 +272,7 @@ def main() -> None:
             a = ingest_segments(cx, SRC)
             ingest_heartbeat(cx, HB_SRC)
             ingest_server(cx, SERVER_SRC)
+            ingest_host(cx, HOST_SRC)
             total = cx.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
             if a:
                 print(f"ingest: +{a} new (total {total})", flush=True)

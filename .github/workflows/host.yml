@@ -124,7 +124,7 @@ jobs:
             sleep 25
             tail -5 runlogs/supervisor.log
             # FAIL IF NOTHING STARTED (added 2026-09-23). This used to print
-            # `run pid: none` and exit 0 -- a GREEN job with a supervisor sitting
+            # 'run pid: none' and exit 0 -- a GREEN job with a supervisor sitting
             # in a launcher-refused retry loop, which is exactly how a dead run
             # went unnoticed. The launcher REFUSES for concrete, printable
             # reasons (stale java, dead bridge, unreachable server); surface the
