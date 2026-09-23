@@ -260,7 +260,11 @@ def probe_ollama_model(model: str, deep: bool = True) -> bool:
         resp = client.generate(
             model=model, prompt='Return {"ok": true} as JSON, nothing else.',
             images=[_synthetic_probe_png()], format="json", keep_alive=-1,
-            options={"num_predict": 32, "temperature": 0.0})
+            # num_ctx HERE TOO. This probe is what FIRST loads the model, so
+            # it fixes the KV-cache size for the whole run -- capping it only
+            # at the query sites would leave the 32k allocation already made.
+            options={"num_predict": 32, "temperature": 0.0,
+                     "num_ctx": int(os.environ.get("DEVAI_VLM_NUM_CTX", 4096))})
         txt = (resp.get("response") or "").strip()
         json.loads(txt)            # must parse; content is not checked
         logger.info("VLM smoke check passed: %s answered a real generate "

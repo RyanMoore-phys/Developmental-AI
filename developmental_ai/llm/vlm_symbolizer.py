@@ -583,6 +583,24 @@ class VLMSymbolizer:
         fovea: bool = False,
         fovea_frac: float = 0.4,
         input_max_side: int = 0,
+        # ---- KV-CACHE CEILING (2026-09-23) -------------------------------
+        # WITHOUT THIS, OLLAMA ALLOCATES A KV CACHE FOR THE MODEL'S FULL
+        # DEFAULT CONTEXT (32k+ on qwen2.5vl). MEASURED on `main`:
+        # llama-server held 8.85 GB anon-rss for a model whose weights are
+        # 3.2 GB, and the kernel OOM-killed it:
+        #   Out of memory: Killed process 158714 (llama-server)
+        #   anon-rss:8848808kB
+        # taking the agent with it (8 supervisor restarts). The 5.6 GB of
+        # overhead is cache for context this sensor never uses.
+        # BUDGET: one 336px tile is ~144 tokens after 2x2 merge, the flat
+        # boolean prompt is ~200, num_predict is 256 -> under 700. 4096 is
+        # ~6x headroom.
+        # DO NOT SHRINK THIS CASUALLY. Too small silently TRUNCATES the image
+        # or the prompt and the model answers from a partial scene -- a
+        # degraded sensor that still returns confident booleans, which is
+        # exactly the llava failure this file spent weeks unwinding. Watch
+        # per-predicate agreement if you change it.
+        num_ctx: int = 4096,
         # FOVEA CADENCE DECOUPLING (2026-08-08). The fovea used to alternate
         # with the full channel and therefore inherit its ANNEALED interval —
         # but the anneal is driven by FULL-frame agreement, which says nothing
@@ -608,6 +626,7 @@ class VLMSymbolizer:
         reprobe_after_failures: int = 5,
     ):
         self.model = model
+        self.num_ctx = int(num_ctx)
         # See _ollama_scene_query: re-run the boot smoke probe every this
         # many CONSECUTIVE failures, so a mid-run Ollama crash is reported
         # instead of silently producing zero labels at DEBUG forever. 0 =
@@ -790,7 +809,13 @@ class VLMSymbolizer:
             resp = client.generate(
                 model=self.model, prompt=_SCENE_PROMPT, images=[png_bytes],
                 format="json", keep_alive=-1,
-                options={"num_predict": 256, "temperature": 0.0})
+                # num_ctx CAPS THE KV CACHE -- see the constructor note.
+                # keep_alive=-1 is DELIBERATELY UNCHANGED: this is called
+                # every ~30-50 steps, so unloading would pay a full model
+                # reload most calls. Capping the cache is what makes keeping
+                # it resident affordable.
+                options={"num_predict": 256, "temperature": 0.0,
+                         "num_ctx": self.num_ctx})
             txt = (resp.get("response") or "").strip()
             self._consec_failures = 0
             return txt
@@ -945,7 +970,8 @@ class VLMSymbolizer:
             resp = client.generate(
                 model=self.model, prompt=_FOVEA_PROMPT, images=[png_bytes],
                 format="json", keep_alive=-1,
-                options={"num_predict": 128, "temperature": 0.0})
+                options={"num_predict": 128, "temperature": 0.0,
+                         "num_ctx": self.num_ctx})
             return (resp.get("response") or "").strip()
         except Exception as e:
             logger.debug("VLMSymbolizer fovea query failed: %s", e)

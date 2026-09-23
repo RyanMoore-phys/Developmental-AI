@@ -1641,6 +1641,16 @@ symbolic_grounding:
   # So the plain tag IS the small quantized VLM this was reaching for, and
   # provisioning now completes instead of failing at the last stage.
   model: qwen2.5vl:3b
+  # ---- KV-CACHE CEILING (2026-09-23) -----------------------------------
+  # Ollama sizes its KV cache from the model default (32k+ on qwen2.5vl)
+  # unless told otherwise. MEASURED on `main`: llama-server at 8.85 GB
+  # anon-rss for 3.2 GB of weights, OOM-killed by the kernel, taking the
+  # agent with it (8 restarts in 90 minutes). One 336px tile is ~144 tokens,
+  # the prompt ~200, num_predict 256 -> under 700 used. 4096 is ~6x headroom.
+  # LOWERING THIS IS A SENSOR CHANGE: too small truncates the image and the
+  # model answers confidently from a partial scene. Watch per-predicate
+  # agreement if you touch it.
+  num_ctx: 4096
   # Downscale the WHOLE-FRAME request to this longest side before the PNG
   # encode. 336 is qwen2.5vl's ViT tile size, so the model sees the tiling it
   # would have produced anyway and stops paying to re-tile pixels it was

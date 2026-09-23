@@ -1113,6 +1113,10 @@ class DevelopmentalAI:
                 pass
             self.symbolizer = VLMSymbolizer(
                 model=sg_cfg.get("model", "llava:7b"),
+                # KV-cache ceiling. Config-driven so the OOM fix is tunable
+                # without an edit; see the VLMSymbolizer constructor for why
+                # shrinking it is a SENSOR change, not just a memory knob.
+                num_ctx=sg_cfg.get("num_ctx", 4096),
                 interval=sg_cfg.get("interval", 60),
                 max_interval=sg_cfg.get("max_interval", 600),
                 latent_dim=self.world_model.rssm.latent_dim,

@@ -57,7 +57,17 @@ rm -rf runlogs/brain
 # has 6/12 and two of them are pinned to Minecraft clients by the
 # launchClient taskset wrap. Oversubscribing torch against that costs
 # throughput rather than buying it.
+# PYTORCH_CUDA_ALLOC_CONF (2026-09-23). The agent died with:
+#   CUDA out of memory. Tried to allocate 64.00 MiB. GPU 0 has a total
+#   capacity of 7.56 GiB of which 68.88 MiB is free.
+# 64 MiB failing on a card with 3+ GiB held by this process is FRAGMENTATION,
+# not exhaustion, and torch names the fix in the error text itself.
+# expandable_segments lets the allocator grow a segment instead of needing a
+# contiguous block. This does NOT create memory: it is worth ~a few hundred MB
+# of headroom, and the real fix for this box is the VLM KV-cache cap in
+# configs (symbolic_grounding.num_ctx). Keep both.
 DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=6 MINERL_HEADLESS=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   setsid ./venv_mc/bin/python run_minecraft.py \
     --config configs/minecraft_skybot.yaml \
     --timesteps "$TS" --seed 0 --out minecraft_skybot_results \
