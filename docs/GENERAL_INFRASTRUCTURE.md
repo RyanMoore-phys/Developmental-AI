@@ -1404,7 +1404,7 @@ tests/_infra_*_smoke.py  one suite per module, 70+ contracts total
   (income, territory delta, caused events) feed the StuckMonitor; L1 refills
   the search budget, L2 doubles exploration weights for one segment
   (self-restoring — never a latch), L3 writes a structured help request to
-  `podlogs/help_requests.jsonl` and dumps the decision trace.
+  `runlogs/help_requests.jsonl` and dumps the decision trace.
 * **Gates on the known suppressors (#20).** seek-nudge budget, magnet
   weight, learned-option offers — each states its condition every segment;
   the registry alarms past the declared budget.
@@ -1580,7 +1580,7 @@ green:
   gaze buckets + refill seek), `prime` (social_prime a KNOWN category —
   emulate the what, discover the how), `explore_wider` (the L2 boost on
   request), `conserve` (no-op is an answer). Rate-limited; dialogue logged
-  to `podlogs/help_responses.jsonl`.
+  to `runlogs/help_responses.jsonl`.
 * **STARVED vs BROKEN degenerate split (the 5th guard-becomes-latch).**
   The min-positives gate fixed cold start, then latched on a WARM head:
   historical positives + ground-filled view → constant-low → flagged → the

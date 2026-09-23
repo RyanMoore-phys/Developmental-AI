@@ -8,7 +8,7 @@ are checked against the metrics dump rather than live so they can be re-run
 on any archived run.
 
 Run on the pod:
-    PYTHONPATH=. python scripts/pod_falsifiers.py --metrics podlogs/metrics.json
+    PYTHONPATH=. python scripts/host_falsifiers.py --metrics runlogs/metrics.json
 """
 import argparse
 import json
@@ -23,7 +23,7 @@ def _arr(m, k):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--metrics", default="podlogs/metrics.json")
+    ap.add_argument("--metrics", default="runlogs/metrics.json")
     a = ap.parse_args()
     m = json.load(open(a.metrics))
     verdicts = []

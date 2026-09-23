@@ -229,7 +229,7 @@ environment:
   # restarts, so "mastered" survives a redeploy — every restart used to
   # re-open the dirt tier at full worth and reset the familiarity decay.
   # Primary stream only (scouts explore local throwaway worlds).
-  break_memory_path: podlogs/breaks_by_type.json
+  break_memory_path: runlogs/breaks_by_type.json
 # =====================================================================
 # THE SENSOR BUS (2026-09-19)
 # ---------------------------------------------------------------------
@@ -2305,12 +2305,12 @@ llm:
 # with declared reopen budgets, proof-of-life heartbeats, the reward ledger +
 # farm detector, signal-informativeness monitoring, behaviour-drift alarms,
 # stuck escalation ending in structured HELP REQUESTS
-# (podlogs/help_requests.jsonl), episodic event memory, the affordance map,
+# (runlogs/help_requests.jsonl), episodic event memory, the affordance map,
 # and empowerment shaping (reachable-future diversity — the general mechanism
 # that makes pits/towers unattractive with zero domain knowledge).
 infra:
   enabled: true
-  log_dir: podlogs
+  log_dir: runlogs
   # DEGENERATE-SIGNAL GATE (2026-08-11). This set is the magnet's EXCLUSION
   # list, so a wrong entry here silently disables the drive that finds
   # trees. A signal counts as degenerate only once the teacher has actually
@@ -2339,7 +2339,7 @@ infra:
   # explore_wider / conserve. Guidance only biases what is INTERESTING
   # (curiosity injection, gaze novelty, exploration weights — all existing,
   # self-expiring levers); the agent's own body still discovers the how.
-  # Rate-limited; every exchange logged to podlogs/help_responses.jsonl.
+  # Rate-limited; every exchange logged to runlogs/help_responses.jsonl.
   # Fails to a no-op without a VLM.
   advisor_enabled: true
   advisor_min_gap: 4096
@@ -2642,7 +2642,7 @@ viewer:
   port: 8000
 brain_viewer:
   enabled: true
-  out_dir: podlogs/brain
+  out_dir: runlogs/brain
   interval: 400
   ghost_frontier: true
 skill_composition:
@@ -2871,7 +2871,7 @@ goals:
   seed: 0
 video:
   enabled: true
-  out_dir: podlogs/mc_videos
+  out_dir: runlogs/mc_videos
   head: 3
   every: 25
   upscale: 6
@@ -2879,7 +2879,7 @@ video:
 lifelong:
   enabled: true
   forever: false
-  stop_file: podlogs/STOP
+  stop_file: runlogs/STOP
   segment_steps: 1024
   active_skills: 24
   active_goals: 48
@@ -2912,7 +2912,7 @@ lifelong:
 # a segment that takes minutes. Set false only if a run is throughput-bound
 # and you have decided to trade the guarantee away.
 #
-# WHY ROTATION: podlogs/ollama.log reached 29 MB unattended in this project.
+# WHY ROTATION: runlogs/ollama.log reached 29 MB unattended in this project.
 # The tracker must not become the thing that fills the pod's disk.
 #
 # The collector on the mini tails this file and dedupes on `seq`; see
@@ -2920,7 +2920,7 @@ lifelong:
 # SQLite the dashboard reads is a rebuildable view over it.
 metrics:
   enabled: true
-  path: podlogs/metrics.jsonl
+  path: runlogs/metrics.jsonl
   max_bytes: 67108864        # 64 MB per file
   keep: 5                    # ~320 MB worst case, bounded
   fsync: true
@@ -2935,7 +2935,7 @@ metrics:
   # heartbeat is never mistaken for a per-segment observation.
   # 0 disables it.
   heartbeat_seconds: 15
-  heartbeat_path: podlogs/heartbeat.jsonl
+  heartbeat_path: runlogs/heartbeat.jsonl
   # No fsync: a lost heartbeat costs one dashboard point, whereas a lost
   # segment record loses the only account of that segment. Different data,
   # different durability.

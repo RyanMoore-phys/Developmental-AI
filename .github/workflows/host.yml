@@ -1,7 +1,7 @@
 # Manual pod operations. Nothing here is triggered by a push.
 #
 # NO BRANCH PROTECTION, NO GITHUB SECRETS, NO TAILNET REQUIRED.
-# Every action runs through scripts/pod_exec.sh, which defaults to plain SSH
+# Every action runs through scripts/host_exec.sh, which defaults to plain SSH
 # using the key already on the runner host. Set DEPLOY_TRANSPORT=tailscale in
 # the runner .env to switch to Tailscale SSH (needs a tailnet ACL rule —
 # optional, see docs/CI_SETUP.md).
@@ -9,16 +9,16 @@
 #   status     read-only health report. Safe. Start here.
 #   connect    tailscale + socat bridge to the Paper server.
 #   launch     start training under the supervisor.
-#   stop       GRACEFUL stop via podlogs/STOP.
+#   stop       GRACEFUL stop via runlogs/STOP.
 #   provision  bootstrap a BARE box (40-60 min). Destructive — guarded.
 #
 # WHY `stop` WRITES A FILE INSTEAD OF KILLING: the supervisor treats a killed
-# process as a crash and relaunches it. `touch podlogs/STOP` is the only stop
+# process as a crash and relaunches it. `touch runlogs/STOP` is the only stop
 # that stays stopped (CLAUDE.md §2).
 #
 # SAFETY PRECONDITION: a self-hosted runner must only ever serve a PRIVATE
 # repo. On a public repo any fork could run arbitrary code as the runner user.
-name: pod
+name: host
 
 # The run list showed five identical rows called "pod" with no way to tell a
 # read-only `status` from a `launch` or a destructive `provision`. run-name is
@@ -64,8 +64,8 @@ jobs:
       - name: Preflight — pod reachable
         run: |
           set -euo pipefail
-          bash scripts/pod_exec.sh 'echo "pod: $(hostname)"' \
-            || { echo "::error::cannot reach the pod. If using the default ssh transport, POD_SSH_PORT rotates on every pod restart — update the runner .env."; exit 1; }
+          bash scripts/host_exec.sh 'echo "pod: $(hostname)"' \
+            || { echo "::error::cannot reach the pod. If using the default ssh transport, MAIN_SSH_PORT rotates on every pod restart — update the runner .env."; exit 1; }
 
       # ---------------------------------------------------------------- #
       - name: status
@@ -73,27 +73,27 @@ jobs:
         run: |
           # Patterns are SPLIT so this command line cannot match itself:
           # `pgrep -f run_minecraft` matches the shell running the pgrep.
-          bash scripts/pod_exec.sh '
+          bash scripts/host_exec.sh '
             cd /workspace/devai 2>/dev/null || { echo "no /workspace/devai"; exit 0; }
             R="run_min""ecraft"; S="supervise""_skybot"
             echo "== run =="
-            pgrep -f "$R[.]py" >/dev/null && echo "training LIVE (pid $(cat podlogs/skybot_run.pid 2>/dev/null))" || echo "training not running"
+            pgrep -f "$R[.]py" >/dev/null && echo "training LIVE (pid $(cat runlogs/skybot_run.pid 2>/dev/null))" || echo "training not running"
             echo "supervisor: $(pgrep -f "$S" | wc -l) proc"
-            echo "STOP file:  $(test -f podlogs/STOP && echo PRESENT || echo absent)"
+            echo "STOP file:  $(test -f runlogs/STOP && echo PRESENT || echo absent)"
             echo "== bridge =="
             ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "socat bridge UP" || echo "socat bridge DOWN"
             pgrep -x tailscaled >/dev/null && echo "tailscaled up" || echo "tailscaled DOWN"
             echo "== gpu =="
             nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
             echo "== last log =="
-            tail -15 podlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"'
+            tail -15 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"'
 
       - name: connect
         if: ${{ github.event.inputs.action == 'connect' }}
         run: |
           set -euo pipefail
           : "${MC_SERVER_TS_IP:?set MC_SERVER_TS_IP in the runner .env (Paper server tailnet IP)}"
-          bash scripts/pod_exec.sh \
+          bash scripts/host_exec.sh \
             "cd /workspace/devai && bash scripts/connect_server.sh bridge ${MC_SERVER_TS_IP}"
 
       - name: launch
@@ -105,14 +105,14 @@ jobs:
           # launch_skybot.sh owns the pre-flight and REFUSES if the bridge or
           # the server is down — a run started against a dead bridge strands
           # the primary stream in a connect-fail rebuild loop.
-          bash scripts/pod_exec.sh "
+          bash scripts/host_exec.sh "
             cd /workspace/devai
-            rm -f podlogs/STOP
+            rm -f runlogs/STOP
             setsid nohup bash scripts/supervise_skybot.sh ${TS_STEPS} \
-              > podlogs/supervisor.log 2>&1 < /dev/null &
+              > runlogs/supervisor.log 2>&1 < /dev/null &
             sleep 25
-            tail -5 podlogs/supervisor.log
-            echo \"run pid: \$(cat podlogs/skybot_run.pid 2>/dev/null || echo none)\""
+            tail -5 runlogs/supervisor.log
+            echo \"run pid: \$(cat runlogs/skybot_run.pid 2>/dev/null || echo none)\""
 
       - name: stop
         if: ${{ github.event.inputs.action == 'stop' }}
@@ -124,37 +124,37 @@ jobs:
         # check. Five minutes was also less than a normal shutdown (segment
         # ~5 min + replay-buffer save ~8.5 min, both measured), so it timed
         # out on healthy stops and lied about it every time. See
-        # scripts/pod_stop_wait.sh for the full account.
+        # scripts/host_stop_wait.sh for the full account.
         run: |
           set -euo pipefail
-          bash scripts/pod_stop_wait.sh 1200
+          bash scripts/host_stop_wait.sh 1200
 
       # ---------------------------------------------------------------- #
       # provision needs rsync as well as exec, so it builds its own ssh line
-      # rather than going through pod_exec.sh. Same env vars.
+      # rather than going through host_exec.sh. Same env vars.
       # ---------------------------------------------------------------- #
       - name: provision
         if: ${{ github.event.inputs.action == 'provision' }}
         run: |
           set -euo pipefail
-          : "${POD_HOST:?set POD_HOST in the runner .env}"
-          : "${POD_SSH_PORT:?set POD_SSH_PORT in the runner .env}"
-          KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
+          : "${MAIN_HOST:?set MAIN_HOST in the runner .env}"
+          : "${MAIN_SSH_PORT:?set MAIN_SSH_PORT in the runner .env}"
+          KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
           [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY"; exit 1; }
-          SSH="ssh -p $POD_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
-          $SSH "root@$POD_HOST" 'mkdir -p /workspace/devai/podlogs'
+          SSH="ssh -p $MAIN_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          $SSH "${MAIN_USER:-root}@$MAIN_HOST" 'mkdir -p /workspace/devai/runlogs'
           rsync -rlptz -e "$SSH" \
             developmental_ai configs scripts tests run_minecraft.py requirements.txt \
-            "root@$POD_HOST:/workspace/devai/"
+            "${MAIN_USER:-root}@$MAIN_HOST:/workspace/devai/"
           # TS_AUTHKEY (optional, runner .env) lets stage 1c join the tailnet
           # non-interactively so the pod comes out already reachable.
-          $SSH "root@$POD_HOST" "cd /workspace/devai && TS_AUTHKEY='${TS_AUTHKEY:-}' \
-            nohup bash scripts/provision_pod.sh > podlogs/provision.log 2>&1 < /dev/null &
+          $SSH "${MAIN_USER:-root}@$MAIN_HOST" "cd /workspace/devai && TS_AUTHKEY='${TS_AUTHKEY:-}' \
+            nohup bash scripts/provision_host.sh > runlogs/provision.log 2>&1 < /dev/null &
             echo started"
           echo "provisioning started; polling stage markers"
           for i in $(seq 1 110); do
             sleep 60
-            OUT=$($SSH "root@$POD_HOST" 'grep -E "^=== STAGE|PROVISION-" /workspace/devai/podlogs/provision.log | tail -2' 2>/dev/null || true)
+            OUT=$($SSH "${MAIN_USER:-root}@$MAIN_HOST" 'grep -E "^=== STAGE|PROVISION-" /workspace/devai/runlogs/provision.log | tail -2' 2>/dev/null || true)
             echo "[$i min] $OUT"
             case "$OUT" in
               *PROVISION-COMPLETE*) echo "provisioning finished"; exit 0 ;;

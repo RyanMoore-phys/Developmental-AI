@@ -4,7 +4,7 @@
 > computer — Ubuntu Server, **192.168.1.10**, on the LAN and the tailnet at
 > once — not a rented pod. It is installed at `/workspace/devai` and deployed
 > to as `root@` deliberately, so every command in this file works unchanged;
-> only `POD_HOST` and `POD_PORT` below take different values (`22`, fixed —
+> only `MAIN_HOST` and `POD_PORT` below take different values (`22`, fixed —
 > the rotating-port problem is gone). CI reads them from the runner's `.env`,
 > never from here: see `docs/CI_SETUP.md`. The 16 GB of RAM forced several
 > config cuts — CLAUDE.md §6 lists them.
@@ -16,9 +16,9 @@ run. The habit is kept now that the address is fixed, because the runner `.env`
 is the one place that should name a host.
 
 ```bash
-export POD_HOST=<host-ip>             # 192.168.1.10, or the pod's Connect IP
+export MAIN_HOST=<host-ip>             # 192.168.1.10, or the pod's Connect IP
 export POD_PORT=<ssh-port>            # 22 on the main computer
-SSH="ssh root@$POD_HOST -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
+SSH="ssh root@$MAIN_HOST -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 # NOTE: zsh will NOT run a command stored in a variable ($SSH ...). Either paste
 # the full ssh line, or wrap it in a shell function. (Known gotcha.)
@@ -35,7 +35,7 @@ From the parent repo dir:
 rsync -rlptz -e "ssh -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   developmental_ai configs scripts run_minecraft.py \
-  root@"$POD_HOST":/workspace/devai/
+  root@"$MAIN_HOST":/workspace/devai/
 ```
 
 ## 2. Launch
@@ -47,18 +47,18 @@ $SSH 'cd /workspace/devai && bash scripts/launch_lifelong.sh 1000000'
 ```
 
 What it does: **refuses** if a run or stale java is alive; ensures `Xvfb :77`,
-`openbox`, and `ollama serve`; `rm -rf podlogs/brain`; then launches DETACHED via
+`openbox`, and `ollama serve`; `rm -rf runlogs/brain`; then launches DETACHED via
 `setsid` with `DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MINERL_HEADLESS=1`,
-logging to `podlogs/minecraft_lifelong_run.log`, pid → `podlogs/lifelong_run.pid`.
+logging to `runlogs/minecraft_lifelong_run.log`, pid → `runlogs/lifelong_run.pid`.
 
 First Minecraft boot takes **~90 s** (4 java clients spawn). Episode 1 appears a
 few minutes later (~5–6 min/segment). It does NOT wipe skill_bank or broadcaster
-state — it continues the lifelong memory; only `podlogs/brain` is regenerated.
+state — it continues the lifelong memory; only `runlogs/brain` is regenerated.
 
 ## 3. Monitor — the signals that matter
 
 ```bash
-$SSH 'cd /workspace/devai && grep -aE "Episode [0-9]+ \| Timestep|this ep:" podlogs/minecraft_lifelong_run.log | tail'
+$SSH 'cd /workspace/devai && grep -aE "Episode [0-9]+ \| Timestep|this ep:" runlogs/minecraft_lifelong_run.log | tail'
 ```
 
 - **`Reward (avg): X (this ep: Y)`** — the *cumulative mean* is `~sum/N` and
@@ -70,7 +70,7 @@ $SSH 'cd /workspace/devai && grep -aE "Episode [0-9]+ \| Timestep|this ep:" podl
 - **Curiosity magnet line** — `tree=…` prob and `target=…`. `tree=0.000, target=
   stone_visible` means the fleet wandered off-tree (the seek drive should recover
   it).
-- **Liveness:** `ps -o %cpu,etime -p $(cat podlogs/lifelong_run.pid)` — ~100% CPU
+- **Liveness:** `ps -o %cpu,etime -p $(cat runlogs/lifelong_run.pid)` — ~100% CPU
   = advancing; ~0% = hung.
 - **Log-breaking:** it shows as GOAL unlocks in `broadcaster_state.json`
   (`slot_uid` + `unlock_log`), NOT as skill "behaviours" (skills need ~20 eps of
@@ -79,21 +79,21 @@ $SSH 'cd /workspace/devai && grep -aE "Episode [0-9]+ \| Timestep|this ep:" podl
 Quick health one-liner:
 
 ```bash
-$SSH 'cd /workspace/devai && echo "cpu:"; ps -o %cpu,etime -p $(cat podlogs/lifelong_run.pid); \
-  grep -aicE "Traceback|CRITICAL|Fatal" podlogs/minecraft_lifelong_run.log; \
-  grep -aoE "h_evolve=[0-9.na]+" podlogs/minecraft_lifelong_run.log | tail -3'
+$SSH 'cd /workspace/devai && echo "cpu:"; ps -o %cpu,etime -p $(cat runlogs/lifelong_run.pid); \
+  grep -aicE "Traceback|CRITICAL|Fatal" runlogs/minecraft_lifelong_run.log; \
+  grep -aoE "h_evolve=[0-9.na]+" runlogs/minecraft_lifelong_run.log | tail -3'
 ```
 
 ## 4. Stop (gracefully)
 
 ```bash
-$SSH 'cd /workspace/devai && kill $(cat podlogs/lifelong_run.pid); sleep 6; \
+$SSH 'cd /workspace/devai && kill $(cat runlogs/lifelong_run.pid); sleep 6; \
   pkill -x java; sleep 3; \
   echo "python left: $(pgrep -fc run_minecraft[.]py) java left: $(pgrep -xc java)"'
 ```
 
-Archive the log first if you want to keep it: `cp podlogs/minecraft_lifelong_run.log
-podlogs/minecraft_lifelong_run.$(some-tag).log`. The launch script's `>` redirect
+Archive the log first if you want to keep it: `cp runlogs/minecraft_lifelong_run.log
+runlogs/minecraft_lifelong_run.$(some-tag).log`. The launch script's `>` redirect
 truncates the live log on the next start.
 
 ## Compute note

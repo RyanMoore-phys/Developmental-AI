@@ -512,7 +512,7 @@ class ReplayBuffer:
         #     collection, which is the one thing this model is short of.
         #   * The work under the lock: seven column writes.
         #
-        # Two counters, read by scripts/pod_profile_step.py. The cost of the
+        # Two counters, read by scripts/host_profile_step.py. The cost of the
         # timing itself is two perf_counter calls per add.
         _t_wait = time.perf_counter()
         with self._lock:

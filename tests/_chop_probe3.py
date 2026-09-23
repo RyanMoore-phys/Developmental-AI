@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-FRAMES = "podlogs/probe3_frames"
+FRAMES = "runlogs/probe3_frames"
 
 
 def act_of(env, **kw):

@@ -15,7 +15,7 @@ Everything here has been proven on an RTX A4000 / AMD EPYC pod, Ubuntu 22.04.
 
 - A RunPod account + an SSH key. **Use `~/.ssh/skybot_ed25519`** — the key the
   RunPod dashboard shows as "id_ed25519" does not exist locally under that name.
-- The brain backup (`pod_repository/data/skill_bank_mc_curiosity/`, the byte-exact
+- The brain backup (`host_repository/data/skill_bank_mc_curiosity/`, the byte-exact
   3.5 GB skill bank) and this repo, on your Mac.
 - For external-server mode only: a Tailscale account, and a Minecraft server you
   control (see `SERVER_CONNECTION.md`).
@@ -49,7 +49,7 @@ rsync -rlptz -e "ssh -p <PORT> -i ~/.ssh/skybot_ed25519 -o StrictHostKeyChecking
 
 Use `-rlptz`, **not** `-az` — the network volume forbids chown, so `-a` exits 23
 (files still copy, but the non-zero exit is confusing). The cached VirtualGL
-`.deb` under `pod_repository/data/minerl_build/` must be included (provisioning
+`.deb` under `host_repository/data/minerl_build/` must be included (provisioning
 prefers it over a live download).
 
 ## 3. Provision (~40–60 min)
@@ -57,11 +57,11 @@ prefers it over a live download).
 Run detached and watch the log — the MineRL build alone runs a full gradle build:
 
 ```bash
-$SSH 'cd /workspace/devai && nohup bash scripts/provision_pod.sh > podlogs/provision.log 2>&1 &'
-$SSH 'tail -f /workspace/devai/podlogs/provision.log'   # Ctrl-C to stop watching
+$SSH 'cd /workspace/devai && nohup bash scripts/provision_host.sh > runlogs/provision.log 2>&1 &'
+$SSH 'tail -f /workspace/devai/runlogs/provision.log'   # Ctrl-C to stop watching
 ```
 
-`scripts/provision_pod.sh` stages (see `PROVISIONING.md` for the deep why of each):
+`scripts/provision_host.sh` stages (see `PROVISIONING.md` for the deep why of each):
 
 | Stage | What |
 |---|---|
@@ -92,7 +92,7 @@ lifelong memory (goals + minted skills). Upload the backup as a BACKGROUND task
 
 ```bash
 rsync -rlptz --partial -e "ssh -p <PORT> -i ~/.ssh/skybot_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-  pod_repository/data/skill_bank_mc_curiosity/ \
+  host_repository/data/skill_bank_mc_curiosity/ \
   root@<IP>:/workspace/devai/skill_bank_mc_curiosity/
 ```
 
@@ -114,7 +114,7 @@ $SSH 'cd /workspace/devai && bash scripts/launch_lifelong.sh 1000000'
 ```
 
 4 local envs (env 0 = the continuous lifelong stream + 3 scouts), config
-`configs/minecraft_lifelong.yaml`, log `podlogs/minecraft_lifelong_run.log`.
+`configs/minecraft_lifelong.yaml`, log `runlogs/minecraft_lifelong_run.log`.
 
 ### External-server mode
 
@@ -139,8 +139,8 @@ $SSH 'cd /workspace/devai
   echo "each pinned 1 core:"; for p in $(pgrep -x java); do taskset -cp $p; done
   echo "futex aborts: $(cat logs/mc_*.log 2>/dev/null | grep -ac "futex facility")  (want 0)"
   echo "GPU:"; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
-  echo "async WM: $(grep -ac "async WM trainer started" podlogs/*run.log)"
-  echo "prospection: $(grep -ac "Prospection re-rank" podlogs/*run.log) decisions"'
+  echo "async WM: $(grep -ac "async WM trainer started" runlogs/*run.log)"
+  echo "prospection: $(grep -ac "Prospection re-rank" runlogs/*run.log) decisions"'
 ```
 
 Boot takes ~2 min for the GPU clients. Healthy = 4 (or 2) java each pinned to
@@ -150,7 +150,7 @@ lines.
 
 ## 7. Stopping / restarting
 
-- **Graceful (lifelong forever-mode only):** `touch podlogs/STOP`. Budgeted runs
+- **Graceful (lifelong forever-mode only):** `touch runlogs/STOP`. Budgeted runs
   (`forever: false`) need SIGTERM; if it doesn't exit in ~3 min, SIGKILL is safe
   — the skill bank writes atomically (tmp+fsync+rename), so a hard kill loses
   only in-memory WM/policy state (which is from-scratch each run anyway; the

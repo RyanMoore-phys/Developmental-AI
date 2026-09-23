@@ -34,7 +34,7 @@ class LifelongController:
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", False))
         self.forever = bool(cfg.get("forever", False))
-        self.stop_file = str(cfg.get("stop_file", "podlogs/STOP"))
+        self.stop_file = str(cfg.get("stop_file", "runlogs/STOP"))
         self.segment_steps = int(cfg.get("segment_steps", 1024))
         # per-segment soft leak of carried state (1.0 = no decay). Kept in
         # [0,1]; applied once per segment boundary, so within a segment the
@@ -80,7 +80,7 @@ class LifelongController:
 
         Gated on `enabled`, NOT on `forever` (fixed 2026-07-25). Requiring
         forever-mode made the stop-file a no-op for every BUDGETED run — the
-        mode actually in use — so `touch podlogs/STOP` did nothing and the only
+        mode actually in use — so `touch runlogs/STOP` did nothing and the only
         way to end a run was killing it mid-write. An operator asking a run to
         stop means the same thing whether or not a step budget exists.
         """

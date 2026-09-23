@@ -86,19 +86,24 @@ else
 # After editing:  cd ~/actions-runner && ./svc.sh stop && ./svc.sh start
 
 # --- required ---
-POD_HOST=<redacted-host>
-# ROTATES ON EVERY POD RESTART. When a job fails at the preflight step with an
-# ssh error, this is almost always why: update it here and restart the service.
-POD_SSH_PORT=19983
-POD_SSH_KEYFILE=$HOME/.ssh/skybot_ed25519
+# THE TRAINING HOST. Since 2026-09-22 this is the owned Ubuntu box `main` on
+# the LAN, NOT a rented pod -- which is why these are MAIN_* and not POD_*.
+# The port no longer rotates (that was RunPod remapping 22 on every restart);
+# it is a fixed sshd on a fixed address, so this file should now be stable.
+MAIN_HOST=192.168.1.10
+MAIN_SSH_PORT=22
+# The login account on `main`. A NON-ROOT user needs PASSWORDLESS SUDO there:
+# provisioning installs apt packages and creates /workspace under /.
+MAIN_USER=skybot
+MAIN_SSH_KEYFILE=$HOME/.ssh/id_ed25519
 
 # --- required for: pod.yml action=connect ---
 MC_SERVER_TS_IP=100.64.0.11
 
 # --- optional ---
 # Use Tailscale SSH instead of plain ssh. Needs the tailnet ACL rule in
-# docs/CI_SETUP.md section 4, and POD_HOST becomes the MagicDNS name.
-# Worth it only to stop maintaining POD_SSH_PORT above.
+# docs/CI_SETUP.md section 4, and MAIN_HOST becomes the MagicDNS name.
+# Worth it only to stop maintaining MAIN_SSH_PORT above.
 #DEPLOY_TRANSPORT=tailscale
 #TS_AUTHKEY=tskey-auth-...
 EOF
@@ -119,11 +124,11 @@ Runner installed.
   dir:    ${RUNNER_DIR}
   name:   ${RUNNER_NAME}
   labels: self-hosted, ${ARCH}, ${LABELS}
-  env:    ${RUNNER_DIR}/.env   (edit POD_SSH_PORT after every pod restart)
+  env:    ${RUNNER_DIR}/.env   (MAIN_HOST / MAIN_SSH_PORT / MAIN_SSH_KEYFILE)
 
 CHECK IT:
   1. ${REPO_URL}/settings/actions/runners  -> should show "Idle"
-  2. bash scripts/pod_exec.sh 'hostname'   -> should print the pod hostname
+  2. bash scripts/host_exec.sh 'hostname'   -> should print the pod hostname
      (run with the same env: set -a; . ~/actions-runner/.env; set +a)
   3. Actions -> pod -> Run workflow -> action=status
 

@@ -11,7 +11,7 @@ signature of this project's most expensive failure class: machinery that
 runs, logs, and does nothing.
 
 Run on the pod:
-    PYTHONPATH=. python scripts/pod_stage2_integration.py --steps 500
+    PYTHONPATH=. python scripts/host_stage2_integration.py --steps 500
 """
 import argparse
 import json
@@ -30,7 +30,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--config", default="configs/minecraft_skybot.yaml")
-    ap.add_argument("--out", default="podlogs/stage2")
+    ap.add_argument("--out", default="runlogs/stage2")
     ap.add_argument("--baseline-rate", type=float, default=0.0,
                     help="pre-change steps/s; 2.7 is skipped if 0")
     a = ap.parse_args()

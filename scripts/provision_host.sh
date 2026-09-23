@@ -5,14 +5,30 @@
 # patch MouseHelper and rebuild).
 #
 # Usage (from /workspace/devai, after rsyncing the repo there):
-#   nohup bash scripts/provision_pod.sh > podlogs/provision.log 2>&1 &
+#   nohup bash scripts/provision_host.sh > runlogs/provision.log 2>&1 &
 set -x
+# ---- ROOT vs SUDO (added 2026-09-22) --------------------------------------
+# On RunPod this always ran as root, so apt/dpkg/installers were bare. The
+# owned box `main` logs in as a normal account, so every privileged command
+# now goes through $SUDO -- EMPTY when we are already root, so the old path is
+# byte-for-byte unchanged and this cannot regress a root host.
+# A non-root MAIN_USER therefore REQUIRES PASSWORDLESS SUDO on the target:
+# this script runs detached under nohup with no tty, so a password prompt does
+# not block visibly, it just fails the stage and keeps going with -x noise.
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else
+  SUDO="sudo"
+  sudo -n true 2>/dev/null || {
+    echo "FATAL: $(whoami) has no PASSWORDLESS sudo on $(hostname)."
+    echo "  Provisioning installs apt packages and writes under /. Fix with:"
+    echo "    echo \"$(whoami) ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/90-$(whoami)"
+    exit 1; }
+fi
 cd /workspace/devai || exit 1
-mkdir -p podlogs
+mkdir -p runlogs
 
 echo "=== STAGE 1: apt packages ==="
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
+$SUDO apt-get update -q
 # PYTHON 3.10 ON UBUNTU >=24.04 (2026-08-11, Vast RTX 5060 Ti box).
 # 24.04 (noble) ships python3.12 and carries NO python3.10 packages, but the
 # whole MineRL chain is pinned to 3.10 (legacy gym + setuptools==65.5.1; 3.12
@@ -23,12 +39,12 @@ apt-get update -q
 . /etc/os-release
 if ! apt-cache policy python3.10-venv 2>/dev/null | grep -q "Candidate: [0-9]"; then
   echo "  python3.10 absent on ${PRETTY_NAME:-this release} -> adding deadsnakes"
-  apt-get install -y -q software-properties-common
-  add-apt-repository -y ppa:deadsnakes/ppa \
+  $SUDO apt-get install -y -q software-properties-common
+  $SUDO add-apt-repository -y ppa:deadsnakes/ppa \
     || { echo "PROVISION-FAILED: deadsnakes-ppa"; exit 1; }
-  apt-get update -q
+  $SUDO apt-get update -q
 fi
-apt-get install -y -q openjdk-8-jdk-headless xvfb openbox xdotool psmisc \
+$SUDO apt-get install -y -q openjdk-8-jdk-headless xvfb openbox xdotool psmisc \
     python3.10-venv python3.10-dev
 java -version || { echo "PROVISION-FAILED: java"; exit 1; }
 python3.10 --version || { echo "PROVISION-FAILED: python3.10"; exit 1; }
@@ -44,13 +60,13 @@ echo "=== STAGE 1b: VirtualGL (GPU headless GL via EGL) ==="
 if ! which vglrun >/dev/null 2>&1; then
   VGL_DEB=/tmp/virtualgl_3.1.1_amd64.deb
   # Prefer the byte-exact cached .deb (reproducible); fall back to SourceForge.
-  if [ -f pod_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb ]; then
-    cp pod_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb "$VGL_DEB"
+  if [ -f host_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb ]; then
+    cp host_repository/data/minerl_build/virtualgl_3.1.1_amd64.deb "$VGL_DEB"
   else
     wget -qO "$VGL_DEB" "https://sourceforge.net/projects/virtualgl/files/3.1.1/virtualgl_3.1.1_amd64.deb/download" \
       || { echo "PROVISION-FAILED: virtualgl download"; exit 1; }
   fi
-  apt-get install -y -q "$VGL_DEB" || dpkg -i "$VGL_DEB" \
+  $SUDO apt-get install -y -q "$VGL_DEB" || $SUDO dpkg -i "$VGL_DEB" \
     || { echo "PROVISION-FAILED: virtualgl install"; exit 1; }
 fi
 which vglrun || { echo "PROVISION-FAILED: virtualgl missing"; exit 1; }
@@ -63,7 +79,7 @@ echo "=== STAGE 1c: Tailscale + socat (OPTIONAL — external-server play) ==="
 # up` LOGIN is interactive (device approval) and CANNOT be scripted — it is a
 # manual step, see scripts/connect_server.sh + docs/SERVER_CONNECTION.md.
 if ! which tailscale >/dev/null 2>&1; then
-  curl -fsSL https://tailscale.com/install.sh | sh || \
+  curl -fsSL https://tailscale.com/install.sh | $SUDO sh || \
     echo "WARN: tailscale install failed (external-server play unavailable)"
 fi
 which socat >/dev/null 2>&1 || apt-get install -y -q socat || \
@@ -372,12 +388,12 @@ echo "=== STAGE 6: ollama + the VLM THE CONFIG ASKS FOR ==="
 # useless for weeks; qwen2.5vl:7b scored 8/8 on the same probe battery).
 # A provisioner that installs a different model than the run requests is a
 # silent, expensive drift, so derive the name from the config itself.
-which ollama || (curl -fsSL https://ollama.com/install.sh | sh)
-pgrep -x ollama >/dev/null || (OLLAMA_DEBUG=0 nohup ollama serve >> podlogs/ollama.log 2>&1 < /dev/null & sleep 5)
+which ollama || (curl -fsSL https://ollama.com/install.sh | $SUDO sh)
+pgrep -x ollama >/dev/null || (OLLAMA_DEBUG=0 nohup ollama serve >> runlogs/ollama.log 2>&1 < /dev/null & sleep 5)
 # append-mode above + capper below: 581 MB of VLM-server chatter in 5 days
 # (measured 2026-08-16) would eat the disk on a long lifelong run
-pgrep -f "cap_log[.]sh podlogs/ollama[.]log" >/dev/null || \
-  (nohup bash scripts/cap_log.sh podlogs/ollama.log >> podlogs/cap_log.log 2>&1 < /dev/null &)
+pgrep -f "cap_log[.]sh runlogs/ollama[.]log" >/dev/null || \
+  (nohup bash scripts/cap_log.sh runlogs/ollama.log >> runlogs/cap_log.log 2>&1 < /dev/null &)
 # NOTE the key is symbolic_grounding.model — NOT llm.model, which names the
 # (disabled) text model llama3.1:8b. Pulling that one would waste 5 GB and
 # still leave the grounding head with no teacher.

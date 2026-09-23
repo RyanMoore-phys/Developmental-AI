@@ -937,7 +937,7 @@ replay/WM reward head); the raw env reward stream (metrics, spike discovery,
 grading) is untouched. Goal discovery now ingests ALL parallel streams
 (signature clustering dedups cross-stream events) — 8× the odds of the first
 grounding event. Tests: `_vision_scaffold_smoke.py` (stub-VLM semantics,
-all-stream mint+dedup, Crafter loop wiring), `_vision_pod_smoke.py` (real
+all-stream mint+dedup, Crafter loop wiring), `_vision_host_smoke.py` (real
 llava on real gameplay frames, strict-JSON + latency + competence checks).
 
 **Adversarial review (18-agent workflow, 2026-07-16):** 11 confirmed findings,

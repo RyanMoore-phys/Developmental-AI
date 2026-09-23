@@ -1,7 +1,7 @@
 # Provisioning a fresh pod
 
 MineRL v1.0.0 + MCP-Reborn is **notoriously fragile** to build. The authoritative
-script is `data/scripts/provision_pod.sh` (also `scripts/provision_pod.sh` in the
+script is `data/scripts/provision_host.sh` (also `scripts/provision_host.sh` in the
 parent repo). This doc explains the non-obvious traps so you can debug it — do
 NOT try to reproduce the build by hand from memory; run the script and consult
 this when a step fails.

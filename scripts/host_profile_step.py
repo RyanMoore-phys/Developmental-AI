@@ -8,7 +8,7 @@ while the instrument sat there fully built.
 
 This reads the accumulator directly. No new instrumentation, no guessing.
 
-    PYTHONPATH=. python scripts/pod_profile_step.py --steps 120
+    PYTHONPATH=. python scripts/host_profile_step.py --steps 120
 """
 import argparse
 import json
@@ -25,7 +25,7 @@ def main():
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--config", default="configs/minecraft_skybot.yaml")
     ap.add_argument("--envs", type=int, default=2)
-    ap.add_argument("--out", default="podlogs/profile")
+    ap.add_argument("--out", default="runlogs/profile")
     ap.add_argument("--no-vlm", action="store_true",
                     help="disable the symbolizer to isolate its cost")
     ap.add_argument("--no-async", action="store_true",

@@ -5,7 +5,7 @@ Moves the self-hosted runner off the dev Mac and onto a mini running Linux,
 storage, starting **automatically on boot**, on a machine that **powers itself
 back on after an outage**.
 
-No application code changes. `deploy.yml`, `pod.yml` and `pipeline.yml` already
+No application code changes. `deploy.yml`, `host.yml` and `pipeline.yml` already
 say `runs-on: self-hosted`, which matches any self-hosted runner on any OS.
 `ci.yml` runs the test suite on GitHub-hosted `ubuntu-latest` and never touches
 this machine.
@@ -17,7 +17,7 @@ this machine.
 | | Where it runs |
 |---|---|
 | `ci.yml` — the 12-suite test gate | GitHub-hosted `ubuntu-latest` |
-| `deploy.yml`, `pod.yml`, `pipeline.yml` | **this runner** |
+| `deploy.yml`, `host.yml`, `pipeline.yml` | **this runner** |
 
 So the container needs `openssh-client` and `rsync` (it ssh/rsyncs to the
 training pod) and **not** a Python/ML stack. It is close to idle in steady
@@ -47,7 +47,7 @@ goes near GitHub.
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 # copy skybot_ed25519 across from the dev Mac, then:
 chmod 600 ~/.ssh/skybot_ed25519
-ssh -i ~/.ssh/skybot_ed25519 -p <POD_SSH_PORT> root@<POD_HOST> hostname
+ssh -i ~/.ssh/skybot_ed25519 -p <MAIN_SSH_PORT> root@<MAIN_HOST> hostname
 ```
 
 Do that last check **before** building anything — it isolates "key/network is
@@ -58,10 +58,10 @@ wrong" from "container is wrong", which otherwise present identically.
 ```bash
 git clone https://github.com/<your-org>/Developmental-AI.git
 cd Developmental-AI/docker/runner
-# THE NAME MUST BE `.env` — compose interpolates ${POD_SSH_KEY_HOST_PATH}
+# THE NAME MUST BE `.env` — compose interpolates ${MAIN_SSH_KEY_HOST_PATH}
 # at parse time and only reads the shell or a file called exactly `.env`.
 cp runner.env.example .env && chmod 600 .env
-# edit .env: RUNNER_TOKEN, POD_SSH_KEY_HOST_PATH, POD_HOST, POD_SSH_PORT
+# edit .env: RUNNER_TOKEN, MAIN_SSH_KEY_HOST_PATH, MAIN_HOST, MAIN_SSH_PORT
 docker compose up -d --build
 docker compose logs -f          # expect "Listening for Jobs"
 ```
@@ -76,7 +76,7 @@ you wipe the volumes.
 ```bash
 # 1. GitHub -> Settings -> Actions -> Runners shows it Idle
 # 2. the mounted key and the network path both work, from INSIDE the container:
-docker compose exec runner bash -c 'ssh -i "$POD_SSH_KEYFILE" -p "$POD_SSH_PORT" root@"$POD_HOST" hostname'
+docker compose exec runner bash -c 'ssh -i "$MAIN_SSH_KEYFILE" -p "$MAIN_SSH_PORT" root@"$MAIN_HOST" hostname'
 # 3. resource caps are actually applied:
 docker stats --no-stream skybot-runner
 # 4. Actions -> pod -> Run workflow -> action=status   (read-only)
@@ -129,7 +129,7 @@ mode there is.
 |---|---|
 | Logs | `docker compose logs -f` |
 | Restart | `docker compose restart` |
-| Update `POD_SSH_PORT` after a pod restart | edit `.env`, then `docker compose up -d` |
+| Update `MAIN_SSH_PORT` after a pod restart | edit `.env`, then `docker compose up -d` |
 | Upgrade the runner | bump `RUNNER_VERSION` in the Dockerfile, `docker compose up -d --build` |
 | Full reset | `docker compose down -v` (wipes registration — needs a fresh token) |
 

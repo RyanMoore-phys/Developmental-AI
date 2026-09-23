@@ -23,7 +23,7 @@ import time
 
 import numpy as np
 
-FRAMES = "podlogs/hold_probe_frames"
+FRAMES = "runlogs/hold_probe_frames"
 
 
 def save(arr, name, upscale=1):

@@ -62,11 +62,11 @@ in every test docstring, and it's what works on the pod.
 
 Training does **not** run on the Mac. It runs on a rented GPU pod
 (`scripts/launch_skybot.sh`, kept alive by `scripts/supervise_skybot.sh`).
-See `pod_repository/docs/RUNNING.md`.
+See `host_repository/docs/RUNNING.md`.
 
 ### Stopping a run
 
-`touch podlogs/STOP` — graceful, and the supervisor won't restart it. Do **not**
+`touch runlogs/STOP` — graceful, and the supervisor won't restart it. Do **not**
 `kill` the python process: the supervisor treats that as a crash and relaunches.
 Also note `pkill -f "tailscale nc <ip>"` will kill the **socat bridge** too
 (socat's cmdline contains that string) — this has stranded a run before.
@@ -208,12 +208,59 @@ system.
   — far tighter than the pod it replaced (16 GB VRAM, 128 cores, 125 GB RAM),
   and several config values were cut to fit (see below). Everything still
   installs at `/workspace/devai` and deploys as `root@`, deliberately: the box
-  is shaped like a pod so no deploy script, workflow or path needed changing.
-  The old vast.ai pod is off. IPs in `pod_repository/docs/RUNNING.md` and
-  `scripts/deploy_skybot.sh` are **stale** (older RunPod box).
+  is shaped like a pod so almost nothing needed changing. **One thing did, and
+  it cost a failed deploy (2026-09-22): `/workspace` itself.** On RunPod that
+  was the platform-mounted network volume, present before any script ran —
+  nothing in this repo has ever created it, and `provision_host.sh` opens with
+  `cd /workspace/devai || exit 1`, so it cannot be what makes it either. On an
+  owned box nobody mounts it, and `rsync` creates only the LAST path component,
+  so the deploy died on `mkdir "/workspace/devai" failed: No such file or
+  directory (2)` — **exit code 11, which reads like a permissions problem and
+  is not one.** `deploy_skybot.sh` now creates it and prints the filesystem and
+  free space, because a silently-created `/workspace` on the root disk is also
+  how you would learn far too late that a data volume failed to mount.
+  The old vast.ai pod is off. IPs in `host_repository/docs/RUNNING.md` are
+  **stale** (older RunPod box).
 - **Everything targets the host via the runner's `.env`**, never a value in the
-  tree: `POD_HOST`, `POD_SSH_PORT`, `POD_SSH_KEYFILE`, `MC_SERVER_TS_IP`. To
+  tree: `MAIN_HOST`, `MAIN_SSH_PORT`, `MAIN_SSH_KEYFILE`, `MAIN_USER`,
+  `MC_SERVER_TS_IP`. To
   move hosts again, edit `.env` — not the repo. See `docs/CI_SETUP.md`.
+  **These were `POD_*` until 2026-09-22** (138 occurrences across 14 files).
+  Renamed because the name had stopped describing the thing: there is no pod,
+  the target is the owned box `main`, and the port no longer rotates. There is
+  deliberately **no `POD_*` fallback** — every consumer guards with `:?` and
+  names the missing variable, so a stale `.env` fails loudly at the preflight
+  instead of expanding to `root@` and reporting `Could not resolve hostname`.
+- **`MAIN_USER` (added 2026-09-22) — the login account, was hardcoded `root`.**
+  RunPod only ever gave you root; `main` is a normal Ubuntu box, so it is
+  `skybot`. Default stays `root`, so a root host is unchanged. **A non-root
+  `MAIN_USER` REQUIRES PASSWORDLESS SUDO on the target** — provisioning installs
+  apt packages and creates `/workspace` under `/`. `provision_host.sh` now routes
+  every privileged command through `$SUDO` (empty when already root) and aborts
+  at the top with a `sudoers.d` recipe if `sudo -n true` fails; it runs detached
+  under `nohup` with no tty, so a password prompt would not block visibly — it
+  would just fail stages silently amid `set -x` noise.
+- **Keep `MAIN_HOST` an IP, not the name `main`.** The runner on `node1` is
+  **dockerized**, and `docker/runner/docker-compose.yml` sets no `extra_hosts`
+  and no `dns`. A container does not inherit `node1`'s `/etc/hosts`, and mDNS
+  (`main.local`) needs an avahi client it does not have — so a name that
+  resolves perfectly in your shell fails inside the container as `Could not
+  resolve hostname`. Use `skybot@main` freely in hand-typed commands; leave
+  the `.env` on the address. To use the name there too, add
+  `extra_hosts: ["main:192.168.1.10"]` to the runner service first.
+- **`podlogs/` is now `runlogs/`, and every `pod_*` file is `host_*` (2026-09-22).**
+  267 references across 61 files; `pod.yml` became `host.yml` (safe — `deploy.yml`
+  triggers on `workflows: ["ci"]`, never on this one). **THE TRAP IS BRAIN STATE,
+  NOT CODE.** `break_memory_path` lives under that directory, so any backup taken
+  before this rename carries `podlogs/` paths: restoring one onto a renamed tree
+  silently starts the break memory EMPTY rather than erroring, and the agent
+  re-opens every mastered block tier at full worth. On restore, `mv podlogs
+  runlogs` FIRST. This was safe to do now only because `main` was unprovisioned
+  and the old pod was already off — there was no live state to orphan.
+- **The runner lives on `node1`, a DIFFERENT machine from the training host.**
+  `node1` runs the self-hosted Actions runner and holds the only `.env`; `main`
+  (192.168.1.10) is the box everything deploys to. Its `hostname` really does
+  print `main`, which is the quickest way to tell which one you are sitting on.
 - **Game server:** the user's own Paper server, on **another LAN machine**,
   reached through `socat` → `127.0.0.1:25565` exactly as before. The bridge now
   has **two far sides** and picks by address family: RFC1918 goes over plain
@@ -244,7 +291,7 @@ system.
   and replaces it with *disk failure* — 256 GB, one NVMe, no redundancy — so
   the habit still stands: **rsync the brain host→Mac periodically during long
   runs.** Code always flows Mac→host, so code is never at risk.
-  **`pull_brain.sh` does not exist** despite `deploy_pod.sh`'s header citing
+  **`pull_brain.sh` does not exist** despite `deploy_host.sh`'s header citing
   it; nothing automates this yet.
 
 ---
@@ -262,7 +309,7 @@ system.
   **per-instance** spec. Slot 0 keeps the bare name `SkyBot` (the offline UUID
   owns that player's data).
 - Boot hangs are solved by **VirtualGL EGL + per-core `taskset`** (an NVIDIA/AMD
-  memcpy race); this is baked into `provision_pod.sh`.
+  memcpy race); this is baked into `provision_host.sh`.
 
 ---
 
@@ -277,7 +324,7 @@ system.
 | Sensors, slots, action space | `docs/PLURALITY_ROADMAP.md` — phases 1-7 |
 | How any of it gets proven | `docs/TESTING_PLAN.md` — stages 0-5 |
 | What's next | `NEXT_OBJECTIVES.md`, `ROADMAP.md` |
-| Pod ops | `pod_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
+| Pod ops | `host_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
 | Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |
 
 ---

@@ -60,7 +60,7 @@ class InfraStack:
     """Bundle of general monitors with graceful per-piece degradation."""
 
     def __init__(self, cfg: Optional[dict], action_dim: int,
-                 log_dir: str = "podlogs"):
+                 log_dir: str = "runlogs"):
         cfg = dict(cfg or {})
         self.enabled = bool(cfg.get("enabled", True))
         self.log_dir = str(cfg.get("log_dir", log_dir))

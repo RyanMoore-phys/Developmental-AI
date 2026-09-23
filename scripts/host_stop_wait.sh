@@ -26,10 +26,10 @@
 # --allow-stop-live. Two real bugs, read as flaky tooling.
 #
 # NEVER `kill`: the supervisor treats a killed process as a crash and
-# relaunches it (CLAUDE.md §2). `touch podlogs/STOP` is the only stop that
+# relaunches it (CLAUDE.md §2). `touch runlogs/STOP` is the only stop that
 # stays stopped.
 #
-# Usage: pod_stop_wait.sh [timeout_seconds]   (default 1200 = 20 min)
+# Usage: host_stop_wait.sh [timeout_seconds]   (default 1200 = 20 min)
 set -euo pipefail
 
 TIMEOUT="${1:-1200}"
@@ -37,11 +37,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The pattern is SPLIT so this command line cannot match itself in pgrep —
 # the same self-match trap documented in supervise_skybot.sh.
-bash "$HERE/pod_exec.sh" "
+bash "$HERE/host_exec.sh" "
   set -eu
   cd /workspace/devai
   R=\"run_min\"\"ecraft\"
-  touch podlogs/STOP
+  touch runlogs/STOP
   echo 'STOP written; the agent finishes its segment, saves the brain, exits.'
   echo 'A full graceful stop is ~13 min (segment ~5, replay buffer ~8.5).'
   DEADLINE=\$(( \$(date +%s) + ${TIMEOUT} ))
@@ -51,9 +51,9 @@ bash "$HERE/pod_exec.sh" "
       exit 0
     fi
     # Show progress so a long wait is legible rather than looking hung.
-    echo \"  still running (\$(( DEADLINE - \$(date +%s) ))s of budget left) — \$(tail -1 podlogs/minecraft_skybot_run.log 2>/dev/null | cut -c1-90)\"
+    echo \"  still running (\$(( DEADLINE - \$(date +%s) ))s of budget left) — \$(tail -1 runlogs/minecraft_skybot_run.log 2>/dev/null | cut -c1-90)\"
     sleep 15
   done
-  echo \"TIMED OUT after ${TIMEOUT}s with training still alive (pid \$(cat podlogs/skybot_run.pid 2>/dev/null || echo unknown)).\"
+  echo \"TIMED OUT after ${TIMEOUT}s with training still alive (pid \$(cat runlogs/skybot_run.pid 2>/dev/null || echo unknown)).\"
   echo \"The STOP file is in place, so it should still exit on its own; re-run stop to keep waiting.\"
   exit 1"

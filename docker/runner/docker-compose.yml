@@ -9,6 +9,16 @@
 # runner back after a reboot or a power cut with no human step. Note
 # `unless-stopped` rather than `always`: if you deliberately `docker compose
 # stop` the runner, it should STAY stopped across a reboot.
+# ---- PROJECT NAME IS PINNED (added 2026-09-22) ----------------------------
+# Compose derives the project name from the DIRECTORY unless told otherwise,
+# and the `runner_work` volume below is project-scoped -> `<project>_runner_work`.
+# So running this file from a different path silently creates a DIFFERENT
+# volume: the runner loses its registration, re-registers (needing a fresh
+# RUNNER_TOKEN) and re-clones every checkout. Pinning the name makes the
+# directory irrelevant, which is what lets this move from a hand-copied
+# ~/skybot-runner into a git checkout without touching the registration.
+name: skybot-runner
+
 services:
   runner:
     build:
@@ -25,7 +35,7 @@ services:
     #   * `${VAR}`     -> interpolated into THIS YAML at PARSE time, and it
     #                     reads ONLY the shell environment or a file literally
     #                     called `.env` in this directory
-    # The volume mount below uses `${POD_SSH_KEY_HOST_PATH}`, so with the
+    # The volume mount below uses `${MAIN_SSH_KEY_HOST_PATH}`, so with the
     # values in `runner.env` Compose never saw it and every command — even
     # `down -v` — failed with "required variable is missing" while the value
     # sat right there in the file. Naming it `.env` makes one file serve both.
@@ -52,7 +62,7 @@ services:
     volumes:
       # The pod SSH key, READ-ONLY. This is why the pipeline needs no GitHub
       # secret at all: the credential stays on this host and is mounted in.
-      - ${POD_SSH_KEY_HOST_PATH:?set POD_SSH_KEY_HOST_PATH in docker/runner/.env (the file MUST be named .env — see the env_file note above)}:/home/runner/.ssh/skybot_ed25519:ro
+      - ${MAIN_SSH_KEY_HOST_PATH:?set MAIN_SSH_KEY_HOST_PATH in docker/runner/.env (the file MUST be named .env — see the env_file note above)}:/home/runner/.ssh/skybot_ed25519:ro
       # Persist registration + checkouts so a restart does not re-register or
       # re-clone. The entrypoint checks for .runner and skips config.sh.
       # Persists job checkouts across a container restart. The image creates

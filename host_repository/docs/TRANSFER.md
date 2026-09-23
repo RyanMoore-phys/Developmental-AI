@@ -4,7 +4,7 @@ RunPod pods are ephemeral; the **MooseFS `/workspace` network volume is
 persistent**. If the new pod re-attaches the same volume, the brain
 (`skill_bank_mc_curiosity/`) and the built jar are already there — you only
 re-connect + re-sync code. If it's a fresh volume, you must re-provision AND
-restore the brain from a backup like `../pod_repository/data/`.
+restore the brain from a backup like `../host_repository/data/`.
 
 ## Connecting to a restarted/new pod (the 3 gotchas that bit us)
 
@@ -50,7 +50,7 @@ rsync -rlpt --partial -e "ssh …same…" \
   DEST/skill_bank_mc_curiosity/
 ```
 
-Backup is at `../pod_repository/data/skill_bank_mc_curiosity/` as of 2026-07-22.
+Backup is at `../host_repository/data/skill_bank_mc_curiosity/` as of 2026-07-22.
 The **3.5 GB is mostly per-skill `policy.pt` PPO snapshots** — they ARE the skill
 weights, so they're vital, not bloat. There is NO separate policy/WM checkpoint
 (`minecraft_lifelong_results/` had no `.pt`) — the skill bank is the durable state.
@@ -59,7 +59,7 @@ weights, so they're vital, not bloat. There is NO separate policy/WM checkpoint
 
 ```bash
 rsync -rlptz -e "ssh …" \
-  ../pod_repository/data/skill_bank_mc_curiosity/ \
+  ../host_repository/data/skill_bank_mc_curiosity/ \
   root@<IP>:/workspace/devai/skill_bank_mc_curiosity/
 ```
 
@@ -71,7 +71,7 @@ confirming the restore landed.
 
 1. Get IP + port; connect (the 3 gotchas above).
 2. `du -sh /workspace/devai` — volume re-attached (has venv_mc + jar + bank) or fresh?
-3. If fresh: run `scripts/provision_pod.sh` (see `PROVISIONING.md`); restore the
+3. If fresh: run `scripts/provision_host.sh` (see `PROVISIONING.md`); restore the
    brain backup.
 4. `rsync` current code from the Mac (`developmental_ai configs scripts run_minecraft.py`).
 5. `bash scripts/launch_lifelong.sh 1000000`; verify boot + `h_evolve` + no errors.
@@ -80,6 +80,6 @@ confirming the restore landed.
 
 - `skill_bank_mc_curiosity_predup_archive_704550/` (1.7 GB) — a pre-dedup backup
   of the 16 restored skills; largely redundant with the active bank.
-- `podlogs/*.log` — diagnostic history (rescued to `data/logs/`).
+- `runlogs/*.log` — diagnostic history (rescued to `data/logs/`).
 - The built jar (`…/MCP-Reborn/build/libs/mcprec-6.13.jar`) — re-buildable but
   saves the whole provisioning saga if you keep a copy.

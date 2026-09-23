@@ -9,7 +9,7 @@
 # Truncating under an append-mode (`>>`) writer is fully safe: its next
 # write lands at the new EOF.
 #
-# Born 2026-08-16: podlogs/ollama.log hit 581 MB in 5 days (llama-server at
+# Born 2026-08-16: runlogs/ollama.log hit 581 MB in 5 days (llama-server at
 # log-verbosity 4). Same lesson as the 18 GB java log, generalised into a
 # reusable guard instead of a third one-off.
 FILE=${1:?usage: cap_log.sh <file> [max_kb] [keep_bytes] [interval_s]}

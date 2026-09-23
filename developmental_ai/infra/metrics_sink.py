@@ -21,7 +21,7 @@ WHY fsync, NOT JUST flush
     written record is on disk when `write()` returns.
 
 WHY ROTATION IS NOT OPTIONAL
-    `podlogs/ollama.log` reached 29 MB unattended in this project, and the VLM
+    `runlogs/ollama.log` reached 29 MB unattended in this project, and the VLM
     chatter that filled it needed a dedicated capper script. A per-segment
     record on a multi-day run does the same more slowly. Rotating here means
     the tracker cannot be the thing that fills the pod's disk.
@@ -76,7 +76,7 @@ class MetricsSink:
     def __init__(self, cfg: Optional[dict] = None):
         cfg = dict(cfg or {})
         self.enabled = bool(cfg.get("enabled", True))
-        self.path = str(cfg.get("path", "podlogs/metrics.jsonl"))
+        self.path = str(cfg.get("path", "runlogs/metrics.jsonl"))
         # 64 MB default: ~100k segments at typical record size, and small
         # enough that the rsync backfill of a rotated file stays quick.
         self.max_bytes = int(cfg.get("max_bytes", 64 * 1024 * 1024))

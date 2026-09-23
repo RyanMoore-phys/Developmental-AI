@@ -83,7 +83,7 @@ class UnstuckAdvisor:
     def __init__(self, query_fn: Callable[[str, Optional[List[bytes]]],
                                           Optional[str]],
                  min_gap: int = 4096,
-                 log_dir: str = "podlogs",
+                 log_dir: str = "runlogs",
                  response_file: str = "help_responses.jsonl"):
         self._query = query_fn
         self.min_gap = int(min_gap)

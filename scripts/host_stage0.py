@@ -21,7 +21,7 @@ Exit code 0 = go. Non-zero = stop and report, which is what the standing
 instruction asks for.
 
 Run on the pod:
-    PYTHONPATH=. python scripts/pod_stage0.py --all
+    PYTHONPATH=. python scripts/host_stage0.py --all
 """
 import argparse
 import json
@@ -152,7 +152,7 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--image-size", type=int, default=128)
     ap.add_argument("--render-size", type=int, default=384)
-    ap.add_argument("--out", default="podlogs/stage0")
+    ap.add_argument("--out", default="runlogs/stage0")
     a = ap.parse_args()
 
     print("=== Stage 0: MineRL feasibility ===")

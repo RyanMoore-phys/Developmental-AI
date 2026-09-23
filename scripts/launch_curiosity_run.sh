@@ -8,7 +8,7 @@ set -e
 cd /workspace/devai
 TS=${1:-400000}
 SEED=${2:-0}
-LOG=podlogs/minecraft_curiosity_run.log
+LOG=runlogs/minecraft_curiosity_run.log
 
 # refuse to double-launch
 if pgrep -f "run_minecraft[.]py" >/dev/null; then
@@ -21,7 +21,7 @@ fi
 # infra
 pgrep -f "Xvfb [:]77" >/dev/null || { nohup Xvfb :77 -screen 0 800x600x24 >/dev/null 2>&1 < /dev/null & sleep 2; }
 DISPLAY=:77 sh -c 'pgrep -x openbox >/dev/null' || { DISPLAY=:77 nohup openbox >/dev/null 2>&1 < /dev/null & sleep 1; }
-pgrep -x ollama >/dev/null || { nohup ollama serve > podlogs/ollama.log 2>&1 < /dev/null & sleep 5; }
+pgrep -x ollama >/dev/null || { nohup ollama serve > runlogs/ollama.log 2>&1 < /dev/null & sleep 5; }
 ollama list | grep -q llava || { echo "REFUSED: llava model missing"; exit 1; }
 
 DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MINERL_HEADLESS=1 \
@@ -31,5 +31,5 @@ DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MINERL_HEADLESS=1 \
     --out minecraft_curiosity_results > "$LOG" 2>&1 < /dev/null &
 PY=$!
 disown
-echo "$PY" > podlogs/curiosity_run.pid
+echo "$PY" > runlogs/curiosity_run.pid
 echo "LAUNCHED python_pid=$PY log=$LOG"

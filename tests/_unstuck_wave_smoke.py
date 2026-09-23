@@ -13,7 +13,7 @@ THE LIVE FINDINGS THIS ENCODES (vast.ai pod, run of 2026-08-16)
     3. The pitch clamp is an attractor with no exit tax: the gaze-bucket
        bonus saturates 1/sqrt(n), so nothing durable prices leaning on the
        clamp.
-    4. (ops) podlogs/ollama.log: 581 MB in 5 days — capped in the launch
+    4. (ops) runlogs/ollama.log: 581 MB in 5 days — capped in the launch
        scripts, not tested here.
 
 Contracts:

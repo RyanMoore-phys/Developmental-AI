@@ -1721,7 +1721,7 @@ class DevelopmentalAI:
         if bv_cfg.get("enabled", False):
             from developmental_ai.skill_bank.brain_state import (
                 BrainStateEmitter)
-            _bv_dir = bv_cfg.get("out_dir", "podlogs/brain")
+            _bv_dir = bv_cfg.get("out_dir", "runlogs/brain")
             os.makedirs(_bv_dir, exist_ok=True)
             self.brain_emitter = BrainStateEmitter(
                 self.skill_bank,
@@ -2182,7 +2182,7 @@ class DevelopmentalAI:
                 self.consequence = ConsequenceMap(_cq_cfg)
                 _cqp = os.path.join(
                     str((self.config.get("infra", {}) or {}).get(
-                        "log_dir", "podlogs")), "consequence_state.json")
+                        "log_dir", "runlogs")), "consequence_state.json")
                 self._consequence_path = _cqp
                 if self.consequence.load(_cqp):
                     logger.info(
@@ -2221,7 +2221,7 @@ class DevelopmentalAI:
                 self.anticipation = AnticipationMap(_an_cfg)
                 _anp = os.path.join(
                     str((self.config.get("infra", {}) or {}).get(
-                        "log_dir", "podlogs")), "anticipation_state.json")
+                        "log_dir", "runlogs")), "anticipation_state.json")
                 self._anticipation_path = _anp
                 if self.anticipation.load(_anp):
                     logger.info(
@@ -2268,7 +2268,7 @@ class DevelopmentalAI:
                 if _hb > 0:
                     _hcfg = dict(_mcfg)
                     _hcfg["path"] = _mcfg.get(
-                        "heartbeat_path", "podlogs/heartbeat.jsonl")
+                        "heartbeat_path", "runlogs/heartbeat.jsonl")
                     # fsync EVERY 15s would be gratuitous — a lost heartbeat
                     # costs one dashboard point, unlike a lost segment record.
                     _hcfg["fsync"] = bool(_mcfg.get("heartbeat_fsync", False))
@@ -8850,7 +8850,7 @@ class DevelopmentalAI:
         try:
             if self.consequence is not None:
                 self.consequence.save(getattr(self, "_consequence_path",
-                                              "podlogs/consequence_state.json"))
+                                              "runlogs/consequence_state.json"))
         except Exception as _e:
             logger.warning("consequence checkpoint failed: %s", _e)
 
@@ -8861,7 +8861,7 @@ class DevelopmentalAI:
             if self.anticipation is not None:
                 self.anticipation.save(getattr(
                     self, "_anticipation_path",
-                    "podlogs/anticipation_state.json"))
+                    "runlogs/anticipation_state.json"))
         except Exception as _e:
             logger.warning("anticipation checkpoint failed: %s", _e)
 
@@ -9783,7 +9783,7 @@ class DevelopmentalAI:
                 # total_timesteps (see _frames_per).
                 min_gap=self._frames_per(
                     int(_icfg.get("advisor_min_gap", 4096))),
-                log_dir=str(_icfg.get("log_dir", "podlogs")))
+                log_dir=str(_icfg.get("log_dir", "runlogs")))
             self._unstuck_advisor = adv
         _cats = (list(getattr(self.vision_scaffold, "target_categories",
                               None) or [])

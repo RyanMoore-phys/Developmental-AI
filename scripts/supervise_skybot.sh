@@ -19,22 +19,22 @@
 #   launcher's own pre-flight still refuses to start on a dead tunnel, so a
 #   broken bridge produces a clean refusal loop rather than a stranded agent.
 #
-#   STOP-FILE AWARE: `touch podlogs/STOP` ends the supervision loop cleanly —
+#   STOP-FILE AWARE: `touch runlogs/STOP` ends the supervision loop cleanly —
 #   the same file lifelong.stop_file already uses, so a deliberate stop is
 #   never mistaken for a crash and restarted.
 #
 # Usage:
 #   setsid nohup bash scripts/supervise_skybot.sh 4000000 \
-#       > podlogs/supervisor.log 2>&1 < /dev/null &
+#       > runlogs/supervisor.log 2>&1 < /dev/null &
 set -u
 cd /workspace/devai
 
 TS=${1:-4000000}
 BACKOFF=15          # seconds after a crash; doubles, capped
 MAX_BACKOFF=300
-STOP=podlogs/STOP
-CRASHLOG=podlogs/crashes.log
-mkdir -p podlogs
+STOP=runlogs/STOP
+CRASHLOG=runlogs/crashes.log
+mkdir -p runlogs
 
 echo "[supervisor] started $(date -Is) budget=$TS"
 
@@ -91,14 +91,14 @@ while true; do
     # crash loop hides the very fault it is papering over.
     {
         echo "=== agent exited $(date -Is) ==="
-        tail -30 podlogs/minecraft_skybot_run.log 2>/dev/null \
+        tail -30 runlogs/minecraft_skybot_run.log 2>/dev/null \
             | grep -A22 "Traceback" | head -30
         echo
     } >> "$CRASHLOG"
     # A DETERMINISTIC fault (one that fires on the first segment every time)
     # cannot resolve itself, and retrying it just walks the backoff to its cap
     # and idles the pod while looking like progress. Stop loudly instead.
-    SIG=$(tail -30 podlogs/minecraft_skybot_run.log 2>/dev/null \
+    SIG=$(tail -30 runlogs/minecraft_skybot_run.log 2>/dev/null \
           | grep -m1 -E "^[A-Za-z_.]*(Error|Exception)" | cut -c1-120)
     if [ -n "$SIG" ] && [ "$SIG" = "${LAST_SIG:-}" ]; then
         SAME=$(( ${SAME:-1} + 1 ))

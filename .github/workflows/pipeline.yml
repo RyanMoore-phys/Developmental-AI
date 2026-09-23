@@ -1,6 +1,6 @@
 # The whole chain in one place: preflight -> deploy -> connect -> launch -> report.
 #
-# This is the "run everything" workflow. Unlike pod.yml (one action at a time)
+# This is the "run everything" workflow. Unlike host.yml (one action at a time)
 # each stage here is its own JOB, so the run view shows a chain of boxes and a
 # failure tells you WHICH stage broke without reading a log.
 #
@@ -76,19 +76,19 @@ jobs:
       - name: Pod reachable?
         run: |
           set -euo pipefail
-          bash scripts/pod_exec.sh 'echo "pod: $(hostname)"' \
-            || { echo "::error::cannot reach the pod. POD_SSH_PORT rotates on every pod restart — update ~/actions-runner/.env and RESTART the runner (.env is only read at start)."; exit 1; }
+          bash scripts/host_exec.sh 'echo "pod: $(hostname)"' \
+            || { echo "::error::cannot reach the pod. MAIN_SSH_PORT rotates on every pod restart — update ~/actions-runner/.env and RESTART the runner (.env is only read at start)."; exit 1; }
 
       - name: Probe pod state
         id: probe
         run: |
           set -euo pipefail
           # Patterns SPLIT so this command line cannot match itself.
-          OUT=$(bash scripts/pod_exec.sh '
+          OUT=$(bash scripts/host_exec.sh '
             cd /workspace/devai 2>/dev/null || { echo "NOREPO"; exit 0; }
             R="run_min""ecraft"
             pgrep -f "$R[.]py" >/dev/null && echo "LIVE" || echo "IDLE"
-            test -f podlogs/STOP && echo "STOP_PRESENT" || echo "STOP_ABSENT"
+            test -f runlogs/STOP && echo "STOP_PRESENT" || echo "STOP_ABSENT"
             ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "BRIDGE_UP" || echo "BRIDGE_DOWN"')
           echo "$OUT"
           case "$OUT" in *LIVE*) L=true ;; *) L=false ;; esac
@@ -121,10 +121,10 @@ jobs:
           set -euo pipefail
           # Run unconditionally rather than trusting preflight's reading:
           # the script exits immediately when nothing is running, and both
-          # launch paths `rm -f podlogs/STOP` before starting, so a STOP file
+          # launch paths `rm -f runlogs/STOP` before starting, so a STOP file
           # written against an idle pod cannot strand the next launch.
           # Gating on a prior job's probe would only reintroduce a stale read.
-          bash scripts/pod_stop_wait.sh 1200
+          bash scripts/host_stop_wait.sh 1200
 
   deploy:
     # `stop` is in `needs` even when unchecked: a skipped job still resolves,
@@ -142,7 +142,7 @@ jobs:
         # names the fix instead of leaving you to guess at flags.
         run: |
           set -euo pipefail
-          if bash scripts/pod_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
+          if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
             echo "::error::training is STILL LIVE. Re-run this pipeline with stop=true (it waits up to 20 min for a real exit). Do not reach for allow_stop_live unless you intend to discard the current segment."
             exit 1
           fi
@@ -154,7 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "deploying $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
-          bash scripts/deploy_skybot.sh "${POD_SSH_PORT:-22}"
+          bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
 
   connect:
     needs: [preflight, stop, deploy]
@@ -175,7 +175,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${MC_SERVER_TS_IP:?set MC_SERVER_TS_IP in ~/actions-runner/.env}"
-          bash scripts/pod_exec.sh \
+          bash scripts/host_exec.sh \
             "cd /workspace/devai && bash scripts/connect_server.sh bridge ${MC_SERVER_TS_IP}"
 
   launch:
@@ -199,7 +199,7 @@ jobs:
         # chain this pipeline exists to provide. Ask the pod now.
         run: |
           set -euo pipefail
-          if bash scripts/pod_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
+          if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
             echo "::error::training is already LIVE. Relaunching would cost the run's continuity. Re-run with stop=true, which waits for a real exit."
             exit 1
           fi
@@ -213,14 +213,14 @@ jobs:
           # launch_skybot.sh owns the pre-flight and REFUSES if the bridge or
           # server is down — a run started against a dead bridge strands the
           # primary stream in a connect-fail rebuild loop.
-          bash scripts/pod_exec.sh "
+          bash scripts/host_exec.sh "
             cd /workspace/devai
-            rm -f podlogs/STOP
+            rm -f runlogs/STOP
             setsid nohup bash scripts/supervise_skybot.sh ${TS_STEPS} \
-              > podlogs/supervisor.log 2>&1 < /dev/null &
+              > runlogs/supervisor.log 2>&1 < /dev/null &
             sleep 25
-            tail -5 podlogs/supervisor.log
-            echo \"run pid: \$(cat podlogs/skybot_run.pid 2>/dev/null || echo none)\""
+            tail -5 runlogs/supervisor.log
+            echo \"run pid: \$(cat runlogs/skybot_run.pid 2>/dev/null || echo none)\""
 
       - name: Verify it is ACTUALLY running
         run: |
@@ -229,11 +229,11 @@ jobs:
           # long history of things that look started and produce nothing.
           # Wait, then require the run log to exist AND be growing.
           sleep 60
-          bash scripts/pod_exec.sh '
+          bash scripts/host_exec.sh '
             cd /workspace/devai
             R="run_min""ecraft"
             pgrep -f "$R[.]py" >/dev/null || { echo "process died within 60s"; exit 1; }
-            L=podlogs/minecraft_skybot_run.log
+            L=runlogs/minecraft_skybot_run.log
             [ -f "$L" ] || { echo "no run log after 60s"; exit 1; }
             A=$(wc -c < "$L"); sleep 30; B=$(wc -c < "$L")
             echo "log grew $A -> $B bytes"
@@ -259,12 +259,12 @@ jobs:
             echo "| launch | ${{ needs.launch.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          bash scripts/pod_exec.sh '
+          bash scripts/host_exec.sh '
             cd /workspace/devai 2>/dev/null || exit 0
             R="run_min""ecraft"
             pgrep -f "$R[.]py" >/dev/null && echo "training LIVE" || echo "training not running"
-            echo "STOP: $(test -f podlogs/STOP && echo present || echo absent)"
+            echo "STOP: $(test -f runlogs/STOP && echo present || echo absent)"
             ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" && echo "bridge UP" || echo "bridge DOWN"
-            tail -8 podlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log"' \
+            tail -8 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log"' \
             | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"

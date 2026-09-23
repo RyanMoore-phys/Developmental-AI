@@ -84,21 +84,21 @@ jobs:
           set -euo pipefail
           T="${DEPLOY_TRANSPORT:-ssh}"
           if [ "$T" = "tailscale" ]; then
-            : "${POD_HOST:?POD_HOST not set in the runner .env}"
+            : "${MAIN_HOST:?MAIN_HOST not set in the runner .env}"
             command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
             # If this HANGS rather than fails, the tailnet ACL ssh rule is
             # action "check" (interactive re-auth) instead of "accept".
-            tailscale ssh "root@${POD_HOST}" 'echo "pod: $(hostname)"' \
-              || { echo "::error::Tailscale SSH to ${POD_HOST} failed — see docs/CI_SETUP.md"; exit 1; }
+            tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" 'echo "pod: $(hostname)"' \
+              || { echo "::error::Tailscale SSH to ${MAIN_HOST} failed — see docs/CI_SETUP.md"; exit 1; }
           else
-            : "${POD_HOST:?POD_HOST not set in the runner .env (pod IP for ssh transport)}"
-            : "${POD_SSH_PORT:?POD_SSH_PORT not set in the runner .env}"
-            KEY="${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
+            : "${MAIN_HOST:?MAIN_HOST not set in the runner .env (training-host IP for ssh transport)}"
+            : "${MAIN_SSH_PORT:?MAIN_SSH_PORT not set in the runner .env}"
+            KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
             [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY on the runner host"; exit 1; }
-            ssh -p "$POD_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
+            ssh -p "$MAIN_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
-                "root@$POD_HOST" 'echo "pod: $(hostname)"' \
-              || { echo "::error::ssh to $POD_HOST:$POD_SSH_PORT failed. The pod's SSH port rotates on every restart — update POD_SSH_PORT in the runner .env."; exit 1; }
+                "${MAIN_USER:-root}@$MAIN_HOST" 'echo "pod: $(hostname)"' \
+              || { echo "::error::ssh to $MAIN_HOST:$MAIN_SSH_PORT failed. The pod's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
           fi
 
       # STEP-LEVEL TIMEOUT (added 2026-09-02). A hang here used to run until
@@ -109,14 +109,14 @@ jobs:
       - name: Sync code + pod-side smoke tests
         timeout-minutes: 12
         env:
-          # deploy_skybot.sh reads these; POD_HOST/POD_SSH_PORT/POD_SSH_KEYFILE
+          # deploy_skybot.sh reads these; MAIN_HOST/MAIN_SSH_PORT/MAIN_SSH_KEYFILE
           # come from the runner .env and are NOT redefined here (an unset
           # `${{ vars.X }}` would expand to "" and shadow them).
           DEPLOY_LAUNCH: ${{ github.event.inputs.launch == 'true' && '1' || '0' }}
           DEPLOY_ALLOW_STOP_LIVE: ${{ github.event.inputs.allow_stop_live == 'true' && '1' || '0' }}
         run: |
           set -euo pipefail
-          bash scripts/deploy_skybot.sh "${POD_SSH_PORT:-22}"
+          bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
 
       - name: Report final pod state
         run: |
@@ -124,15 +124,15 @@ jobs:
           CMD='cd /workspace/devai 2>/dev/null || exit 0
                R="run_min""ecraft"
                if pgrep -f "$R[.]py" >/dev/null; then
-                 echo "training LIVE (pid $(cat podlogs/skybot_run.pid 2>/dev/null))"
+                 echo "training LIVE (pid $(cat runlogs/skybot_run.pid 2>/dev/null))"
                else
                  echo "training not running"
                fi
-               echo "STOP file: $(test -f podlogs/STOP && echo present || echo absent)"'
+               echo "STOP file: $(test -f runlogs/STOP && echo present || echo absent)"'
           if [ "$T" = "tailscale" ]; then
-            tailscale ssh "root@${POD_HOST}" "$CMD"
+            tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" "$CMD"
           else
-            ssh -p "$POD_SSH_PORT" -i "${POD_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}" \
+            ssh -p "$MAIN_SSH_PORT" -i "${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}" \
               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              "root@$POD_HOST" "$CMD"
+              "${MAIN_USER:-root}@$MAIN_HOST" "$CMD"
           fi

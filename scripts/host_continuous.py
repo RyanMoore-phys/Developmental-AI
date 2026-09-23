@@ -13,13 +13,13 @@ and says what CHANGED, which is the only question worth asking of a system
 that was already green yesterday.
 
   # one cycle
-  PYTHONPATH=. python scripts/pod_continuous.py --once
+  PYTHONPATH=. python scripts/host_continuous.py --once
 
   # every 30 min, forever (nohup it)
-  PYTHONPATH=. python scripts/pod_continuous.py --interval 1800
+  PYTHONPATH=. python scripts/host_continuous.py --interval 1800
 
   # what has moved since the first row
-  PYTHONPATH=. python scripts/pod_continuous.py --report
+  PYTHONPATH=. python scripts/host_continuous.py --report
 """
 import argparse
 import json
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, ".")
 
-LEDGER = "podlogs/continuous_ledger.jsonl"
+LEDGER = "runlogs/continuous_ledger.jsonl"
 
 # Metrics with a DIRECTION we care about, and what direction that is.
 # "down" = should fall (a loss). "stable" = should not wander.
@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--interval", type=int, default=1800)
     ap.add_argument("--tiers", default="unit,contract")
-    ap.add_argument("--metrics", default="podlogs/metrics.json")
+    ap.add_argument("--metrics", default="runlogs/metrics.json")
     a = ap.parse_args()
     if a.report:
         return report()

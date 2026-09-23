@@ -165,7 +165,7 @@ skills_as_options:
   mine_cooccurrence: true
 brain_viewer:
   enabled: true
-  out_dir: podlogs/brain
+  out_dir: runlogs/brain
   interval: 400
   ghost_frontier: true
 skill_composition:
@@ -235,7 +235,7 @@ goals:
   seed: 0
 video:
   enabled: true
-  out_dir: podlogs/mc_videos
+  out_dir: runlogs/mc_videos
   head: 3
   every: 25
   upscale: 6
@@ -243,7 +243,7 @@ video:
 lifelong:
   enabled: false
   forever: false
-  stop_file: podlogs/STOP
+  stop_file: runlogs/STOP
   segment_steps: 1024
   active_skills: 24
   active_goals: 48

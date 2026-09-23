@@ -176,7 +176,7 @@ goals:
   seed: 0
 video:
   enabled: true
-  out_dir: podlogs/mc_videos
+  out_dir: runlogs/mc_videos
   head: 3
   every: 25
   upscale: 4

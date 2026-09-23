@@ -21,7 +21,7 @@ runner on your own machine already has them:
 | Reach the pod | tailnet OAuth client | the machine can already reach it |
 | Which pod / server | repo variables | runner `.env`, a local file |
 
-`deploy.yml` and `pod.yml` reference **zero** `secrets.*` — verified.
+`deploy.yml` and `host.yml` reference **zero** `secrets.*` — verified.
 
 ## Why there is no branch protection
 
@@ -74,18 +74,18 @@ rather than a refactor. To move hosts again, edit this — not the repo.
 ```bash
 cat > ~/actions-runner/.env <<'EOF'
 # --- required ---
-POD_HOST=192.168.1.10           # the main computer, on the LAN
-POD_SSH_PORT=22                  # a fixed box: this no longer rotates
-POD_SSH_KEYFILE=/Users/rimac/.ssh/id_ed25519
+MAIN_HOST=192.168.1.10           # the main computer, on the LAN
+MAIN_SSH_PORT=22                  # a fixed box: this no longer rotates
+MAIN_SSH_KEYFILE=/Users/rimac/.ssh/id_ed25519
 
-# --- required for `pod.yml action=connect` ---
+# --- required for `host.yml action=connect` ---
 MC_SERVER_TS_IP=192.168.1.XX     # the Paper server. LAN IP or tailnet IP —
                                  # connect_server.sh picks the transport from
                                  # the address itself (see below).
 
 # --- optional ---
 # DEPLOY_TRANSPORT=tailscale     # use Tailscale SSH instead of ssh; needs the
-                                 # ACL rule in section 4, and POD_HOST becomes
+                                 # ACL rule in section 4, and MAIN_HOST becomes
                                  # the MagicDNS name (e.g. devai-pod-2)
 # TS_AUTHKEY=tskey-auth-...      # lets `provision` join a fresh box to the
                                  # tailnet without a browser click
@@ -110,14 +110,14 @@ presents `127.0.0.1:25565`, so `environment.remote_server` never changes.
 
 **Switching back to the tailnet when ethernet returns** is one value: set
 `MC_SERVER_TS_IP` to the Paper server's `100.x` address and re-run
-`pod.yml action=connect`. Nothing else moves.
+`host.yml action=connect`. Nothing else moves.
 
 Restart the runner after editing (`./svc.sh stop && ./svc.sh start`) — `.env`
 is read at service start.
 
 ### The one thing you must keep updated
 
-**On a rented pod, `POD_SSH_PORT` changes every restart** (22655 → 22681 →
+**On a rented pod, `MAIN_SSH_PORT` changes every restart** (22655 → 22681 →
 34276 → 19983 → …). When a job fails at the preflight step with an ssh error,
 that is almost always why: update `.env`, restart the runner, re-run.
 
@@ -134,15 +134,15 @@ zero extra configuration.
 ```bash
 # 1. runner shows "Idle" under Settings -> Actions -> Runners
 # 2. transport works, straight from the runner host:
-POD_HOST=... POD_SSH_PORT=... bash scripts/pod_exec.sh 'hostname'
+MAIN_HOST=... MAIN_SSH_PORT=... bash scripts/host_exec.sh 'hostname'
 # 3. read-only workflow:  Actions -> pod -> Run workflow -> action=status
 # 4. then deploy, then connect, then launch.
 ```
 
 ### Bootstrapping a BARE host — provision before you push
 
-**`provision` is self-seeding; `deploy` is not.** `pod.yml action=provision`
-rsyncs the tree itself before running `provision_pod.sh`, so it works against
+**`provision` is self-seeding; `deploy` is not.** `host.yml action=provision`
+rsyncs the tree itself before running `provision_host.sh`, so it works against
 an empty box. `deploy_skybot.sh` runs its smoke tests with
 `./venv_mc/bin/python`, which **provisioning is what creates** — so a deploy
 against a bare host fails at the smoke step, having already synced.
@@ -155,12 +155,12 @@ Order for a fresh box:
 1. Root SSH reachable (`PermitRootLogin prohibit-password`, key in
    `/root/.ssh/authorized_keys`). `provision` creates `/workspace/devai`.
 2. `.env` above → **restart the runner**.
-3. `pod.yml action=status` — read-only; proves the transport.
-4. `pod.yml action=provision confirm_provision=PROVISION` (40–60 min).
+3. `host.yml action=status` — read-only; proves the transport.
+4. `host.yml action=provision confirm_provision=PROVISION` (40–60 min).
    Picks the torch wheel from the card's compute capability — **cu128 on
    Blackwell (RTX 50xx)**, cu124 otherwise — and hard-fails if CUDA is
    visible-but-unusable rather than falling silently back to CPU.
-5. `pod.yml action=connect` — expect `bridge mode: lan` then
+5. `host.yml action=connect` — expect `bridge mode: lan` then
    `SERVER REACHABLE`.
 6. Only now push, or run `deploy.yml` with `launch=false` to sync and
    smoke-test without starting training.
@@ -171,7 +171,7 @@ Do **not** test `action=provision` against a working pod: it does
 
 ## 4. Optional — Tailscale SSH transport
 
-Only if you want to stop updating `POD_SSH_PORT`. On the pod, once:
+Only if you want to stop updating `MAIN_SSH_PORT`. On the pod, once:
 
 ```bash
 tailscale set --ssh=true
@@ -214,7 +214,7 @@ versions off production was right.
 them with:
 
 ```bash
-bash scripts/pod_exec.sh 'cd /workspace/devai && ./venv_mc/bin/pip list'
+bash scripts/host_exec.sh 'cd /workspace/devai && ./venv_mc/bin/pip list'
 ```
 
 A CI that tests a stack the pod does not run is worse than no CI — it reports
@@ -226,7 +226,7 @@ green for a configuration nobody deploys.
 
 | Value | Where | In git? | In GitHub? |
 |---|---|---|---|
-| `POD_HOST`, `POD_SSH_PORT` | runner `.env` | no | no |
+| `MAIN_HOST`, `MAIN_SSH_PORT` | runner `.env` | no | no |
 | SSH private key | `~/.ssh/` on the runner host | no | no |
 | `MC_SERVER_TS_IP` | runner `.env` | no | no |
 | `TS_AUTHKEY` (optional) | runner `.env` | no | no |

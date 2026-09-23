@@ -30,7 +30,7 @@
 # pre-flight refuses to start unless this bridge + tailnet are up).
 set -e
 cd /workspace/devai
-mkdir -p podlogs /workspace/tailscale-state
+mkdir -p runlogs /workspace/tailscale-state
 
 case "${1:-}" in
   login)
@@ -56,10 +56,10 @@ case "${1:-}" in
     pgrep -x tailscaled >/dev/null || {
       nohup tailscaled --tun=userspace-networking \
         --statedir=/workspace/tailscale-state \
-        > podlogs/tailscaled.log 2>&1 < /dev/null &
+        > runlogs/tailscaled.log 2>&1 < /dev/null &
       sleep 3
     }
-    pgrep -x tailscaled >/dev/null || { echo "tailscaled FAILED"; tail -5 podlogs/tailscaled.log; exit 1; }
+    pgrep -x tailscaled >/dev/null || { echo "tailscaled FAILED"; tail -5 runlogs/tailscaled.log; exit 1; }
 
     if [ -n "$AUTHKEY" ]; then
       echo "tailscaled up (userspace). Non-interactive login (authkey)..."
@@ -132,9 +132,9 @@ case "${1:-}" in
     echo "bridge mode: $MODE (far side $IP:25565)"
     pkill -x socat 2>/dev/null || true; sleep 1
     setsid socat "TCP-LISTEN:25565,bind=127.0.0.1,fork,reuseaddr" \
-      "$FAR" > podlogs/socat_mc.log 2>&1 < /dev/null &
+      "$FAR" > runlogs/socat_mc.log 2>&1 < /dev/null &
     sleep 2
-    ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" || { echo "bridge FAILED"; cat podlogs/socat_mc.log; exit 1; }
+    ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" || { echo "bridge FAILED"; cat runlogs/socat_mc.log; exit 1; }
     echo "bridge up ($MODE): 127.0.0.1:25565 -> $IP:25565"
     if timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 2>/dev/null | grep -E "version|players"; then
       echo "SERVER REACHABLE — ready. Launch: bash scripts/launch_skybot.sh 1000000"

@@ -95,7 +95,7 @@ def main():
         hires = rsize > agent.image_size
         agent.env = VideoRecorder(
             agent.env,
-            out_dir=vcfg.get("out_dir", "podlogs/mc_videos"),
+            out_dir=vcfg.get("out_dir", "runlogs/mc_videos"),
             source="render" if hires else "obs",
             image_hw=(agent.image_size, agent.image_size),
             channels=3,

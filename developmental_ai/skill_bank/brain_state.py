@@ -40,7 +40,7 @@ class BrainStateEmitter:
     are in-memory reads except note frontmatter (refreshed lazily)."""
 
     def __init__(self, skill_bank, broadcaster=None, knowledge_graph=None,
-                 symbolizer=None, out_path: str = "podlogs/brain/brain_state.json",
+                 symbolizer=None, out_path: str = "runlogs/brain/brain_state.json",
                  precedence_threshold: float = 0.34, long_term_store=None):
         self.skill_bank = skill_bank
         self.broadcaster = broadcaster

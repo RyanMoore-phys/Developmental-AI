@@ -265,7 +265,7 @@ def test_loop_init_block_actually_runs():
             f"this is the exact bug that made the subsystem inert")
     assert "os.path.join" in block, "path build not using the module's os"
     # and the real join works
-    assert _real_os.path.join("podlogs", "consequence_state.json")
+    assert _real_os.path.join("runlogs", "consequence_state.json")
     print(" 11. loop init block references only resolvable names — the "
           "`_os` silent-death cannot recur")
 

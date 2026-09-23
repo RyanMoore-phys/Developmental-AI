@@ -48,7 +48,7 @@ MineRL that no amount of reading settles.
 
 | # | Question | How | If NO |
 |---|---|---|---|
-| 0.1 | Does MineRL build and step at all on this pod? | `scripts/pod_stage0.py --boot` | **Stop.** Report. |
+| 0.1 | Does MineRL build and step at all on this pod? | `scripts/host_stage0.py --boot` | **Stop.** Report. |
 | 0.2 | Does the action space contain `hotbar.1-9`, `left`, `right`, `sprint`, `sneak`? | `_validate_macros` crashes at boot if not; `--dump-space` prints it | Remove those macros (append-only, so indices 0–20 survive) and re-run. Report the reduced set. |
 | 0.3 | Does POV include the HUD overlay? | `--dump-frame` writes a PNG; inspect the bottom 12% | A2 stays disabled permanently; A9 keeps the keys but the agent cannot see selection. Record it. |
 | 0.4 | Is there any audio handler? | `--probe-audio` lists observation handlers | Expected NO. M1 stays disabled; the Python half waits. |
@@ -96,7 +96,7 @@ plumbing carries real data.
 | 2.7 | Step rate ≥ 90% of the pre-change baseline | A1 adds a crop and A5 adds macros; neither may cost throughput |
 | 2.8 | Occupancy map is non-zero after 100 steps of walking | Proves the probe→scan→map chain carries a real signal |
 
-Script: `scripts/pod_stage2_integration.py`.
+Script: `scripts/host_stage2_integration.py`.
 
 ---
 
@@ -115,7 +115,7 @@ developmental loop is running, and each is silent when wrong:
 | 3.8 | replay buffer carries the sensor column at the right width | A column written at the wrong width restores as neutral forever |
 
 ```bash
-PYTHONPATH=. python scripts/pod_stage3_loop.py --steps 300
+PYTHONPATH=. python scripts/host_stage3_loop.py --steps 300
 ```
 
 Runs with **one client and no external server** — MineRL generates its own
@@ -161,7 +161,7 @@ project keeps having: **being paid for doing nothing.**
    nothing is passable — the belief that stops an agent trying.
 6. **Per-sensor variance, hourly.** A sensor that goes constant has died.
 
-Script: `scripts/pod_falsifiers.py`, run against the metrics dump Stage 3
+Script: `scripts/host_falsifiers.py`, run against the metrics dump Stage 3
 and the soak both write.
 
 ---

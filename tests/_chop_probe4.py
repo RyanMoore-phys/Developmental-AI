@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-FRAMES = "podlogs/probe4_frames"
+FRAMES = "runlogs/probe4_frames"
 
 
 def save(frame, name):

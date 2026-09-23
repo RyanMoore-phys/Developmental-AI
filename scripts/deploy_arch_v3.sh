@@ -2,7 +2,7 @@
 # Deploy arch v3 to the pod: stop cleanly, sync, verify, relaunch, PROVE it.
 #
 # LESSONS BAKED IN (both cost a wasted deploy earlier today):
-#   * the stop file is `podlogs/STOP` — NOT `STOP_LIFELONG`, which does not
+#   * the stop file is `runlogs/STOP` — NOT `STOP_LIFELONG`, which does not
 #     exist and which the loop therefore ignored while I reported success.
 #   * a stopped-and-relaunched run must be proven by a CHANGED PID, not by
 #     `pgrep -c` returning 1: the old process survived and kept writing to
@@ -14,8 +14,8 @@ cd /workspace/devai || exit 1
 OLD=$(pgrep -f "run_minecraft[.]py" | head -1)
 echo "=== old PID=${OLD:-none} ==="
 
-echo "=== graceful stop (podlogs/STOP) ==="
-touch podlogs/STOP
+echo "=== graceful stop (runlogs/STOP) ==="
+touch runlogs/STOP
 for i in $(seq 1 24); do
   sleep 10
   pgrep -f "run_minecraft[.]py" >/dev/null || { echo "  exited after ~$((i*10))s"; break; }
@@ -23,7 +23,7 @@ done
 pgrep -f "run_minecraft[.]py" >/dev/null && { echo "  SIGTERM"; pkill -TERM -f "run_minecraft[.]py"; sleep 20; }
 pgrep -f "run_minecraft[.]py" >/dev/null && { echo "  SIGKILL"; pkill -KILL -f "run_minecraft[.]py"; sleep 8; }
 pkill -KILL -x java 2>/dev/null; sleep 5
-rm -f podlogs/STOP
+rm -f runlogs/STOP
 echo "  stopped: runs=$(pgrep -fc "run_minecraft[.]py") java=$(pgrep -xc java || echo 0)"
 
 echo "=== skill bank MUST be intact (never wiped) ==="
@@ -55,18 +55,18 @@ done
 [ "$fail" -gt 0 ] && { echo "*** $fail pod smoke failure(s) — NOT relaunching ***"; exit 1; }
 
 echo "=== relaunch ==="
-mv -f podlogs/minecraft_lifelong_run.log podlogs/run_pre_archv3.log 2>/dev/null
-nohup bash scripts/launch_lifelong.sh 1000000 > podlogs/launch.out 2>&1 &
+mv -f runlogs/minecraft_lifelong_run.log runlogs/run_pre_archv3.log 2>/dev/null
+nohup bash scripts/launch_lifelong.sh 1000000 > runlogs/launch.out 2>&1 &
 sleep 120
 
 NEW=$(pgrep -f "run_minecraft[.]py" | head -1)
 echo "=== PROOF OF A NEW PROCESS ==="
 echo "  old=${OLD:-none}  new=${NEW:-none}"
-if [ -z "$NEW" ]; then echo "  *** NOTHING RUNNING ***"; tail -20 podlogs/launch.out; exit 1; fi
+if [ -z "$NEW" ]; then echo "  *** NOTHING RUNNING ***"; tail -20 runlogs/launch.out; exit 1; fi
 [ "$NEW" = "${OLD:-x}" ] && { echo "  *** PID UNCHANGED — relaunch did not take ***"; exit 1; }
 ps -eo pid,etime,args | grep "run_minecraft[.]py" | grep -v grep | head -1
 
-L=podlogs/minecraft_lifelong_run.log
+L=runlogs/minecraft_lifelong_run.log
 echo "=== arch v3 LIVE? ==="
 echo "  action_dim/arch: $(grep -a 'action_dim=' "$L" 2>/dev/null | head -1)"
 echo "  conv policy:     $(grep -aic 'arch=conv\|CONV kdim' "$L" 2>/dev/null) mentions"

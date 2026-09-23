@@ -402,7 +402,7 @@ magnitude the moment this ships, which is the live confirmation.
 accumulates per-phase wall clock and prints `Phase timing: … | UNACCOUNTED …`,
 and we are at ~3.4 steps/s against a 10 steps/s ceiling with the config's own
 finding that *our* Python is the binding constraint. But **there are no
-`podlogs` on this machine** and the pod is tailnet-only, so the read could not
+`runlogs` on this machine** and the pod is tailnet-only, so the read could not
 be performed. It remains the largest available multiplier and it needs no new
 ideas — just that line, off the running system.
 

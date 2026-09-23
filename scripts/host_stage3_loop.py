@@ -18,7 +18,7 @@ the machinery carry real signal end to end", not "does the agent learn" —
 that is Stage 5 and takes days.
 
 Run on the pod:
-    PYTHONPATH=. python scripts/pod_stage3_loop.py --steps 300
+    PYTHONPATH=. python scripts/host_stage3_loop.py --steps 300
 """
 import argparse
 import json
@@ -36,7 +36,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--config", default="configs/minecraft_skybot.yaml")
-    ap.add_argument("--out", default="podlogs/stage3")
+    ap.add_argument("--out", default="runlogs/stage3")
     ap.add_argument("--envs", type=int, default=2)
     a = ap.parse_args()
 

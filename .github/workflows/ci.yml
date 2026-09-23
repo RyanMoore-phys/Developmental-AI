@@ -32,7 +32,7 @@ on:
 
 jobs:
   smoke:
-    # DEFAULTS TO A CLEAN GITHUB RUNNER ON PURPOSE, unlike deploy.yml/pod.yml.
+    # DEFAULTS TO A CLEAN GITHUB RUNNER ON PURPOSE, unlike deploy.yml/host.yml.
     # This job needs NO secrets and never touches the pod, so it gains nothing
     # from being self-hosted — and it loses the one thing a throwaway box is
     # good for: a clean-room dependency check. A missing `crafter`/`minigrid`

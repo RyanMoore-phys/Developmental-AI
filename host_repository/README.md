@@ -13,7 +13,7 @@ grounding, running as a **lifelong continuous stream** (no episodic resets).
 ## What's in here
 
 ```
-pod_repository/
+host_repository/
 ├── README.md            ← you are here (index + quickstart + connection)
 ├── docs/
 │   ├── RECREATE.md        ★ full end-to-end pod recreation (start here)
@@ -29,7 +29,7 @@ pod_repository/
     ├── broadcaster_state.json     goal index
     ├── configs/                   minecraft_lifelong.yaml, minecraft_skybot.yaml
     ├── minerl_build/              cached VirtualGL .deb (reproducible provisioning)
-    ├── scripts/                   provision_pod.sh, launch_lifelong.sh,
+    ├── scripts/                   provision_host.sh, launch_lifelong.sh,
     │                              launch_skybot.sh, connect_server.sh,
     │                              mc_ping.py, rcon.py
     └── logs/                      run diagnostic logs
@@ -51,12 +51,12 @@ pod. This folder holds the pod-side DATA + the operational knowledge.
 and the port change on every pod rebuild, so any literal in this file is stale
 the moment it is written — and a stale address reads exactly like a dead run
 (see the port note below). Set them in your shell, or read them from the CI
-variables `POD_SSH_HOST` / `POD_SSH_PORT`, which are the single source of truth:
+variables `MAIN_HOST` / `MAIN_SSH_PORT`, which are the single source of truth:
 
 ```bash
-export POD_HOST=<current-pod-ip>      # RunPod dashboard -> Connect
+export MAIN_HOST=<current-pod-ip>      # RunPod dashboard -> Connect
 export POD_PORT=<current-ssh-port>
-ssh root@"$POD_HOST" -p "$POD_PORT" -i ~/.ssh/skybot_ed25519 \
+ssh root@"$MAIN_HOST" -p "$POD_PORT" -i ~/.ssh/skybot_ed25519 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 ```
 
@@ -88,20 +88,20 @@ tailscale ssh root@<pod-magicdns-name>     # e.g. devai-pod-2
 
 ```bash
 # 1. sync code from the Mac (run from the parent repo dir)
-#    POD_HOST/POD_PORT as exported above — no literals, they go stale.
+#    MAIN_HOST/POD_PORT as exported above — no literals, they go stale.
 rsync -rlptz -e "ssh -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   developmental_ai configs scripts run_minecraft.py \
-  root@"$POD_HOST":/workspace/devai/
+  root@"$MAIN_HOST":/workspace/devai/
 
-#    or just: POD_HOST=<magicdns-name> DEPLOY_TRANSPORT=tailscale \
+#    or just: MAIN_HOST=<magicdns-name> DEPLOY_TRANSPORT=tailscale \
 #               bash scripts/deploy_skybot.sh
 
 # 2. launch (idempotent; refuses if a run or stale java is alive)
 ssh <conn> 'cd /workspace/devai && bash scripts/launch_lifelong.sh 1000000'
 
 # 3. watch
-ssh <conn> 'tail -f /workspace/devai/podlogs/minecraft_lifelong_run.log'
+ssh <conn> 'tail -f /workspace/devai/runlogs/minecraft_lifelong_run.log'
 ```
 
 See `docs/RUNNING.md` for the full launch/monitor/stop workflow and the exact

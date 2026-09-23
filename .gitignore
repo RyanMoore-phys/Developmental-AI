@@ -53,7 +53,7 @@ _work/
 # (three near-duplicate 49250-wide input layers). The pod bank alone is 3.4 GB
 # of files that are 0.82-0.995 cosine-identical to each other. Git is the
 # wrong tool; GitHub LFS gives 1 GB free, which one skill would nearly fill.
-pod_repository/data/
+host_repository/data/
 # ANCHORED WITH A LEADING SLASH — DO NOT REMOVE IT (fix 2026-09-02).
 # These were unanchored (`skill_bank*/`), and a gitignore pattern with no
 # leading slash matches at EVERY depth. So `skill_bank*/` also matched
@@ -81,7 +81,7 @@ brain_backup*/
 
 # ---- run outputs ----
 logs/
-podlogs/
+runlogs/
 pod_results/
 experiments/results/
 runs/
