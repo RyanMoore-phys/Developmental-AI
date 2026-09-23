@@ -86,7 +86,18 @@ jobs:
             echo "== gpu =="
             nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
             echo "== last log =="
-            tail -15 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"'
+            tail -15 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"
+            # SUPERVISOR LOG TOO (added 2026-09-23). "supervisor: 1 proc" +
+            # "training not running" + "no run log yet" is a CRASH LOOP: the
+            # supervisor relaunches an agent that dies before it opens its own
+            # log, so the only evidence is here. Status used to show neither,
+            # which made a loop look identical to an idle box.
+            echo "== supervisor (last 25) =="
+            tail -25 runlogs/supervisor.log 2>/dev/null || echo "no supervisor log"
+            echo "== restart count =="
+            grep -ciE "launch|restart|relaunch" runlogs/supervisor.log 2>/dev/null || echo 0
+            echo "== python/java tracebacks seen =="
+            grep -iE "Traceback|Error|Exception|FAILED" runlogs/supervisor.log 2>/dev/null | tail -8 || echo "none"'
 
       - name: connect
         if: ${{ github.event.inputs.action == 'connect' }}
@@ -112,7 +123,20 @@ jobs:
               > runlogs/supervisor.log 2>&1 < /dev/null &
             sleep 25
             tail -5 runlogs/supervisor.log
-            echo \"run pid: \$(cat runlogs/skybot_run.pid 2>/dev/null || echo none)\""
+            # FAIL IF NOTHING STARTED (added 2026-09-23). This used to print
+            # `run pid: none` and exit 0 -- a GREEN job with a supervisor sitting
+            # in a launcher-refused retry loop, which is exactly how a dead run
+            # went unnoticed. The launcher REFUSES for concrete, printable
+            # reasons (stale java, dead bridge, unreachable server); surface the
+            # refusal and fail, so green means a live agent.
+            PID=\$(cat runlogs/skybot_run.pid 2>/dev/null || true)
+            if [ -n \"\$PID\" ] && ps -p \"\$PID\" >/dev/null 2>&1; then
+              echo \"run pid: \$PID (LIVE)\"
+            else
+              echo '::error::launch did not produce a live agent -- see REFUSED above'
+              grep -E 'REFUSED|refused' runlogs/supervisor.log 2>/dev/null | tail -5
+              exit 1
+            fi"
 
       - name: stop
         if: ${{ github.event.inputs.action == 'stop' }}

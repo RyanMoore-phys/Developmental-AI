@@ -17,7 +17,30 @@ set -e
 cd /workspace/devai
 TS=${1:-1000000}
 if pgrep -f "run_minecraft[.]py" >/dev/null; then echo "REFUSED: run alive"; exit 1; fi
-if pgrep -x java >/dev/null; then echo "REFUSED: stale java"; exit 1; fi
+# ---- STALE JAVA: CLEAR BUILD RESIDUE, REFUSE ONLY ON A REAL CLIENT --------
+# This was a bare `pgrep -x java -> REFUSED: stale java` (2026-09-23), and it
+# was a LATCH in the CLAUDE.md 4.1 sense: STAGE 3b of provisioning runs a
+# gradle build, gradle leaves a DAEMON alive for hours, nothing in this repo
+# ever stops it -- so the very act of provisioning a fresh host made the next
+# launch impossible, forever, until a human noticed. The supervisor just
+# retried every 60s printing four words that named no process.
+# A gradle daemon is BUILD RESIDUE and never a competing Minecraft client, so
+# it is safe to stop. Anything else still refuses -- that guard is real, a
+# second client would fight for the server slots -- but now it PRINTS what it
+# found, which is the difference between a diagnosis and a guess.
+# Pattern SPLIT so pkill -f cannot match this script's own cmdline.
+_GD="Gradle""Daemon"
+if pgrep -f "$_GD" >/dev/null 2>&1; then
+  echo "  clearing gradle daemon(s) left by the MineRL build"
+  pkill -f "$_GD" 2>/dev/null || true
+  sleep 3
+fi
+if pgrep -x java >/dev/null; then
+  echo "REFUSED: stale java — not gradle residue. Running java processes:"
+  ps -eo pid,etime,args | grep "[j]ava" | head -5 | sed 's/^/    /'
+  echo "  If these are dead MineRL clients, clear them with: pkill -9 -x java"
+  exit 1
+fi
 pgrep -x tailscaled >/dev/null || { echo "REFUSED: tailscaled down"; exit 1; }
 ss -tln | grep -q "127.0.0.1:25565" || { echo "REFUSED: socat bridge down"; exit 1; }
 timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 >/dev/null 2>&1 \
