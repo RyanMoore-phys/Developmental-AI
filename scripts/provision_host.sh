@@ -44,7 +44,12 @@ if ! apt-cache policy python3.10-venv 2>/dev/null | grep -q "Candidate: [0-9]"; 
     || { echo "PROVISION-FAILED: deadsnakes-ppa"; exit 1; }
   $SUDO apt-get update -q
 fi
-$SUDO apt-get install -y -q openjdk-8-jdk-headless xvfb openbox xdotool psmisc \
+# socat MOVED HERE from STAGE 1c (2026-09-23). It was `apt-get install socat`
+# with NO sudo and a `|| echo WARN` swallow, so on a non-root host it failed
+# silently, provisioning still said COMPLETE, and `action: connect` died with
+# `setsid: failed to execute socat`. It is NOT optional: remote_server_scope
+# `all` routes BOTH streams through the socat bridge.
+$SUDO apt-get install -y -q socat openjdk-8-jdk-headless xvfb openbox xdotool psmisc \
     python3.10-venv python3.10-dev
 java -version || { echo "PROVISION-FAILED: java"; exit 1; }
 python3.10 --version || { echo "PROVISION-FAILED: python3.10"; exit 1; }
@@ -102,8 +107,11 @@ if ! which tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | $SUDO sh || \
     echo "WARN: tailscale install failed (external-server play unavailable)"
 fi
-which socat >/dev/null 2>&1 || apt-get install -y -q socat || \
-  echo "WARN: socat install failed (external-server play unavailable)"
+which socat >/dev/null 2>&1 || $SUDO apt-get install -y -q socat || true
+# PROVISION-FAILED, NOT "WARN". The old warning was invisible: host.yml polls
+# only `^=== STAGE|PROVISION-`, so a swallowed socat failure reported COMPLETE
+# and surfaced an hour later as a broken bridge. Fail where it is cheap to fix.
+which socat >/dev/null 2>&1 || { echo "PROVISION-FAILED: socat absent (needed by the server bridge)"; exit 1; }
 echo "tailscale: $(which tailscale 2>/dev/null || echo ABSENT) | socat: $(which socat 2>/dev/null || echo ABSENT)"
 # NON-INTERACTIVE TAILNET JOIN (2026-09-02). With TS_AUTHKEY exported, join
 # here so a CI provision produces a pod that is already reachable — otherwise
