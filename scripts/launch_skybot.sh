@@ -1,7 +1,15 @@
 #!/bin/bash
 # Launch the lifelong organism against the user's external Paper server
-# ("SkyBot"): env 0 joins the server via the pod-local socat->tailscale
-# bridge (127.0.0.1:25565); the scout stays in a local generated world.
+# ("SkyBot"): EVERY stream joins the server via the host-local socat bridge
+# on 127.0.0.1:25565 -- `remote_server_scope: all` has been set since
+# 2026-08-17, so no stream runs a local generated world any more. (This
+# header said "the scout stays in a local generated world" until 2026-09-22;
+# it was stale, and it is the first thing anyone reads when asking whether
+# the run is really on the external server.)
+#
+# The bridge's far side is EITHER the tailnet or the LAN -- see
+# scripts/connect_server.sh; this endpoint is identical either way, which is
+# why nothing here needs to know which.
 # Pre-flight refuses to start unless the bridge + tailnet are actually up —
 # a run launched with a dead bridge would strand the primary in a
 # connect-fail rebuild loop.
@@ -22,7 +30,11 @@ pgrep -x ollama >/dev/null || { OLLAMA_DEBUG=0 nohup ollama serve >> podlogs/oll
 pgrep -f "cap_log[.]sh podlogs/ollama[.]log" >/dev/null || \
   { nohup bash scripts/cap_log.sh podlogs/ollama.log >> podlogs/cap_log.log 2>&1 < /dev/null & }
 rm -rf podlogs/brain
-DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MINERL_HEADLESS=1 \
+# OMP_NUM_THREADS 16 -> 6 (2026-09-22): the pod had 128 cores, this box
+# has 6/12 and two of them are pinned to Minecraft clients by the
+# launchClient taskset wrap. Oversubscribing torch against that costs
+# throughput rather than buying it.
+DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=6 MINERL_HEADLESS=1 \
   setsid ./venv_mc/bin/python run_minecraft.py \
     --config configs/minecraft_skybot.yaml \
     --timesteps "$TS" --seed 0 --out minecraft_skybot_results \

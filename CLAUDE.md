@@ -41,8 +41,22 @@ cd "/Users/rimac/Desktop/Developmental AI"
 ```
 
 Tests are **standalone `__main__` scripts**, not pytest. Each prints numbered
-contract lines and ends with `[name] ALL PASS`. There is no runner; run the ones
-your change touches. A `.pth` file in the venv makes `import developmental_ai`
+contract lines and ends with `[name] ALL PASS`. Since 2026-09-19 there IS a
+runner, `tests/run_all.py`, in three tiers — but it only shells out to those
+same scripts, so running one directly still works and is still the right move
+when you are iterating:
+
+```bash
+PYTHONPATH=. python tests/run_all.py unit       # parts: shapes, bounds, ~3s
+PYTHONPATH=. python tests/run_all.py contract   # design arguments, ~10s
+PYTHONPATH=. python tests/run_all.py legacy     # needs gymnasium -> pod only
+PYTHONPATH=. python tests/run_all.py all        # exit code = failing suites
+```
+
+**The two tiers mean different things.** A `unit` failure is a bug in a
+function. A `contract` failure means a DESIGN CLAIM stopped holding — those
+docstrings name the live incident and the measured numbers, and one going red
+is a finding, not a chore. A `.pth` file in the venv makes `import developmental_ai`
 work from any cwd, but prefix `PYTHONPATH=.` anyway — that's the documented form
 in every test docstring, and it's what works on the pod.
 
@@ -104,6 +118,15 @@ Reward logic is duplicated between them. An edit that lands in one and not the
 other is silent — it just doesn't apply live. Use `replace_all: true`, then
 **grep to confirm the count is 2**. Several tests assert exactly this, e.g.
 `assert src.count("_gui_now2 = bool(") == 2`.
+
+**There is a THIRD body, and it is unwired** (found 2026-09-22): `_run_episode`
+(~line 3645), the single-env path. It has **none** of Waves 1–2 or Phases 1–7 —
+no `info["sensors"]`, no `_augment_proprio`, no `_wm_proprio_batch`, no
+`_flow_senses`, no `_spatial_step`, no `_phase_mark`. Reaching it is easy and
+silent: `parallel_envs.num_envs <= 1` sets `_use_parallel_envs = False`, which
+raises if `lifelong.enabled` is true and otherwise drops straight into it.
+**So `num_envs: 1` is not "the same agent with one client"** — it is the
+pre-Wave-1 agent. Keep `num_envs: 2`, or port the wiring first.
 
 ### 4.3 The γ-discounting defect in state costs
 
@@ -179,22 +202,50 @@ system.
 
 ## 6. Live infrastructure
 
-- **Training pod:** vast.ai, reached **only over the tailnet**. There is no
-  `vastai` CLI and no API key on this Mac — if the pod is down, only the user
-  can restart it from the console. IPs in `pod_repository/docs/RUNNING.md` and
-  `scripts/deploy_skybot.sh` are **stale** (old RunPod box).
-- **Game server:** the user's own Paper server, reached via
-  tailscale-userspace → `socat` → `127.0.0.1:25565` on the pod. The *server* is
-  the client-count bottleneck, not the pod: 4 MineRL clients produced 0 segments
-  in 17 minutes. 2 is the proven number.
+- **Training host (since 2026-09-22): the user's own main computer**, not a
+  rented pod. Ubuntu Server at **192.168.1.10**, on the **LAN and the tailnet
+  at once**. RTX 5050 (8 GB), Ryzen 5 5500 (6c/12t), **16 GB RAM**, 256 GB NVMe
+  — far tighter than the pod it replaced (16 GB VRAM, 128 cores, 125 GB RAM),
+  and several config values were cut to fit (see below). Everything still
+  installs at `/workspace/devai` and deploys as `root@`, deliberately: the box
+  is shaped like a pod so no deploy script, workflow or path needed changing.
+  The old vast.ai pod is off. IPs in `pod_repository/docs/RUNNING.md` and
+  `scripts/deploy_skybot.sh` are **stale** (older RunPod box).
+- **Everything targets the host via the runner's `.env`**, never a value in the
+  tree: `POD_HOST`, `POD_SSH_PORT`, `POD_SSH_KEYFILE`, `MC_SERVER_TS_IP`. To
+  move hosts again, edit `.env` — not the repo. See `docs/CI_SETUP.md`.
+- **Game server:** the user's own Paper server, on **another LAN machine**,
+  reached through `socat` → `127.0.0.1:25565` exactly as before. The bridge now
+  has **two far sides** and picks by address family: RFC1918 goes over plain
+  TCP on the LAN, everything else (tailnet 100.x, MagicDNS names) keeps
+  `tailscale nc` untouched. **Tailscale is fully retained** — it is the path
+  again as soon as ethernet is back, via one `.env` value. The endpoint the
+  agent sees is `127.0.0.1:25565` either way, which is why
+  `environment.remote_server` never changes. The *server* is the client-count
+  bottleneck, not the host: 4 MineRL clients produced 0 segments in 17 minutes.
+  2 is the proven number, and `remote_server_scope: all` puts **both** streams
+  on the Paper server (no stream runs a local generated world).
+- **What the 16 GB box forced (2026-09-22).** `buffer_growth` was capped at
+  **2 GB** (`hard_max_gb` 16 → 2, `max_ram_frac` 0.6 → 0.15) and
+  `block_transitions` 25000 → **5000**. That last one is not cosmetic: the
+  **initial block is allocated per stream WITHOUT a budget request** —
+  `ReplayBuffer.__init__` allocates outright and only `maybe_grow()` calls
+  `MEMORY_BUDGET.request()` — so real RSS exceeds `hard_max_gb` by
+  `num_streams × block_transitions` always. At 25k blocks a "2 GB" ceiling
+  measured **3.70 GB**. Revisit `block_transitions` whenever `hard_max_gb`
+  moves. `OMP_NUM_THREADS` is 6, not 16.
 - **Ollama** serves the VLM on the same GPU. `fovea_interval: 12` cost **28% of
   the step rate**; 30 is the tuned value. VLM frequency trades directly against
   training throughput.
 - **Backups:** brain state (`world_model.pt`, `symbolizer.pt`, `familiarity.pt`,
   `magnet.pt`, `knowledge_graph.json`, `options_state.json`, break memory, skill
-  bank) lives **only on the pod**. A pod died with ~11 days of unbacked state.
-  **rsync the brain pod→Mac periodically during long runs.** Code always flows
-  Mac→pod, so code is never at risk.
+  bank) lives **only on the training host**. A pod died with ~11 days of
+  unbacked state. Moving to owned hardware removes the *pod-terminated* risk
+  and replaces it with *disk failure* — 256 GB, one NVMe, no redundancy — so
+  the habit still stands: **rsync the brain host→Mac periodically during long
+  runs.** Code always flows Mac→host, so code is never at risk.
+  **`pull_brain.sh` does not exist** despite `deploy_pod.sh`'s header citing
+  it; nothing automates this yet.
 
 ---
 
@@ -222,6 +273,9 @@ system.
 | Why isn't it acting? | `docs/ACTION_STALL_AUDIT.md` — 30+ ranked issues |
 | Domain-independent redesign | `docs/GENERAL_INFRASTRUCTURE.md` — 57 changes |
 | Open findings | `AUDIT_FINDINGS.md` |
+| Depth/flow from motion | `docs/PERSPECTIVE_LEARNING.md` — waves 1-2 |
+| Sensors, slots, action space | `docs/PLURALITY_ROADMAP.md` — phases 1-7 |
+| How any of it gets proven | `docs/TESTING_PLAN.md` — stages 0-5 |
 | What's next | `NEXT_OBJECTIVES.md`, `ROADMAP.md` |
 | Pod ops | `pod_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
 | Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |

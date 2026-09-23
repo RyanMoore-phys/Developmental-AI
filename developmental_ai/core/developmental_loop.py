@@ -320,6 +320,10 @@ class DevelopmentalAI:
             agent_view_size=env_cfg.get("agent_view_size"),
             action_repeat=env_cfg.get("action_repeat", 1),
             render_size=env_cfg.get("render_size", 0),
+            # THE SENSOR BUS. Absent from config -> None -> the adapter
+            # emits info["proprio"] and nothing else, i.e. exactly the
+            # pre-bus behaviour for every other config in the tree.
+            sensors_cfg=(self.config.get("sensors") or None),
             lifelong=self._lifelong,
             remote_server=env_cfg.get("remote_server"),
             # this site builds the PRIMARY env, so it keeps the bare prefix
@@ -374,6 +378,103 @@ class DevelopmentalAI:
         # last-seen self-state per env; act() consumes this (it runs before
         # the step, so there is no "this step" proprio yet)
         self._proprio_per_env = None
+        # RAW env proprio as of the CURRENT observation, one slot per body.
+        # Separate from _proprio_per_env (which is the loop-AUGMENTED vector
+        # the policy reads): the world model gets the env's own body sense
+        # only, because the augmented one contains the flow senses the world
+        # model itself produces. None when the world model was built without
+        # a body (world_model.proprio absent), so nothing allocates.
+        self._wm_proprio_prev = None
+        # ---- PERSPECTIVE FROM MOTION: per-step sense state ---------------
+        self._flow_now = None
+        self._flow_prev_latent = None
+        self._flow_prev_valid = None
+        self._flow_resid_now = 0.0
+        # ---- SPATIAL SURPRISE (2026-09-19, roadmap P4) -------------------
+        # 8x8 to match the encoder's own spatial grid, so a surprise cell and
+        # a feature-map cell describe the same patch of world. Curiosity has
+        # been SCENE-LEVEL since the project began: the agent could be
+        # surprised, but never surprised BY A PLACE IN THE FRAME. This is 64
+        # numbers that were already being computed and then averaged away.
+        self._surprise_grid = int(
+            (self.config.get("sensors") or {}).get("surprise_grid", 8))
+        self._surprise_now = None
+        # ---- SPATIAL MEMORY (2026-09-19, roadmap G2/P2/P3) --------------
+        # The first representations in this system that outlive the frame
+        # they came from. All three are built from the agent's OWN estimates
+        # — the world model's forward-probe magnitude and the body's sensed
+        # ego-motion — never from the engine's truth, which exists in this
+        # codebase only as the RED oracle and only to measure them.
+        _sp = (self.config.get("spatial") or {})
+        self._spatial_on = bool(_sp.get("enabled", False))
+        self._occ_grid = int(_sp.get("occupancy_grid", 16))
+        self._sr_grid = int(_sp.get("successor_grid", 8))
+        self._walk_bins = int(_sp.get("walk_bins", 8))
+        self._probe_grid = int(_sp.get("probe_grid", 8))
+        self._occupancy = self._successor = self._walkable = None
+        self._probe_map_now = None
+        self._occ_now = self._sr_now = self._walk_now = None
+        if self._spatial_on:
+            from developmental_ai.spatial import (
+                EgocentricOccupancy, SuccessorMap, WalkabilityMap)
+            self._occupancy = EgocentricOccupancy(
+                grid=self._occ_grid,
+                cell_blocks=float(_sp.get("occupancy_cell_blocks", 1.0)),
+                decay=float(_sp.get("occupancy_decay", 0.93)),
+                fov_rad=math.radians(float(
+                    (self.config.get("world_model") or {}).get(
+                        "camera_fov_deg", 70.0))),
+                max_range=float(_sp.get("max_range_blocks", 12.0)))
+            self._successor = SuccessorMap(
+                grid=self._sr_grid,
+                cell_blocks=float(_sp.get("successor_cell_blocks", 8.0)),
+                gamma=float(_sp.get("successor_gamma", 0.95)),
+                lr=float(_sp.get("successor_lr", 0.1)))
+            self._walkable = WalkabilityMap(
+                bins=self._walk_bins, lr=float(_sp.get("walk_lr", 0.1)))
+            logger.info(
+                "spatial memory ON: occupancy %dx%d, successor %dx%d, "
+                "walkability %d bearings, probe map %dx%d",
+                self._occ_grid, self._occ_grid, self._sr_grid, self._sr_grid,
+                self._walk_bins, self._probe_grid, self._probe_grid)
+        # ---- THE ORACLE (2026-09-19, roadmap O1) -------------------------
+        # RED sensors exist to make the project measurable, never to be used.
+        # Enabled purely from the sensor config; there is no world-model or
+        # policy switch for it because there is no world-model or policy
+        # PATH for it.
+        _oc = (self.config.get("sensors") or {})
+        self._oracle_enabled = "true_position" in list(_oc.get("enabled") or [])
+        self._oracle_every = int(_oc.get("oracle_report_every", 500))
+        self._oracle_drift = deque(maxlen=2000)
+        self._oracle_steps = 0
+        self._oracle_origin = None
+        self._oracle_last = None
+        self._oracle_travel = 0.0
+        # THE COUNTERFACTUAL PROBE: "if I walked forward from here, how would
+        # the scene sweep past me?" Reuses the vision scaffold's EXISTING
+        # declaration of which actions are forward motion rather than adding a
+        # second, driftable copy of that fact. First entry is plain walk.
+        # THE KEY IS `llm.vision`, NOT `vision_scaffold` (fixed 2026-09-20).
+        # This read a top-level key that does not exist and fell back to the
+        # literal [1, 2, 6] — which happens to equal the configured value, so
+        # nothing misbehaved and nobody noticed. That is the trap: change
+        # llm.vision.forward_actions and the probe silently keeps aiming at
+        # the old action. Found by AST-auditing every config.get() literal
+        # against the live YAML; see tests/_config_keys_smoke.py.
+        _fwd = list(((self.config.get("llm", {}) or {}).get("vision", {})
+                     or {}).get("forward_actions", [1, 2, 6]) or [1])
+        self._flow_probe_idx = int(
+            (self.config.get("world_model", {}) or {}).get(
+                "flow_probe_action", _fwd[0]))
+        # THE CONFIG KEY IS `symbolic_grounding`, NOT `symbol_grounding`.
+        # This read the wrong key from 2026-09-18 until it was caught on
+        # 2026-09-20. It happened to be harmless — the fallback 0.4 equals
+        # the configured value — but a silent fallback to a default is
+        # exactly how a setting stops meaning anything, and the next person
+        # to change fovea_frac would have found the flow senses ignoring it.
+        self._flow_fovea_frac = float(
+            (self.config.get("symbolic_grounding", {}) or {}).get(
+                "fovea_frac", 0.4))
         if self._proprio_source is not None:
             logger.info("proprioception: %d dims from %s (%s)",
                         int(self._proprio_source.PROPRIO_DIM),
@@ -427,6 +528,68 @@ class DevelopmentalAI:
 
         # ---- Create World Model (RSSM) ----
         wm_cfg = self.config.get("world_model", {})
+        _slot_cfg = self.config.get("slots") or {}
+        # WIDTH OF THE BODY SENSE THE WORLD MODEL RECEIVES. Opt-in: a config
+        # without `world_model.proprio` gets 0 and the model is built exactly
+        # as before. Gated on the env actually HAVING a body vector, so
+        # turning the flag on in an env with no proprioception is a no-op
+        # rather than a shape error at the first forward pass.
+        # ---- WIDTH COMES FROM THE SENSOR BUS (2026-09-19) ----------------
+        # Was PROPRIO_DIM. The bus is the single declaration of what the
+        # transport vector contains and in what order; reading the env's
+        # proprio width here instead would silently truncate every sensor
+        # registered after the first one.
+        #
+        # The bus is rebuilt here rather than read off the adapter because
+        # the world model is constructed BEFORE any env exists, and the
+        # layout is a pure function of config — so the two cannot disagree.
+        self._sensor_bus = None
+        self._sensor_image_specs = []
+        _sen_cfg = self.config.get("sensors") or {}
+        if (bool(wm_cfg.get("proprio", False))
+                and getattr(self, "_proprio_source", None) is not None):
+            if _sen_cfg.get("enabled") is not None:
+                from developmental_ai.sensors import build_default_bus
+                self._sensor_bus = build_default_bus(
+                    int(self._proprio_source.PROPRIO_DIM),
+                    lambda ctx: None,          # widths only; the ENV reads
+                    enabled=list(_sen_cfg.get("enabled") or []),
+                    fovea_size=int(_sen_cfg.get("fovea_size", 32)))
+                self._wm_proprio_dim = int(self._sensor_bus.width)
+                self._sensor_image_specs = [
+                    (off, shp[0], shp[1], shp[2])
+                    for _n, off, _w, shp in self._sensor_bus.image_layout()]
+                # image_layout offsets are relative to the IMAGE block, which
+                # begins after all vector fields.
+                _vw = int(self._sensor_bus.vector_width)
+                self._sensor_image_specs = [
+                    (off + _vw, c, h, w)
+                    for (off, c, h, w) in self._sensor_image_specs]
+                self._sensor_layout_hash = self._sensor_bus.layout_hash()
+                logger.info("sensor bus (world model): %s",
+                            self._sensor_bus.describe())
+            else:
+                self._wm_proprio_dim = int(
+                    self._proprio_source.PROPRIO_DIM)
+                self._sensor_layout_hash = "proprio-only"
+        else:
+            self._wm_proprio_dim = 0
+            self._sensor_layout_hash = "none"
+        # WHERE EACH BODY FIELD LIVES, derived from the env's own key order
+        # so it cannot drift from PROPRIO_KEYS. Empty when the env has no
+        # body, which disables the depth parameterization rather than letting
+        # it read someone else's vector by index.
+        _pk = tuple(getattr(self._proprio_source, "PROPRIO_KEYS", ())
+                    if getattr(self, "_proprio_source", None) is not None
+                    else ())
+        self._proprio_layout = {k: i for i, k in enumerate(_pk)}
+        if self._wm_proprio_dim:
+            logger.info(
+                "world model receives PROPRIOCEPTION: %d dims (%s). It can "
+                "now tell 'I turned my head' from 'the world spun' — the "
+                "discrimination the flow head needs.",
+                self._wm_proprio_dim,
+                ", ".join(self._proprio_source.PROPRIO_KEYS))
         self.world_model = WorldModel(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -449,6 +612,56 @@ class DevelopmentalAI:
             inverse_dynamics=bool(wm_cfg.get("inverse_dynamics", False)),
             inverse_dynamics_scale=float(wm_cfg.get("inverse_dynamics_scale", 1.0)),
             discrete_actions=self.is_discrete,
+            # ---- PERSPECTIVE FROM MOTION (2026-09-18) --------------------
+            # See world_model/rssm.py's FlowHead block for the argument. All
+            # six default to the historical behaviour, so the ten non-Minecraft
+            # configs build exactly the model they built before.
+            min_grid=int(wm_cfg.get("spatial_grid", 4)),
+            coord_channels=bool(wm_cfg.get("coord_channels", False)),
+            readout_channels=int(wm_cfg.get("readout_channels", 0)),
+            flow_head=bool(wm_cfg.get("flow_head", False)),
+            flow_size=int(wm_cfg.get("flow_size", 32)),
+            flow_photo_size=int(wm_cfg.get("flow_photo_size", 0)),
+            flow_weight=float(wm_cfg.get("flow_weight", 1.0)),
+            flow_smooth_weight=float(wm_cfg.get("flow_smooth_weight", 0.05)),
+            recon_residual_lambda=float(
+                wm_cfg.get("recon_residual_lambda", 0.0)),
+            latent_horizons=wm_cfg.get("latent_horizons") or [],
+            latent_horizon_weight=float(
+                wm_cfg.get("latent_horizon_weight", 1.0)),
+            # ---- OBJECT SLOTS (roadmap R1-R4) -----------------------------
+            # Gated on the flow head by construction (WorldModel refuses to
+            # build them without it) AND shipped off, because slots decode
+            # the flow field and a flow field that has not been shown to
+            # learn on live frames is noise to decompose.
+            slots=bool(_slot_cfg.get("enabled", False)),
+            num_slots=int(_slot_cfg.get("num_slots", 6)),
+            slot_dim=int(_slot_cfg.get("slot_dim", 64)),
+            slot_iters=int(_slot_cfg.get("iters", 3)),
+            slot_weight=float(_slot_cfg.get("weight", 1.0)),
+            # ---- WAVE 2 (2026-09-18) -------------------------------------
+            # Every default below reproduces Wave 1 term for term, which is
+            # what makes the "every switch reverts" contract assertable.
+            flow_mode=str(wm_cfg.get("flow_mode", "raw")),
+            flow_automask=bool(wm_cfg.get("flow_automask", False)),
+            flow_scales=wm_cfg.get("flow_scales") or [1],
+            flow_strides=wm_cfg.get("flow_strides") or [1],
+            camera_fov_deg=float(wm_cfg.get("camera_fov_deg", 70.0)),
+            # The body's field layout comes from the ENV, which owns what its
+            # proprio vector means — not from a constant in the world model
+            # that would silently mis-read a different body.
+            proprio_layout=self._proprio_layout,
+            move_scale=float(getattr(
+                getattr(self, "_proprio_source", None), "MOVE_SCALE", 1.0)),
+            # THE ENV'S RAW BODY VECTOR, not the loop-augmented one. The
+            # augmented vector carries the flow senses themselves (see
+            # _augment_proprio), and feeding a model's own output back into
+            # its input is circular. The raw env vector is also the only one
+            # available at buffer-add time, which is where the column is
+            # written.
+            proprio_dim=self._wm_proprio_dim,
+            sensor_image_specs=self._sensor_image_specs,
+            sensor_feature_dim=int(_sen_cfg.get("feature_dim", 64)),
         ).to(self.device)
         # Causal action alignment (ON by default since the July 2026 audit —
         # CODE_AUDIT_2026-07.md §A). When on, the WM learns true
@@ -500,6 +713,8 @@ class DevelopmentalAI:
                 per_epsilon=per_cfg.get("epsilon", 1e-2),
                 obs_uint8=_obs_uint8,
                 growth=wm_cfg.get("buffer_growth"),
+                proprio_dim=self._wm_proprio_dim,
+                sensor_layout=self._sensor_layout_hash,
             )
         else:
             self.replay_buffer = ReplayBuffer(
@@ -511,6 +726,8 @@ class DevelopmentalAI:
                 per_epsilon=per_cfg.get("epsilon", 1e-2),
                 obs_uint8=_obs_uint8,
                 growth=wm_cfg.get("buffer_growth"),
+                proprio_dim=self._wm_proprio_dim,
+                sensor_layout=self._sensor_layout_hash,
             )
         # Prioritized + asynchronous replay are opt-in. When both are off, the
         # buffer behaves exactly like the original uniform/synchronous sampler.
@@ -698,6 +915,30 @@ class DevelopmentalAI:
         # sparse-reward tasks). 0.0 = off (original behaviour).
         self._goal_replay_fraction = float(
             wm_cfg.get("goal_replay_fraction", 0.0))
+        # HOW BIG A REWARD COUNTS AS "THE GOAL" (2026-09-18). The stratum
+        # above used the sampler's 1e-3 default, i.e. "did anything pay at
+        # all". On a SCOUT stream that is a sharp question — it stores the
+        # raw env reward and _break_reward pays exactly 0.0 for everything
+        # that is not a log or an ore. On the PRIMARY stream it is almost
+        # vacuous: what gets stored is `prim_extrinsic`, which carries magnet
+        # shaping, approach and goal-dwell on top of the env reward, and
+        # those are nonzero on most steps. So the mechanism that exists
+        # BECAUSE this run has ~35 log breaks in its entire history was
+        # selecting from approximately every window.
+        #
+        # 5.0 is log-sized by construction (a log pays 20.0 + 0.5/tick, an
+        # ore 10.0, and no shaping term comes close), so the stratum means
+        # what its name says regardless of how the channels are mixed.
+        # 1e-3 restores the old behaviour exactly.
+        self._goal_replay_threshold = float(
+            wm_cfg.get("goal_replay_threshold", 1e-3))
+        self._wm_reward_pool = -1
+        if self._goal_replay_fraction > 0.0:
+            logger.info(
+                "goal-prioritized replay: %.0f%% of each WM batch from "
+                "windows paying > %.3g (log=20+0.5/tick, ore=10, all else 0)",
+                100.0 * self._goal_replay_fraction,
+                self._goal_replay_threshold)
 
         # ---- Create Curiosity Engine ----
         # mode: "novelty" (default; ICM raw prediction error) or
@@ -745,6 +986,14 @@ class DevelopmentalAI:
                 # action accounts for. False = off = byte-identical.
                 action_conditional=cur_cfg.get("action_conditional", False),
                 null_action=cur_cfg.get("null_action", 0),
+                # PERSPECTIVE FROM MOTION: weight of the world model's flow
+                # residual against the forward-model error when the two are
+                # summed for BUCKETING. Only has an effect when a flow head
+                # exists to supply one, so this is inert in every config that
+                # has not opted in. 0.0 disables the channel without
+                # rebuilding the world model, and is the revert.
+                flow_error_weight=float(
+                    cur_cfg.get("flow_error_weight", 1.0)),
             ).to(self.device)
             if cur_cfg.get("action_conditional", False):
                 logger.info(
@@ -897,11 +1146,19 @@ class DevelopmentalAI:
                 # ENCODER FEATURES OF THE CROP rather than the whole-frame
                 # RSSM latent, so its input describes the same region its
                 # labels do. Width is the encoder's, not the RSSM's.
-                # rssm.obs_dim IS the encoder's output width (the RSSM is
-                # constructed with obs_dim=hidden_dim). Read from the live
-                # object, never from config, so the two cannot drift.
+                #
+                # ---- WAS `rssm.obs_dim` (fixed 2026-09-18) ---------------
+                # That read was correct only while the identity
+                # `rssm.obs_dim == encoder width` held. Feeding
+                # proprioception into the embed BREAKS it: the RSSM is now
+                # built with `hidden_dim + proprio_dim`, while _encode_crop
+                # still returns bare encoder features. The head would have
+                # been constructed 13 wider than its own input and thrown on
+                # the first crop. `encoder.vec_dim` is the encoder's own
+                # declaration of its width and cannot drift from it.
                 fovea_latent_dim=(
-                    int(self.world_model.rssm.obs_dim)
+                    int(getattr(self.world_model.encoder, "vec_dim",
+                                self.world_model.rssm.obs_dim))
                     if sg_cfg.get("fovea_crop_input", True) else None))
             if sg_cfg.get("fovea_crop_input", True):
                 self.symbolizer.set_crop_encoder(self._encode_crop)
@@ -1347,10 +1604,21 @@ class DevelopmentalAI:
             # +4 loop-side senses when grounding exists: reach + the three
             # episodic-bearing fields (validity*proximity, sin, cos) — see
             # _augment_proprio (2026-08-09; was +1 reach-only)
+            # +4 when a symbolizer exists (reach + the three episodic-bearing
+            # fields) and +4 more when the flow head exists (flow_fovea,
+            # flow_edge, flow_ratio, mover). MUST mirror _augment_proprio
+            # field-for-field: that function is the only writer, this is the
+            # only declaration of the width, and a mismatch is silent — the
+            # policy would read four senses shifted by four positions.
             proprio_dim=(int(getattr(
                 getattr(self, "_proprio_source", None), "PROPRIO_DIM", 0))
                 + (4 if getattr(self, "_proprio_source", None) is not None
-                   and self.symbolizer is not None else 0)),
+                   and self.symbolizer is not None else 0)
+                + ((4 + self._surprise_grid * self._surprise_grid)
+                   if getattr(self, "_proprio_source", None) is not None
+                   and bool(getattr(self.world_model, "flow_enabled", False))
+                   else 0)
+                + self._spatial_width()),
             # ROW-AWARE UPDATE TRIGGER (2026-09-01) — see should_update().
             # 0/0 keeps the historical env-step-only behaviour.
             min_rows_per_update=int(
@@ -2128,6 +2396,24 @@ class DevelopmentalAI:
             "dream_critic_loss": deque(maxlen=100),
             "dream_returns_mean": deque(maxlen=100),
             "inverse_dynamics_loss": deque(maxlen=100),
+            # PERSPECTIVE FROM MOTION. `flow_loss` is the photometric warp
+            # error — the number that has to go DOWN for any of this to be
+            # real, and the go/no-go for the object-slot wave. `flow_residual`
+            # is what the warp could not explain, i.e. the curiosity channel's
+            # input; watching it against `moved` is the falsifier (income at
+            # moved~0 means another wage for standing still).
+            "flow_loss": deque(maxlen=100),
+            "flow_residual": deque(maxlen=100),
+            # Auto-mask retained fraction. 1.0 = nothing dropped. Trending
+            # toward 0 means the photometric loss is starving itself, which
+            # is the one way auto-masking can go wrong quietly.
+            "flow_mask": deque(maxlen=100),
+            # P1. If this does not fall, imagined trajectories are fiction
+            # past step one — and the policy trains on 15-step dreams.
+            "horizon_loss": deque(maxlen=100),
+            # R1. If this does not fall below what one undifferentiated field
+            # achieves, the decomposition is not buying anything.
+            "slot_loss": deque(maxlen=100),
             # The stage controller's SPINE (it drives every stage transition
             # via prediction_error) and, until 2026-09-04, never recorded
             # anywhere a human could read. Added alongside the WM-loss
@@ -3399,7 +3685,7 @@ class DevelopmentalAI:
         rssm_state = self.world_model.rssm.initial_state(1, self.device)
         with torch.no_grad():
             _init_obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            _init_encoded = self.world_model.encoder(_init_obs_t)
+            _init_encoded = self.world_model.embed(_init_obs_t)
             _zero_act = torch.zeros(1, self.action_dim, device=self.device)
             rssm_state, _ = self.world_model.rssm.observe_step(
                 rssm_state, _zero_act, _init_encoded
@@ -3536,7 +3822,7 @@ class DevelopmentalAI:
                 except Exception:
                     wm_pred_obs = None
 
-            encoded_obs = self.world_model.encoder(next_obs_tensor)
+            encoded_obs = self.world_model.embed(next_obs_tensor)
             rssm_state, _ = self.world_model.rssm.observe_step(
                 rssm_state, action_tensor, encoded_obs
             )
@@ -3679,6 +3965,10 @@ class DevelopmentalAI:
                 agent_view_size=env_cfg.get("agent_view_size"),
                 action_repeat=env_cfg.get("action_repeat", 1),
                 render_size=env_cfg.get("render_size", 0),
+                # THE SENSOR BUS. Absent from config -> None -> the
+                # adapter emits info["proprio"] and nothing else, i.e.
+                # exactly the pre-bus behaviour for every other config.
+                sensors_cfg=(self.config.get("sensors") or None),
                 lifelong=getattr(self, "_lifelong", False),
                 # remote_server_scope "primary" (default): only env 0 — the
                 # continuous lifelong stream — joins the external server; the
@@ -3741,6 +4031,10 @@ class DevelopmentalAI:
             agent_view_size=env_cfg.get("agent_view_size"),
             action_repeat=env_cfg.get("action_repeat", 1),
             render_size=env_cfg.get("render_size", 0),
+            # THE SENSOR BUS. Absent from config -> None -> the adapter
+            # emits info["proprio"] and nothing else, i.e. exactly the
+            # pre-bus behaviour for every other config in the tree.
+            sensors_cfg=(self.config.get("sensors") or None),
             lifelong=self._lifelong,
             remote_server=_remote,
             agent_name=_name,
@@ -3971,7 +4265,7 @@ class DevelopmentalAI:
         rssm_state = self.world_model.rssm.initial_state(n, self.device)
         with torch.no_grad():
             obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
-            encoded = self.world_model.encoder(obs_t)
+            encoded = self.world_model.embed(obs_t)
             zero_act = torch.zeros(n, self.action_dim, device=self.device)
             rssm_state, _ = self.world_model.rssm.observe_step(
                 rssm_state, zero_act, encoded
@@ -4136,6 +4430,13 @@ class DevelopmentalAI:
             # keep the body sense fresh for the NEXT act() (see _props)
             if self._proprio_source is not None:
                 self._proprio_per_env = [None] * n
+            # PERSISTS across steps (it is a one-step memory), so it is sized
+            # once and never cleared here — unlike _proprio_per_env above,
+            # which is this step's fresh reading.
+            if (self._wm_proprio_dim
+                    and (self._wm_proprio_prev is None
+                         or len(self._wm_proprio_prev) != n)):
+                self._wm_proprio_prev = [None] * n
             for e_i, f in enumerate(futs):
                 _rst = False
                 try:
@@ -4175,6 +4476,7 @@ class DevelopmentalAI:
             self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
+            self._env_parts_add(step_infos)
             _pt = self._phase_mark("env", _pt)
             # ---- SET HERE, NOT IN THE COVERAGE BLOCK (2026-09-01) ----
             # `_boring_view_factor()` reads `_last_world_info["pitch"]`, and
@@ -4337,8 +4639,26 @@ class DevelopmentalAI:
             _pt = self._phase_mark("goals", _pt)
 
             # ---- 3. CURIOSITY (batched) ----
+            # PERSPECTIVE FROM MOTION joins the drive HERE, as a second
+            # prediction-error channel feeding learning progress — NOT as a
+            # new reward term. LP pays for error going DOWN, so a new channel
+            # changes what the agent can make progress ON, never how much it
+            # is paid for standing anywhere. And the residual is a ratio
+            # against how much the frame changed at all: no movement, no
+            # change, no residual, no income.
+            # EVALUATION SINK. Reads info["oracle"] and nothing else writes
+            # to the agent from here — see _oracle_observe.
+            self._oracle_observe(step_infos, n)
+            _fr = self._flow_residual_batch(
+                obs_t, next_obs_t, action_tensor, n,
+                ego=self._flow_ego_batch(step_infos, n))
+            self._flow_resid_now = (
+                float(_fr[0]) if _fr is not None else 0.0)
+            if _fr is not None:
+                self.training_metrics["flow_residual"].append(
+                    self._flow_resid_now)
             intrinsic = self.curiosity.compute_intrinsic_reward(
-                obs_t, action_tensor, next_obs_t
+                obs_t, action_tensor, next_obs_t, extra_error=_fr
             )
             # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
             # compression progress does; the raw-error term is damped by
@@ -4355,7 +4675,12 @@ class DevelopmentalAI:
             # torn latents flow into the permanently carried lifelong state.
             # Uncontended (sync mode) the RLock costs ~1us.
             with self._wm_param_lock, torch.no_grad():
-                encoded_next = self.world_model.encoder(next_obs_t)
+                # SAME BODY THE TRAINER SEES. The world model is trained on
+                # (frame, proprio) pairs from the buffer; encoding the live
+                # frame with a zero body here would make every acting latent
+                # come from a distribution the model never trained on.
+                encoded_next = self.world_model.embed(
+                    next_obs_t, self._wm_proprio_batch(step_infos, n))
                 rssm_state, _ = self.world_model.rssm.observe_step(
                     rssm_state, action_tensor, encoded_next
                 )
@@ -4492,6 +4817,45 @@ class DevelopmentalAI:
             # fresh for the NEXT act(), matching how proprio is refreshed.
             if not use_dream_actor and self.symbolizer is not None:
                 self._reach_now = self._reach_sense(latent[0:1])
+            # PERSPECTIVE FROM MOTION, same cadence and same cost profile as
+            # reach. Deliberately NOT gated on the symbolizer: this is
+            # geometry read off the world model, and it exists in an env that
+            # never grounds a single symbol.
+            if getattr(self.world_model, "flow_enabled", False):
+                if not use_dream_actor:
+                    self._flow_now = self._flow_senses(
+                        latent[0:1], self._flow_resid_now)
+                    self._spatial_step(
+                        latent[0:1], step_infos,
+                        # DID THE AGENT ASK TO MOVE. Walkability is learned
+                        # from the GAP between the command and the outcome,
+                        # so the command half has to come from the action
+                        # actually issued to the primary body.
+                        self._is_move_action(int(env_actions[0])))
+                # THE MEMORY IS REFRESHED EVEN WHILE DREAMING, deliberately.
+                # The senses above are for ACTING and a dreaming agent is not
+                # acting, but the cache is a fact about which frame the next
+                # residual will be measured against. Leaving it stale through
+                # a dream block would make the first waking residual compare
+                # the current frame to one from before the dream — a splice
+                # across time that reads as enormous unexplained motion.
+                # THE ONE-STEP MEMORY, refreshed AFTER it has been consumed.
+                # `valid` marks the streams whose next frame will still belong
+                # to THIS world: a stream that just ended or was rebuilt has a
+                # previous frame from a different world entirely, and warping
+                # across that splice would report a near-total residual and
+                # read as the most interesting event in the run.
+                self._flow_prev_latent = latent.detach()
+                self._flow_prev_valid = torch.tensor(
+                    [not (bool(dones[i]) or bool(restarted[i]))
+                     for i in range(n)],
+                    dtype=torch.bool, device=self.device)
+            # THE ORACLE'S FRAME RESETS WITH THE WORLD. The dead reckoner's
+            # origin is the episode start; truth must be re-anchored at the
+            # same instant or the drift measurement becomes a constant offset.
+            if bool(dones[0]) or bool(restarted[0]):
+                self._oracle_reset()
+                self._spatial_reset()
             # MASTERY HABITUATION: a break of a long-mastered type damps this
             # step's whole intrinsic (see _habituation_factor) — applied
             # BEFORE the magnet so its LP attribution habituates too.
@@ -4728,7 +5092,32 @@ class DevelopmentalAI:
                     # dynamics, and must certainly not OVERSAMPLE it.
                     restart=bool(restarted[e_i]) or bool(
                         (step_infos[e_i] or {}).get("env_restarted")),
+                    # THE BODY AS IT WAS WHEN obs_list[e_i] WAS SEEN, not as
+                    # it is now. `step_infos` describes the state AFTER this
+                    # step, so writing it here would pair o_t with proprio
+                    # from t+1 and hand the world model a one-step lookahead
+                    # on its own motion — the same off-by-one the causal
+                    # action alignment exists to prevent.
+                    proprio=(self._wm_proprio_prev[e_i]
+                             if (self._wm_proprio_prev is not None
+                                 and e_i < len(self._wm_proprio_prev))
+                             else None),
                 )
+            # Advance the one-step body memory AFTER the write.
+            if self._wm_proprio_prev is not None:
+                for e_i in range(n):
+                    _si = step_infos[e_i] or {}
+                    self._wm_proprio_prev[e_i] = (
+                        _si.get("sensors")
+                        if _si.get("sensors") is not None
+                        else _si.get("proprio"))
+            # ---- SUB-PHASING `store` (2026-09-20) --------------------
+            # The measured profile put 287 ms/step (21.6%) in `store`, which
+            # is not explicable from reading this window: it writes one
+            # replay row per env and appends a few numpy arrays to the PPO
+            # rollout lists. Rather than guess (CLAUDE.md 5), split the
+            # bucket and let the next profile name the cost.
+            _pt = self._phase_mark("store_buf", _pt)
 
             # Primary stream feeds the on-policy PPO rollout (waking only).
             if not use_dream_actor and primary_pol is not None:
@@ -4880,6 +5269,8 @@ class DevelopmentalAI:
                         primary_pol["log_prob"], primary_pol["value"],
                         knowledge=primary_kv, feats=self._feats_row(0))
 
+            _pt = self._phase_mark("store_ppo", _pt)
+
             # ---- 6. ADVANCE / AUTORESET ----
             primary_done = dones[0]
             for e_i in range(n):
@@ -4912,6 +5303,7 @@ class DevelopmentalAI:
                 else:
                     obs_list[e_i] = next_obs_list[e_i]
 
+            _pt = self._phase_mark("store_reset", _pt)
             # A2: hand this step's encoder output to the next act(). MUST be
             # after the advance loop above — validity is decided by whether
             # obs_list[e] IS next_obs_list[e] (same object = the env kept
@@ -5014,7 +5406,7 @@ class DevelopmentalAI:
         rssm_state = self.world_model.rssm.initial_state(n, self.device)
         with torch.no_grad():
             obs_t = torch.from_numpy(np.stack(obs_list)).to(self.device)
-            encoded = self.world_model.encoder(obs_t)
+            encoded = self.world_model.embed(obs_t)
             zero_act = torch.zeros(n, self.action_dim, device=self.device)
             rssm_state, _ = self.world_model.rssm.observe_step(
                 rssm_state, zero_act, encoded
@@ -5198,6 +5590,13 @@ class DevelopmentalAI:
             # keep the body sense fresh for the NEXT act() (see _props)
             if self._proprio_source is not None:
                 self._proprio_per_env = [None] * n
+            # PERSISTS across steps (it is a one-step memory), so it is sized
+            # once and never cleared here — unlike _proprio_per_env above,
+            # which is this step's fresh reading.
+            if (self._wm_proprio_dim
+                    and (self._wm_proprio_prev is None
+                         or len(self._wm_proprio_prev) != n)):
+                self._wm_proprio_prev = [None] * n
             for e_i, f in enumerate(futs):
                 _rst = False
                 try:
@@ -5239,6 +5638,7 @@ class DevelopmentalAI:
             self._env_wait_sum = (getattr(self, "_env_wait_sum", 0.0)
                                   + (time.time() - _t_env0))
             self._env_wait_n = getattr(self, "_env_wait_n", 0) + 1
+            self._env_parts_add(step_infos)
             _pt = self._phase_mark("env", _pt)
             # ---- SET HERE, NOT IN THE COVERAGE BLOCK (2026-09-01) ----
             # `_boring_view_factor()` reads `_last_world_info["pitch"]`, and
@@ -5401,8 +5801,26 @@ class DevelopmentalAI:
             _pt = self._phase_mark("goals", _pt)
 
             # ---- 3. CURIOSITY (batched) ----
+            # PERSPECTIVE FROM MOTION joins the drive HERE, as a second
+            # prediction-error channel feeding learning progress — NOT as a
+            # new reward term. LP pays for error going DOWN, so a new channel
+            # changes what the agent can make progress ON, never how much it
+            # is paid for standing anywhere. And the residual is a ratio
+            # against how much the frame changed at all: no movement, no
+            # change, no residual, no income.
+            # EVALUATION SINK. Reads info["oracle"] and nothing else writes
+            # to the agent from here — see _oracle_observe.
+            self._oracle_observe(step_infos, n)
+            _fr = self._flow_residual_batch(
+                obs_t, next_obs_t, action_tensor, n,
+                ego=self._flow_ego_batch(step_infos, n))
+            self._flow_resid_now = (
+                float(_fr[0]) if _fr is not None else 0.0)
+            if _fr is not None:
+                self.training_metrics["flow_residual"].append(
+                    self._flow_resid_now)
             intrinsic = self.curiosity.compute_intrinsic_reward(
-                obs_t, action_tensor, next_obs_t
+                obs_t, action_tensor, next_obs_t, extra_error=_fr
             )
             # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
             # compression progress does; the raw-error term is damped by
@@ -5466,7 +5884,12 @@ class DevelopmentalAI:
             # torn latents flow into the permanently carried lifelong state.
             # Uncontended (sync mode) the RLock costs ~1us.
             with self._wm_param_lock, torch.no_grad():
-                encoded_next = self.world_model.encoder(next_obs_t)
+                # SAME BODY THE TRAINER SEES. The world model is trained on
+                # (frame, proprio) pairs from the buffer; encoding the live
+                # frame with a zero body here would make every acting latent
+                # come from a distribution the model never trained on.
+                encoded_next = self.world_model.embed(
+                    next_obs_t, self._wm_proprio_batch(step_infos, n))
                 rssm_state, _ = self.world_model.rssm.observe_step(
                     rssm_state, action_tensor, encoded_next
                 )
@@ -5569,6 +5992,45 @@ class DevelopmentalAI:
             # potential were silently inert the whole time.
             if not use_dream_actor and self.symbolizer is not None:
                 self._reach_now = self._reach_sense(latent[0:1])
+            # PERSPECTIVE FROM MOTION, same cadence and same cost profile as
+            # reach. Deliberately NOT gated on the symbolizer: this is
+            # geometry read off the world model, and it exists in an env that
+            # never grounds a single symbol.
+            if getattr(self.world_model, "flow_enabled", False):
+                if not use_dream_actor:
+                    self._flow_now = self._flow_senses(
+                        latent[0:1], self._flow_resid_now)
+                    self._spatial_step(
+                        latent[0:1], step_infos,
+                        # DID THE AGENT ASK TO MOVE. Walkability is learned
+                        # from the GAP between the command and the outcome,
+                        # so the command half has to come from the action
+                        # actually issued to the primary body.
+                        self._is_move_action(int(env_actions[0])))
+                # THE MEMORY IS REFRESHED EVEN WHILE DREAMING, deliberately.
+                # The senses above are for ACTING and a dreaming agent is not
+                # acting, but the cache is a fact about which frame the next
+                # residual will be measured against. Leaving it stale through
+                # a dream block would make the first waking residual compare
+                # the current frame to one from before the dream — a splice
+                # across time that reads as enormous unexplained motion.
+                # THE ONE-STEP MEMORY, refreshed AFTER it has been consumed.
+                # `valid` marks the streams whose next frame will still belong
+                # to THIS world: a stream that just ended or was rebuilt has a
+                # previous frame from a different world entirely, and warping
+                # across that splice would report a near-total residual and
+                # read as the most interesting event in the run.
+                self._flow_prev_latent = latent.detach()
+                self._flow_prev_valid = torch.tensor(
+                    [not (bool(dones[i]) or bool(restarted[i]))
+                     for i in range(n)],
+                    dtype=torch.bool, device=self.device)
+            # THE ORACLE'S FRAME RESETS WITH THE WORLD. The dead reckoner's
+            # origin is the episode start; truth must be re-anchored at the
+            # same instant or the drift measurement becomes a constant offset.
+            if bool(dones[0]) or bool(restarted[0]):
+                self._oracle_reset()
+                self._spatial_reset()
                 # PREFER MEASURED OVER PREDICTED (2026-08-04). The VLM-taught
                 # `breakable_in_reach` head sat at 0.01-0.03 for an entire run
                 # in which the agent broke 4931 blocks — llava cannot judge
@@ -6286,7 +6748,32 @@ class DevelopmentalAI:
                     # dynamics, and must certainly not OVERSAMPLE it.
                     restart=bool(restarted[e_i]) or bool(
                         (step_infos[e_i] or {}).get("env_restarted")),
+                    # THE BODY AS IT WAS WHEN obs_list[e_i] WAS SEEN, not as
+                    # it is now. `step_infos` describes the state AFTER this
+                    # step, so writing it here would pair o_t with proprio
+                    # from t+1 and hand the world model a one-step lookahead
+                    # on its own motion — the same off-by-one the causal
+                    # action alignment exists to prevent.
+                    proprio=(self._wm_proprio_prev[e_i]
+                             if (self._wm_proprio_prev is not None
+                                 and e_i < len(self._wm_proprio_prev))
+                             else None),
                 )
+            # Advance the one-step body memory AFTER the write.
+            if self._wm_proprio_prev is not None:
+                for e_i in range(n):
+                    _si = step_infos[e_i] or {}
+                    self._wm_proprio_prev[e_i] = (
+                        _si.get("sensors")
+                        if _si.get("sensors") is not None
+                        else _si.get("proprio"))
+            # ---- SUB-PHASING `store` (2026-09-20) --------------------
+            # The measured profile put 287 ms/step (21.6%) in `store`, which
+            # is not explicable from reading this window: it writes one
+            # replay row per env and appends a few numpy arrays to the PPO
+            # rollout lists. Rather than guess (CLAUDE.md 5), split the
+            # bucket and let the next profile name the cost.
+            _pt = self._phase_mark("store_buf", _pt)
 
             # Primary stream feeds the on-policy PPO rollout (waking only).
             if not use_dream_actor and primary_pol is not None:
@@ -6515,6 +7002,7 @@ class DevelopmentalAI:
             # crash-restart the adapter caught internally (it rebuilt the CLIENT
             # but the mission only launches inside reset()) — that stream must be
             # reset here or it wedges on a stale frame forever (audit critical).
+            _pt = self._phase_mark("store_ppo", _pt)
             _reset_to = float(self.config.get("parallel_envs", {}).get(
                 "reset_timeout_s", 300))
             for e_i in range(n):
@@ -6590,6 +7078,7 @@ class DevelopmentalAI:
                 else:
                     obs_list[e_i] = next_obs_list[e_i]  # (no truncation in LL)
 
+            _pt = self._phase_mark("store_reset", _pt)
             # A2: hand this step's encoder output to the next act(). MUST be
             # after the advance loop above — validity is decided by whether
             # obs_list[e] IS next_obs_list[e] (same object = the env kept
@@ -6649,12 +7138,20 @@ class DevelopmentalAI:
                     _skip = 1.0 - self._wm_blocks_run / self._wm_cadence_hits
                     _bms = float(getattr(self, "_wm_block_ms", 0.0))
                     _bit = int(getattr(self, "_wm_block_iters", 0) or 0)
+                    _pool = int(getattr(self, "_wm_reward_pool", -1))
                     print(f"  AsyncWM replay-ratio: {self._wm_blocks_run}"
                           f"/{self._wm_cadence_hits} blocks run "
                           f"(skip {_skip:.1%})"
                           + (f" | block {_bms:.0f} ms / {_bit} iters "
                              f"({_bms / max(1, _bit):.1f} ms/iter)"
-                             if _bit else ""), flush=True)
+                             if _bit else "")
+                          # THE GOAL POOL. Printed next to the block timing
+                          # because that is where someone reading the log is
+                          # already looking, and because a pool of ~0 means
+                          # goal_replay_fraction is buying nothing no matter
+                          # what it is set to.
+                          + (f" | reward pool {_pool} windows"
+                             if _pool >= 0 else ""), flush=True)
                     # ---- train_iters FROM MEASURED SKIP (2026-09-01) ------
                     # `train_iters: 384` is a NOMINAL figure. With the async
                     # trainer's skip-if-busy, the ratio the GPU actually
@@ -6808,6 +7305,10 @@ class DevelopmentalAI:
         ("kl_divergence", "kl"),
         ("reconstruction_error", "reconstruction"),
         ("inverse_dynamics_loss", "inverse"),
+        ("flow_loss", "flow"),
+        ("flow_mask", "flow_mask"),
+        ("horizon_loss", "horizon"),
+        ("slot_loss", "slot"),
         ("symbolic_decoder_loss", "symbolic_decoder_loss"),
         ("symbolic_decoder_accuracy", "symbolic_decoder_accuracy"),
     )
@@ -6920,6 +7421,11 @@ class DevelopmentalAI:
                         continues=batch["continues"],
                         importance_weights=batch["weights"],
                         return_per_sample=True,
+                        # ABSENT when the buffer has no body column, which is
+                        # exactly what a model built with proprio_dim=0
+                        # expects; a model built WITH one reads neutral zeros
+                        # rather than raising (see WorldModel.embed).
+                        proprio=batch.get("proprio"),
                     )
                     self.replay_buffer.update_priorities(
                         batch["start_indices"], seq_len, errs
@@ -6930,6 +7436,7 @@ class DevelopmentalAI:
                     actions=batch["actions"],
                     rewards=batch["rewards"],
                     continues=batch["continues"],
+                    proprio=batch.get("proprio"),
                 )
 
         try:
@@ -6962,18 +7469,27 @@ class DevelopmentalAI:
                         device=self.device,
                         prioritized=prioritized,
                         reward_fraction=self._goal_replay_fraction,
+                        reward_threshold=self._goal_replay_threshold,
                         terminal_fraction=terminal_fraction,
                     )
                     metrics = _do_train(batch)
             self._wm_block_ms = 1000.0 * (time.perf_counter() - _t_wm)
             self._wm_block_iters = int(train_iters)
+            # HOW MANY GOAL WINDOWS THE STRATUM ACTUALLY HAD. This is the
+            # measurement that says whether goal_replay_threshold changed
+            # anything: under the old 1e-3 default on the primary stream this
+            # was approximately "every window in the buffer"; log-sized it
+            # should be a countable number of real breaks.
+            if batch is not None:
+                self._wm_reward_pool = int(batch.get("reward_pool", -1))
 
             # Train the symbolic decoder on the last batch (same lock: the
             # sd heads are read on the main thread every step via the glue)
             with self._wm_param_lock:
                 with torch.no_grad():
                     states, _ = self.world_model.observe_sequence(
-                        batch["observations"], batch["actions"]
+                        batch["observations"], batch["actions"],
+                        batch.get("proprio"),
                     )
                     latent_states = torch.cat(
                         [states["h"], states["z"]], dim=-1)
@@ -7051,6 +7567,7 @@ class DevelopmentalAI:
                 device=self.device,
                 prioritized=prioritized,
                 reward_fraction=self._goal_replay_fraction,
+                reward_threshold=self._goal_replay_threshold,
                 terminal_fraction=float(self.config.get(
                     "world_model", {}).get("terminal_fraction", 0.25)),
             )
@@ -7234,7 +7751,8 @@ class DevelopmentalAI:
             reward_fraction=self._goal_replay_fraction)
         with torch.no_grad():
             states, _ = self.world_model.observe_sequence(
-                batch["observations"], batch["actions"])
+                batch["observations"], batch["actions"],
+                batch.get("proprio"))
             t_idx = torch.randint(0, states["h"].shape[1], (n_roll,))
             start = {"h": states["h"][torch.arange(n_roll), t_idx],
                      "z": states["z"][torch.arange(n_roll), t_idx]}
@@ -8549,7 +9067,8 @@ class DevelopmentalAI:
 
             with torch.no_grad():
                 states, _ = self.world_model.observe_sequence(
-                    batch["observations"], batch["actions"]
+                    batch["observations"], batch["actions"],
+                    batch.get("proprio")
                 )
                 # Pick random timesteps along the sequences as starting points
                 seq_len = states["h"].shape[1]
@@ -8613,7 +9132,8 @@ class DevelopmentalAI:
         acts = data["actions"]                            # (B, L, A) one-hot
         ld = self.world_model.rssm.latent_dim
         with torch.no_grad():
-            states, infos = self.world_model.observe_sequence(obs, acts)
+            states, infos = self.world_model.observe_sequence(
+                obs, acts, data.get("proprio"))
             latent = self.world_model.rssm.get_latent(
                 {"h": states["h"], "z": states["z"]}).reshape(-1, ld)
             teacher_logits = self.dream_actor.get_action_dist(latent).logits  # (N, A)
@@ -9061,8 +9581,12 @@ class DevelopmentalAI:
     #
     # Cost: one perf_counter() per phase per step (~50ns each), no locks, no
     # allocation beyond one dict. Reset by _log_progress each segment.
-    _PHASES = ("act", "env", "goals", "curiosity", "world", "vlm", "store",
-               "ppo")
+    # `store` is split into four since 2026-09-20: the measured profile put
+    # 21.6% of the step there and nothing in that window accounts for it.
+    # `store` now holds only what the sub-buckets do not, so the four plus
+    # `store` still sum to the original bucket.
+    _PHASES = ("act", "env", "goals", "curiosity", "world", "vlm",
+               "store_buf", "store_ppo", "store_reset", "store", "ppo")
 
     def _frames_per(self, decisions: int) -> int:
         """Convert a threshold expressed in DECISIONS into env FRAMES.
@@ -9092,6 +9616,38 @@ class DevelopmentalAI:
         per scaffold step, so it was already in decision units.
         """
         return int(decisions) * max(1, int(getattr(self, "_num_envs", 1) or 1))
+
+    # Sub-buckets of `env`, reported by the ADAPTER on info["step_ms"].
+    # `_ENV_PARTS` is in-thread time inside one client's step(); the clients
+    # run concurrently, so these apportion the WAIT rather than adding to it.
+    _ENV_PARTS = ("engine", "obs", "sense", "adapter")
+
+    def _env_parts_add(self, step_infos) -> None:
+        """Fold this step's adapter breakdown into the segment accumulator.
+
+        THE SLOWEST CLIENT, NOT THE MEAN. The loop waits on `f.result()` for
+        every future, so the wall cost of the fan-out is the max, and a mean
+        would flatter a fleet with one straggler. `_env_slow_sum` is what the
+        `env` phase should be if the pool were perfectly parallel; the gap
+        between it and the measured phase IS the pool/GIL overhead, which is
+        the number that says whether adding clients buys anything.
+        """
+        _acc = getattr(self, "_env_parts", None)
+        if _acc is None:
+            _acc = self._env_parts = {}
+        _slow = 0.0
+        _seen = False
+        for _inf in (step_infos or ()):
+            _p = (_inf or {}).get("step_ms") if isinstance(_inf, dict) else None
+            if not isinstance(_p, dict):
+                continue
+            _seen = True
+            for _k in self._ENV_PARTS:
+                _acc[_k] = _acc.get(_k, 0.0) + float(_p.get(_k, 0.0))
+            _slow = max(_slow, float(_p.get("total", 0.0)))
+        if _seen:
+            _acc["_n"] = _acc.get("_n", 0.0) + 1.0
+            _acc["_slow"] = _acc.get("_slow", 0.0) + _slow
 
     def _phase_mark(self, name: str, t0: float) -> float:
         """Add elapsed wall clock to phase `name`; return a fresh timestamp.
@@ -9682,6 +10238,325 @@ class DevelopmentalAI:
             self._habit_sum = getattr(self, "_habit_sum", 0.0) + f
         return f
 
+    # The neutral row: no flow, no mover, and a figure/ground ratio of 0.5
+    # meaning "the attended region is at the same depth as its surround".
+    # 0.5 rather than 0.0 because 0.0 is a CLAIM (the thing I am looking at is
+    # further away than everything around it), and a body without the sense
+    # must not make claims.
+    _FLOW_NEUTRAL = {"flow_fovea": 0.0, "flow_edge": 0.0,
+                     "flow_ratio": 0.5, "mover": 0.0}
+
+    def _flow_ego_batch(self, step_infos, n: int):
+        """(n, 3) body motion over THIS step, or None.
+
+        Built from the two raw proprio readings the loop already holds:
+        `_wm_proprio_prev` describes obs_t (it is advanced only after the
+        buffer write, which happens later in the step) and `step_infos`
+        describes next_obs_t. So at curiosity time both ends of the interval
+        are in hand and no new state is needed.
+
+        None unless the world model is in depth mode — every other mode
+        ignores ego, and building it would be pure cost.
+        """
+        if (getattr(self.world_model, "flow_mode", "raw") != "depth"
+                or not self._wm_proprio_dim
+                or self._wm_proprio_prev is None):
+            return None
+        try:
+            prev = self._wm_proprio_batch_from(self._wm_proprio_prev, n)
+            now = self._wm_proprio_batch(step_infos, n)
+            if prev is None or now is None:
+                return None
+            from developmental_ai.world_model.rssm import ego_from_proprio
+            return ego_from_proprio(
+                prev, now, self._proprio_layout,
+                float(getattr(getattr(self, "_proprio_source", None),
+                              "MOVE_SCALE", 1.0)))
+        except Exception as _e:
+            logger.debug("ego from proprio failed: %s", _e)
+            return None
+
+    def _wm_proprio_batch_from(self, rows, n: int):
+        """(n, proprio_dim) from a list of raw vectors, missing -> zeros."""
+        if not self._wm_proprio_dim:
+            return None
+        d = self._wm_proprio_dim
+        out = np.zeros((n, d), dtype=np.float32)
+        for e_i in range(min(n, len(rows) if rows is not None else 0)):
+            v = rows[e_i]
+            if v is None:
+                continue
+            v = np.asarray(v, dtype=np.float32).reshape(-1)
+            out[e_i, :min(d, v.shape[0])] = v[:d]
+        return torch.from_numpy(out).to(self.device)
+
+    def _flow_residual_batch(self, obs_t, next_obs_t, action_tensor, n: int,
+                             ego=None):
+        """(n,) unexplained-motion fraction for THIS step's transition.
+
+        ALIGNMENT IS THE WHOLE POINT OF THIS BEING SEPARATE. Curiosity scores
+        the transition (obs_t -> next_obs_t) under action a_t, so the residual
+        must be measured on that same pair. The latent of obs_t is last step's
+        POST-observe latent — this step's observe has not run yet — which is
+        exactly what `_flow_prev_latent` holds. Reading `self._flow_now`
+        instead (the version cached for proprioception) would score the
+        transition one step stale.
+
+        Returns None when there is no flow head or no usable previous latent,
+        which the caller passes straight through as "no extra channel".
+        """
+        if not getattr(self.world_model, "flow_enabled", False):
+            return None
+        pl = self._flow_prev_latent
+        if pl is None or pl.shape[0] != n:
+            return None                       # first step, or the fleet resized
+        try:
+            with torch.no_grad():
+                _r, _m = self.world_model.flow_residual(
+                    obs_t, next_obs_t, pl, action_tensor,
+                    valid=self._flow_prev_valid, ego=ego,
+                    return_map=True, map_size=self._surprise_grid)
+            # WHERE the world model is wrong, for the PRIMARY stream only —
+            # the same cadence and the same cost profile every other loop-side
+            # sense gets. Kept as a plain array; _augment_proprio appends it.
+            self._surprise_now = _m[0, 0].reshape(-1).detach().cpu().numpy()
+            return _r
+        except Exception as _e:
+            logger.debug("flow residual failed: %s", _e)
+            return None
+
+    def _flow_senses(self, latent_row, mover: float):
+        """The three probe senses for the primary stream, plus `mover`.
+
+        Cheap by construction: one FlowHead forward on a latent the loop has
+        already computed. Nothing here touches the env, renders, or calls a
+        VLM — the three things that have historically cost step rate.
+
+        `mover` is passed in rather than recomputed: the residual was already
+        measured against the correct frame pair when curiosity ran earlier in
+        this same step (see _flow_residual_batch), and warping twice to get the
+        same number would be pure cost.
+
+        NOT A REWARD. These enter proprioception and nothing else, on the
+        doctrine _reach_sense states: a felt affordance, not a rangefinder,
+        and not a payment. tests/_perspective_smoke.py holds the contract that
+        nothing downstream of them can pay while the agent stands still.
+        """
+        out = dict(self._FLOW_NEUTRAL)
+        try:
+            probe = torch.zeros(1, self.action_dim, device=self.device)
+            probe[0, self._flow_probe_idx] = 1.0
+            out.update(self.world_model.flow_probe(
+                latent_row, probe, fovea_frac=self._flow_fovea_frac))
+            out["mover"] = float(mover)
+        except Exception as _e:                      # never stall the step
+            logger.debug("flow senses failed: %s", _e)
+        return out
+
+    def _oracle_observe(self, step_infos, n: int) -> None:
+        """Consume the RED channel. EVALUATION ONLY — writes nothing the
+        agent can read.
+
+        WHAT THIS MEASURES TODAY. `dead_reckon` integrates the agent's own
+        sensed body-relative displacement from an episode-local origin; the
+        engine's true position says where it actually went. The difference is
+        DRIFT, and until now it was an assumption. Reported as a running
+        mean and as drift-per-block-travelled, which is the scale-free form —
+        an agent that has walked 500 blocks should not look worse than one
+        that walked 5 for the same absolute error.
+
+        WHY THIS IS THE ONLY CONSUMER. `info["oracle"]` is a separate dict
+        from `info["sensors"]`; the replay buffer never carries it, and
+        SensorBus.read_policy never builds it. A meaning has no route into
+        the world model, and this method is deliberately the single place
+        that touches one — so the isolation test has exactly one thing to
+        check rather than a habit to audit.
+        """
+        if not self._oracle_enabled:
+            return
+        _si = (step_infos[0] or {}) if step_infos else {}
+        pos = (_si.get("oracle") or {}).get("true_position")
+        if pos is None:
+            return
+        pos = np.asarray(pos, dtype=np.float64)
+        w = _si.get("world") or {}
+        dr = (w.get("dr_x"), w.get("dr_z"))
+        if dr[0] is None:
+            return
+        if self._oracle_origin is None:
+            # The dead reckoner's origin is the episode start, so truth has
+            # to be measured from the same instant or the comparison is an
+            # offset rather than a drift.
+            self._oracle_origin = pos.copy()
+            self._oracle_travel = 0.0
+            self._oracle_last = pos.copy()
+            return
+        self._oracle_travel += float(np.hypot(*(pos - self._oracle_last)[[0, 2]]))
+        self._oracle_last = pos.copy()
+        true_dx = float(pos[0] - self._oracle_origin[0])
+        true_dz = float(pos[2] - self._oracle_origin[2])
+        err = float(np.hypot(float(dr[0]) - true_dx, float(dr[1]) - true_dz))
+        self._oracle_drift.append(err)
+        self._oracle_steps += 1
+        if self._oracle_steps % max(1, self._oracle_every) == 0:
+            _m = float(np.mean(self._oracle_drift)) if self._oracle_drift else 0.0
+            _rel = _m / max(1.0, self._oracle_travel)
+            logger.info(
+                "ORACLE (evaluation only): dead-reckoning drift mean %.2f "
+                "blocks over %.0f blocks travelled (%.1f%% of path); "
+                "estimate (%.1f, %.1f) vs true (%.1f, %.1f)",
+                _m, self._oracle_travel, 100.0 * _rel,
+                float(dr[0]), float(dr[1]), true_dx, true_dz)
+            self.training_metrics.setdefault(
+                "oracle_dr_drift", deque(maxlen=100)).append(_m)
+
+    def _oracle_reset(self) -> None:
+        """A new world is a new frame of reference for both sides."""
+        self._oracle_origin = None
+        self._oracle_last = None
+        self._oracle_travel = 0.0
+
+    def _spatial_width(self) -> int:
+        """THE single declaration of how many fields the spatial maps add.
+
+        Read by the policy's proprio_dim and written by _spatial_fields.
+        Two call sites, one number — the arrangement that exists because the
+        reach sense was once appended in one loop body and declared in
+        neither, and was silently dead in every run.
+        """
+        if not self._spatial_on:
+            return 0
+        return (self._probe_grid * self._probe_grid        # G1 sweep map
+                + self._occ_grid * self._occ_grid          # G2 occupancy
+                + self._sr_grid * self._sr_grid            # P2 successor
+                + self._walk_bins)                         # P3 walkability
+
+    def _spatial_fields(self, e_i: int) -> List[float]:
+        """The spatial maps as a flat list, or neutral when unavailable.
+
+        PRIMARY STREAM ONLY carries real values, exactly like reach and the
+        flow senses: the maps are built from the primary's latent once per
+        step. A scout reads the neutral row, which for every one of these is
+        zero — "I have no record of anything there" — except walkability,
+        whose neutral is 0.5 because zero would be a CLAIM that the world is
+        a solid block, and that is the belief that stops an agent trying.
+        """
+        n_probe = self._probe_grid * self._probe_grid
+        n_occ = self._occ_grid * self._occ_grid
+        n_sr = self._sr_grid * self._sr_grid
+        if e_i != 0:
+            return ([0.0] * (n_probe + n_occ + n_sr)
+                    + [0.5] * self._walk_bins)
+        out: List[float] = []
+        for arr, n, neutral in (
+                (self._probe_map_now, n_probe, 0.0),
+                (self._occ_now, n_occ, 0.0),
+                (self._sr_now, n_sr, 0.0),
+                (self._walk_now, self._walk_bins, 0.5)):
+            if arr is None:
+                out.extend([neutral] * n)
+                continue
+            flat = np.asarray(arr, dtype=np.float32).reshape(-1)
+            if flat.shape[0] != n:
+                out.extend([neutral] * n)
+            else:
+                out.extend(float(x) for x in flat)
+        return out
+
+    def _is_move_action(self, action_idx: int) -> bool:
+        """Does this macro command forward translation?
+
+        Reuses the vision scaffold's EXISTING declaration of which actions
+        are forward motion rather than adding a second, driftable copy of
+        that fact — the same source `_flow_probe_idx` reads.
+        """
+        return int(action_idx) in set(
+            ((self.config.get("llm", {}) or {}).get("vision", {}) or {}).get(
+                "forward_actions", [1, 2, 6]) or [])
+
+    def _spatial_step(self, latent_row, step_infos,
+                      commanded_move: bool = False) -> None:
+        """Advance the three spatial maps by one step. Primary stream only.
+
+        ORDER MATTERS AND IS NOT ARBITRARY: the maps are re-registered by the
+        ego-motion of the step that has JUST HAPPENED, then written with the
+        frame that resulted from it. Writing first would place this frame's
+        reading at the body's previous pose.
+
+        Costs one extra FlowHead forward on a latent the loop already has —
+        the same deal _reach_sense and the flow probe get. Nothing here
+        touches the env, renders, or calls a VLM.
+        """
+        if not self._spatial_on:
+            return
+        try:
+            w = ((step_infos[0] or {}).get("world") or {}) if step_infos else {}
+            d_yaw = math.radians(float(w.get("yaw_delta", 0.0) or 0.0))
+            fwd = float(w.get("move_fwd", 0.0) or 0.0)
+            lat = float(w.get("move_lat", 0.0) or 0.0)
+
+            probe = torch.zeros(1, self.action_dim, device=self.device)
+            probe[0, self._flow_probe_idx] = 1.0
+            pm = self.world_model.probe_map(
+                latent_row, probe, map_size=self._probe_grid)
+            self._probe_map_now = (
+                None if pm is None
+                else pm[0, 0].detach().cpu().numpy().astype(np.float32))
+
+            self._occ_now = self._occupancy.step(
+                self._probe_map_now, d_yaw, fwd, lat)
+            self._sr_now = self._successor.step(
+                float(w.get("dr_x", 0.0) or 0.0),
+                float(w.get("dr_z", 0.0) or 0.0))
+            # "Did I ASK to move" is the action, not the outcome — that is
+            # the whole point: the label comes from the gap between them.
+            self._walk_now = self._walkable.step(
+                bool(commanded_move),
+                float(w.get("moved", 0.0) or 0.0), d_yaw)
+        except Exception as _e:
+            logger.debug("spatial step failed: %s", _e)
+
+    def _spatial_reset(self) -> None:
+        """A new world is a new map. World persistence is impossible in this
+        fork (measured), so carrying any of these across a reset would be
+        remembering a place that no longer exists."""
+        if not self._spatial_on:
+            return
+        self._occupancy.reset()
+        self._successor.reset()
+        self._walkable.reset()
+        self._occ_now = self._sr_now = self._walk_now = None
+        self._probe_map_now = None
+
+    def _wm_proprio_batch(self, step_infos, n: int):
+        """(n, proprio_dim) tensor of RAW env body vectors, or None.
+
+        None when the world model was built without a body — which is the
+        signal WorldModel.embed reads to skip the concat entirely, so a
+        non-Minecraft config never allocates this.
+
+        A body that is missing for one stream reads NEUTRAL ZEROS rather than
+        failing the batch: a scout whose client is rebuilding still has to
+        produce a latent this step.
+        """
+        if not self._wm_proprio_dim:
+            return None
+        d = self._wm_proprio_dim
+        out = np.zeros((n, d), dtype=np.float32)
+        for e_i in range(n):
+            _si = (step_infos[e_i] or {}) if e_i < len(step_infos) else {}
+            # `sensors` is the bus transport; `proprio` is the pre-bus
+            # 13-field vector and remains the fallback so a config without a
+            # `sensors:` block behaves exactly as it did.
+            v = _si.get("sensors")
+            if v is None:
+                v = _si.get("proprio")
+            if v is None:
+                continue
+            v = np.asarray(v, dtype=np.float32).reshape(-1)
+            out[e_i, :min(d, v.shape[0])] = v[:d]
+        return torch.from_numpy(out).to(self.device)
+
     def _augment_proprio(self, pp, e_i: int):
         """LOOP-SIDE BODY SENSES, appended to the env's proprio vector in ONE
         place for every loop body (2026-08-09).
@@ -9705,11 +10580,25 @@ class DevelopmentalAI:
                                      not a beacon) and reads neutral when
                                      nothing has ever been sighted.
         """
-        if pp is None or self.symbolizer is None:
+        if pp is None:
+            return pp
+        # WIDTH IS UNCONDITIONAL ONCE A SENSE EXISTS. The symbolizer guard
+        # below covers only the four symbolizer-DERIVED fields; the flow
+        # senses come from the world model and must be appended whether or
+        # not a symbolizer was built, or the policy's proprio_dim and this
+        # vector disagree by four and every row is silently misread.
+        _flow_on = bool(getattr(
+            getattr(self, "world_model", None), "flow_enabled", False))
+        if self.symbolizer is None and not _flow_on:
             return pp
         try:
-            ext = [0.0, 0.0, 0.0, 0.0]
-            if e_i == 0:
+            # THE FOUR SYMBOLIZER-DERIVED FIELDS EXIST ONLY IF IT DOES. Their
+            # presence is what the policy's proprio_dim declaration keys on,
+            # so appending four zeros in a symbolizer-less run would make this
+            # vector four wider than the policy expects and shift every flow
+            # sense into the wrong slot.
+            ext = [0.0, 0.0, 0.0, 0.0] if self.symbolizer is not None else []
+            if e_i == 0 and self.symbolizer is not None:
                 ext[0] = float(getattr(self, "_reach_now", 0.0))
                 if (self.infra is not None
                         and self.infra.episodic is not None
@@ -9747,6 +10636,42 @@ class DevelopmentalAI:
                             ext[1] = float(validity * proximity)
                             ext[2] = float(math.sin(rel))
                             ext[3] = float(math.cos(rel))
+            if _flow_on:
+                # ---- PERSPECTIVE FROM MOTION: four geometric senses -----
+                # PRIMARY STREAM ONLY carries real values, exactly like
+                # reach: the senses are read off the primary's latent once
+                # per step. A scout reads the neutral row — 0 flow, 0.5
+                # ratio (neither figure nor ground), 0 mover — which is the
+                # honest encoding of "this body has no such sense", not a
+                # claim that nothing is moving.
+                fn = (getattr(self, "_flow_now", None) if e_i == 0 else None)
+                fn = fn or self._FLOW_NEUTRAL
+                ext.extend([
+                    float(fn.get("flow_fovea", 0.0)),
+                    float(fn.get("flow_edge", 0.0)),
+                    float(fn.get("flow_ratio", 0.5)),
+                    float(fn.get("mover", 0.0)),
+                ])
+                # ---- P4: WHERE the model is wrong ----------------------
+                # POLICY ONLY, deliberately. This is derived FROM the world
+                # model, so feeding it back into the world model's own input
+                # would be circular — the same argument that keeps the flow
+                # senses out of the sensor bus and in this vector instead.
+                _sm = (getattr(self, "_surprise_now", None)
+                       if e_i == 0 else None)
+                _n = self._surprise_grid * self._surprise_grid
+                if _sm is not None and len(_sm) == _n:
+                    ext.extend(float(x) for x in _sm)
+                else:
+                    ext.extend([0.0] * _n)
+            if self._spatial_on:
+                # ---- G1/G2/P2/P3: the maps that outlive the frame -------
+                # POLICY ONLY, like every other world-model-derived sense:
+                # feeding a model's own output back into its input is
+                # circular. Widths here must mirror _spatial_width() exactly
+                # — that function is the only declaration and this is the
+                # only writer, and a mismatch is silent.
+                ext.extend(self._spatial_fields(e_i))
             return np.concatenate([np.asarray(pp, dtype=np.float32),
                                    np.asarray(ext, dtype=np.float32)])
         except Exception:
@@ -11109,6 +12034,31 @@ class DevelopmentalAI:
                                 f"UNACCOUNTED {_un:.0f}ms "
                                 f"({100.0*_un/max(1e-6,_step_ms):.0f}%)")
                             print("  Phase timing: " + " | ".join(_parts))
+                            # WHAT IS INSIDE `env` (2026-09-21). `env` is the
+                            # largest phase left and was one opaque number.
+                            # These are IN-THREAD means per client-step, so
+                            # they do NOT sum to the `env` wall time — the
+                            # comparison that matters is `slowest` (what env
+                            # would cost with a perfect pool) against the
+                            # measured `env` above. A large gap is pool/GIL
+                            # overhead and means extra clients are being
+                            # serialised rather than overlapped.
+                            _ep = getattr(self, "_env_parts", None) or {}
+                            _en = float(_ep.get("_n", 0.0))
+                            if _en:
+                                _eparts = [
+                                    f"{_k} {_ep.get(_k, 0.0)/_en:.0f}ms"
+                                    for _k in self._ENV_PARTS]
+                                _slow = _ep.get("_slow", 0.0) / _en
+                                _envw = 1000.0 * _acc.get("env", 0.0) / max(
+                                    1, _ewn)
+                                print("  Env breakdown (in-thread): "
+                                      + " | ".join(_eparts)
+                                      + f" | slowest client {_slow:.0f}ms"
+                                      + f" vs env phase {_envw:.0f}ms"
+                                      + f" -> pool overhead "
+                                        f"{_envw - _slow:+.0f}ms")
+                    self._env_parts = {}
                     self._phase_acc = {}
                     self._env_wait_sum = 0.0
                     self._env_wait_n = 0

@@ -44,10 +44,14 @@ headless). First reset compiles/launches the Java client (~90s).
 from __future__ import annotations
 
 import logging
+from time import perf_counter as _perf
 from typing import Any, Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
+
+from developmental_ai.sensors import (
+    build_default_bus, crop_centre as _crop_centre, DeadReckoner)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +142,94 @@ TREECHOP_MACROS: list = [
     # true: ~60 ticks for a barehanded oak log is still ~2 consecutive picks.
     # Editing the VALUE is safe; only the INDEX is append-only.
     {"attack": 1, "_ticks": 40},                         # 12 HOLD attack
+    # ---- FINE AIM (2026-09-19, A5) --------------------------------------
+    # THE ARITHMETIC THAT FORCED THIS. Every camera action above moves the
+    # view by 15 degrees, which at Minecraft's default 70-degree FOV is 21%
+    # OF THE FRAME per press. A one-block target subtends:
+    #
+    #     2 blocks   28 deg    fine
+    #     5 blocks   11.4 deg  one step overshoots
+    #    10 blocks    5.7 deg  the step is 2.6x the TARGET
+    #    20 blocks    2.9 deg  the step is 5x the target
+    #
+    # So approaching a tree carries +/-7.5 degrees of UNAVOIDABLE aim error —
+    # about +/-1.3 blocks of lateral drift at 10 blocks — and every
+    # close-range correction swings the view clean past the trunk. That is a
+    # limit cycle, and it is a better mechanical account of "13,305 blocks
+    # broken, 35 logs" than any perception story: the agent gets near trees,
+    # cannot converge on the trunk, and whatever sits under an unsteerable
+    # crosshair at ground level is dirt.
+    #
+    # PRECEDENT FOR THE SHAPE. VPT — the strongest Minecraft agent ever
+    # built — uses mu-law quantised camera bins: fine near zero, coarse far
+    # out. 15/5/2 is that shape at three levels, and it means the agent can
+    # still turn fast when it wants to.
+    #
+    # APPEND ONLY, like the 10->12 widening before it. Indices 0-12 keep
+    # their exact meaning; tests/_action_widening_smoke.py pins the five
+    # conditions that make a stored narrower head safe to load.
+    #
+    # NOTHING HERE IS A SKILL. These are finer versions of buttons the agent
+    # already has. What to aim at, and when, remains entirely unlearned.
+    {"camera": [0.0, -5.0]},                             # 13 turn left  fine
+    {"camera": [0.0, 5.0]},                              # 14 turn right fine
+    {"camera": [-5.0, 0.0]},                             # 15 look up    fine
+    {"camera": [5.0, 0.0]},                              # 16 look down  fine
+    {"camera": [0.0, -2.0]},                             # 17 turn left  micro
+    {"camera": [0.0, 2.0]},                              # 18 turn right micro
+    {"camera": [-2.0, 0.0]},                             # 19 look up    micro
+    {"camera": [2.0, 0.0]},                              # 20 look down  micro
+    # ---- THE REST OF A PLAYER'S HANDS (2026-09-19, roadmap A7/A8/A9) ----
+    # APPEND ONLY. Indices 0-20 keep their exact meaning; every saved skill,
+    # policy and config indexes actions BY POSITION, so rebinding one
+    # silently relabels every frozen skill that ever pressed it.
+    #
+    # A7 — STRAFE, SPRINT, SNEAK. A player has all three and the agent had
+    # none. Strafing matters most: turning and moving are coupled through
+    # the heading, so ORBITING a tree while keeping it centred was not
+    # expressible at all. Sneak is what stops you walking off a ledge.
+    {"left": 1},                                         # 21 strafe left
+    {"right": 1},                                        # 22 strafe right
+    {"forward": 1, "sprint": 1},                         # 23 sprint
+    {"sneak": 1},                                        # 24 sneak
+    {"jump": 1},                                         # 25 jump in place
+    # A8 — HOLD DURATION AS A CHOICE. Index 12 holds attack for a fixed 40
+    # ticks. The config's own arithmetic: a barehanded log needs ~60 ticks
+    # and an iron axe ~8, so ONE fixed duration cannot serve both — it is
+    # either far too long for a tool or two thirds too short for bare hands.
+    # The 120 cap exists because `attack_run` has been observed at 13538;
+    # nothing here may exceed it.
+    {"attack": 1, "_ticks": 10},                         # 26 tap attack
+    {"attack": 1, "_ticks": 120},                        # 27 long hold
+    # ---- A9 (HOTBAR) WAS PROPOSED AND REMOVED. Do not re-add without
+    # reading this (2026-09-19).
+    #
+    # THE CASE FOR IT: without hotbar keys the agent can never deliberately
+    # equip anything. CLAUDE.md 7 records that there is no equip action and
+    # `equipped_items` is dead in MineRL 1.0, so mainhand is DERIVED FROM
+    # EVIDENCE. Hotbar keys are the player's actual mechanism, and they are
+    # real — Stage 0 measured hotbar.1-9 inside MineRL's 24-key space.
+    #
+    # THE CASE AGAINST, WHICH WON. tests/_action_widening_smoke.py already
+    # carried `# still no hotbar keys (deliberate: minimal exploration
+    # burden)` — a decision someone made and pinned in a test. Nine more
+    # macros is a 32% larger action space, and MEASUREMENT MADE THE TRADE
+    # WORSE rather than better:
+    #
+    #   * Stage 0.3 measured that MineRL's POV does NOT render the HUD
+    #     (bottom-band pixel variance 0.029 against 0.290 mid-frame). The
+    #     agent cannot SEE its selection change, so these would be nine
+    #     actions with no perceptible effect whatsoever.
+    #   * The agent has never crafted anything and has 35 logs in its entire
+    #     history. There is nothing to select BETWEEN. currentItem
+    #     initialises to slot 0, so the one slot that matters is already
+    #     active.
+    #
+    # Nine invisible actions over an empty inventory is exploration burden
+    # bought with nothing. The right time to add them is when the agent
+    # HOLDS more than one thing, and the right way to make them learnable is
+    # a selection sense grounded in consequence — not the highlight, which
+    # this engine does not draw.
 ]
 
 
@@ -149,6 +241,7 @@ class MineRLEnvAdapter(gym.Env):
     def __init__(self, env_name: str = "MineRLTreechop-v0",
                  macros: Optional[list] = None, image_size: int = 64,
                  action_repeat: int = 1, render_size: int = 0,
+                 sensors_cfg: Optional[Dict] = None,
                  lifelong: bool = False, remote_server: Optional[str] = None,
                  remote_step_delay_s: float = 0.0,
                  start_tool: Optional[str] = START_TOOL,
@@ -326,6 +419,34 @@ class MineRLEnvAdapter(gym.Env):
         # walk at any repeat instead of pinning at 1.0.
         self._move_scale = self.MOVE_SCALE * self.action_repeat / 2.0
         self._last_pov: Optional[np.ndarray] = None
+        self._last_pov_small: Optional[np.ndarray] = None
+        # ---- THE SENSOR BUS (2026-09-19) ---------------------------------
+        # One registry for every transducer the agent has, so adding a sense
+        # is a registration rather than a schema migration against the replay
+        # buffer, the world model and both loop bodies. `proprio` is simply
+        # its first registered sensor and keeps its field order, which is
+        # what lets a buffer written before the bus existed still line up.
+        #
+        # None disables the whole mechanism and reproduces the pre-bus
+        # behaviour exactly — info["proprio"] and nothing else.
+        self._fovea_size = int(sensors_cfg.get("fovea_size", 32)) \
+            if sensors_cfg else 32
+        self._cur_fovea: Optional[np.ndarray] = None
+        self._prev_y: Optional[float] = None
+        self._prev_yaw: Optional[float] = None
+        self._fall_dist: float = 0.0
+        self._dr = DeadReckoner()
+        self._prev_fovea: Optional[np.ndarray] = None
+        self._sensor_bus = None
+        if sensors_cfg and sensors_cfg.get("enabled") is not None:
+            self._sensor_bus = build_default_bus(
+                self.PROPRIO_DIM, lambda ctx: self._proprio(ctx["world"]),
+                enabled=list(sensors_cfg.get("enabled") or []),
+                fovea_size=self._fovea_size,
+                # The SAME normalizer `moved` uses, so the signed components
+                # read on the same scale as the magnitude they refine.
+                move_scale=self._move_scale)
+            logger.info("sensor bus: %s", self._sensor_bus.describe())
         self._log_count = 0
         self._mine_baseline: Dict[str, int] = {}
         self._broken_this_episode: set = set()
@@ -438,6 +559,7 @@ class MineRLEnvAdapter(gym.Env):
         # per-step false tool_lost loop (~7000 bogus KG facts).
         self._prev_derived_hand: Optional[str] = None
         self._env = self._make_underlying()
+        self._validate_macros()
 
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0, shape=(3 * self.image_size * self.image_size,),
@@ -459,9 +581,26 @@ class MineRLEnvAdapter(gym.Env):
         frame (videos + vision LLM see real Minecraft) while the returned
         obs is the block-mean downsample the agent has always seen."""
         pov = np.asarray(obs["pov"], dtype=np.uint8)
+        # THE FOVEAL CROP IS CUT HERE, BEFORE THE DOWNSAMPLE (2026-09-19).
+        # `_last_pov` already kept the native frame for video and the VLM;
+        # this is the one place in the step where native pixels exist, so it
+        # is the only place the crosshair crop can be taken without a second
+        # render. The PREVIOUS crop is carried for the delta sensor — one
+        # 32x32x3 array, not a second frame.
+        if self._sensor_bus is not None:
+            self._prev_fovea = self._cur_fovea
+            self._cur_fovea = _crop_centre(pov, self._fovea_size)
         self._last_pov = pov                     # kept raw for video/render
         if self.render_size != self.image_size:
             pov = self._block_mean(pov, self.render_size // self.image_size)
+            # THE DOWNSAMPLE IS KEPT, NOT RECOMPUTED. The whole-scene sensors
+            # (light, sky, screen_fx) want exactly this frame, and it already
+            # exists here for free. Left None when no downsample happened, so
+            # `_scene` falls back to the native frame rather than caching the
+            # same array under two keys.
+            self._last_pov_small = pov
+        else:
+            self._last_pov_small = None
         return (pov.astype(np.float32) / 255.0).transpose(2, 0, 1).flatten()
 
     def _last_obs(self) -> np.ndarray:
@@ -480,6 +619,46 @@ class MineRLEnvAdapter(gym.Env):
         """How many game ticks this macro is held for."""
         return max(1, int(self._macros[int(idx)].get(
             "_ticks", self.action_repeat)))
+
+    def _validate_macros(self) -> None:
+        """Every macro key must exist in the REAL action space.
+
+        WHY THIS IS A HARD FAILURE AND NOT A WARNING. `_macro_to_action`
+        does `act[k] = v` on the dict `action_space.noop()` returns. A key
+        the engine does not have is therefore ACCEPTED SILENTLY and dropped
+        on the floor at the socket — the macro looks like it fired, the
+        policy learns a button that does nothing, and the only symptom is
+        that the agent never does the thing. That is the single most
+        expensive failure mode in this project's history, and it is worth a
+        boot-time crash to make impossible.
+
+        Checked ONCE at construction, against the live space, because the
+        answer depends on which MineRL env spec was built and no amount of
+        reading the source settles it.
+        """
+        try:
+            noop = self._env.action_space.noop()
+        except Exception as e:                       # pragma: no cover
+            logger.warning("cannot validate macros against action space: %s", e)
+            return
+        known = set(noop.keys())
+        missing = {}
+        for i, m in enumerate(self._macros):
+            for k in m:
+                if k == "_ticks" or k in known:
+                    continue
+                missing.setdefault(k, []).append(i)
+        if missing:
+            raise RuntimeError(
+                "macro keys absent from the MineRL action space: "
+                + "; ".join(f"{k!r} (macros {v})" for k, v in
+                            sorted(missing.items()))
+                + f". The space offers: {sorted(known)}. These keys would be "
+                  f"set on the action dict and DROPPED at the socket, so the "
+                  f"policy would learn buttons that do nothing.")
+        logger.info(
+            "action space validated: %d macros over %d engine keys",
+            len(self._macros), len(known))
 
     def _macro_to_action(self, idx: int) -> Dict:
         act = self._env.action_space.noop()
@@ -968,8 +1147,61 @@ class MineRLEnvAdapter(gym.Env):
             out["moved"] = (0.0 if _pxz is None else
                             float(np.hypot(float(x) - _pxz[0],
                                            float(z) - _pxz[1])))
+            # ---- SIGNED DISPLACEMENT (2026-09-19, roadmap G4) ------------
+            # `moved` is a MAGNITUDE, so nothing downstream can tell walking
+            # forward from being shoved sideways by a mob, or from pressing
+            # `back`. A player feels all three. Resolving the same delta this
+            # method already computes into BODY-RELATIVE forward/lateral
+            # components is the transducer for that feeling — it names
+            # nothing, and it comes from exactly the measurement `moved`
+            # already comes from, which is why it inherits `moved`'s GREEN
+            # classification rather than needing a new argument.
+            _dxz = ((0.0, 0.0) if _pxz is None else
+                    (float(x) - _pxz[0], float(z) - _pxz[1]))
+            _yw = out.get("yaw")
+            if _yw is None:
+                out["move_fwd"] = out["move_lat"] = 0.0
+            else:
+                # MINECRAFT HEADING CONVENTION: yaw 0 faces +z (south) and
+                # yaw grows CLOCKWISE (yaw 90 faces -x/west). The forward
+                # unit vector is therefore (-sin, +cos) in (x, z), and
+                # lateral is that rotated a quarter turn. Getting this sign
+                # wrong is the episodic-bearing bug this repo already shipped
+                # once, so tests/_sensor_bus_smoke.py pins it by cases.
+                _r = float(np.radians(float(_yw)))
+                _fx, _fz = -float(np.sin(_r)), float(np.cos(_r))
+                out["move_fwd"] = _dxz[0] * _fx + _dxz[1] * _fz
+                out["move_lat"] = _dxz[0] * _fz - _dxz[1] * _fx
+            # ---- DEAD RECKONING (roadmap G3) ----------------------------
+            # Integrated from the body-relative components ABOVE, never from
+            # the engine's absolute position. Origin is wherever the episode
+            # started, which is precisely a player's mental map without F3:
+            # an egocentric frame with no world coordinates in it.
+            # HOW MUCH THE HEAD TURNED THIS STEP, continuous across the
+            # 360->0 wrap. Camera actions are COMMANDED in degrees but the
+            # realised turn is what the maps must be re-registered by, and
+            # the two differ whenever a step is dropped or clamped.
+            _pyw = getattr(self, "_prev_yaw", None)
+            if _yw is None or _pyw is None:
+                out["yaw_delta"] = 0.0
+            else:
+                _d = (float(_yw) - float(_pyw) + 180.0) % 360.0 - 180.0
+                out["yaw_delta"] = float(_d)
+            self._prev_yaw = None if _yw is None else float(_yw)
+            self._dr.step(out["move_fwd"], out["move_lat"], _yw)
+            out["dr_x"], out["dr_z"] = self._dr.x, self._dr.z
             self._prev_xz = (float(x), float(z))
-            out["y"] = float(out.get("ypos", 0.0) or 0.0)
+            _py = getattr(self, "_prev_y", None)
+            _ynow = float(out.get("ypos", 0.0) or 0.0)
+            out["move_dy"] = 0.0 if _py is None else (_ynow - _py)
+            # FALL DISTANCE: a player knows they are falling and roughly how
+            # far. Accumulates while descending, zeroes the moment it stops.
+            _fall = getattr(self, "_fall_dist", 0.0)
+            self._fall_dist = (_fall - out["move_dy"]
+                               if out["move_dy"] < -1e-3 else 0.0)
+            out["fall_dist"] = float(self._fall_dist)
+            self._prev_y = _ynow
+            out["y"] = _ynow
         # WHAT IS IN HAND — decides the chop-completion question (see
         # create_observables). "air"/none => barehanded => a log needs ~60
         # ticks but the chop option only holds attack for 50.
@@ -1561,6 +1793,7 @@ class MineRLEnvAdapter(gym.Env):
         # whole scene change as "someone else did something" (2026-08-09)
         self._prev_small_pov = None
         self._env = self._make_underlying()
+        self._validate_macros()
 
     # ---- gymnasium API ----------------------------------------------------
     def reset(self, *, seed: Optional[int] = None,
@@ -1575,6 +1808,16 @@ class MineRLEnvAdapter(gym.Env):
         # a fresh world teleports the body: the first displacement after a
         # reset is meaningless and must read 0, not "sprinted 200 blocks"
         self._prev_xz = None
+        # A NEW WORLD IS A NEW FRAME OF REFERENCE. World persistence is
+        # impossible in this fork (measured) — every episode is a fresh map —
+        # so carrying the integrator across a reset would be integrating a
+        # trajectory through two unrelated worlds.
+        self._prev_y = None
+        self._prev_yaw = None
+        self._fall_dist = 0.0
+        self._dr.reset()
+        self._cur_fovea = None
+        self._prev_fovea = None
         if seed is not None:
             try:
                 self._env.seed(int(seed))
@@ -1624,15 +1867,24 @@ class MineRLEnvAdapter(gym.Env):
 
     def step(self, action: int
              ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        # ---- WHERE THE STEP ACTUALLY GOES (2026-09-21) -------------------
+        # `env` is the largest phase left and it was one opaque number. These
+        # four stamps split it into engine round-trip, observation build,
+        # sensing, and adapter bookkeeping, and ride out on `info["step_ms"]`.
+        # IN-THREAD time, not wall clock: envs step concurrently in a pool,
+        # so these apportion the WAIT rather than adding to it.
+        _t_step0 = _perf()
         act = self._macro_to_action(action)
         total_reward = 0.0
         obs, done, info = None, False, {}
+        _t_engine = _t_obs = _t_sense = 0.0
         try:
             for _ in range(self._macro_ticks(action)):
                 obs, reward, done, info = self._env.step(act)
                 total_reward += float(reward)  # spec pays none; kept if fixed
                 if done:
                     break
+            _t_engine = _perf() - _t_step0
         except Exception as e:  # client died mid-episode: salvage the episode
             logger.warning(
                 "MineRL step failed (%s) — rebuilding client and truncating "
@@ -2089,6 +2341,21 @@ class MineRLEnvAdapter(gym.Env):
         if _broke_now:
             self._attack_run = 0
         self._mine_prev = dict(mine_now)
+        # ---- THE OBSERVATION IS BUILT HERE, NOT IN THE RETURN ------------
+        # `_pov_to_obs` is the ONLY writer of `_last_pov` and of the foveal
+        # crop pair, and it used to run inside the return expression — AFTER
+        # the sensor block below. So every image sensor read the PREVIOUS
+        # step's frame: `screen_fx` and `light` described the world before the
+        # action, and `fovea_delta` differenced t-1 against t-2. The one
+        # sensor whose entire purpose is "did THIS swing land" structurally
+        # could not see this swing. Found 2026-09-21 while sub-phasing `env`;
+        # pinned by test_sensors_see_this_step in tests/_sensor_bus_smoke.py.
+        #
+        # Safe to hoist: nothing between here and the return reads or mutates
+        # `obs["pov"]`, and `_pov_to_obs` reads nothing else.
+        _t_a = _perf()
+        _obs_vec = self._pov_to_obs(obs)
+        _t_obs = _perf() - _t_a
         info = dict(info) if isinstance(info, dict) else {}
         # territory novelty + damage/death (consumed as INTRINSIC by the loop)
         try:
@@ -2099,6 +2366,7 @@ class MineRLEnvAdapter(gym.Env):
         # `world` is assembled from the raw obs; two facts the agent needs are
         # only known HERE: whether a menu is covering the screen, and how much
         # it is carrying. Fold them in, then emit the fixed proprio vector.
+        _t_a = _perf()
         try:
             _w = info["world"]
             _w["gui_open"] = bool(_gui)
@@ -2115,8 +2383,29 @@ class MineRLEnvAdapter(gym.Env):
             _w["attack_run"] = float(self._attack_run)
             _w["reach_evidence"] = float(self._reach_evidence)
             info["proprio"] = self._proprio(_w)
+            # THE BUS READS THE SAME `world` THE PROPRIO VECTOR DOES, plus
+            # the native frame, so every sensor sees one consistent snapshot
+            # of this step. RED sensors are not visited by read_policy at
+            # all — there is no filter here to forget.
+            if self._sensor_bus is not None:
+                _ctx = {"world": _w, "info": info,
+                        "pov_native": self._last_pov,
+                        "pov_small": self._last_pov_small,
+                        "prev_fovea": self._prev_fovea}
+                info["sensors"] = self._sensor_bus.read_policy(_ctx)
+                info["sensor_layout"] = self._sensor_bus.layout_hash()
+                _oracle = self._sensor_bus.read_oracle(_ctx)
+                if _oracle:
+                    # EVALUATION SINK ONLY. Deliberately a separate key that
+                    # the replay buffer does not carry, so a meaning cannot
+                    # ride into the world model on the sensor column.
+                    info["oracle"] = _oracle
         except Exception:
             info["proprio"] = np.zeros(self.PROPRIO_DIM, dtype=np.float32)
+            if self._sensor_bus is not None:
+                info["sensors"] = self._sensor_bus.neutral_policy()
+                info["sensor_layout"] = self._sensor_bus.layout_hash()
+        _t_sense = _perf() - _t_a
         # TICKS-TO-BREAK: the measured quantity, carried on info so the loop
         # can print it. `attack_run` is the CURRENT unbroken attack streak —
         # a large streak with no breaks is the signature of swinging at
@@ -2199,7 +2488,18 @@ class MineRLEnvAdapter(gym.Env):
         terminated = new_count >= 64
         # Otherwise MineRL's `done` is the step limit -> TRUNCATION (the
         # agent didn't fail — time ran out), keeping GAE bootstrapping right.
-        return (self._pov_to_obs(obs), total_reward, terminated,
+        _t_tot = _perf() - _t_step0
+        # `adapter` is the remainder on purpose: rewards, stats, the event
+        # stream and the GUI accounting, none of which is worth its own stamp
+        # until one of them is shown to matter.
+        info["step_ms"] = {
+            "engine": _t_engine * 1e3,     # socket + server ticks + render
+            "obs": _t_obs * 1e3,           # downsample, fovea crop, flatten
+            "sense": _t_sense * 1e3,       # proprio + the sensor bus
+            "adapter": max(0.0, _t_tot - _t_engine - _t_obs - _t_sense) * 1e3,
+            "total": _t_tot * 1e3,
+        }
+        return (_obs_vec, total_reward, terminated,
                 bool(done) and not terminated, info)
 
     def render(self):

@@ -67,7 +67,7 @@ class EvalEpisodeRunner:
             init_obs_t = torch.FloatTensor(obs).unsqueeze(0).to(
                 self.agent.device
             )
-            init_encoded = self.agent.world_model.encoder(init_obs_t)
+            init_encoded = self.agent.world_model.embed(init_obs_t)
             zero_act = torch.zeros(
                 1, self.agent.action_dim, device=self.agent.device
             )
@@ -123,7 +123,7 @@ class EvalEpisodeRunner:
                     obs_t, act_t, next_obs_t
                 ).item()
 
-                encoded = self.agent.world_model.encoder(next_obs_t)
+                encoded = self.agent.world_model.embed(next_obs_t)
                 rssm_state, _ = self.agent.world_model.rssm.observe_step(
                     rssm_state, act_t, encoded
                 )

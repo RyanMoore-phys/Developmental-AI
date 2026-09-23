@@ -1,15 +1,36 @@
 # External Minecraft server mode — full setup (both sides)
 
-Point the organism's primary stream (env 0) at your OWN Minecraft server
-instead of a MineRL-generated world. The AI still learns exactly as on MineRL
-(same pixel observations, same actions, same discovery machinery); only the
-world changes. The bot lives on the GPU pod and connects *out* to your server
-over a private Tailscale tunnel — your server is never exposed to the internet.
+Point the organism at your OWN Minecraft server instead of a MineRL-generated
+world. The AI still learns exactly as on MineRL (same pixel observations, same
+actions, same discovery machinery); only the world changes. The bot connects
+*out* to your server — the server is never exposed to the internet.
+
+**Every stream, not just env 0.** `remote_server_scope: all` has been set since
+2026-08-17, so all `num_envs` clients join the same persistent server (that is
+the peer-learning experiment). Each needs its own identity — see
+`agent_name_prefix`; slot 0 keeps the bare `SkyBot`, scouts become `SkyBot1`,
+`SkyBot2`, … and on an offline-mode server each new name is a NEW player the
+whitelist must include.
+
+**TWO WAYS OUT, ONE ENDPOINT (since 2026-09-22).** The java client always
+talks to `127.0.0.1:25565`; only the far side of the socat differs, and
+`connect_server.sh bridge` picks it from the address you give it:
 
 ```
-[pod: java client] --127.0.0.1:25565--> [socat] --tailnet--> [your server:25565]
-        env 0                              bridge      (ACL-caged, tag:devai)
+                                        ,--tailnet--> [your server:25565]
+[java clients] --127.0.0.1:25565--> [socat]           (ACL-caged, tag:devai)
+   env 0..N                             `--LAN TCP--> [your server:25565]
 ```
+
+| address given to `bridge` | far side |
+|---|---|
+| `192.168.*`, `10.*`, `172.16–31.*` | plain `socat` TCP over the LAN |
+| `100.x` tailnet, MagicDNS names, anything else | `tailscale nc` — unchanged |
+
+Because the endpoint is identical either way, `environment.remote_server` stays
+`127.0.0.1:25565` and nothing downstream knows or cares which path is live.
+`CONNECT_MODE=lan|tailscale` overrides the choice. **Tailscale is retained in
+full** — section A4/A5 below still apply, and switching back is one argument.
 
 **Reality checks up front**
 - The client is Minecraft **1.16.5**. A newer server (e.g. 1.21) must run
@@ -104,10 +125,22 @@ anything tagged `tag:devai` reach ONLY the game port. After approving the pod
 
 ---
 
-## B. THE POD
+## B. THE TRAINING HOST
 
-Tailscale + socat are installed by provisioning (stage 1c). Bring the tunnel up
-in two phases (the device-approval step is interactive):
+Since 2026-09-22 this is the user's own machine (Ubuntu Server, 192.168.1.10),
+not a rented pod — but it is installed at `/workspace/devai` and deployed to as
+`root@` exactly like one, so every command below is unchanged.
+
+Tailscale + socat are installed by provisioning (stage 1c).
+
+**Over the LAN — one phase.** No login step: nothing is traversing the tailnet.
+
+```bash
+bash scripts/connect_server.sh bridge 192.168.1.XX     # the server's LAN IP
+#   Prints "bridge mode: lan", then "SERVER REACHABLE" with version/protocol.
+```
+
+**Over the tailnet — two phases**, the device-approval step being interactive:
 
 ```bash
 # Phase 1 — login. Prints an approval URL.
@@ -117,9 +150,18 @@ bash scripts/connect_server.sh login
 
 # Phase 2 — bridge to the server's tailscale IP (from A4), and ping it.
 bash scripts/connect_server.sh bridge <server-tailscale-ip>
-#   Success prints: "SERVER REACHABLE" with the server's version/protocol.
+#   Prints "bridge mode: tailscale", then "SERVER REACHABLE".
 #   protocol 754 in the reply = a 1.16.5 client is accepted (Via is working).
 ```
+
+`tailscale status` is required **only** on the tailscale path. Gating the LAN
+path on it would be a CLAUDE.md §4.1 latch — a precondition nothing on that
+path could satisfy. The MC ping runs on both, because it is the check that
+actually carries value and it fails for the same reasons either way.
+
+If the ping fails on the LAN path, the usual cause is `server-ip=` in
+`server.properties` bound to `127.0.0.1` instead of listening on the LAN, or a
+firewall on 25565. The script says which to check per mode.
 
 Then launch external-server mode:
 
@@ -129,6 +171,12 @@ bash scripts/launch_skybot.sh 1000000
 
 Its pre-flight refuses to start unless tailscaled + the bridge + the server ping
 all pass, so a dead tunnel can't strand the primary in a connect-fail loop.
+
+NOTE that the launcher's pre-flight still checks `tailscaled` even on the LAN
+path. On the main computer tailscaled runs anyway (it is kept for when
+ethernet returns), so this passes — but it is a check unrelated to whether the
+LAN bridge works, and it would refuse a perfectly healthy LAN run if tailscaled
+ever stopped. Left as-is deliberately; worth revisiting if that ever bites.
 
 ---
 
@@ -143,16 +191,23 @@ all pass, so a dead tunnel can't strand the primary in a connect-fail loop.
   adapter detects the frozen POV (150 motion-commanded steps with no frame
   change) and rebuilds → the fresh mission rejoins automatically. Hard socket
   errors rejoin the same way.
-- A live server never resets, which suits the lifelong design (env 0 is a single
-  continuous life); death is respawn, not a world reset.
+- A live server never resets, which suits the lifelong design (each stream is a
+  single continuous life); death is respawn, not a world reset.
 
 ## D. Config knobs (`configs/minecraft_skybot.yaml`)
 
 ```yaml
 environment:
-  remote_server: "127.0.0.1:25565"   # the pod-local bridge endpoint
-  remote_server_scope: primary       # only env 0 joins; scouts stay local. "all" = every stream joins
+  remote_server: "127.0.0.1:25565"   # the host-local bridge endpoint — the
+                                     # SAME on the LAN and tailnet paths, which
+                                     # is why this line never changes
+  remote_server_scope: all           # LIVE VALUE: every stream joins the server
+                                     # ("primary" = only env 0; scouts local)
 ```
+
+The live config uses **`all`** (since 2026-08-17), so no stream runs a local
+generated world. Whitelist `SkyBot` **and** `SkyBot1` — with `online-mode=false`
+each name is a distinct player.
 
 Set `remote_server: null` (or use `configs/minecraft_lifelong.yaml`) to go back
 to pure-MineRL local worlds — the SkyBot tunnel can stay running, idle.

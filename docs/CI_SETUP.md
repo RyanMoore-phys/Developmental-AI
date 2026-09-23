@@ -67,34 +67,62 @@ cd ~/actions-runner
 The runner reads `.env` from its own root and applies it to every job. **This
 file is never committed — it is not in the repo at all.**
 
+**This file is the ONLY place the training host is named.** Nothing in the
+tree hardcodes it, which is what made moving off the rented pod an `.env` edit
+rather than a refactor. To move hosts again, edit this — not the repo.
+
 ```bash
 cat > ~/actions-runner/.env <<'EOF'
 # --- required ---
-POD_HOST=<redacted-host>          # pod IP (ssh transport, the default)
-POD_SSH_PORT=19983               # ROTATES on every pod restart — see below
-POD_SSH_KEYFILE=/Users/rimac/.ssh/skybot_ed25519
+POD_HOST=192.168.1.10           # the main computer, on the LAN
+POD_SSH_PORT=22                  # a fixed box: this no longer rotates
+POD_SSH_KEYFILE=/Users/rimac/.ssh/id_ed25519
 
 # --- required for `pod.yml action=connect` ---
-MC_SERVER_TS_IP=100.64.0.11    # the Paper server's tailnet IP
+MC_SERVER_TS_IP=192.168.1.XX     # the Paper server. LAN IP or tailnet IP —
+                                 # connect_server.sh picks the transport from
+                                 # the address itself (see below).
 
 # --- optional ---
 # DEPLOY_TRANSPORT=tailscale     # use Tailscale SSH instead of ssh; needs the
                                  # ACL rule in section 4, and POD_HOST becomes
                                  # the MagicDNS name (e.g. devai-pod-2)
-# TS_AUTHKEY=tskey-auth-...      # lets `provision` join a fresh pod to the
+# TS_AUTHKEY=tskey-auth-...      # lets `provision` join a fresh box to the
                                  # tailnet without a browser click
 EOF
 chmod 600 ~/actions-runner/.env
 ```
+
+### `MC_SERVER_TS_IP` is no longer tailnet-only (2026-09-22)
+
+The name is kept for compatibility with both workflows; the **value** may now
+be either. `connect_server.sh bridge` chooses by address family:
+
+| `MC_SERVER_TS_IP` | far side of the bridge |
+|---|---|
+| `192.168.*`, `10.*`, `172.16–31.*` | plain `socat` TCP over the LAN |
+| `100.x` tailnet, MagicDNS names, anything else | `tailscale nc` — **unchanged** |
+
+Unrecognised input defaults to **tailscale**, deliberately: every value that
+worked before still works, and a MagicDNS name is not pattern-matchable as a
+tailnet address. `CONNECT_MODE=lan|tailscale` forces it. Either way the bridge
+presents `127.0.0.1:25565`, so `environment.remote_server` never changes.
+
+**Switching back to the tailnet when ethernet returns** is one value: set
+`MC_SERVER_TS_IP` to the Paper server's `100.x` address and re-run
+`pod.yml action=connect`. Nothing else moves.
 
 Restart the runner after editing (`./svc.sh stop && ./svc.sh start`) — `.env`
 is read at service start.
 
 ### The one thing you must keep updated
 
-**`POD_SSH_PORT` changes every time the pod restarts** (22655 → 22681 → 34276
-→ 19983 → …). When a job fails at the preflight step with an ssh error, this
-is almost always why. Update `.env`, restart the runner, re-run.
+**On a rented pod, `POD_SSH_PORT` changes every restart** (22655 → 22681 →
+34276 → 19983 → …). When a job fails at the preflight step with an ssh error,
+that is almost always why: update `.env`, restart the runner, re-run.
+
+**On the main computer this no longer applies** — port 22 is fixed. The
+equivalent failure there is the box being asleep or off the LAN.
 
 This is the single reason to consider the tailscale transport later: a MagicDNS
 name is stable across rebuilds, so nothing needs updating. It costs one ACL
@@ -110,6 +138,32 @@ POD_HOST=... POD_SSH_PORT=... bash scripts/pod_exec.sh 'hostname'
 # 3. read-only workflow:  Actions -> pod -> Run workflow -> action=status
 # 4. then deploy, then connect, then launch.
 ```
+
+### Bootstrapping a BARE host — provision before you push
+
+**`provision` is self-seeding; `deploy` is not.** `pod.yml action=provision`
+rsyncs the tree itself before running `provision_pod.sh`, so it works against
+an empty box. `deploy_skybot.sh` runs its smoke tests with
+`./venv_mc/bin/python`, which **provisioning is what creates** — so a deploy
+against a bare host fails at the smoke step, having already synced.
+
+`deploy.yml` also fires automatically whenever `ci` passes. So on a new host,
+pushing before `.env` is updated aims a deploy at the *old* target.
+
+Order for a fresh box:
+
+1. Root SSH reachable (`PermitRootLogin prohibit-password`, key in
+   `/root/.ssh/authorized_keys`). `provision` creates `/workspace/devai`.
+2. `.env` above → **restart the runner**.
+3. `pod.yml action=status` — read-only; proves the transport.
+4. `pod.yml action=provision confirm_provision=PROVISION` (40–60 min).
+   Picks the torch wheel from the card's compute capability — **cu128 on
+   Blackwell (RTX 50xx)**, cu124 otherwise — and hard-fails if CUDA is
+   visible-but-unusable rather than falling silently back to CPU.
+5. `pod.yml action=connect` — expect `bridge mode: lan` then
+   `SERVER REACHABLE`.
+6. Only now push, or run `deploy.yml` with `launch=false` to sync and
+   smoke-test without starting training.
 
 Do **not** test `action=provision` against a working pod: it does
 `rm -rf mc-build` and rebuilds MineRL (40–60 min). It is guarded behind typing

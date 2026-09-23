@@ -206,10 +206,33 @@ def probe_ollama_model(model: str, deep: bool = True) -> bool:
         return True
     try:
         _resp = ollama_lib.list() or {}
-        _models = _resp.get("models", _resp) or []
+        # ---- THE CLIENT RETURNS OBJECTS, NOT DICTS (fixed 2026-09-20) -----
+        # Newer `ollama` python clients return pydantic models: `list()` gives
+        # a ListResponse whose `.models` holds Model objects with a `.model`
+        # attribute. The old code tested `isinstance(m, dict)`, fell through
+        # to `str(m)`, and compared the REPR — so the available set contained
+        #     "model='qwen2.5vl:3b' modified_at=datetime.datetime(...)"
+        # which never equals "qwen2.5vl:3b".
+        #
+        # MEASURED CONSEQUENCE, and it is exactly the failure this whole
+        # function was written to prevent: on a pod where `ollama list` showed
+        # qwen2.5vl:3b present, every run logged VLM MODEL NOT FOUND and
+        # proceeded with the labeller disabled — while Ollama kept 4.2 GB of
+        # VRAM resident for a model nothing ever called. Zero labels, full
+        # cost, and the only symptom was an absence of facts.
+        if isinstance(_resp, dict):
+            _models = _resp.get("models", _resp) or []
+        else:
+            _models = getattr(_resp, "models", None) or []
         names = set()
         for m in _models:
-            n = (m.get("model") or m.get("name")) if isinstance(m, dict) else m
+            if isinstance(m, dict):
+                n = m.get("model") or m.get("name")
+            elif isinstance(m, str):
+                n = m
+            else:
+                # pydantic Model (or anything else exposing the field)
+                n = getattr(m, "model", None) or getattr(m, "name", None)
             if n:
                 names.add(str(n))
                 names.add(str(n).split(":")[0])

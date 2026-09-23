@@ -1,12 +1,23 @@
 # Running a training run
 
+> **HOST CHANGED 2026-09-22.** Training now runs on the user's own main
+> computer — Ubuntu Server, **192.168.1.10**, on the LAN and the tailnet at
+> once — not a rented pod. It is installed at `/workspace/devai` and deployed
+> to as `root@` deliberately, so every command in this file works unchanged;
+> only `POD_HOST` and `POD_PORT` below take different values (`22`, fixed —
+> the rotating-port problem is gone). CI reads them from the runner's `.env`,
+> never from here: see `docs/CI_SETUP.md`. The 16 GB of RAM forced several
+> config cuts — CLAUDE.md §6 lists them.
+
 All commands assume the connection shorthand. **No literal host/port here
-(2026-09-02):** both change on every pod rebuild, so a written-down address is
-stale immediately — and a stale address reads exactly like a dead run.
+(2026-09-02):** on a rented pod both changed on every rebuild, so a written-down
+address was stale immediately — and a stale address reads exactly like a dead
+run. The habit is kept now that the address is fixed, because the runner `.env`
+is the one place that should name a host.
 
 ```bash
-export POD_HOST=<current-pod-ip>      # RunPod dashboard -> Connect
-export POD_PORT=<current-ssh-port>
+export POD_HOST=<host-ip>             # 192.168.1.10, or the pod's Connect IP
+export POD_PORT=<ssh-port>            # 22 on the main computer
 SSH="ssh root@$POD_HOST -p $POD_PORT -i ~/.ssh/skybot_ed25519 \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 # NOTE: zsh will NOT run a command stored in a variable ($SSH ...). Either paste

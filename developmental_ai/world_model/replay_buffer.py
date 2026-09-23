@@ -33,6 +33,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import queue
 from typing import Dict, List, Optional, Tuple
 
@@ -317,10 +318,31 @@ class ReplayBuffer:
         per_epsilon: float = 1e-2,
         obs_uint8: bool = False,
         growth: Optional[Dict] = None,
+        proprio_dim: int = 0,
+        sensor_layout: str = "",
     ):
         self.capacity = capacity
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        # ---- PROPRIOCEPTION COLUMN (2026-09-18) --------------------------
+        # The world model used to see pixels and the intended action only, so
+        # "I turned my head" and "the world spun" were the same observation.
+        # Optical flow in a first-person game is dominated by camera rotation,
+        # so the flow head needs the body state that produced it. 13 float32
+        # per row against 49152 uint8 of pixels — 0.03% of the row.
+        #
+        # 0 = no column at all = every array, every save file and every
+        # sample_sequences return is byte-identical to before, which is what
+        # keeps the ten non-Minecraft configs untouched.
+        self.proprio_dim = int(proprio_dim or 0)
+        # ---- LAYOUT HASH (2026-09-19) ------------------------------------
+        # The sensor column is a FLAT CONCATENATION, so its meaning depends
+        # entirely on the order and widths of its fields. Width alone is not
+        # enough: two different sensor sets can be the same width and mean
+        # completely different things field-for-field. The hash pins order
+        # and width together, and a mismatch on load restores NEUTRAL rather
+        # than reading someone else's layout as this one's.
+        self.sensor_layout = str(sensor_layout or "")
         # uint8 observation storage (rich-env program, step 8): for [0,1]
         # pixel observations, store quantized uint8 (x255) and dequantize on
         # gather — a 4x RAM cut (100k x 12288-d drops ~4.9GB -> ~1.2GB) at a
@@ -353,11 +375,17 @@ class ReplayBuffer:
             self.actions = BlockArray(self._block, (action_dim,), np.float32)
             self.rewards = BlockArray(self._block, (), np.float32)
             self.dones = BlockArray(self._block, (), np.float32)
+            self.proprio = (BlockArray(self._block, (self.proprio_dim,),
+                                       np.float32)
+                            if self.proprio_dim else None)
         else:
             self.observations = np.zeros((capacity, obs_dim), dtype=_obs_dtype)
             self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
             self.rewards = np.zeros(capacity, dtype=np.float32)
             self.dones = np.zeros(capacity, dtype=np.float32)
+            self.proprio = (np.zeros((capacity, self.proprio_dim),
+                                     dtype=np.float32)
+                            if self.proprio_dim else None)
         # ---- RESTART IS NOT A DEATH (2026-09-01) -------------------------
         # The loop stores `done = terminal or crash_restart`, because for the
         # ADVANTAGE trace both sever the trajectory identically. For the
@@ -383,6 +411,14 @@ class ReplayBuffer:
             # are guaranteed to be sampled at least once before being
             # deprioritized.
             self.priorities = np.zeros(capacity, dtype=np.float32)
+        # Size of the goal-replay candidate pool at the last sample. -1 until
+        # a sample with reward_fraction > 0 has run, so "never asked" is
+        # distinguishable from "asked and found nothing".
+        self.last_reward_pool = -1
+        # Seconds spent WAITING for _lock in add(), and seconds spent HOLDING
+        # it. Monotonic; the profiler diffs them across a run.
+        self.lock_wait_s = 0.0
+        self.lock_held_s = 0.0
         self.per_alpha = per_alpha      # how strongly to prioritize (0 = uniform)
         self.per_beta = per_beta        # importance-sampling correction strength
         self.per_epsilon = per_epsilon  # floor so nothing has zero probability
@@ -392,6 +428,38 @@ class ReplayBuffer:
 
         self.position = 0    # Current write position (circular)
         self.size = 0        # How many transitions stored so far
+
+        # ---- THE VALID-STARTS CACHE (2026-09-20) -------------------------
+        # `_find_valid_starts` and `_find_reward_starts` each build an
+        # (n_starts x seq_len) index matrix and gather over it. At the
+        # configured 1,000,000 capacity that is a 32-MILLION-entry matrix,
+        # ~256 MB, TWICE per call — rebuilt identically 384 times per
+        # training block, while holding the lock the acting thread needs to
+        # store a step. It also grows with the buffer, so the agent got
+        # slower the longer it ran.
+        #
+        # The answer barely changes between calls: a training block adds only
+        # a handful of rows. So it is computed once and reused until enough
+        # new experience has arrived to matter.
+        self._writes = 0                    # monotonic; bumped by add()
+        self._starts_cache: Dict[Tuple, Tuple] = {}
+        # How many new rows may arrive before a rescan. The newest rows are
+        # simply not sampleable until then — a mild recency bias, traded for
+        # one scan per block instead of 384.
+        self._starts_refresh_after = 64
+        # THE MARGIN THAT MAKES STALENESS SAFE, and it is the whole reason
+        # this is correct rather than merely fast. The scan excludes starts
+        # whose window crosses the write head. `position` keeps advancing
+        # after the scan — and now also DURING the gather, which happens
+        # outside the lock — so the exclusion is widened by far more rows
+        # than can be written in that time. At 1M capacity this costs 0.4%
+        # of sampleable starts.
+        #
+        # Without it, a stale start could be handed out after the write head
+        # had run into it, and the model would learn a splice between two
+        # unrelated worlds as if it were dynamics — exactly what the
+        # dones-based exclusion exists to prevent.
+        self._seam_margin = 4096
         self._current_episode_start = 0
 
         # A lock guarding writes so a background sampler can read safely.
@@ -404,6 +472,7 @@ class ReplayBuffer:
         reward: float,
         done: bool,
         restart: bool = False,
+        proprio: Optional[np.ndarray] = None,
     ) -> None:
         """
         Add a single transition to the buffer.
@@ -430,17 +499,45 @@ class ReplayBuffer:
                 np.round(np.asarray(observation, np.float32) * 255.0),
                 0, 255).astype(np.uint8)
 
+        # ---- WHY THIS IS TIMED (2026-09-20) ------------------------------
+        # The sub-phase profile put 605 ms/step (36.2%) in the buffer write —
+        # more than the MineRL client. Two candidates, and they need
+        # different fixes, so they get measured apart rather than guessed
+        # between:
+        #
+        #   * WAITING for the lock. `sample_sequences` holds this same lock
+        #     through a 25 MB -> 100 MB gather, and with train_iters 384 the
+        #     async trainer takes it hundreds of times per block. If this
+        #     dominates, the LEARNER IS STARVING THE ACTOR — it caps data
+        #     collection, which is the one thing this model is short of.
+        #   * The work under the lock: seven column writes.
+        #
+        # Two counters, read by scripts/pod_profile_step.py. The cost of the
+        # timing itself is two perf_counter calls per add.
+        _t_wait = time.perf_counter()
         with self._lock:
+            self.lock_wait_s += time.perf_counter() - _t_wait
+            _t_write = time.perf_counter()
             self.observations[self.position] = observation
             self.actions[self.position] = action_array
             self.rewards[self.position] = reward
             self.dones[self.position] = float(done)
             self.restarts[self.position] = bool(restart)
+            if self.proprio is not None:
+                # A stream with no body sense writes NEUTRAL ZEROS rather than
+                # raising — the same convention _augment_proprio uses for every
+                # missing sense, and what lets a scout share one buffer schema
+                # with the lifelong stream.
+                self.proprio[self.position] = (
+                    np.zeros(self.proprio_dim, np.float32) if proprio is None
+                    else np.asarray(proprio, np.float32)[:self.proprio_dim])
             # New experience enters at max priority so PER will sample it soon.
             self.priorities[self.position] = self.max_priority
 
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
+            self._writes += 1
+            self.lock_held_s += time.perf_counter() - _t_write
 
             # GROWTH IS FLAGGED HERE, NEVER PERFORMED HERE. This runs on the
             # acting thread once per env step; allocating a 1.2 GB block in it
@@ -495,12 +592,19 @@ class ReplayBuffer:
                 MEMORY_BUDGET.source, self.capacity)
             return False
         with self._lock:
+            # GROWTH MOVES `capacity`, so every cached start index could now
+            # mean a different row. Drop the cache outright rather than try
+            # to reason about which entries survive.
+            self._starts_cache.clear()
             # PUBLISH ORDER IS LOAD-BEARING: every column gets its block
             # BEFORE `capacity` moves. A reader racing this sees the old
             # capacity over a consistent buffer, never an index past the end
             # of a column that has not grown yet.
             for _c in (self.observations, self.actions, self.rewards,
-                       self.dones, self.priorities, self.restarts):
+                       self.dones, self.priorities, self.restarts,
+                       self.proprio):
+                if _c is None:      # proprio column absent (proprio_dim == 0)
+                    continue
                 _c.add_block()
             self.capacity += self._block
             self._grow_pending = False
@@ -519,6 +623,7 @@ class ReplayBuffer:
         prioritized: bool = False,
         beta: Optional[float] = None,
         reward_fraction: float = 0.0,
+        reward_threshold: float = 1e-3,
     ) -> Dict[str, torch.Tensor]:
         """
         Sample random contiguous sequences for world model training.
@@ -595,7 +700,26 @@ class ReplayBuffer:
             # terminal oversampling above does NOT cover this: most terminals are
             # timeouts (reward 0) on hard envs.
             if n_reward > 0:
-                reward_starts = self._find_reward_starts(seq_len)
+                # ---- THE THRESHOLD IS THE WHOLE STRATUM (2026-09-18) -----
+                # This call used to take the 1e-3 default, which asks "did
+                # ANYTHING pay in this window". That question is sharp on a
+                # SCOUT stream (it stores the raw env reward, and
+                # _break_reward pays 0.0 for everything that is not a log or
+                # an ore) and nearly meaningless on the PRIMARY one, which
+                # stores `prim_extrinsic` — raw reward PLUS magnet shaping,
+                # approach and goal-dwell, i.e. terms that are nonzero on
+                # most steps. So on the one stream that matters,
+                # "reward-bearing window" was approximately "any window", and
+                # goal_replay_fraction bought close to nothing on a run whose
+                # entire history contains ~35 log breaks.
+                #
+                # A LOG-SIZED threshold is correct whether or not that
+                # dilution is as bad as it looks: at >= 5.0 only a log
+                # (20.0 + 0.5/tick) or an ore (10.0) can clear it, and no
+                # amount of shaping reaches that.
+                reward_starts = self._find_reward_starts(
+                    seq_len, threshold=reward_threshold)
+                self.last_reward_pool = int(len(reward_starts))
                 if len(reward_starts) > 0:
                     r_probs = self._priority_probs(reward_starts, seq_len) if prioritized else None
                     # Repeats ARE allowed here, unlike the terminal pool
@@ -666,10 +790,24 @@ class ReplayBuffer:
             else:
                 weights = np.ones(len(indices), dtype=np.float32)
 
-            # Gather while still holding the lock so writes can't tear a row.
-            obs_seqs, act_seqs, rew_seqs, cont_seqs = self._gather(indices, seq_len)
+            # SNAPSHOT THE CHOICE, THEN LET GO OF THE KEY (2026-09-20).
+            # This used to gather INSIDE the lock, on the reasoning that a
+            # concurrent write could otherwise tear a row. The gather is the
+            # slow part — ~2.3 s per call — and holding the lock through it
+            # made the acting thread queue behind 384 of them per training
+            # block, which measured as 36% of SkyBot's step time.
+            #
+            # It is safe to release here because the seam margin above keeps
+            # every selected window clear of the write head by
+            # seq_len + refresh_after + 4096 rows, while a gather admits at
+            # most a handful of writes at any realistic step rate. The choice
+            # is copied so a later write cannot change it underneath us.
+            indices = np.array(indices, dtype=np.int64, copy=True)
 
-        return {
+        obs_seqs, act_seqs, rew_seqs, cont_seqs, pp_seqs = self._gather(
+            indices, seq_len)
+
+        batch = {
             "observations": torch.from_numpy(obs_seqs).to(device),
             "actions": torch.from_numpy(act_seqs).to(device),
             "rewards": torch.from_numpy(rew_seqs).to(device),
@@ -677,24 +815,59 @@ class ReplayBuffer:
             "weights": torch.from_numpy(weights).to(device),
             "start_indices": indices.astype(np.int64),
         }
+        # ABSENT, NOT ZERO-FILLED, when there is no body column: a consumer
+        # that asks for `proprio` and gets None knows the buffer never had it,
+        # whereas a silent zero tensor would look like a body that reads flat.
+        if pp_seqs is not None:
+            batch["proprio"] = torch.from_numpy(pp_seqs).to(device)
+        # HOW MANY WINDOWS THE GOAL STRATUM ACTUALLY HAD TO CHOOSE FROM.
+        # This is the measurement that tells us whether the threshold above
+        # is doing anything: if the pool was previously ~every window and is
+        # now a few dozen, the stratum has gone from decorative to real.
+        batch["reward_pool"] = int(getattr(self, "last_reward_pool", -1))
+        return batch
 
-    def _gather(
-        self, indices: np.ndarray, seq_len: int
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Vectorized gather of contiguous sequences (no Python loops)."""
+    def _gather(self, indices: np.ndarray, seq_len: int):
+        """Vectorized gather of contiguous sequences (no Python loops).
+
+        Returns (obs, act, rew, cont, proprio); `proprio` is None when the
+        buffer has no body column, which is what every non-Minecraft config
+        gets and what makes this change a no-op for them.
+        """
         # (batch, seq_len) matrix of absolute buffer indices.
         idx = (indices[:, None] + np.arange(seq_len)[None, :]) % self.capacity
         obs_seqs = self.observations[idx]          # (B, T, obs_dim)
+        # ---- ONE CONVERSION, NOT SIX (2026-09-20) ------------------------
+        # This used to convert the pixels to float32 and then call astype on
+        # ALL FIVE return values. astype copies unconditionally — even when
+        # the dtype already matches — so five of those six copies produced a
+        # byte-identical duplicate and threw the original away.
+        #
+        # np.asarray is a no-op when the dtype already matches. The pixels
+        # are converted exactly once; nothing else is copied. Fancy indexing
+        # above already returns fresh arrays, so none of these alias storage.
+        #
+        # HONEST ABOUT THE PAYOFF: this is strictly less work and it is NOT
+        # measurably faster. Interleaved, min of 9 runs at a 12,288-wide
+        # observation: 1.115 ms before, 1.140 ms after. The scattered-row
+        # gather dominates, not the copying. The wall-clock win in this
+        # change set comes from the valid-starts cache and from releasing
+        # the lock before the gather — not from here.
         if self._obs_uint8:
             obs_seqs = obs_seqs.astype(np.float32) / 255.0
+        else:
+            obs_seqs = np.asarray(obs_seqs, dtype=np.float32)
         act_seqs = self.actions[idx]               # (B, T, action_dim)
         rew_seqs = self.rewards[idx]               # (B, T)
         cont_seqs = 1.0 - self.dones[idx]          # (B, T) continue = not done
+        pp_seqs = (np.asarray(self.proprio[idx], dtype=np.float32)
+                   if self.proprio is not None else None)
         return (
-            obs_seqs.astype(np.float32),
-            act_seqs.astype(np.float32),
-            rew_seqs.astype(np.float32),
-            cont_seqs.astype(np.float32),
+            obs_seqs,
+            np.asarray(act_seqs, dtype=np.float32),
+            np.asarray(rew_seqs, dtype=np.float32),
+            np.asarray(cont_seqs, dtype=np.float32),
+            pp_seqs,
         )
 
     def _priority_probs(self, starts: np.ndarray, seq_len: int) -> Optional[np.ndarray]:
@@ -733,7 +906,34 @@ class ReplayBuffer:
             self.priorities[idx] = errors[:, None]
             self.max_priority = max(self.max_priority, float(errors.max()))
 
+    def _cached_starts(self, key, build):
+        """Return a cached scan, rebuilding only when enough has been written.
+
+        The cache is keyed by the scan's parameters, stamped with the write
+        counter, and dropped wholesale by `maybe_grow`/`load` — the two places
+        where capacity, size or position move discontinuously and every
+        previously computed index could mean something else.
+        """
+        hit = self._starts_cache.get(key)
+        if hit is not None:
+            value, writes_at = hit
+            if self._writes - writes_at <= self._starts_refresh_after:
+                return value
+        value = build()
+        self._starts_cache[key] = (value, self._writes)
+        return value
+
     def _find_valid_starts(self, seq_len: int):
+        return self._cached_starts(
+            ("valid", int(seq_len)),
+            lambda: self._scan_valid_starts(seq_len))
+
+    def _find_reward_starts(self, seq_len: int, threshold: float = 1e-3):
+        return self._cached_starts(
+            ("reward", int(seq_len), float(threshold)),
+            lambda: self._scan_reward_starts(seq_len, threshold))
+
+    def _scan_valid_starts(self, seq_len: int):
         """
         Find buffer positions where a sequence of seq_len can be sampled.
         Vectorized with numpy — replaces the old O(size * seq_len) Python loop.
@@ -753,8 +953,15 @@ class ReplayBuffer:
         # offset > 0 splices the newest and oldest transitions as if they
         # were temporally contiguous.
         if self.size == self.capacity:
+            # WIDENED BY THE SEAM MARGIN (2026-09-20). The plain `seq_len`
+            # exclusion was exact only while the scan was recomputed on every
+            # call and the gather happened under the lock. Neither is true
+            # now: the result is cached across writes, and the gather runs
+            # unlocked. The margin covers both, with orders of magnitude to
+            # spare at realistic step rates.
+            _excl = seq_len + self._starts_refresh_after + self._seam_margin
             offset = (self.position - starts) % self.capacity
-            starts = starts[~((offset > 0) & (offset < seq_len))]
+            starts = starts[~((offset > 0) & (offset < _excl))]
         idx = (starts[:, None] + np.arange(seq_len)[None, :]) % self.capacity
         done_window = self.dones[idx] > 0.5            # (n_starts, seq_len)
         any_done = done_window.any(axis=1)
@@ -790,7 +997,7 @@ class ReplayBuffer:
 
         return normal, terminal
 
-    def _find_reward_starts(self, seq_len: int, threshold: float = 1e-3):
+    def _scan_reward_starts(self, seq_len: int, threshold: float = 1e-3):
         """Buffer positions whose length-`seq_len` window contains a nonzero
         reward (|reward| > threshold) — the goal-prioritized-replay candidates."""
         n_starts = self.size - seq_len
@@ -799,8 +1006,15 @@ class ReplayBuffer:
         starts = np.arange(n_starts, dtype=np.int64)
         # Same write-seam exclusion as _find_valid_starts.
         if self.size == self.capacity:
+            # WIDENED BY THE SEAM MARGIN (2026-09-20). The plain `seq_len`
+            # exclusion was exact only while the scan was recomputed on every
+            # call and the gather happened under the lock. Neither is true
+            # now: the result is cached across writes, and the gather runs
+            # unlocked. The margin covers both, with orders of magnitude to
+            # spare at realistic step rates.
+            _excl = seq_len + self._starts_refresh_after + self._seam_margin
             offset = (self.position - starts) % self.capacity
-            starts = starts[~((offset > 0) & (offset < seq_len))]
+            starts = starts[~((offset > 0) & (offset < _excl))]
         idx = (starts[:, None] + np.arange(seq_len)[None, :]) % self.capacity
         has_reward = (np.abs(self.rewards[idx]) > threshold).any(axis=1)
         # Reward windows must not cross an episode boundary either: on
@@ -857,12 +1071,16 @@ class ReplayBuffer:
                 "priorities": self.priorities[order],
                 "restarts": self.restarts[order],
             }
+            if self.proprio is not None:
+                cols["proprio"] = self.proprio[order]
             meta = {
                 "n": n,
                 "obs_dim": int(self.obs_dim),
                 "action_dim": int(self.action_dim),
                 "obs_uint8": bool(self._obs_uint8),
                 "max_priority": float(self.max_priority),
+                "proprio_dim": int(self.proprio_dim),
+                "sensor_layout": str(self.sensor_layout),
             }
         tmp = path + ".tmp"
         if os.path.isdir(tmp):
@@ -921,6 +1139,43 @@ class ReplayBuffer:
         cols["restarts"] = (np.load(_rp) if os.path.isfile(_rp)
                             else np.zeros(int(cols["observations"].shape[0]),
                                           dtype=bool))
+        # `proprio` gets the SAME treatment as `restarts`, for the same
+        # reason: it arrived 2026-09-18 and the live pod's persisted buffer
+        # predates it. Absent means "this experience carries no body sense",
+        # which reads as neutral zeros — identical to how a scout stream is
+        # stored. Making it mandatory would brick the only copy of the
+        # agent's experience over a column worth 0.03% of a row.
+        _pp = os.path.join(path, "proprio.npy")
+        if self.proprio is not None:
+            _n0 = int(cols["observations"].shape[0])
+            _saved_layout = str(meta.get("sensor_layout", ""))
+            # An EMPTY layout on either side means "unknown", which is the
+            # pre-bus case and must still load — the pod's buffer is the only
+            # copy of the agent's experience.
+            _layout_ok = (not self.sensor_layout or not _saved_layout
+                          or _saved_layout == self.sensor_layout)
+            if not _layout_ok:
+                logger.warning(
+                    "buffer sensor layout %s != live %s — restoring NEUTRAL "
+                    "ZEROS. The widths may match by coincidence; the FIELDS "
+                    "do not, and reading one layout as another teaches the "
+                    "model a body it does not have.",
+                    _saved_layout, self.sensor_layout)
+            if os.path.isfile(_pp) and _layout_ok:
+                _loaded = np.load(_pp)
+                if int(_loaded.shape[1]) != self.proprio_dim:
+                    # A WIDTH CHANGE IS NOT RESTORABLE. Field k means a
+                    # different sense than it did, so carrying the values
+                    # over would teach the model a body it does not have.
+                    logger.warning(
+                        "buffer proprio width %d != live %d — restoring "
+                        "NEUTRAL ZEROS for %d transitions rather than "
+                        "misaligned senses",
+                        int(_loaded.shape[1]), self.proprio_dim, _n0)
+                    _loaded = np.zeros((_n0, self.proprio_dim), np.float32)
+                cols["proprio"] = _loaded
+            else:
+                cols["proprio"] = np.zeros((_n0, self.proprio_dim), np.float32)
         n = int(cols["observations"].shape[0])
         # GROW TO FIT rather than discard (2026-09-01). Truncating to "newest"
         # is right for a shrunken fixed buffer, but with growth on it would
@@ -942,8 +1197,15 @@ class ReplayBuffer:
             self.dones[:n] = cols["dones"]
             self.priorities[:n] = cols["priorities"]
             self.restarts[:n] = cols["restarts"].astype(bool)
+            if self.proprio is not None and "proprio" in cols:
+                self.proprio[:n] = cols["proprio"]
             self.size = n
             self.position = n % self.capacity
+            # A RESTORED BUFFER IS A DIFFERENT BUFFER. size and position both
+            # move discontinuously here, so nothing scanned before this point
+            # describes the rows that are now in place.
+            self._starts_cache.clear()
+            self._writes += 1
             self.max_priority = float(meta.get("max_priority", 1.0)) or 1.0
             # Episode boundaries are deliberately NOT restored: those indices
             # describe the old layout, and `_find_valid_starts` reads `dones`
@@ -991,10 +1253,13 @@ class MultiStreamReplayBuffer:
         per_epsilon: float = 1e-2,
         obs_uint8: bool = False,
         growth: Optional[Dict] = None,
+        proprio_dim: int = 0,
+        sensor_layout: str = "",
     ):
         self.num_streams = num_streams
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self.proprio_dim = int(proprio_dim or 0)
         # Split capacity across streams so total memory matches the single buffer.
         per_stream_cap = max(1000, capacity // max(1, num_streams))
         self.streams: List[ReplayBuffer] = [
@@ -1012,6 +1277,12 @@ class MultiStreamReplayBuffer:
                 # draw on the same pool, so N streams cannot each take a
                 # fraction of the machine and overshoot by N.
                 growth=growth,
+                # EVERY stream gets the column, including scouts that write
+                # neutral zeros into it. A per-stream schema would mean the
+                # world model's input width depended on which body the batch
+                # came from.
+                proprio_dim=self.proprio_dim,
+                sensor_layout=sensor_layout,
             )
             for _ in range(num_streams)
         ]
@@ -1025,9 +1296,9 @@ class MultiStreamReplayBuffer:
         return sum(s.capacity for s in self.streams)
 
     def add(self, observation, action, reward, done, stream: int = 0,
-            restart: bool = False) -> None:
+            restart: bool = False, proprio=None) -> None:
         self.streams[stream].add(observation, action, reward, done,
-                                 restart=restart)
+                                 restart=restart, proprio=proprio)
 
     def save(self, path: str, max_transitions: Optional[int] = None) -> int:
         """Persist every stream under `path/stream_<i>`. Returns total written.
@@ -1073,6 +1344,7 @@ class MultiStreamReplayBuffer:
         prioritized: bool = False,
         beta: Optional[float] = None,
         reward_fraction: float = 0.0,
+        reward_threshold: float = 1e-3,
     ) -> Dict[str, torch.Tensor]:
         # Only sample from streams that have enough data for one sequence.
         ready = [i for i, s in enumerate(self.streams) if s.size >= seq_len + 1]
@@ -1087,8 +1359,12 @@ class MultiStreamReplayBuffer:
         remainder = batch_size - base * n_ready
         counts = [base + (1 if k < remainder else 0) for k in range(n_ready)]
 
-        obs_l, act_l, rew_l, cont_l, w_l = [], [], [], [], []
+        obs_l, act_l, rew_l, cont_l, w_l, pp_l = [], [], [], [], [], []
         stream_ids, local_idx = [], []
+        # SUMMED ACROSS STREAMS, not averaged: the question this answers is
+        # "how many goal windows exist in the whole brain's experience", and
+        # a fleet of two bodies genuinely has two pools to draw from.
+        pool_total = -1
         for k, stream_i in enumerate(ready):
             count = counts[k]
             if count <= 0:
@@ -1101,12 +1377,18 @@ class MultiStreamReplayBuffer:
                 prioritized=prioritized,
                 beta=beta,
                 reward_fraction=reward_fraction,
+                reward_threshold=reward_threshold,
             )
             obs_l.append(sub["observations"])
             act_l.append(sub["actions"])
             rew_l.append(sub["rewards"])
             cont_l.append(sub["continues"])
             w_l.append(sub["weights"])
+            if "proprio" in sub:
+                pp_l.append(sub["proprio"])
+            _rp = int(sub.get("reward_pool", -1))
+            if _rp >= 0:
+                pool_total = max(0, pool_total) + _rp
             stream_ids.append(np.full(count, stream_i, dtype=np.int64))
             local_idx.append(sub["start_indices"])
 
@@ -1114,7 +1396,7 @@ class MultiStreamReplayBuffer:
             [np.concatenate(stream_ids), np.concatenate(local_idx)], axis=1
         )  # (batch, 2) = [stream_id, index]
 
-        return {
+        batch = {
             "observations": torch.cat(obs_l, dim=0),
             "actions": torch.cat(act_l, dim=0),
             "rewards": torch.cat(rew_l, dim=0),
@@ -1122,6 +1404,15 @@ class MultiStreamReplayBuffer:
             "weights": torch.cat(w_l, dim=0),
             "start_indices": start_indices,
         }
+        # ALL-OR-NOTHING across streams. Every stream is built with the same
+        # proprio_dim, so a partial list means one of them failed to produce
+        # its column — concatenating the rest would silently misalign rows
+        # against observations. Dropping the key degrades to "no body sense
+        # this batch", which the world model already handles.
+        if pp_l and len(pp_l) == len(obs_l):
+            batch["proprio"] = torch.cat(pp_l, dim=0)
+        batch["reward_pool"] = int(pool_total)
+        return batch
 
     def update_priorities(
         self, start_indices: np.ndarray, seq_len: int, errors: np.ndarray
@@ -1168,6 +1459,7 @@ class BackgroundSampler:
         terminal_fraction: float = 0.25,
         max_prefetch: int = 4,
         reward_fraction: float = 0.0,
+        reward_threshold: float = 1e-3,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -1176,6 +1468,7 @@ class BackgroundSampler:
         self.prioritized = prioritized
         self.terminal_fraction = terminal_fraction
         self.reward_fraction = reward_fraction
+        self.reward_threshold = reward_threshold
 
         self._jobs: "queue.Queue[int]" = queue.Queue()
         self._results: "queue.Queue" = queue.Queue(maxsize=max_prefetch)
@@ -1197,6 +1490,7 @@ class BackgroundSampler:
                     terminal_fraction=self.terminal_fraction,
                     prioritized=self.prioritized,
                     reward_fraction=self.reward_fraction,
+                    reward_threshold=self.reward_threshold,
                 )
                 self._results.put(batch)
             except Exception as e:  # surface sampling errors to the consumer

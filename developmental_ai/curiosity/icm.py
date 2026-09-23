@@ -230,9 +230,18 @@ class IntrinsicCuriosityModule(nn.Module):
         action: torch.Tensor,
         next_obs: torch.Tensor,
         update_state: bool = True,
+        extra_error: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute curiosity reward for a batch of transitions.
+
+        `extra_error` is an ADDITIONAL per-sample prediction error from
+        outside this module (the world model's flow residual — see
+        LearningProgressCuriosity, which is the only subclass that uses it).
+        The base class ignores it: plain ICM pays raw error, so folding a
+        second error channel in would be a new income stream rather than a
+        richer definition of progress. Accepted here only so the call sites
+        do not have to branch on which curiosity is installed.
 
         High prediction error → high reward → agent explores here more.
         Low prediction error → low reward → agent has learned this, move on.

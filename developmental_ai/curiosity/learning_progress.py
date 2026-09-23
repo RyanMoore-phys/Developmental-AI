@@ -46,8 +46,18 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                  lp_pixel_pool: int = 4, lp_proto_thresh: float = 0.025,
                  lp_max_protos: int = 512, lp_abs_frac: float = 0.0,
                  action_conditional: bool = False, null_action: int = 0,
+                 flow_error_weight: float = 1.0,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        # Relative weight of the world model's flow residual against the
+        # forward-model error when the two are summed for bucketing. 1.0 is
+        # "both channels count the same"; 0.0 disables the channel entirely
+        # and is the revert, without needing the world model rebuilt.
+        self.flow_error_weight = float(flow_error_weight)
+        # Last flow residual seen, for the telemetry split. 0.0 until a flow
+        # head actually supplies one, which is also what it reads in every
+        # env that has none.
+        self.last_flow_error = 0.0
         # ---- ABSOLUTE PROGRESS FLOOR (2026-08-02) ------------------------
         # LP is a DERIVATIVE, so a world the model has mastered should pay
         # exactly nothing. It did not. The significance gate below is purely
@@ -211,7 +221,35 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         self._bucket_err = {k: v for k, v in self._bucket_err.items() if len(v) > 1}
 
     def compute_intrinsic_reward(self, obs, action, next_obs,
-                                 update_state: bool = True):
+                                 update_state: bool = True,
+                                 extra_error=None):
+        """Learning progress over the agent's total prediction error.
+
+        ---- THE FLOW RESIDUAL CHANNEL (2026-09-18) ----------------------
+        `extra_error` is a per-sample error from the world model's flow head:
+        how much of the change between the last two frames the
+        action-conditioned warp could NOT explain. It is ADDED to the
+        forward-model error that gets BUCKETED, so learning progress is
+        measured over "how well do I predict this scene AND how it sweeps
+        past me" rather than the latent prediction alone.
+
+        WHY THIS IS NOT A NEW INCOME STREAM. Nothing here pays for error; LP
+        pays for error GOING DOWN, and only when the drop clears both
+        significance gates below. Adding a channel changes WHAT the agent can
+        make progress on, not how much it is paid for standing anywhere.
+
+        WHY IT CANNOT BE FARMED BY STARING. The flow residual requires
+        ego-motion to be nonzero: no movement -> no predicted flow -> nothing
+        to be wrong about -> zero contribution. Flat sky has no parallax and
+        no texture for the warp to fail on. This is the property
+        tests/_perspective_smoke.py asserts directly, and it is structural
+        rather than a guard someone has to remember to re-open.
+
+        `last_pred_error` IS DELIBERATELY NOT CONTAMINATED. It is documented
+        as raw forward-model surprise and is read by skill wm_fidelity and the
+        occlusion split; mixing a second channel into it would silently change
+        what those two measure.
+        """
         with torch.no_grad():
             features = self.encoder(obs)
             next_features = self.encoder(next_obs)
@@ -246,7 +284,18 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                     (_err_null - pred_error) / (_err_null + 1e-8),
                     min=0.0, max=1.0)
                 self.last_action_attribution = float(_gate.mean().item())
-            errs = pred_error.detach().cpu().numpy()
+            # THE BUCKETED ERROR, which may carry the flow channel. Kept
+            # separate from `pred_error` so `last_pred_error` above stays the
+            # pure forward-model number its consumers expect.
+            lp_error = pred_error
+            if extra_error is not None:
+                _xe = torch.as_tensor(
+                    extra_error, dtype=lp_error.dtype, device=lp_error.device
+                ).reshape(-1)
+                if _xe.shape[0] == lp_error.shape[0]:
+                    lp_error = lp_error + float(self.flow_error_weight) * _xe
+                    self.last_flow_error = float(_xe.mean().item())
+            errs = lp_error.detach().cpu().numpy()
             obs_np = obs.detach().cpu().numpy()
             lp = np.zeros(len(errs), dtype=np.float32)
             for i in range(len(errs)):

@@ -47,7 +47,12 @@ else
   # put a real endpoint in the tree. POD_HOST is the single source of truth.
   HOST="${2:-${POD_HOST:?set POD_HOST or pass HOST as arg 2}}"
   TS="${3:-4000000}"
-  KEY="${POD_SSH_KEY:-$HOME/.ssh/skybot_ed25519}"
+  # POD_SSH_KEYFILE is the spelling the runner .env, both workflows,
+  # pod_exec.sh and setup_runner.sh all use; this script alone read
+  # POD_SSH_KEY. Both defaulted to the same path, so nothing showed --
+  # until a host with a different key, where this would silently ignore
+  # the .env and fail with a bare "Permission denied (publickey)".
+  KEY="${POD_SSH_KEYFILE:-${POD_SSH_KEY:-$HOME/.ssh/skybot_ed25519}}"
   # UserKnownHostsFile=/dev/null is REQUIRED: RunPod reuses IPs across pods, so
   # the host key changes and plain ssh refuses with a HOST KEY CHANGED error.
   # BatchMode=yes IS LOAD-BEARING IN CI (added 2026-09-02).

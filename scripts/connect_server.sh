@@ -14,10 +14,17 @@
 #     -> same thing with no browser step, and enables Tailscale SSH so CI can
 #        get back IN. Use an ephemeral, pre-authorised, tag:devai auth key.
 #
-#   Phase 2 (bridge):  bash scripts/connect_server.sh bridge <server-tailscale-ip>
+#   Phase 2 (bridge):  bash scripts/connect_server.sh bridge <server-address>
 #     -> starts a socat bridge so the java client's 127.0.0.1:25565 is
-#        forwarded over the tailnet to <server-tailscale-ip>:25565, then
-#        Minecraft-pings it to confirm the server answers.
+#        forwarded to <server-address>:25565, then Minecraft-pings it to
+#        confirm the server answers.
+#
+#        TWO FAR SIDES, ONE ENDPOINT (2026-09-22). An RFC1918 address
+#        (192.168./10./172.16-31.) is reached over PLAIN TCP on the LAN;
+#        anything else — tailnet 100.x, MagicDNS names — goes over the tailnet
+#        via `tailscale nc`, exactly as before. Phase 1 is still required for
+#        the tailnet path and is untouched. CONNECT_MODE=lan|tailscale forces
+#        the choice.
 #
 # After both phases succeed, launch with scripts/launch_skybot.sh (its
 # pre-flight refuses to start unless this bridge + tailnet are up).
@@ -78,22 +85,73 @@ case "${1:-}" in
     echo ">>>   bash scripts/connect_server.sh bridge <server-tailscale-ip>"
     ;;
   bridge)
-    IP="${2:?usage: connect_server.sh bridge <server-tailscale-ip>}"
-    tailscale status >/dev/null 2>&1 || { echo "not logged in — run: connect_server.sh login"; exit 1; }
+    IP="${2:?usage: connect_server.sh bridge <server-ip-or-magicdns-name>}"
+    # ---- WHICH TRANSPORT (2026-09-22) ---------------------------------------
+    # THE BRIDGE ALWAYS PRESENTS THE SAME ENDPOINT to the game client —
+    # 127.0.0.1:25565 — so nothing downstream has to know which way the packets
+    # actually leave this box: not `environment.remote_server` in
+    # configs/minecraft_skybot.yaml, not launch_skybot.sh's pre-flight, not
+    # pod.yml's `connect` action. Only the FAR side of the socat changes, which
+    # is why moving from a rented pod to a LAN machine needs no config edit and
+    # no workflow edit — just a different address in the runner .env.
+    #
+    # RFC1918 ADDRESSES GO OVER PLAIN TCP. `tailscale nc` speaks only to the
+    # tailnet, so it silently cannot carry 192.168.1.x. EVERYTHING ELSE KEEPS
+    # `tailscale nc` untouched: 100.x CGNAT tailnet addresses, MagicDNS names,
+    # and anything unrecognised. Defaulting the UNKNOWN case to tailscale
+    # rather than to LAN is deliberate — every input that works today keeps
+    # working, and a MagicDNS name is not pattern-matchable as a tailnet
+    # address, so guessing "LAN" on unknown input would break the proven path.
+    #
+    # CONNECT_MODE=lan|tailscale overrides the guess when it is wrong.
+    case "${CONNECT_MODE:-auto}" in
+      lan|tailscale) MODE="$CONNECT_MODE" ;;
+      *)
+        case "$IP" in
+          127.*|localhost)
+            echo "REFUSED: $IP is this machine. A bridge from 127.0.0.1:25565"
+            echo "  to itself would loop. If the Paper server runs on THIS box,"
+            echo "  no bridge is needed — 127.0.0.1:25565 already reaches it."
+            exit 1 ;;
+          192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) MODE=lan ;;
+          *) MODE=tailscale ;;
+        esac ;;
+    esac
+    if [ "$MODE" = "tailscale" ]; then
+      tailscale status >/dev/null 2>&1 || { echo "not logged in — run: connect_server.sh login"; exit 1; }
+      FAR="EXEC:tailscale nc $IP 25565"
+    else
+      # NO `tailscale status` GATE ON THIS BRANCH (CLAUDE.md 4.1). On the LAN
+      # path it is a precondition nothing on that path can satisfy, and a guard
+      # whose only escape is "a human edits the script" is a latch. The MC ping
+      # below is the check that actually carries value here, and it is
+      # transport-independent — it fails for exactly the same reasons either
+      # way, and it can be satisfied by fixing the thing it names.
+      FAR="TCP:$IP:25565"
+    fi
+    echo "bridge mode: $MODE (far side $IP:25565)"
     pkill -x socat 2>/dev/null || true; sleep 1
     setsid socat "TCP-LISTEN:25565,bind=127.0.0.1,fork,reuseaddr" \
-      "EXEC:tailscale nc $IP 25565" > podlogs/socat_mc.log 2>&1 < /dev/null &
+      "$FAR" > podlogs/socat_mc.log 2>&1 < /dev/null &
     sleep 2
     ss -tln 2>/dev/null | grep -q "127.0.0.1:25565" || { echo "bridge FAILED"; cat podlogs/socat_mc.log; exit 1; }
-    echo "bridge up: 127.0.0.1:25565 -> $IP:25565"
+    echo "bridge up ($MODE): 127.0.0.1:25565 -> $IP:25565"
     if timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 2>/dev/null | grep -E "version|players"; then
       echo "SERVER REACHABLE — ready. Launch: bash scripts/launch_skybot.sh 1000000"
     else
       echo "WARN: bridge up but server did not answer the MC ping."
       echo "  Check: server online, ViaVersion+ViaBackwards loaded (accepts protocol 754),"
-      echo "  its tailscale IP correct, and the tag:devai ACL allows $IP:25565."
+      if [ "$MODE" = "tailscale" ]; then
+        echo "  its tailscale IP correct, and the tag:devai ACL allows $IP:25565."
+      else
+        echo "  its LAN IP correct, server-ip= in server.properties NOT bound to"
+        echo "  127.0.0.1 (it must listen on the LAN), and no firewall on 25565."
+      fi
     fi
     ;;
   *)
-    echo "usage: connect_server.sh login [--authkey <key>] | bridge <server-tailscale-ip>"; exit 1;;
+    echo "usage: connect_server.sh login [--authkey <key>] | bridge <server-ip-or-magicdns-name>"
+    echo "       bridge auto-selects plain TCP for RFC1918 (192.168./10./172.16-31.)"
+    echo "       and tailscale nc for everything else; CONNECT_MODE=lan|tailscale overrides."
+    exit 1;;
 esac

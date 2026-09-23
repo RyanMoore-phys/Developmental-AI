@@ -652,6 +652,11 @@ class VLMSymbolizer:
 
         head_hidden = int(head_hidden or hidden_dim)
         self.head_hidden = head_hidden      # part of the arch signature
+        # Kept so the per-slot head (R3) can be built with the SAME
+        # architecture later, once the slot width is known.
+        self._head_lr = float(lr)
+        self._head_layers = int(head_layers)
+        self._head_members = int(head_members)
         self.head = GroundedSymbolHead(
             latent_dim, len(PREDICATES), head_hidden, lr,
             n_layers=head_layers, n_members=head_members).to(self.device)
@@ -704,6 +709,22 @@ class VLMSymbolizer:
                         len(FOVEA_PREDICATES))
             if self.fovea_enabled else None)
         self.fovea_label_counts = {p: 0 for p in FOVEA_PREDICATES}
+        # ---- R3: THE SAME HEAD, PER SLOT (2026-09-19) --------------------
+        # Predicates have always been scored on a WHOLE-FRAME latent, which
+        # is the root of the position-blindness recorded under symbol_weight
+        # ("a tree at the edge of frame and a tree dead-centre pay exactly
+        # the same") and of the magnet's admitted inability to tell two trees
+        # apart. Attaching the same head to a SLOT vector is the whole fix:
+        # `tree_visible` stops being a property of the view and becomes a
+        # property of a thing in it.
+        #
+        # Deliberately the SAME class and the SAME vocabulary — nothing new
+        # is declared. Only the input changes, from "everything I can see"
+        # to "this one region that moved together".
+        #
+        # Built lazily: slot width is not known until the world model is.
+        self.slot_head = None
+        self.slot_head_dim = None
         # POSITIVE sightings per foveal predicate (review 2026-08-09): the
         # label count says "the head was TAUGHT about this key", which is
         # free after ~5 fovea labels for every key at once — it can never
@@ -1182,6 +1203,44 @@ class VLMSymbolizer:
                 self.fovea_head.train_replay(
                     self.fovea_replay, self.replay_batch, self.replay_steps,
                     pos_weight=pw, device=self.device)
+
+    def ensure_slot_head(self, slot_dim: int) -> None:
+        """Create the per-slot predicate head once the slot width is known."""
+        if self.slot_head is not None and self.slot_head_dim == int(slot_dim):
+            return
+        self.slot_head_dim = int(slot_dim)
+        self.slot_head = GroundedSymbolHead(
+            self.slot_head_dim, len(PREDICATES), self.head_hidden,
+            self._head_lr, n_layers=self._head_layers,
+            n_members=self._head_members).to(self.device)
+        logger.info(
+            "per-slot grounding head: %d predicates on a %d-d slot vector. "
+            "The frame head is unchanged; this one answers 'what is THIS "
+            "thing' rather than 'what is in view'.",
+            len(PREDICATES), self.slot_head_dim)
+
+    @torch.no_grad()
+    def slot_probs(self, slots) -> Optional[torch.Tensor]:
+        """(K, D) slot vectors -> (K, n_predicates) probabilities.
+
+        NO LABEL SOURCE OF ITS OWN YET, and that gap is deliberate rather
+        than overlooked. The frame head is taught by the VLM and corrected by
+        consequences; the honest way to teach a slot head is to route the
+        same label to WHICHEVER SLOT OWNS THE EVIDENCE — the slot whose
+        attention covers the region the VLM was describing inherits it.
+
+        That attribution needs the live run to calibrate (how much attention
+        overlap counts as ownership, and what to do when two slots split a
+        tree), so it is not guessed at here. Until then this head reports its
+        prior and trains on nothing, which is the honest state for a head
+        that has never been taught.
+        """
+        if self.slot_head is None or slots is None:
+            return None
+        x = slots if isinstance(slots, torch.Tensor) else torch.as_tensor(slots)
+        if x.dim() == 3:
+            x = x[0]
+        return self.slot_head.predict(x.to(self.device).float())
 
     def fovea_probs(self, latent: torch.Tensor) -> Optional[Dict[str, float]]:
         """Per-step P(object under my gaze) from the agent's own latent —

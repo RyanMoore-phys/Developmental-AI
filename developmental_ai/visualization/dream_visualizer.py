@@ -112,7 +112,7 @@ class DreamVisualizer:
                 obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
                 if batch_size > 1:
                     obs_t = obs_t.expand(batch_size, -1)
-                encoded = self.wm.encoder(obs_t)
+                encoded = self.wm.embed(obs_t)
                 zero_act = torch.zeros(
                     batch_size, self.agent.action_dim, device=self.device
                 )
@@ -174,7 +174,7 @@ class DreamVisualizer:
         rssm_state = self.wm.rssm.initial_state(1, self.device)
         with torch.no_grad():
             obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            encoded = self.wm.encoder(obs_t)
+            encoded = self.wm.embed(obs_t)
             zero_act = torch.zeros(1, self.agent.action_dim, device=self.device)
             rssm_state, _ = self.wm.rssm.observe_step(
                 rssm_state, zero_act, encoded
@@ -198,7 +198,7 @@ class DreamVisualizer:
 
             with torch.no_grad():
                 next_obs_t = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-                encoded = self.wm.encoder(next_obs_t)
+                encoded = self.wm.embed(next_obs_t)
                 rssm_state, _ = self.wm.rssm.observe_step(
                     rssm_state, act_t, encoded
                 )

@@ -230,6 +230,286 @@ environment:
   # re-open the dirt tier at full worth and reset the familiarity decay.
   # Primary stream only (scouts explore local throwaway worlds).
   break_memory_path: podlogs/breaks_by_type.json
+# =====================================================================
+# THE SENSOR BUS (2026-09-19)
+# ---------------------------------------------------------------------
+# One registry for every transducer the agent has. Adding a sense is now a
+# REGISTRATION, not a schema migration against the replay buffer, the world
+# model and both loop bodies.
+#
+# THE RULE EVERY ENTRY HERE OBEYS:
+#   A SENSE is a transducer — it reports a physical quantity the agent's own
+#   body or its own screen makes available, WITHOUT NAMING WHAT ANYTHING IS.
+#   A MEANING names, classifies or identifies.
+#   Senses may be policy input. Meanings may only ever be evaluation.
+#
+#   green  a pure sense                    -> policy input
+#   amber  a sense that leaks structure
+#          the agent should have earned    -> opt-in, default OFF
+#   red    a meaning (block names, entity
+#          lists, true coordinates)        -> EVALUATION ONLY, and excluded
+#          STRUCTURALLY: read_policy never visits a RED sensor, so there is
+#          no code path along which a meaning reaches the world model.
+#
+# "Player-perceivable" is NOT the test. A player can press F3 and read
+# `minecraft:oak_log`; that string is player-perceivable and still forbidden,
+# because the thesis is not "only what a player can see" — it is "meaning is
+# earned, never declared". A human reading `oak_log` already knows English.
+# SkyBot has no elsewhere.
+#
+# REMOVING THIS BLOCK ENTIRELY reverts to the pre-bus behaviour exactly:
+# info["proprio"] and nothing else. That is what every other config gets.
+sensors:
+  enabled:
+    # The 13 body fields, unchanged and FIRST in wire order so a buffer
+    # written before the bus existed still lines up field-for-field.
+    - proprio
+    # A4 — the damage vignette and friends, 6 floats. `damage_taken` is a
+    # COUNTER in info; what a player experiences is a full-screen red flash.
+    # The config's own note is that the creature vocabulary never produced a
+    # fact because "nothing measurable ever told the agent it was hurt".
+    # This is the measurable thing, and it has been on screen all along.
+    - screen_fx
+    # A1 — THE CROSSHAIR FOVEA AT NATIVE RESOLUTION. The game renders at
+    # render_size 384 and the agent sees a 128px downsample. Three
+    # player-critical signals live below that floor, all at the crosshair:
+    #   * the BLOCK-BREAKING CRACK OVERLAY — how a player knows a swing is
+    #     landing and progressing. 13,305 breaks for 35 logs is exactly what
+    #     an agent that cannot see this would produce;
+    #   * the BLOCK OUTLINE WIREFRAME, drawn only when a block is in reach —
+    #     _reach_sense LEARNS this while the game renders the truth;
+    #   * BREAK PARTICLES, whose colour carries the material.
+    # 32x32 of a 384px frame is ~6 degrees at 3x the acuity available
+    # anywhere else, for +6% numbers and ZERO extra render cost.
+    - fovea_native
+    # A3 — |fovea_t - fovea_{t-1}|. The crack overlay is an ANIMATION; this
+    # states "something at the crosshair is changing" outright instead of
+    # asking the RSSM to difference it out of a 4,352-d latent.
+    - fovea_delta
+    # G3 — DEAD RECKONING, 16 floats. The engine's absolute XYZ is already
+    # in `info`; using it would be GPS, and a player without F3 does not
+    # have world coordinates. The agent instead integrates its OWN sensed
+    # body-relative displacement from an origin at the episode start, which
+    # is exactly a player's mental map: an egocentric frame with no world
+    # coordinates in it.
+    #
+    # Encoded at four spatial scales (4/16/64/256 blocks per cycle) rather
+    # than as raw (x, z), which is unbounded and gives a linear layer no
+    # reason to treat nearby positions as similar. Banino et al. (Nature
+    # 2018) found grid-like multi-scale codes EMERGE from training a network
+    # to path-integrate, and then let agents beat expert humans at
+    # goal-directed navigation.
+    #
+    # Its error is not assumed — `true_position` below MEASURES it.
+    - dead_reckon
+    # G4 — THE MOTION THE BODY FEELS, 5 floats. `moved` in the proprio
+    # vector is a MAGNITUDE, so nothing downstream can tell walking forward
+    # from being shoved sideways by a mob, or from pressing `back`. A player
+    # feels all three, plus falling. Signed forward/lateral relative to
+    # heading, vertical rate, fall distance, and whether it is descending.
+    - motion
+    # O1 — THE PRIVILEGED CHANNEL. RED: EVALUATION ONLY, NEVER INPUT.
+    #
+    # This is F3's information and it is registered so the project can
+    # finally MEASURE itself, not so the agent can use it. MineDojo calls
+    # exactly this class of observation "privileged information"; that is
+    # the right term for it.
+    #
+    # IT CANNOT REACH THE WORLD MODEL. SensorBus.read_policy does not visit
+    # RED sensors — there is no filter to forget — and RED readings travel
+    # in info["oracle"], a separate dict the replay buffer never carries.
+    # tests/_oracle_isolation_smoke.py asserts the barrier three ways.
+    #
+    # Enabling it costs nothing the agent can spend: it buys drift
+    # measurement for `dead_reckon` and, once a ray handler exists, depth
+    # accuracy for the flow head.
+    - true_position
+    # G5 — ILLUMINATION STRUCTURE, 4 floats, read off the retina rather than
+    # off F3's light-level readout (pixels are the player's own eye and are
+    # GREEN; the readout is a quantised truth and would be AMBER). NOT mean
+    # brightness — screen_fx already carries that. These describe the SHAPE
+    # of the light: darkest region, median, brightest region, and how much
+    # of the view is unlit. A cave mouth in a sunlit field is a low p05 with
+    # a high p95, which no single mean can express.
+    - light
+    # G6 — SKY APPEARANCE, 4 floats.
+    #
+    # THE ROADMAP ITEM SAID "time-of-day phase (sin, cos)" AND THAT WAS
+    # WRONG: dawn and dusk look nearly identical in one frame, so a phase
+    # cannot honestly be derived from one. A player separates them by which
+    # horizon the sun is on (a compass the agent lacks) and by memory.
+    # So this reports brightness, warm-cool balance, vertical gradient and
+    # the sun/moon disc fraction, and claims nothing about phase. The CLOCK
+    # is left for the RSSM to integrate across steps, which is the honest
+    # division of labour: the sensor transduces, the recurrent model
+    # remembers.
+    - sky
+    # ---- REGISTERED BUT NOT ENABLED -----------------------------------
+    # Both exist in the registry and can be switched on by adding them to
+    # this list. Neither is on, and each for a reason that is a FACT rather
+    # than a preference:
+    #
+    # A2 `hud` — the hotbar, the selection highlight, the held-item model
+    #   and the health/hunger bars, at native resolution. This is the
+    #   OBSERVATION half of the hotbar keys added to the macro table: the
+    #   agent can now change its selection but cannot see that it did.
+    #   FlatInventoryObservation gives item->count with NO SLOT INDICES and
+    #   `equipped_items` is dead in MineRL 1.0, so mainhand is derived from
+    #   evidence — the HUD renders the answer every frame.
+    #   MEASURED 2026-09-19 ON THE POD: MineRL's POV does NOT include the
+    #   HUD. The bottom band's pixel variance is 0.029 against 0.290
+    #   mid-frame — an order of magnitude LESS structure where a rendered
+    #   HUD would be an order of magnitude more. The frame is world-only.
+    #
+    #   So this sensor is dead on this engine, not pending. It would read a
+    #   strip of terrain and be worse than nothing. The consequence worth
+    #   knowing: A9's hotbar keys WORK, but the agent cannot see its
+    #   selection change — deliberate equipping is possible and not
+    #   observable, so anything built on it must be grounded in consequence.
+    #
+    # M1 `audio` — block-break sounds carry MATERIAL IDENTITY, footsteps
+    #   carry the block underfoot, mob sounds carry identity, direction and
+    #   distance. Minecraft audio is positional and stereo, so it is a
+    #   spatial sense. On a scoreboard of 13,305 breaks for 35 logs, "it
+    #   cannot hear what it is hitting" is not a small gap.
+    #   BLOCKED ON: MineRL does not expose audio. Its observation space is
+    #   POV + inventory + stats, and there is public evidence of people
+    #   trying to add it to MCP-Reborn with no shipped handler. Making this
+    #   real means MODDING THE JAVA CLIENT to tap the sound engine — days of
+    #   work on the critical path of an environment whose boot sequence is
+    #   already delicate. The Python half is done and waiting; it reads
+    #   info["audio"] and returns neutral every frame until the key exists.
+    #   The contract the Java side must meet is written at the sensor.
+  # ---- P4: the spatial surprise map ---------------------------------
+  # Side of the grid on which "where is the world model wrong" is reported
+  # to the POLICY (never to the world model — that would be circular). 8
+  # matches the encoder's own spatial grid, so a surprise cell and a
+  # feature-map cell describe the same patch of world.
+  #
+  # These 64 numbers were ALREADY BEING COMPUTED inside flow_residual and
+  # then averaged into a scalar. Curiosity has been scene-level since the
+  # project began: the agent could be surprised, but never surprised BY A
+  # PLACE IN THE FRAME — which is why the vision magnet can want a category
+  # and never an instance.
+  surprise_grid: 8
+  # Side of the native-resolution crop, in native pixels.
+  fovea_size: 32
+  # Width each IMAGE sensor is encoded to before it meets the body vector.
+  # NOT a flat concat: the foveal crop is 3,072 numbers against 13 body
+  # scalars, and concatenating them raw would drown the body at 236:1. Each
+  # modality gets its own small conv encoder so both arrive comparable.
+  feature_dim: 64
+
+# =====================================================================
+# SPATIAL MEMORY (2026-09-19, roadmap G1/G2/P2/P3)
+# ---------------------------------------------------------------------
+# The first representations in this system that OUTLIVE THE FRAME THEY CAME
+# FROM. Every prior one was per-frame: the grounding head answers "is a tree
+# visible NOW", the magnet targets what is on screen NOW, the flow senses
+# describe THIS step. Nothing carried the fact that a wall was on the left
+# three steps ago — which is why "a tree at the edge of frame and a tree
+# dead-centre pay exactly the same" fairly described the whole stack and not
+# just one reward term.
+#
+# ALL FOUR ARE BUILT FROM THE AGENT'S OWN ESTIMATES: the world model's
+# forward-probe magnitude, and the body's sensed ego-motion. Nothing here
+# reads a block name, a voxel grid or a true coordinate. The engine's
+# position exists in this codebase only as the RED oracle, and only to
+# MEASURE these. They therefore inherit their inputs' errors, which is
+# correct — a mistaken sense of distance should produce a mistaken map.
+#
+# THEY ARE POLICY-ONLY. Feeding a world model's own output back into its
+# input is circular; this is the same argument that keeps the flow senses
+# and the surprise map out of the sensor bus.
+#
+# ---- A NOTE ON THE GATE ---------------------------------------------
+# The roadmap gated this phase on the Wave 1/2 go/no-go (flow_loss falling
+# on LIVE pod frames), because G1 was specified as "expose the depth map"
+# and depth mode is still unvalidated. The implementation sidesteps that:
+# `probe_map` works in BOTH flow modes. Under `depth` the magnitude IS
+# inverse depth by construction; under `raw` it is whatever the head has
+# LEARNED about how fast things sweep. Either way the ORDERING is the useful
+# part — near sweeps fast, far sweeps slow — so nothing here bets on the
+# factorisation being right. What is still gated is how much to TRUST the
+# maps, and that is what the oracle is for.
+spatial:
+  enabled: true
+  # G1 — the forward-probe sweep map: "if I stepped forward, how fast would
+  # each part of the scene sweep past me". `flow_probe` already reduces this
+  # to three scalars for proprioception, which is a 341:1 compression of the
+  # first continuous, spatially-resolved quantity this system has ever had.
+  probe_grid: 8
+  # G2 — rolling top-down occupancy, body at the centre. Cells hold a
+  # decaying confidence that something was there: a MEMORY, not a survey, so
+  # an unobserved cell FADES rather than asserting an emptiness it cannot
+  # vouch for. 16 cells of 1 block spans a 16-block neighbourhood, which is
+  # a little over the render distance that matters for approach.
+  occupancy_grid: 16
+  occupancy_cell_blocks: 1.0
+  # ~10-step half life. Long enough to remember the wall you just turned
+  # away from, short enough that stale geometry stops being asserted.
+  occupancy_decay: 0.93
+  max_range_blocks: 12.0
+  # P2 — successor map over DEAD-RECKONED cells, not egocentric ones. The
+  # egocentric frame re-centres on the body every step, so "the cell I am
+  # in" is always the middle one and every state is its own successor. The
+  # SR needs a state space that holds still while the agent moves through
+  # it; the dead-reckoned frame is exactly that, and is built from the
+  # body's own sense rather than the engine's coordinates.
+  successor_grid: 8
+  successor_cell_blocks: 8.0
+  successor_gamma: 0.95
+  successor_lr: 0.1
+  # P3 — walkability by relative bearing, learned by ANNOTATION BY
+  # INTERACTION: command forward, and whether the body moved is the label.
+  # Nobody labels a wall — the wall labels itself by stopping you, exactly
+  # as _reach_sense is grounded by real break events rather than by a
+  # rangefinder. Prior 0.5 means "no opinion"; zero would be a claim that
+  # the world is solid, which is the belief that stops an agent trying.
+  walk_bins: 8
+  walk_lr: 0.1
+
+# =====================================================================
+# OBJECT SLOTS (2026-09-19, roadmap R1-R4)
+# ---------------------------------------------------------------------
+# THE THING THAT CANNOT CURRENTLY BE SAID: "two trees — one at 5 blocks
+# partly behind leaves, one at 15". The grounding head emits
+# `tree_visible=1, object_left=1`; there is no quantity, no instance and no
+# relation anywhere in the representation, and the vision magnet's own
+# docstring concedes "no instance disambiguation of two trees in one frame".
+# Slots are what make that sentence representable at all.
+#
+# THREE DESIGN CHOICES, EACH FROM A PUBLISHED FAILURE:
+#   * slots decode the FLOW FIELD, not pixels. DINOSAUR found pixel targets
+#     make slots latch onto colour and texture; Minecraft is maximally
+#     textured, so a pixel-target slot model here would confidently segment
+#     grass noise. SAVi showed flow is the target that works, because what
+#     moves together IS an object — this project's own thesis one level down.
+#   * slots are CONDITIONED, not randomly initialised. SAVi's central result
+#     is that one point on an object is enough, and that unconditioned init
+#     does not scale. Two such points are already computed and neither is a
+#     label: the fovea centre, and the peak of the mover residual.
+#   * IDENTITY is separate from APPEARANCE, and updates only while the object
+#     is present (Dual-State Slot Attention; TSA). Otherwise slots SWAP under
+#     occlusion — and an agent walking through a forest occludes constantly.
+#
+# ---- SHIPPED OFF, AND THIS ONE IS NOT A PREFERENCE ------------------
+# Slots decode the flow field. Until `flow_loss` has been shown to FALL ON
+# LIVE POD FRAMES there is no reconstruction target, and this is a slot model
+# trained on noise. SAVi's own stated limitation is that fully-unsupervised
+# decomposition "still fails to scale to diverse realistic data" — a warning
+# about exactly this situation. WorldModel also refuses to build the module
+# without a flow head, so this cannot be half-enabled by accident.
+#
+# NO CONTRACT TESTS SHIP WITH THIS. A green test here would only certify
+# that the plumbing runs; every claim worth asserting needs the live run.
+slots:
+  enabled: false
+  num_slots: 6
+  slot_dim: 64
+  iters: 3
+  weight: 1.0
+
 world_model:
   # ---- SCALE-UP 2026-08-14 (user directive) ----------------------------
   # 12.5M -> 54.1M params; the DYNAMICS CORE (rssm) goes 2.3M -> 21.7M and
@@ -287,6 +567,256 @@ world_model:
   # inside a sizing wave.
   decoder_hidden: 768
   learning_rate: 0.0003
+
+  # ======================================================================
+  # PERSPECTIVE FROM MOTION (2026-09-18, user directive)
+  # ----------------------------------------------------------------------
+  # THE CLAIM: depth is what your own movement reveals, and objectness is
+  # what moves together when you move. A monocular agent that never learns
+  # to predict how the scene sweeps past it has no reason to represent
+  # depth at all, and SkyBot never had one. See docs/PERSPECTIVE_LEARNING.md
+  # for the argument and the citations; world_model/rssm.py's FlowHead block
+  # for the mechanism.
+  #
+  # THIS BLOCK DISCARDS world_model.pt, symbolizer.pt AND THE FOVEA HEAD.
+  # Taken deliberately (user directive: "start the world_model.pt from
+  # scratch, because this is a new learning process"). Three of the four
+  # knobs below change PARAMETER SHAPES, so there is no restoring the old
+  # encoder against them:
+  #   spatial_grid    changes the conv ladder (5 stages -> 4)
+  #   coord_channels  changes the first conv's input width (3 -> 5)
+  #   proprio         changes rssm.obs_dim (768 -> 781)
+  # The replay BUFFER survives: its new proprio column is optional on load
+  # exactly like `restarts` was, so the agent keeps its experience and
+  # re-learns its perception from it.
+
+  # ---- 1. THE BOTTLENECK WAS 4x4 --------------------------------------
+  # An earlier reading of this stack claimed the encoder discards spatial
+  # identity. It does not — flatten+Linear is position-specific. The real
+  # defect is RESOLUTION: `while size > 4` drove every image_size to a 4x4
+  # grid, so at 128px one bottleneck cell covered a 32x32 PIXEL SLAB. A
+  # mid-distance trunk lived entirely inside one cell, indistinct from the
+  # dirt behind it. That is the measured shape of the position-blindness
+  # noted under symbol_weight below, and of the vision magnet's admitted
+  # "no instance disambiguation of two trees in one frame".
+  #
+  # 8x8 costs ONE conv stage and makes a cell 16x16 px — about one block
+  # face at working distance.
+  spatial_grid: 8
+  # Normalized (x, y) planes appended to the INPUT, so the convolutional
+  # stack can express "this texture, over there" instead of leaving all
+  # position information to be reconstructed by the final Linear.
+  coord_channels: true
+  # 8x8x256 would flatten to 16384 and a Linear to 768 would be 12.6M params
+  # (vs 3.1M at 4x4). A 1x1 conv to 128 channels first keeps it at ~6.3M.
+  readout_channels: 128
+
+  # ---- 2. THE FLOW HEAD -----------------------------------------------
+  # Predicts the displacement field a given action would produce, and is
+  # trained by whether that field warps this frame into the next one.
+  # Nothing labels the flow; novel-view synthesis IS the supervision.
+  flow_head: true
+  # Resolution of the predicted field. 32x32 over a 128px frame is one
+  # vector per 4x4 px — far finer than the parallax structure it has to
+  # represent.
+  #
+  # MEASURED COST, not estimated: 5.35M params at the live sizes. Almost none
+  # of that is the deconv stack (0.4M); it is the two Linears in front of it,
+  # driven by latent_dim 4352 and encoder_hidden 768 — fc is 4352x768 = 3.3M
+  # and proj is 768x2048 = 1.6M. So `flow_size` is NOT the knob that makes
+  # this expensive; dropping it to 16 would save ~0.3M and lose half the
+  # field's resolution. If the head ever needs to shrink, narrow its
+  # hidden_dim instead (it is passed encoder_hidden today).
+  flow_size: 32
+  # Resolution the PHOTOMETRIC COMPARISON runs at, which is the memory hot
+  # spot: at batch_size 16 / sequence_length 32 there are 496 frame pairs
+  # per batch, and holding warped+target at full 128px would cost ~100 MB
+  # per tensor on top of the ~100 MB reconstruction already materializes.
+  # Parallax is a low-frequency fact; halving resolution quarters memory.
+  flow_photo_size: 48
+  flow_weight: 1.0
+
+  # ---- WAVE 2 (2026-09-18): a CORRECT photometric loss -----------------
+  # Wave 1's warp loss was a first cut. These three are the standard fixes
+  # it lacked, and each changes what the head can learn at DEPTH
+  # DISCONTINUITIES — which in this world means trunk edges, the one place
+  # the geometry has to be right. Every default in the code is the Wave 1
+  # behaviour; the values here are the opt-in.
+  #
+  # AUTO-MASKING (monodepth2). A pixel whose error is WORSE after warping is
+  # better explained by "nothing moved": it is occluded, or it is texture
+  # travelling with the camera. Charging it as error supervises the field
+  # toward a wrong answer. The mask starts at 100% retained by construction
+  # (at init the head emits zero flow, so warp error == identity error and a
+  # strict `<` would mask everything and kill the gradient — a
+  # guard-becomes-latch of the purest kind). Watch `flow_mask` in telemetry:
+  # a retained fraction trending to 0 means the loss is starving itself.
+  # MEASURED before shipping, on a two-plane synthetic carrying a genuine
+  # occluder: near/far flow ratio 1.11/1.18/1.15x unmasked -> 1.59/1.51/1.64x
+  # masked across three seeds, with 87% of pixels retained. Wins every seed,
+  # ~+40%, and nowhere near starving the loss. This one is not a bet.
+  flow_automask: true
+  # MULTI-SCALE. Photometric losses have bad local minima at large
+  # displacement, and at action_repeat 4 one turn is 15 degrees — large.
+  # Scales DIVIDE flow_photo_size. [1] is single-scale, i.e. Wave 1.
+  #
+  # WEAKER EVIDENCE THAN THE ABOVE, stated rather than glossed: on the same
+  # harness the pyramid beat single-scale in 5 of 6 (shift, seed) pairs and
+  # LOST one. Kept on because it is cheap (1 + 1/4 the pixels), standard, and
+  # the failure mode it addresses — large-displacement local minima — is
+  # under-represented in a 32px synthetic and over-represented in a real
+  # 15-degree turn. The pod is the real test.
+  flow_scales: [1, 2]
+  # ---- LONGER BASELINES: SHIPPED OFF, AND WHY --------------------------
+  # THE THEORY, which I proposed: depth resolution scales with baseline, and
+  # adjacent frames are the worst baseline in the buffer, so warping t->t+k
+  # for k in {1,2,4} from the same head should sharpen depth for free.
+  #
+  # THE MEASUREMENT, which says otherwise. On the two-plane synthetic
+  # (near band moving 4x the far band, truth 4.0x), across three seeds:
+  #     strides [1]      1.60x  1.28x  1.06x
+  #     strides [1,2,4]  0.86x  0.79x  0.84x   <- ORDERING INVERTED
+  # It did not merely fail to help. Below 1.0 the head reports the NEAR
+  # plane as moving slower than the far one.
+  #
+  # DIAGNOSIS, and it is mechanical rather than a toy artifact: one head
+  # produces one field per (latent, action). At stride k the true
+  # displacement is k times larger, and `max_flow` bounds the field — so a
+  # long-stride term can be literally unrepresentable, and an unlearnable
+  # term does not sit quietly: it drags the shared head to a compromise that
+  # destroys the stride-1 field the agent actually acts on.
+  #
+  # THE FIX WAS TRIED AND IS NOT ENOUGH. Scaling the bound with the baseline
+  # (FlowHead.range_scale, kept — it is correct regardless) gave
+  # 0.79x / 1.16x / 1.46x: better than the broken version, still worse than
+  # stride [1] alone on two of three seeds, and wildly variable.
+  #
+  # So the capability stays in the code, config-gated and correct, and OFF.
+  # Turning it on would need a head that is conditioned on the stride as a
+  # first-class input, not one asked to infer it from a summed action.
+  flow_strides: [1]
+  #
+  # ---- MEMORY ----------------------------------------------------------
+  # With strides off, the flow block is 31 pairs x (48^2 + 24^2) = 2880 px
+  # vs Wave 1's 31 x 64^2 = 4096 — i.e. this wave makes the block SMALLER,
+  # not larger. flow_photo_size drops 64 -> 48 to pay for the second scale.
+  #
+  # IF IT EVER OOMs, the lever is flow_photo_size, then flow_scales. Do NOT
+  # reach for batch_size or sequence_length — sequence_length 32 exists
+  # specifically so a barehanded log break (~60 ticks) fits in one window.
+
+  # ---- GEOMETRY THAT IS GIVEN RATHER THAN GUESSED ----------------------
+  # `raw`   the head predicts a 2-channel displacement field directly.
+  # `depth` the head predicts ONE channel of inverse depth, and flow is
+  #         computed analytically from the KNOWN body motion.
+  #
+  # WHY depth IS THE BETTER PARAMETERIZATION. Rotation-induced flow carries
+  # NO depth information and dominates in first person; translation-induced
+  # flow carries all of it. Asked for a raw field, the head must learn that
+  # separation from scratch and will mostly learn the rotation, because that
+  # is where the error mass is. And the ego-motion here is essentially
+  # KNOWN — delta-yaw, delta-pitch and forward distance are a finite
+  # difference of the proprio already in the buffer, so no new column and no
+  # pose regression. It also yields a DEPTH MAP the rest of the system wants.
+  #
+  # SHIPPED AS `raw` ON PURPOSE. The Wave 1 go/no-go (flow_loss falling on
+  # LIVE pod frames) has not run yet, and a depth factorisation built on an
+  # objective that has never seen real Minecraft is exactly the bet this
+  # project keeps losing. Flip this one line once the go/no-go passes.
+  flow_mode: raw
+  # Minecraft's default vertical FOV. A declared SENSOR constant, and the
+  # honest note: getting it wrong rescales every depth uniformly and
+  # PRESERVES ORDERING, and every consumer today (flow_fovea, flow_edge,
+  # flow_ratio) reads only relative magnitude — so a mis-set value is
+  # invisible downstream until someone wants a distance in blocks.
+  camera_fov_deg: 70.0
+
+  # The aperture-problem defence, and the reason flat sky cannot become an
+  # income source. Over a texture-free region the photometric term is
+  # satisfied by ANY flow, so without a prior the head would emit arbitrary
+  # values there and manufacture residual out of nothing.
+  flow_smooth_weight: 0.05
+  # Which action the per-step COUNTERFACTUAL probe asks about ("if I stepped
+  # forward from here, how would the scene sweep past me?"). Defaults to the
+  # first entry of vision_scaffold.forward_actions rather than restating it;
+  # named here only so the coupling is visible.
+  flow_probe_action: 1
+
+  # ---- 3. RESIDUAL-WEIGHTED RECONSTRUCTION ----------------------------
+  # Flat per-pixel MSE over a 128px frame is dominated by sky, ground and
+  # repeated texture; a three-block trunk is rounding error. This is the
+  # documented reason autoencoder world models fail to perceive small
+  # objects, and no amount of extra input resolution fixes a loss that does
+  # not care. Weighting recon by where the WARP failed spends capacity where
+  # motion says something is there.
+  #
+  # ESCAPE PATH: the weight is bounded in [1, 1+lambda] and never reaches
+  # zero, so no region of the frame can become permanently unlearnable —
+  # the failure mode a naive "only train on the interesting pixels" mask
+  # would have had. The batch mean is divided out, so this changes the
+  # DISTRIBUTION of reconstruction effort and not its magnitude (otherwise
+  # lambda would silently double as a learning-rate knob). 0.0 is the revert.
+  recon_residual_lambda: 2.0
+
+  # ---- P1: HORIZONS BEYOND ONE STEP -----------------------------------
+  # The world model is trained to predict ONE step ahead, while the policy
+  # trains on IMAGINED ROLLOUTS fifteen steps long. The horizon the dreams
+  # actually live at has never been supervised at all.
+  #
+  # Each entry rolls the PRIOR forward k steps with the actions actually
+  # taken and charges the divergence from the posterior that resulted. More
+  # supervision per frame from unchanged data — the one answer to data
+  # starvation that needs no new data, on a run whose entire history holds
+  # ~35 log breaks.
+  #
+  # WHY THIS IS NOT THE MULTI-STRIDE WARP THAT FAILED IN WAVE 2. That was
+  # measured to INVERT depth ordering, because one flow field cannot
+  # represent k times the displacement while max_flow bounds it. Latent
+  # rollout has no representability bound: iterated transition is already
+  # the RSSM's job, so a longer horizon asks it to do more of what it does.
+  #
+  # Starts are STRIDED BY k, so the cost is about one extra observe pass per
+  # horizon rather than k of them. [] restores the one-step objective.
+  latent_horizons: [4, 16]
+  latent_horizon_weight: 1.0
+
+  # ---- 4. THE WORLD MODEL GETS A BODY ---------------------------------
+  # It used to see pixels and the INTENDED action only, which makes "I
+  # turned my head" and "the world spun around me" the same observation.
+  # Optical flow in a first-person game is dominated by camera rotation, so
+  # a flow head without a body sense is being asked to re-derive its own
+  # heading from pixels every step. The env's 13 raw proprio fields (pitch,
+  # head_sin/cos, moved, ...) enter the EMBED, i.e. the posterior only —
+  # imagination runs on the prior and is untouched.
+  #
+  # DELIBERATELY THE RAW ENV VECTOR, not the loop-augmented one: the
+  # augmented vector carries the flow senses the world model itself
+  # produces, and feeding a model's own output back into its input is
+  # circular.
+  proprio: true
+
+  # ---- THE BATCH THAT ACTUALLY CONTAINS A LOG (2026-09-18) -------------
+  # goal_replay_fraction (below) carves a slice of every world-model batch
+  # for windows containing "a reward". That question used the sampler's 1e-3
+  # default, i.e. "did ANYTHING pay". On a SCOUT stream that is sharp — it
+  # stores the raw env reward, and _break_reward pays exactly 0.0 for
+  # everything that is not a log or an ore. On the PRIMARY stream it is
+  # nearly vacuous: what gets stored is `prim_extrinsic`, carrying magnet
+  # shaping, approach and goal-dwell on top of the env reward, and those are
+  # nonzero on most steps.
+  #
+  # MEASURED on a synthetic buffer with shaping-sized reward every step and
+  # three log breaks in 400: at 1e-3 the pool was 396 of 396 possible
+  # windows — goal replay was EXACTLY uniform sampling. At 5.0 it was the 12
+  # windows containing a break. A 33x dilution of the one mechanism that
+  # exists because this run's entire history holds ~35 log breaks.
+  #
+  # 5.0 is log-sized by construction (log 20.0 + 0.5/tick, ore 10.0, all
+  # else 0.0) so the stratum means what its name says however the reward
+  # channels are mixed. 1e-3 restores the old behaviour exactly. Watch
+  # `reward pool: N windows` in the AsyncWM line — it should fall by orders
+  # of magnitude the moment this ships, which is the confirmation.
+  goal_replay_threshold: 5.0
   # ---- DATA DIET 2026-08-23: SPAN, RATIO, HORIZON ----------------------
   # These four are RUNTIME dimensions, not parameter shapes, so unlike the
   # 08-14 scale-up none of this discards a trained encoder or RSSM.
@@ -385,10 +915,30 @@ world_model:
   # death. `enabled: false` restores the old fixed preallocation exactly.
   buffer_growth:
     enabled: true
-    # ~25k transitions per block = ~1.2 GB of uint8 observations at
-    # obs_dim 49152. Large enough that growth is rare; small enough that a
-    # part-filled final block is not mostly waste.
-    block_transitions: 25000
+    # ~5k transitions per block = ~247 MB of uint8 observations at obs_dim
+    # 49152. Large enough that growth is rare; small enough that a part-filled
+    # final block is not mostly waste.
+    #
+    # ---- 25000 -> 5000 (2026-09-22): THE BLOCK MUST FIT THE CEILING ------
+    # THE INITIAL BLOCK IS NOT BUDGETED. ReplayBuffer.__init__ allocates one
+    # block per stream OUTRIGHT (replay_buffer.py ~368-380); only maybe_grow()
+    # calls MEMORY_BUDGET.request(). So the floor under any configuration is
+    # `num_streams x block_transitions`, charged to RSS but invisible to the
+    # budget, and the stated ceiling is always understated by exactly that.
+    #
+    # At 25k blocks and hard_max_gb 2 the arithmetic came out:
+    #     2 x 1.233 GB unbudgeted  +  1 budgeted grow  =  3.70 GB actual
+    # against a ceiling that says 2.00 -- a 1.85x overshoot, and most of a
+    # 16 GB box's spare RAM. At 5k:
+    #     2 x 0.247 GB unbudgeted  +  8 budgeted grows =  2.47 GB actual
+    # i.e. 1.23x, and the SAME ~20k transitions per GB either way. Smaller
+    # blocks buy accuracy of the guard, not efficiency.
+    #
+    # The real fix is to charge the initial allocation to the budget too;
+    # until then this keeps the number in `hard_max_gb` close to honest, and
+    # this coupling is why block_transitions must be revisited whenever
+    # hard_max_gb moves.
+    block_transitions: 5000
     # Grow at 85% full, not at 100%: the new block has to be in place BEFORE
     # the write position reaches the end, or transitions get overwritten in
     # the window between the flag and the next world-model block.
@@ -401,7 +951,18 @@ world_model:
     # the normal case rather than the exception. ONE budget is shared by
     # every stream: N streams each taking a fraction of the machine is an
     # N-times overshoot, and N is exactly what varies.
-    max_ram_frac: 0.6
+    #
+    # 0.6 -> 0.15 (2026-09-22, move to the 16 GB main computer). On a bare
+    # host the cgroup lookups find no limit and fall through to psutil, which
+    # reports the machine's 16 GB -- so 0.6 resolved to a 9.6 GB ceiling on a
+    # box where two Java clients (~5 GB), torch (~3 GB), Ollama and Xvfb
+    # already want ~9.5 GB. Nothing would have failed at startup; RSS climbs
+    # as the buffer fills and the OOM killer arrives around hour 10, which is
+    # precisely the failure this whole growth block was written to stop.
+    # The FRACTION is lowered alongside hard_max_gb on purpose: leaving it at
+    # 0.6 would make the ceiling an artefact of node size again the moment
+    # this box gets more RAM.
+    max_ram_frac: 0.15
     # Absolute GB cap on top of the fraction; 0 = fraction only.
     #
     # ---- 0 -> 16 (2026-09-02): A DECISION, NOT A SIDE EFFECT ------------
@@ -420,7 +981,19 @@ world_model:
     # should be a deliberate knob someone can move while watching `wm/loss`,
     # not an accident of node RAM. The fraction still applies underneath, so
     # a small node is still protected; on a big node THIS is the ceiling.
-    hard_max_gb: 16
+    #
+    # ---- 16 -> 2 (2026-09-22): THE SAME DECISION, ON A SMALLER BOX ------
+    # Training moved from the pod (125 GB RAM) to the main computer (16 GB).
+    # 2 GB = ~40k transitions = ~2 hours of history at the measured rate.
+    # That is small by replay standards and it is a real cost -- but the
+    # argument recorded above cuts the same way it did at 16: this is a
+    # LIFELONG, non-stationary stream, and the oldest hours model a policy
+    # the agent no longer runs. Measured budget on this box:
+    #   2 (buffer) + ~5 (two Java clients) + ~3 (torch/CUDA host side)
+    #   + ~1.5 (OS, Xvfb, Ollama host side)  ~= 11.5 GB of 16 GB.
+    # RAISE THIS FIRST if the box gets more RAM -- it is the knob that was
+    # cut hardest for the move, not one that was chosen on its merits.
+    hard_max_gb: 2
   # 4. PERSIST THE MEMORY. The buffer had NO save/load path at all, so the
   #    supervisor's automatic crash-relaunch (and live Python exceptions have
   #    caused those) restarted world-model training from EMPTY. Written on the
@@ -486,6 +1059,29 @@ prioritized_replay:
 async_replay:
   enabled: true
 curiosity:
+  # ---- PERSPECTIVE FROM MOTION joins the DRIVE (2026-09-18) ------------
+  # Weight of the world model's flow residual — how much of the change
+  # between the last two frames the action-conditioned warp could NOT
+  # explain — against the forward-model error, when the two are summed for
+  # LEARNING-PROGRESS BUCKETING.
+  #
+  # THIS IS NOT A NEW INCOME STREAM, and that distinction is the whole
+  # argument for it. LP pays for error going DOWN, never for error; adding a
+  # channel changes what the agent can make progress ON, not how much it is
+  # paid for standing anywhere. And the residual is a RATIO against how much
+  # the frame changed at all, so: no ego-motion -> no change -> no residual
+  # -> no income. Flat sky has neither parallax nor texture for the warp to
+  # fail on, which is the sky exploit closed structurally rather than by a
+  # guard someone has to remember to re-open.
+  #
+  # `last_pred_error` is deliberately NOT contaminated by this — it is
+  # documented as raw forward-model surprise and is read by skill
+  # wm_fidelity and the occlusion split.
+  #
+  # 0.0 disables the channel without rebuilding the world model, and is the
+  # revert. Inert in every config with no flow head to supply a residual.
+  flow_error_weight: 1.0
+
   # EXTERNAL CURIOSITY (ported from lifelong 2026-08-01 — skybot had NO
   # coverage_weight at all, so it defaulted to 0.0 and territory novelty was
   # silently OFF). Count-based novelty over discretised world cells: new
