@@ -41,6 +41,27 @@ if pgrep -x java >/dev/null; then
   echo "  If these are dead MineRL clients, clear them with: pkill -9 -x java"
   exit 1
 fi
+# ---- UNLOAD ANY RESIDENT OLLAMA MODEL (2026-09-23) ------------------------
+# ollama serve is a SEPARATE long-running service and the VLM is requested with
+# keep_alive=-1 (pin forever, deliberately: it is called every ~30-50 steps and
+# reloading each time would cost more than it saves). The consequence is that
+# RESTARTING THE AGENT DOES NOT RELOAD THE MODEL -- so a change to
+# symbolic_grounding.num_ctx has NO EFFECT until the model is unloaded, because
+# the KV cache was sized when it was first loaded, possibly days earlier.
+# That is exactly how the num_ctx fix looked like it had failed: llama-server
+# still at 7.8 GB after a restart, holding a cache for a context the new config
+# had already reduced.
+# Unloading here makes the next generate call re-read the options. Cost: one
+# model load (~seconds) per launch. Non-fatal throughout -- a box with no
+# ollama, or a dead one, must still be able to start training.
+if command -v ollama >/dev/null 2>&1; then
+  _LOADED=$(ollama ps 2>/dev/null | awk "NR>1 {print \$1}")
+  for _m in $_LOADED; do
+    echo "  unloading resident model: $_m (so num_ctx is re-read)"
+    ollama stop "$_m" >/dev/null 2>&1 || true
+  done
+  [ -n "$_LOADED" ] && sleep 2
+fi
 pgrep -x tailscaled >/dev/null || { echo "REFUSED: tailscaled down"; exit 1; }
 ss -tln | grep -q "127.0.0.1:25565" || { echo "REFUSED: socat bridge down"; exit 1; }
 timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 >/dev/null 2>&1 \
