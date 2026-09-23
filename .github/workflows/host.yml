@@ -110,6 +110,22 @@ jobs:
             fi
             grep -E "zero-filling stream|rebuild exhausted|reset exceeded" \
               runlogs/minecraft_skybot_run.log 2>/dev/null | tail -5 | sed "s/^/    /" || true
+            echo "== why it exited =="
+            # The supervisor names crashes.log but nothing ever showed it, so
+            # eight restarts went by with the reason one file away. NO
+            # APOSTROPHES ANYWHERE IN THIS BODY: it is single-quoted at the
+            # ssh boundary, and one apostrophe silently runs the REST of these
+            # commands on the RUNNER instead of the training host (it did).
+            tail -12 runlogs/crashes.log 2>/dev/null | sed "s/^/    /" \
+              || echo "    (no crashes.log)"
+            echo "== was it the OOM killer =="
+            # THE decisive test. 676 MB free with 1.3 GB of swap in use is a
+            # box about to kill something; this says whether it already has.
+            sudo dmesg -T 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" \
+              | tail -5 | sed "s/^/    /" || echo "    (dmesg unreadable or clean)"
+            echo "== top RSS consumers =="
+            ps -eo rss,comm --sort=-rss | head -8 \
+              | awk "NR==1{next}{printf \"    %8.1f MB  %s\\n\", \$1/1024, \$2}"
             echo "== last log =="
             tail -15 runlogs/minecraft_skybot_run.log 2>/dev/null || echo "no run log yet"
             # SUPERVISOR LOG TOO (added 2026-09-23). "supervisor: 1 proc" +
