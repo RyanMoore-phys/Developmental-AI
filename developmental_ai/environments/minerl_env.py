@@ -396,9 +396,16 @@ class MineRLEnvAdapter(gym.Env):
         self._prev_pov_digest: Optional[bytes] = None
         # macros that must change a live frame (camera moves + locomotion);
         # computed from the source list — self._macros is assigned below.
+        # LEFT/RIGHT/JUMP ADDED 2026-09-20 with the strafe macros. This set
+        # decides which steps count toward the frozen-POV watchdog, so a
+        # locomotion macro missing from it makes a dead client take longer to
+        # detect — the agent strafes at a frozen screen and nothing notices.
+        # `sneak` is deliberately absent: sneaking alone does not move you,
+        # so an unchanged frame under it is not evidence of a dead client.
         self._motion_macros = frozenset(
             i for i, m in enumerate(macros or TREECHOP_MACROS)
-            if "camera" in m or "forward" in m or "back" in m)
+            if ("camera" in m or "forward" in m or "back" in m
+                or "left" in m or "right" in m or "jump" in m))
         self._env_name = env_name
         self._macros = list(macros or TREECHOP_MACROS)
         self.image_size = int(image_size)

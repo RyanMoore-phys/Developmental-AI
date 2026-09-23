@@ -241,7 +241,14 @@ def main() -> None:
     _probe = E.__new__(E)
     _probe._macros = _M
     _probe.action_repeat = 2
-    assert len(_M) == 13, f"macro table is {len(_M)} wide, expected 13"
+    # WIDTH IS A FLOOR, NOT A FIXED NUMBER (2026-09-20). This read
+    # `== 13` and broke when the aim/locomotion widening took the table to
+    # 28 — but the very next line states the actual contract, APPEND-ONLY,
+    # and an equality check contradicts it: every legitimate append would
+    # fail a test whose stated purpose is to allow appends and forbid
+    # rebinding. The index assertions below are what protect stored skills;
+    # this one only guarantees the indices being checked exist.
+    assert len(_M) >= 13, f"macro table is {len(_M)} wide, expected >= 13"
     # APPEND-ONLY: every stored skill and policy indexes actions by position
     assert _M[0] == {} and _M[5] == {"attack": 1} and _M[10] == {"inventory": 1}, \
         "existing macro indices moved — that silently rebinds every stored skill"
