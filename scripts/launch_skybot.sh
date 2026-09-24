@@ -61,6 +61,25 @@ if command -v ollama >/dev/null 2>&1; then
     ollama stop "$_m" >/dev/null 2>&1 || true
   done
   [ -n "$_LOADED" ] && sleep 2
+
+  # ---- IF THE VLM IS OFF, OLLAMA HAS NO REASON TO RUN (2026-09-24) --------
+  # Unloading the MODEL is not the same as stopping the SERVICE, and the
+  # service will happily reload 8 GB the moment anything asks. With
+  # symbolic_grounding disabled nothing should ask -- but provisioning starts
+  # `ollama serve` unconditionally (STAGE 6) and the installer leaves a
+  # systemd unit behind, so it comes back on every boot and reprovision.
+  # On a 15.3 GB box that is 54% of RAM held for a sensor we deliberately
+  # turned off. Read the CONFIG, not a flag here, so this can never disagree
+  # with what the agent is actually doing.
+  _VLM_ON=$(./venv_mc/bin/python -c "import yaml,sys; c=yaml.safe_load(open('configs/minecraft_skybot.yaml')); print('1' if (c.get('symbolic_grounding') or {}).get('enabled') else '0')" 2>/dev/null || echo 1)
+  if [ "$_VLM_ON" = "0" ]; then
+    echo "  symbolic_grounding disabled -> stopping ollama entirely"
+    sudo systemctl disable --now ollama 2>/dev/null || true
+    pkill -x ollama 2>/dev/null || true
+    pkill -f llama-server 2>/dev/null || true
+    sleep 2
+    echo "  ollama procs left: $(pgrep -cx ollama 2>/dev/null || echo 0)"
+  fi
 fi
 pgrep -x tailscaled >/dev/null || { echo "REFUSED: tailscaled down"; exit 1; }
 ss -tln | grep -q "127.0.0.1:25565" || { echo "REFUSED: socat bridge down"; exit 1; }
