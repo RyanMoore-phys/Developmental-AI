@@ -89,15 +89,32 @@ def test_W1_sequence_spans_a_tree_break():
     # the VRAM high-water on the first cluster run are what settle it, and
     # world_model.batch_size is the first thing to revert if they do not.
     #
-    # The check is re-based rather than deleted: its job is to stop memory
-    # growing again UNREVIEWED, and that job still matters.
+    # ---- RE-BASED BACK 512 -> 256 (2026-09-24) — THE MEASUREMENT ARRIVED
+    # The text above called the ~3.2 GB "arithmetic, not verified", said the
+    # VRAM high-water on the first real run would settle it, and named
+    # world_model.batch_size as THE FIRST THING TO REVERT if it did not fit.
+    # It did not fit. Measured on `main` (RTX 5050, 7.56 GiB usable), the run
+    # did not merely slow down -- it DIED, three times on the same fault, and
+    # the supervisor stopped itself:
+    #     [supervisor] STOPPING: same fault 3x in a row -- this is
+    #                  deterministic and will not fix itself
+    #     torch.OutOfMemoryError: Tried to allocate 96.00 MiB.
+    #     this process has 6.97 GiB in use (6.66 GiB by PyTorch)
+    # Both fatal tracebacks land in conv_transpose2d; the decoder is 71.7M of
+    # 120.5M params. Ollama held 202 MiB of VRAM at the time -- the VLM was
+    # the SYSTEM-RAM problem, never the VRAM one.
+    # sequence_length stays 32 (W1 above depends on it spanning a whole
+    # log-break); batch 16 -> 8 halves activations and changes only the
+    # gradient estimate. REVERT TARGET on a >=16 GB card: 512.
+    # Still re-based rather than deleted: the job is to stop this moving
+    # UNREVIEWED in either direction.
     trans = int(c["world_model"]["batch_size"]) * seq
-    assert trans == 512, (
-        f"batch x seq is {trans}, expected 512. The capacity wave set this "
-        f"deliberately; any further change needs its own justification and "
-        f"a VRAM measurement, not a quiet edit")
+    assert trans == 256, (
+        f"batch x seq is {trans}, expected 256. Re-based from 512 by a "
+        f"MEASURED OOM death on an 8 GB card (see the note above). Raising "
+        f"it again needs a card with the VRAM to hold it, not an argument")
     print(f"  W1b. batch {c['world_model']['batch_size']} x seq {seq} = "
-          f"{trans} transitions/grad-step (re-based from 256 by the capacity "
+          f"{trans} transitions/grad-step (re-based from 512 by the 8 GB "
           f"wave — a deliberate, UNVERIFIED memory spend; see comment)")
 
 

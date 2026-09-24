@@ -1457,7 +1457,15 @@ class BackgroundSampler:
         device: torch.device,
         prioritized: bool = False,
         terminal_fraction: float = 0.25,
-        max_prefetch: int = 4,
+        # 4 -> 2 (2026-09-24). Each queued batch is a GPU tensor:
+        # 16 x 32 x 3x128x128 fp32 = 101 MB of observations alone, so a depth
+        # of 4 parks ~400 MB of VRAM in a QUEUE, doing nothing, on a card with
+        # 7.56 GiB total where training already wants 6.66 GiB and the run
+        # died on a 96 MiB allocation. Depth 2 still hides the sampling
+        # latency this class exists for (one batch training, one ready) and
+        # gives ~200 MB back. This is a pure memory/latency trade -- it does
+        # not change a single number the model learns from.
+        max_prefetch: int = 2,
         reward_fraction: float = 0.0,
         reward_threshold: float = 1e-3,
     ):

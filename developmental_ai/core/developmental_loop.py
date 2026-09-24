@@ -662,6 +662,10 @@ class DevelopmentalAI:
             proprio_dim=self._wm_proprio_dim,
             sensor_image_specs=self._sensor_image_specs,
             sensor_feature_dim=int(_sen_cfg.get("feature_dim", 64)),
+            # VRAM only — see the AMP block in rssm.py. CUDA-gated inside, so
+            # these are inert on CPU and cannot move a single CPU-side test.
+            amp_dtype=wm_cfg.get("amp_dtype"),
+            grad_checkpoint=bool(wm_cfg.get("grad_checkpoint", False)),
         ).to(self.device)
         # Causal action alignment (ON by default since the July 2026 audit —
         # CODE_AUDIT_2026-07.md §A). When on, the WM learns true

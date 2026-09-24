@@ -62,7 +62,13 @@ def _mb(m):
 
 # ------------------------------------------------------------------ 1 -----
 def test_config_values():
-    assert int(W["batch_size"]) == 16, W["batch_size"]
+    # 16 -> 8 (2026-09-24). The capacity wave raised this to 16 on a 16 GB
+    # pod. `main` has 7.56 GiB usable and the run DIED on it -- same CUDA OOM
+    # three times, supervisor self-stopped, torch holding 6.66 GiB. This is
+    # the revert `_data_diet_smoke` named in advance as the first thing to
+    # undo if the budget did not hold. The other four values below are
+    # untouched: they are capacity, not per-step memory.
+    assert int(W["batch_size"]) == 8, W["batch_size"]
     assert int(CUR["feature_dim"]) == 512, CUR["feature_dim"]
     assert int(POL["hidden_dim"]) == 512, POL["hidden_dim"]
     assert int(C["prospection"]["horizon"]) == 24, C["prospection"]["horizon"]

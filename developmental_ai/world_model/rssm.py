@@ -1257,6 +1257,10 @@ class WorldModel(nn.Module):
         proprio_dim: int = 0,
         sensor_image_specs: Optional[list] = None,
         sensor_feature_dim: int = 64,
+        # VRAM, not behaviour. See the block near self.optimizer below.
+        # Defaults keep the CPU path (every test on the Mac) byte-identical.
+        amp_dtype: Optional[str] = None,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -1460,6 +1464,24 @@ class WorldModel(nn.Module):
                      mode=self.flow_mode)
             if self.flow_enabled else None
         )
+
+        # ---- MIXED PRECISION / CHECKPOINTING (2026-09-24) -----------------
+        # There was NO mixed precision anywhere in this repo: training was
+        # full fp32. On `main` (RTX 5050, 7.56 GiB usable) that does not fit --
+        # torch held 6.66 GiB and the supervisor stopped the run after the same
+        # CUDA OOM three times. bf16 halves activation memory (measured
+        # 50.3 MB -> 25.2 MB for the same tensor).
+        # bf16 AND NOT fp16: bf16 keeps fp32's EXPONENT RANGE, so the underflow
+        # that GradScaler exists to fix does not arise and no scaler is needed.
+        # CUDA-ONLY BY CONSTRUCTION. Every test on the Mac runs on CPU; if
+        # autocast were live there, every contract asserting a loss value would
+        # move for reasons unrelated to what it is testing.
+        _amp = str(amp_dtype or "off").lower()
+        self.amp_dtype = torch.bfloat16 if _amp in ("bf16", "bfloat16") else None
+        # Time-for-memory on the decoder only, OFF by default: turn it on if
+        # bf16 alone does not fit. 40-60% of activation memory for ~25-30%
+        # more compute, and mathematically identical.
+        self.grad_checkpoint = bool(grad_checkpoint)
 
         # Optimizer for all world model parameters (includes inverse head if present)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
@@ -2058,7 +2080,22 @@ class WorldModel(nn.Module):
                 mask_frac = mask_keep / mask_total
 
         # 1. Reconstruction loss: decode latent → predicted observation
-        pred_obs = self.decoder(latents_flat).view(batch_size, seq_len, -1)
+        # OPTIONAL TIME-FOR-MEMORY ON THE DECODER (2026-09-24). Off unless
+        # world_model.grad_checkpoint is set. Both fatal CUDA OOMs on `main`
+        # landed in conv_transpose2d and the decoder is 71.7M of 120.5M params,
+        # so this is where recomputation pays.
+        # use_reentrant=False is REQUIRED: the reentrant path mishandles the
+        # no-grad/eval calls this same decoder serves (imagination, below).
+        # Safe to wrap ONLY the decoder -- CNNDecoder is deterministic, so
+        # there is no RNG state to replay; the RSSM's stochastic sampling
+        # happens outside this call.
+        if (self.grad_checkpoint and self.training
+                and latents_flat.requires_grad):
+            from torch.utils.checkpoint import checkpoint as _ckpt
+            _dec = _ckpt(self.decoder, latents_flat, use_reentrant=False)
+        else:
+            _dec = self.decoder(latents_flat)
+        pred_obs = _dec.view(batch_size, seq_len, -1)
         recon_target = observations if self.pixel_obs else symlog(observations)
         recon_per_elem = F.mse_loss(pred_obs, recon_target, reduction="none")
         # RESIDUAL-WEIGHTED RECONSTRUCTION. A flat per-pixel MSE over a 128px
@@ -2090,9 +2127,28 @@ class WorldModel(nn.Module):
             # The residual of pair t is evidence about content in o_{t+1}, so
             # it weights FRAME t+1. Frame 0 has no pair and keeps weight 1.
             wmap[:, 1:] = 1.0 + self.recon_residual_lambda * rn
-            wflat = wmap.expand(-1, -1, self.image_channels, -1, -1).reshape(
-                batch_size, seq_len, -1)
-            recon_per_elem = recon_per_elem * (wflat / wflat.mean())
+            # BROADCAST, DO NOT EXPAND-THEN-RESHAPE (2026-09-24).
+            # `expand` is a free view, but `.reshape()` on an expanded tensor
+            # FORCES A COPY -- and this weight is IDENTICAL across channels, so
+            # the old line copied the same values 3x. With its two temporaries
+            # that is ~300 MB transient at batch 16 (measured 50.3 MB x 3), on
+            # the exact line the run died at:
+            #   rssm.py:2095 recon_per_elem = recon_per_elem * (wflat/...)
+            #   torch.OutOfMemoryError: Tried to allocate 96.00 MiB
+            # MATHEMATICALLY identical, NOT bit-identical -- measured, after
+            # this comment first claimed otherwise. `expand` replicates the
+            # same values, so wflat.mean() and wmap.mean() are the same
+            # quantity, but the old form reduces 3x MORE ELEMENTS and float32
+            # rounds differently: max abs difference in the per-sequence loss
+            # is 1.19e-07, i.e. fp32 epsilon. That is ~six orders of magnitude
+            # below the bf16 change landing alongside it, and it is recorded
+            # here rather than rounded up to "identical".
+            # The reduction below takes the mean over every non-batch dim, so
+            # the extra channel axis here needs no reshape back.
+            _w = wmap.reshape(batch_size, seq_len, 1, -1)
+            recon_per_elem = recon_per_elem.view(
+                batch_size, seq_len, self.image_channels, -1
+            ) * (_w / wmap.mean())
         per_seq_recon = recon_per_elem.mean(dim=tuple(range(1, recon_per_elem.dim())))
         if w is not None:
             recon_loss = (w * per_seq_recon).sum() / (w.sum() + 1e-8)
@@ -2100,10 +2156,18 @@ class WorldModel(nn.Module):
             recon_loss = per_seq_recon.mean()
 
         # 2. KL divergence loss: how surprised was the model?
-        kl_loss = self.rssm.compute_kl_loss(
-            infos["prior_logits"].reshape(-1, self.rssm.stoch_dim),
-            infos["posterior_logits"].reshape(-1, self.rssm.stoch_dim),
-        )
+        # ---- fp32 ISLAND (2026-09-24) -------------------------------------
+        # The KL is where reduced mantissa bites: free_nats clamps at a FLOOR
+        # of ~0.1, and a measurement pinned at exactly 0.1100 for every config
+        # and seed is how the horizon defect hid last time. Differences that
+        # small must not be an artefact of the dtype. `enabled=False` is a
+        # no-op when autocast was never on (CPU), so this costs nothing there.
+        with torch.autocast("cuda", enabled=False):
+            kl_loss = self.rssm.compute_kl_loss(
+                infos["prior_logits"].reshape(-1, self.rssm.stoch_dim).float(),
+                infos["posterior_logits"].reshape(
+                    -1, self.rssm.stoch_dim).float(),
+            )
 
         # 3. Reward prediction loss — TWOHOT distributional, CLASS-BALANCED.
         # The goal reward fires on ~1% of steps. A scalar MSE head collapses to
@@ -2131,7 +2195,13 @@ class WorldModel(nn.Module):
             rw_elem = rw_elem * w.reshape(batch_size, 1)
         if step_valid is not None:
             rw_elem = rw_elem * step_valid
-        reward_loss = (rw_elem * reward_per_elem).sum() / rw_elem.sum().clamp(min=1e-8)
+        # fp32 ISLAND: the twohot reward target interpolates between bin edges
+        # (symlog buckets, top of this file), and the class-balancing weight
+        # can reach 100x. A weighted sum over both in bf16 is exactly the kind
+        # of reduction that loses the small-reward tail this agent lives on.
+        with torch.autocast("cuda", enabled=False):
+            reward_loss = ((rw_elem.float() * reward_per_elem.float()).sum()
+                           / rw_elem.float().sum().clamp(min=1e-8))
 
         # 4. Continue prediction loss (binary cross-entropy with class balancing)
         # ContinuePredictor returns logits; we use BCE-with-logits for stability.
@@ -2323,15 +2393,26 @@ class WorldModel(nn.Module):
         per_sequence_error is a numpy array used to update PER priorities.
         """
         self.train()
-        out = self.compute_loss(
-            observations,
-            actions,
-            rewards,
-            continues,
-            importance_weights=importance_weights,
-            return_per_sample=return_per_sample,
-            proprio=proprio,
-        )
+        # ---- bf16 AUTOCAST, FORWARD ONLY (2026-09-24) ---------------------
+        # Wraps the LOSS COMPUTATION only. backward(), clip_grad_norm_ and
+        # optimizer.step() stay outside, so master weights and gradients remain
+        # fp32 -- bf16 is used for activations, which is where the memory is.
+        # `enabled=` IS LOAD-BEARING: on CPU (every test on the Mac) this must
+        # be a hard no-op, or contracts asserting loss values move for reasons
+        # that have nothing to do with what they test.
+        _use_amp = (self.amp_dtype is not None
+                    and torch.is_tensor(observations) and observations.is_cuda)
+        with torch.autocast("cuda", dtype=self.amp_dtype or torch.bfloat16,
+                            enabled=_use_amp):
+            out = self.compute_loss(
+                observations,
+                actions,
+                rewards,
+                continues,
+                importance_weights=importance_weights,
+                return_per_sample=return_per_sample,
+                proprio=proprio,
+            )
         if return_per_sample:
             losses, per_sample = out
         else:

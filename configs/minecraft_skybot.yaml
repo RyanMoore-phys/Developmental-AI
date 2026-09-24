@@ -865,7 +865,34 @@ world_model:
   # most starved of the rare log break the whole scoreboard turns on.
   # REVERT IF: the AsyncWM `block ms/iter` line roughly doubles without a
   # matching drop in wm loss.
-  batch_size: 16
+  # ---- 16 -> 8 (2026-09-24), FORCED BY 8 GB OF VRAM -------------------
+  # The run is dead, not slow: the supervisor stopped after the same CUDA OOM
+  # three times ("deterministic and will not fix itself"). Measured at the
+  # moment of death: torch held 6.66 GiB of a 7.56 GiB card and could not get
+  # 96 MiB. Ollama held 202 MiB -- the VLM was NEVER the VRAM problem, it was
+  # the RAM problem; this is the world model filling the card by itself.
+  # Activation memory scales with batch x sequence, and both fatal tracebacks
+  # land in conv_transpose2d (the decoder is 71.7M of 120.5M params).
+  # Halving the batch roughly halves activations. sequence_length stays 32 --
+  # it is what the RSSM learns dynamics over, and shortening it changes WHAT
+  # is learned; batch size changes only the gradient estimate.
+  # THIS IS A REAL TRAINING CHANGE, not a free one: a smaller batch is a
+  # noisier gradient. It is the cheapest change that lets the run exist at
+  # all. REVERT TARGET on a >=16 GB card: batch_size: 16.
+  # ---- VRAM, NOT BEHAVIOUR (2026-09-24) --------------------------------
+  # bf16 halves activation memory (measured 50.3 -> 25.2 MB for the same
+  # tensor). NOT fp16: bf16 keeps fp32's exponent range, so no GradScaler is
+  # needed. CUDA-gated in rssm.py, so this is inert on CPU and cannot move a
+  # single CPU-side contract. KL and the twohot reward loss are held in fp32
+  # islands -- those are the reductions where a lost mantissa would matter.
+  # `off` disables it.
+  amp_dtype: bf16
+  # Time-for-memory on the decoder ONLY (71.7M of 120.5M params; both fatal
+  # OOMs landed in conv_transpose2d). 40-60% of activation memory for ~25-30%
+  # more compute, mathematically identical. OFF until bf16 is proven
+  # insufficient -- one change at a time, per CLAUDE.md 5.
+  grad_checkpoint: false
+  batch_size: 8
   sequence_length: 32
   train_iters: 384
   # ---- ...OR LET THE MEASURED SKIP RATE SET IT (2026-09-01) ------------
