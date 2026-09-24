@@ -489,3 +489,11 @@ pgrep -f "Xvfb [:]77" >/dev/null || (nohup Xvfb :77 -screen 0 800x600x24 >/dev/n
 pgrep -x openbox >/dev/null || (DISPLAY=:77 nohup openbox >/dev/null 2>&1 < /dev/null & sleep 1)
 
 echo "=== PROVISION-COMPLETE ==="
+
+echo "=== STAGE 8: Prometheus exporters (host visibility) ==="
+# LAST, and NON-FATAL. Training must never fail to provision because a metrics
+# exporter could not download. But it belongs IN provisioning: this box had no
+# CPU/RAM/disk/VRAM graphs at all, and everything that went wrong on it in the
+# first 24 hours was found by hand over ssh as a result.
+bash scripts/install_host_exporters.sh \
+  || echo "WARN: exporters not installed — main will not appear in Grafana"

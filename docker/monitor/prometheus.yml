@@ -1,0 +1,37 @@
+# Prometheus scrape config for the SkyBot monitor stack (runs on node1).
+#
+# COMMITTED 2026-09-24. This file existed ONLY on node1 and in no repo, along
+# with Dockerfile.gpu_metrics, gpu_metrics.sh and the Grafana Prometheus
+# datasource. If that disk failed, the monitoring setup was gone. Anything the
+# stack needs belongs here now.
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets:
+          - node-exporter:9100      # node1 (this host, via compose DNS)
+          - 100.64.0.12:9100    # node2
+          - 100.64.0.11:9100      # paper-server
+          # main, THE TRAINING HOST (added 2026-09-24). Nothing watched it
+          # until now: the node-exporter container above is pinned to
+          # `hostname: node1` with `/:/host:ro`, so it reports NODE1's
+          # CPU/RAM/disk, and `gpu-metrics` reads node1's INTEL iGPU. The one
+          # machine doing the work was the one machine with no graphs -- which
+          # is why a VLM holding 54% of RAM and four OOM-kills had to be found
+          # by hand over ssh.
+          # LAN ADDRESS, not tailnet, unlike the two above: main is on the same
+          # wire as node1, and the exporters are bound to this address only.
+          - 192.168.1.10:9100      # main (training host)
+
+  # GPU metrics for main's RTX 5050 -- VRAM used/total, utilisation, temp,
+  # power, per-process. SEPARATE JOB because it is a different exporter
+  # (nvidia_gpu_exporter, which wraps nvidia-smi) on a different port, and
+  # because only one target in this stack has an NVIDIA card. node1's Intel
+  # iGPU keeps its existing path: gpu_metrics.sh -> textfile collector ->
+  # the node job above.
+  - job_name: gpu
+    static_configs:
+      - targets:
+          - 192.168.1.10:9835      # main RTX 5050

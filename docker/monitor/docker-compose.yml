@@ -68,25 +68,6 @@ services:
 
   # 3. JSONL -> SQLite. Idempotent on `seq`, so re-running over the whole file
   #    is safe and is how you rebuild after a bad ingest.
-  # GPU + disk/RAM telemetry for the training host. Reuses the COLLECTOR IMAGE rather
-  # than python:3.11-alpine because it needs an ssh client, which that image
-  # does not have -- and per Dockerfile.collector, installing packages at
-  # runtime is how three containers once looked healthy with an empty
-  # dashboard. entrypoint is overridden because the image's own entrypoint is
-  # the metrics collector.
-  host_poll:
-    build: {context: ., dockerfile: Dockerfile.collector}
-    restart: unless-stopped
-    entrypoint: ["/bin/bash", "/opt/host_poll.sh"]
-    volumes:
-      - ./host_poll.sh:/opt/host_poll.sh:ro
-      - ${MAIN_SSH_KEY_HOST_PATH:?set MAIN_SSH_KEY_HOST_PATH in docker/monitor/.env}:/root/.ssh/skybot_ed25519:ro
-      - metrics_data:/data
-    environment:
-      MAIN_SSH_KEYFILE: /root/.ssh/skybot_ed25519
-      HOST_PATH: /data/host.jsonl
-      HOST_POLL_SECONDS: "15"
-
   ingest:
     image: python:3.11-alpine
     container_name: skybot-ingest
@@ -100,7 +81,6 @@ services:
       METRICS_PATH: /data/metrics.jsonl
       SERVER_PATH: /data/server.jsonl
       HEARTBEAT_PATH: /data/heartbeat.jsonl
-      HOST_PATH: /data/host.jsonl
       POLL_SECONDS: "10"
     deploy:
       resources:
