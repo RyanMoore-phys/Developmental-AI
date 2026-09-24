@@ -4073,6 +4073,33 @@ class DevelopmentalAI:
         from concurrent.futures import TimeoutError as _FTimeout
         timeout = float(self.config.get("parallel_envs", {}).get(
             "reset_timeout_s", 300))
+        def _reap(old_env, i):
+            """Close an ABANDONED client in the background.
+
+            The docstring above says the leaked worker thread "is harmless".
+            That was measured on the 125 GB pod. On `main` (15.3 GB, 2026-09-23)
+            it is NOT: the abandoned process is a full Minecraft JAVA CLIENT
+            holding ~0.5-1 GB, nothing ever reaped it, and `status` showed
+            `java clients: 3 (want 2)` while the box sat at 99% swap with the
+            OOM killer already firing. Every hung reset leaked another one.
+
+            close() is exactly what may hang -- that is why this env was
+            abandoned -- so it runs on a DAEMON thread that is never joined.
+            If it succeeds the memory comes back; if it hangs we are no worse
+            off than before. It must never delay the barrier this whole
+            function exists to protect.
+            """
+            def _c():
+                try:
+                    old_env.close()
+                    logger.info("env %d: abandoned client closed", i)
+                except Exception as ex:
+                    logger.warning("env %d: abandoned client would not close "
+                                   "(%s) — it will hold RAM until the run ends",
+                                   i, ex)
+            threading.Thread(target=_c, daemon=True,
+                             name=f"reap-env{i}").start()
+
         def _bounded_rebuild(i):
             # Rebuild env i and reset it THROUGH THE POOL with a timeout, so a
             # rebuild that also hangs (the hung MineRL client won't die and the
@@ -4100,9 +4127,11 @@ class DevelopmentalAI:
             except _FTimeout:
                 logger.warning("env %d reset exceeded %.0fs — rebuilding "
                                "(abandoning the hung one)", i, timeout)
+                _reap(envs[i], i)          # or it leaks a whole java client
                 obs_list[i] = _bounded_rebuild(i)
             except Exception as ex:
                 logger.warning("env %d reset error (%s) — rebuilding", i, ex)
+                _reap(envs[i], i)
                 obs_list[i] = _bounded_rebuild(i)
         return obs_list
 
@@ -9777,8 +9806,16 @@ class DevelopmentalAI:
                 r = c.generate(model=_model, prompt=prompt,
                                images=images or None, format="json",
                                keep_alive=-1,
+                               # num_ctx HERE TOO. Unreachable while the VLM
+                               # is disabled (guarded on self.symbolizer), but
+                               # this is the advisor path and it would re-load
+                               # the model with an UNCAPPED cache the moment
+                               # symbolic_grounding is turned back on -- the
+                               # exact 8.3 GB that OOM-killed this box.
                                options={"num_predict": 200,
-                                        "temperature": 0.0})
+                                        "temperature": 0.0,
+                                        "num_ctx": getattr(
+                                            self.symbolizer, "num_ctx", 4096)})
                 return (r.get("response") or "").strip()
 
             adv = UnstuckAdvisor(

@@ -1580,7 +1580,28 @@ symbolic:
   enabled: true
   knowledge_source: goal
 symbolic_grounding:
-  enabled: true
+  # ---- VLM OFF ON THIS BOX (2026-09-23) --------------------------------
+  # MEASURED on `main`, not argued. CLAUDE.md asks whether Ollama VRAM is
+  # worth the guidance it provides. On 15.3 GB RAM + 8 GB VRAM: no, twice.
+  #
+  #   COST: llama-server held 8335 MB = 54% of system RAM, was OOM-killed by
+  #   the kernel FOUR times (21:27, 21:45, 22:03 ...), drove swap to 4095/4095
+  #   (100%), and its VRAM share left torch fighting for the card -- the agent
+  #   died in backward() unable to allocate 2 MiB with 6.97 GiB in use.
+  #
+  #   VALUE: while doing that, its labels were being REJECTED. The log shows
+  #   repeated `Symbol grounding: retracted (...) (reliability fell below
+  #   floor)` -- reliability_floor, the guard written after the llava
+  #   incident, was throwing the output away. We paid 54% of RAM for facts
+  #   we then retracted.
+  #
+  # Without it: python 3854 + java 955 + java 857 = ~5.7 GB, leaving ~9.7 GB
+  # free, and torch gets the whole card.
+  #
+  # A HOST-SIZE DECISION, NOT A THESIS CHANGE. Symbol grounding is not wrong;
+  # it does not FIT here. REVERT: set this and llm.vision.enabled back to
+  # true -- on a box with >=16 GB VRAM it should go straight back on.
+  enabled: false
   # llava:7b -> qwen2.5vl:7b (2026-08-06). MEASURED on real 128px SkyBot
   # frames: llava answered tree_visible=true on EVERY patch including
   # canopy-only sky crops, and hallucinated freely on single-material patches
@@ -2135,7 +2156,8 @@ llm:
   # curiosity quenches and re-arming on a novel object. Condition-based, not a
   # clock, so it is correct in a never-ending lifelong stream.
   vision:
-    enabled: true
+    # OFF with symbolic_grounding above - same measured reason.
+    enabled: false
     # 0.6 -> 1.0 (2026-08-09, user request): magnet income read tiny in the
     # ledger. Partly by DESIGN (potentials telescope to ~0 net), but the
     # transient guidance magnitudes were genuinely small against the other
