@@ -35,6 +35,12 @@ CONTRACT = [
     "tests/_fine_aim_smoke.py",
     "tests/_replay_sampling_smoke.py",
     "tests/_config_keys_smoke.py",
+    # REGISTERED 2026-09-25. This file has existed for weeks and was listed
+    # NOWHERE — not here, not in ci.yml — so it had never run once. It gates
+    # the boredom gate, the daydream decay, the max_bonus clamp and
+    # "uncertainty must out-pay a dreamed jackpot"; all real contracts that
+    # were simply switched off. Same gap class as _vision_host_smoke.py.
+    "tests/_imagination_curiosity_smoke.py",
 ]
 
 # These need the full stack (gymnasium / minerl) and so only run on the pod.

@@ -912,6 +912,10 @@ class DevelopmentalAI:
                 "imagined_reward_halflife", 300_000),
             lp_reference=_imag.get("lp_reference", 0.05),
             max_bonus=_imag.get("max_bonus", 0.5),
+            # past-state baseline (2026-09-25) — see imagination_curiosity.py
+            past_states=_imag.get("past_states", 32),
+            baseline_every=_imag.get("baseline_every", 10),
+            baseline_samples=_imag.get("baseline_samples", 4),
         )
         # Goal-prioritized replay: fraction of each WM/dream batch drawn from
         # windows that contain a nonzero reward, so the world model sees the rare

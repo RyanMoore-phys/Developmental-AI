@@ -2914,6 +2914,16 @@ imagination_curiosity:
   imagined_reward_halflife: 300000   # ...which decays over a life
   lp_reference: 0.05             # global_lp at which boredom = 0
   max_bonus: 0.5                 # hard cap on the total intrinsic add
+  # ---- PAST-STATE BASELINE (2026-09-25) --------------------------------
+  # Judge "here" against "where I have been" instead of against a decaying
+  # running maximum. MEASURED cause: both SkyBots dug into a cave, dirt and
+  # stone habituated away via _break_decay, extrinsic hit 0, boredom hit 1.0,
+  # and this module became 69% of ALL income while the agent did nothing for
+  # 196k steps. The old normaliser could not report its own exhaustion.
+  # past_states x baseline_every x every = ~16k steps of remembered history.
+  past_states: 32
+  baseline_every: 10      # recompute the baseline every N probes (cached)
+  baseline_samples: 4     # remembered states imagined per recompute
 goals:
   # REPEATABILITY GATE (ported from lifelong 2026-08-01 — absent here, so one
   # reward spike could mint a skill). A spike must RECUR before it becomes a

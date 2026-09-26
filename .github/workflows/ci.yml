@@ -153,6 +153,13 @@ jobs:
               tests/_capacity_wave_smoke.py
               tests/_anticipation_smoke.py
               tests/_learning_rate_wave_smoke.py
+              # ADDED 2026-09-25. This file existed for weeks and was gated
+              # NOWHERE, so it had never run. It now also carries the
+              # contracts for the cave incident: imagination was 69% of all
+              # income while the agent went 196k steps without breaking a
+              # block, because `dis` was normalised against a DECAYING
+              # running maximum and could not report its own exhaustion.
+              tests/_imagination_curiosity_smoke.py
               # RE-ADDED 2026-09-02 after the arch:rssm bind path was built.
               # This suite is the one that caught it: it mints a skill through
               # the real bank and binds it, so it fails if the encoded-family

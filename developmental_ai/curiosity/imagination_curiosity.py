@@ -42,6 +42,7 @@ and the agent can learn to hallucinate its own reward.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -64,6 +65,11 @@ class ImaginationCuriosity:
         imagined_reward_halflife: int = 300_000,   # steps; "decreases"
         lp_reference: float = 0.05,  # global_lp at which boredom = 0
         max_bonus: float = 0.5,      # hard cap on the TOTAL intrinsic add
+        # ---- PAST-STATE BASELINE (2026-09-25) ---------------------------
+        # See the block above self._past below for why these exist.
+        past_states: int = 32,       # ring buffer of remembered latents
+        baseline_every: int = 10,    # recompute the baseline every N probes
+        baseline_samples: int = 4,   # past states imagined per recompute
     ):
         self.enabled = bool(enabled)
         self.every = max(1, int(every))
@@ -78,6 +84,33 @@ class ImaginationCuriosity:
         # latent variance shrinks as the WM sharpens; a fixed threshold would
         # repeat the eps_abs mistake that latched the vision magnet off)
         self._dis_scale = 1e-6
+        # ---- "HERE" IS JUDGED AGAINST "WHERE I HAVE BEEN" (2026-09-25) ----
+        # WHY: both SkyBots dug into a cave and stopped acting. 196k steps
+        # since a block broke, and 69% of ALL income was this module. The
+        # bonus is computed from the CURRENT state and needs no action, so
+        # standing still somewhere unpredictable paid every step -- and it is
+        # gated on learning progress being dead, so acting would have switched
+        # the income off. Structurally CLAUDE.md 9 again (sky 96%, menu 77%).
+        #
+        # The docstring at the top of this file already promised the cure:
+        # "once the agent goes there and learns, that spot stops paying (it
+        # self-extinguishes LOCALLY but never GLOBALLY)". That was FALSE as
+        # implemented -- see the normalisation note in bonus().
+        #
+        # The fix: remember past latents and ask "is here more uncertain than
+        # I am USED TO?" rather than "is here uncertain?". A learned cave
+        # converges to the baseline and stops paying; a genuinely unmodelled
+        # region still spikes above it. It also makes the comparison one the
+        # agent can only win by MOVING.
+        self._past: "deque[Dict[str, torch.Tensor]]" = deque(
+            maxlen=max(2, int(past_states)))
+        self._baseline_every = max(1, int(baseline_every))
+        self._baseline_samples = max(1, int(baseline_samples))
+        # None until the buffer has anything to say -> cold start keeps the
+        # ORIGINAL behaviour. An agent with no memory should still be curious;
+        # paying 0 here would be a latch of exactly the kind this file warns
+        # about two lines up.
+        self._dis_baseline: Optional[float] = None
         self._last: Dict[str, float] = {
             "disagreement": 0.0, "imagined": 0.0,
             "boredom": 0.0, "bonus": 0.0}
@@ -95,6 +128,79 @@ class ImaginationCuriosity:
         """Halflife decay — the daydream bonus must shrink over a life."""
         return float(0.5 ** (timestep / self.imagined_reward_halflife))
 
+    def _imagine(self, world_model, rssm_state, policy_fn, knowledge):
+        """K rollouts from ONE state. train() is restored even on failure."""
+        K = self.rollouts
+        was_training = world_model.training
+        world_model.eval()
+        try:
+            with torch.no_grad():
+                s0 = {k: rssm_state[k][0:1].detach().clone().repeat(K, 1)
+                      for k in ("h", "z")}
+                kn = (knowledge.unsqueeze(0).expand(K, -1)
+                      if knowledge is not None and knowledge.dim() == 1
+                      else knowledge)
+                return world_model.imagine_trajectory(
+                    s0, policy_fn=policy_fn, horizon=self.horizon,
+                    knowledge=kn)
+        finally:
+            world_model.train(was_training)
+
+    @staticmethod
+    def _spread(imagined) -> float:
+        """Std across rollouts, averaged over horizon and features."""
+        lat = imagined["latents"]              # (K,H,D) or list
+        if isinstance(lat, (list, tuple)):
+            lat = torch.stack(list(lat), dim=1)
+        return float(lat.std(dim=0).mean().item())
+
+    def _sample_past(self, rssm_state) -> None:
+        """Remember this state, SPARSELY.
+
+        Stored every `baseline_every` probes, not every probe, so the buffer
+        spans TIME rather than the last few minutes. At the defaults (probe
+        every 50 steps, stride 10, 32 slots) that is ~16k steps of history.
+        A buffer holding only the recent past would make the baseline agree
+        with wherever the agent currently is -- exactly the comparison this
+        is meant to break.
+        """
+        if self._probes % self._baseline_every:
+            return
+        try:
+            self._past.append({k: rssm_state[k][0:1].detach().clone()
+                               for k in ("h", "z")})
+        except Exception:
+            pass          # a memory that will not store must not kill a run
+
+    def _refresh_baseline(self, world_model, policy_fn, knowledge) -> None:
+        """Mean disagreement over a sample of REMEMBERED states.
+
+        Recomputed every `baseline_every` probes and cached in between. This
+        is the only cost this change adds; paying it every probe would
+        multiply imagination cost by `baseline_samples` on a GPU that has
+        only just stopped running out of memory.
+        """
+        # A baseline needs enough states to be a BASELINE. With one or two,
+        # "typical uncertainty" is just "uncertainty at that one place", and
+        # a single unlucky sample would silence the drive entirely.
+        if len(self._past) < max(2, self._baseline_samples):
+            return
+        if self._probes % self._baseline_every:
+            return
+        try:
+            n = min(self._baseline_samples, len(self._past))
+            # Evenly spaced across the buffer, NOT the newest n -- the newest
+            # are the most likely to be the very place we are comparing
+            # against, which would drive the baseline toward `here`.
+            idx = np.linspace(0, len(self._past) - 1, n).astype(int)
+            vals = [self._spread(self._imagine(world_model, self._past[i],
+                                               policy_fn, knowledge))
+                    for i in idx]
+            if vals:
+                self._dis_baseline = float(np.mean(vals))
+        except Exception:
+            pass          # keep the previous baseline; never break the run
+
     # ---- main ------------------------------------------------------------
     def bonus(self, world_model, rssm_state: Dict[str, torch.Tensor],
               policy_fn, timestep: int, global_lp: float,
@@ -109,29 +215,46 @@ class ImaginationCuriosity:
             self._last.update(boredom=0.0, bonus=0.0)
             return 0.0          # world is still teaching — do not daydream
         try:
-            K, H = self.rollouts, self.horizon
-            was_training = world_model.training
-            world_model.eval()
-            try:
-                with torch.no_grad():
-                    s0 = {k: rssm_state[k][0:1].detach().clone().repeat(K, 1)
-                          for k in ("h", "z")}
-                    kn = (knowledge.unsqueeze(0).expand(K, -1)
-                          if knowledge is not None and knowledge.dim() == 1
-                          else knowledge)
-                    imagined = world_model.imagine_trajectory(
-                        s0, policy_fn=policy_fn, horizon=H, knowledge=kn)
-            finally:
-                world_model.train(was_training)
+            imagined = self._imagine(world_model, rssm_state, policy_fn,
+                                     knowledge)
+            dis_raw = self._spread(imagined)
 
-            # --- 1. DISAGREEMENT: spread across the K imagined futures ---
-            lat = imagined["latents"]              # (K,H,D) or list
-            if isinstance(lat, (list, tuple)):
-                lat = torch.stack(list(lat), dim=1)
-            # std across rollouts, averaged over horizon+features
-            dis_raw = float(lat.std(dim=0).mean().item())
-            self._dis_scale = max(self._dis_scale * 0.999, dis_raw)
-            dis = float(np.clip(dis_raw / (self._dis_scale + 1e-8), 0.0, 1.0))
+            # --- 1. DISAGREEMENT, RELATIVE TO THE AGENT'S OWN HISTORY -----
+            # WHAT WAS HERE, and why it failed (2026-09-25):
+            #     self._dis_scale = max(self._dis_scale * 0.999, dis_raw)
+            #     dis = clip(dis_raw / (self._dis_scale + 1e-8), 0, 1)
+            # A running maximum that DECAYS. When the model learned the cave
+            # and dis_raw fell to a low constant, _dis_scale decayed down to
+            # meet it and `dis` climbed back to ~1.0. "Nothing left to
+            # imagine" therefore read as MAXIMUM NOVELTY, and the bonus could
+            # never self-extinguish the way this module docstring claims.
+            # Same shape as the degenerate-signal gate that counted labels
+            # instead of positives: a measure blind to its own exhaustion.
+            #
+            # NOT replaced with a fixed threshold -- the original note in
+            # __init__ is right that raw latent variance shrinks as the WM
+            # sharpens, and a constant would repeat the eps_abs latch that
+            # killed the vision magnet. Normalising by the BASELINE stays
+            # adaptive AND can reach zero, which a decaying scale cannot.
+            # ORDER MATTERS. Refresh from the PAST first, then remember the
+            # present: appending first made `here` part of its own baseline,
+            # so the very first probe scored (dis_raw - dis_raw) = 0 and the
+            # cold-start path could never run.
+            self._refresh_baseline(world_model, policy_fn, knowledge)
+            self._sample_past(rssm_state)
+            if self._dis_baseline is None:
+                # COLD START: nothing remembered yet, so keep the original
+                # behaviour. An agent with no past should still be curious.
+                self._dis_scale = max(self._dis_scale * 0.999, dis_raw)
+                dis = float(np.clip(dis_raw / (self._dis_scale + 1e-8),
+                                    0.0, 1.0))
+            else:
+                # "How much MORE uncertain is here than I am used to?", as a
+                # fraction of usual. here == usual -> 0. Twice as uncertain
+                # as usual -> 1. No separate scale that can latch.
+                base = self._dis_baseline
+                dis = float(np.clip((dis_raw - base) / (base + 1e-8),
+                                    0.0, 1.0))
 
             # --- 2. IMAGINED REWARD (small, decaying) ---
             rew = imagined.get("rewards")
@@ -148,6 +271,13 @@ class ImaginationCuriosity:
             bonus = float(np.clip(bonus, 0.0, self.max_bonus))
             self._probes += 1
             self._last = {"disagreement": round(dis, 4),
+                          # baseline VISIBLE: without it, "dis fell to 0" and
+                          # "the baseline is wrong" look identical in a log.
+                          "dis_raw": round(dis_raw, 5),
+                          "dis_baseline": (round(self._dis_baseline, 5)
+                                           if self._dis_baseline is not None
+                                           else -1.0),
+                          "past_states": len(self._past),
                           "imagined": round(img, 4),
                           "boredom": round(boredom, 3),
                           "decay": round(decay, 3),
