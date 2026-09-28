@@ -891,7 +891,14 @@ world_model:
   # OOMs landed in conv_transpose2d). 40-60% of activation memory for ~25-30%
   # more compute, mathematically identical. OFF until bf16 is proven
   # insufficient -- one change at a time, per CLAUDE.md 5.
-  grad_checkpoint: false
+  # false -> true (2026-09-28, user request). Trades ~25-30% more compute on
+  # the decoder for 40-60% of ITS activation memory. Mathematically identical
+  # output -- activations are recomputed in backward, not approximated. The
+  # decoder is 71.7M of 120.5M params and BOTH fatal CUDA OOMs landed in
+  # conv_transpose2d, so it is the right thing to trade.
+  # ESTIMATE, NOT MEASUREMENT: ~1.5-2.5 GiB. The pod profile that would settle
+  # it does not exist for this config yet.
+  grad_checkpoint: true
   batch_size: 8
   sequence_length: 32
   train_iters: 384

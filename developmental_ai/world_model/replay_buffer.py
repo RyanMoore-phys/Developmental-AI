@@ -1468,6 +1468,28 @@ class BackgroundSampler:
         max_prefetch: int = 2,
         reward_fraction: float = 0.0,
         reward_threshold: float = 1e-3,
+        # ---- ASSEMBLE ON THE CPU (2026-09-28) ---------------------------
+        # The queue above holds whole batches. Built on the GPU, that parks
+        # VRAM in a container doing nothing -- and `torch.cat` in the
+        # multi-stream path is the exact line the run died on:
+        #   replay_buffer.py:1400 "observations": torch.cat(obs_l, dim=0)
+        #   torch.OutOfMemoryError: Tried to allocate 96.00 MiB
+        # Assembling on the host and moving ONE tensor per batch at
+        # consumption keeps the queue in system RAM, where there is room.
+        # The docstring above has recommended exactly this all along:
+        #   "if you ever see stream issues, set device='cpu' here and move
+        #    in the main thread."
+        # It is also FEWER transfers, not more: the multi-stream path used to
+        # copy each stream to the GPU separately and concatenate there.
+        # DEFAULT OFF (2026-09-28). Built and kept, but not switched on: it
+        # trades ~150 MB of VRAM for ~150 MB of SYSTEM RAM, and system RAM is
+        # the scarcer resource on this box -- 15.3 GB total, swap already at
+        # 1.8 GB. Worse, the transfer path pins (page-locks) that memory, so
+        # the kernel can neither swap nor reclaim it; under pressure that is
+        # strictly more harmful than an ordinary allocation of the same size.
+        # TURN ON WHEN: host RAM is comfortable and VRAM is the binding
+        # constraint. That is the opposite of today.
+        cpu_assembly: bool = False,
     ):
         self.buffer = buffer
         self.batch_size = batch_size
@@ -1477,6 +1499,11 @@ class BackgroundSampler:
         self.terminal_fraction = terminal_fraction
         self.reward_fraction = reward_fraction
         self.reward_threshold = reward_threshold
+        # Only meaningful when the target is CUDA; on CPU it is already true
+        # and pinning would cost RAM for nothing.
+        self._cpu_assembly = bool(cpu_assembly) and device.type == "cuda"
+        self._assemble_device = (torch.device("cpu") if self._cpu_assembly
+                                 else device)
 
         self._jobs: "queue.Queue[int]" = queue.Queue()
         self._results: "queue.Queue" = queue.Queue(maxsize=max_prefetch)
@@ -1494,7 +1521,7 @@ class BackgroundSampler:
                 batch = self.buffer.sample_sequences(
                     batch_size=self.batch_size,
                     seq_len=self.seq_len,
-                    device=self.device,
+                    device=self._assemble_device,
                     terminal_fraction=self.terminal_fraction,
                     prioritized=self.prioritized,
                     reward_fraction=self.reward_fraction,
@@ -1510,11 +1537,33 @@ class BackgroundSampler:
             self._jobs.put(1)
 
     def get(self, timeout: float = 30.0):
-        """Block until the next prefetched batch is ready and return it."""
+        """Block until the next prefetched batch is ready and return it.
+
+        With `cpu_assembly`, the host->device move happens HERE, in the
+        CONSUMER thread, not in the worker. That is the point: the queue then
+        holds system RAM instead of VRAM, and the transfer is issued on the
+        stream that is about to use it.
+        """
         item = self._results.get(timeout=timeout)
         if isinstance(item, Exception):
             raise item
-        return item
+        if not self._cpu_assembly:
+            return item
+        out = {}
+        for k, v in item.items():
+            if not torch.is_tensor(v):
+                out[k] = v                 # start_indices stays numpy
+                continue
+            # non_blocking is only honoured from PAGE-LOCKED memory, so pin
+            # first. Wrapped because pinning can fail under host memory
+            # pressure -- on a 15.3 GB box that is a real possibility, and a
+            # failed pin must degrade to a normal copy, not kill the run.
+            try:
+                v = v.pin_memory()
+                out[k] = v.to(self.device, non_blocking=True)
+            except Exception:
+                out[k] = v.to(self.device)
+        return out
 
     def close(self) -> None:
         """Stop the worker thread (call on shutdown)."""

@@ -51,8 +51,25 @@ touch "$OUT"
 backfill() {
   # -a without -z: these are small JSON lines and the pod link is local-ish;
   # compression costs more CPU on a 2-core mini than it saves.
-  rsync -a -e "ssh ${SSH_OPTS[*]}" \
-    "${MAIN_USER}@${MAIN_HOST}:${REMOTE_PATH}" "$OUT_DIR/.backfill.jsonl" 2>/dev/null || return 0
+  if ! rsync -a -e "ssh ${SSH_OPTS[*]}" \
+       "${MAIN_USER}@${MAIN_HOST}:${REMOTE_PATH}" \
+       "$OUT_DIR/.backfill.jsonl" 2>/dev/null; then
+    # SAY SO. This was `|| return 0`: a missing remote file returned SUCCESS,
+    # so when podlogs/ became runlogs/ (2026-09-22) the collector went on
+    # cheerfully fetching a path that no longer existed and the dashboard
+    # simply stopped updating. Nothing anywhere said why. A collector that
+    # cannot find its source is the one thing it must not be quiet about.
+    # Rate-limited so a long outage does not fill the log it is competing
+    # with for a 98 GB disk.
+    _now=$(date +%s)
+    if [ $(( _now - ${_LAST_WARN:-0} )) -ge 300 ]; then
+      echo "collector: CANNOT FETCH ${REMOTE_PATH} from ${MAIN_HOST}" \
+           "— wrong path, or the agent is not writing it." \
+           "NOTE: podlogs/ was renamed to runlogs/ on 2026-09-22."
+      _LAST_WARN=$_now
+    fi
+    return 0
+  fi
   # Append only what we do not already have, keyed on seq. Sorting by seq and
   # de-duplicating keeps the file replayable from the top.
   cat "$OUT" "$OUT_DIR/.backfill.jsonl" 2>/dev/null \
