@@ -150,7 +150,7 @@
       "id": 3,
       "type": "stat",
       "title": "Players online (expect num_envs)",
-      "description": "Independent server-side truth. On an offline-mode server SkyBot1 is a DIFFERENT player from SkyBot, so a missing whitelist entry shows here as a persistent 1 while the agent's own logs look healthy. -1 means the server was unreachable.",
+      "description": "-1 IS NOT A BUG. server_poll.py records -1 when the Paper server is UNREACHABLE, deliberately: 'a down server is a data point, not an error', and skipping the write would leave a gap indistinguishable from the poller dying. The REASON is in `version`, which reads 'unreachable: <ExceptionName>' -- that column was not shown, so -1 looked like a broken gauge. A sustained -1 usually means MC_HOST in the monitor .env is stale (it held the dead RunPod address until 2026-09-28). Expect 2 when healthy: SkyBot and SkyBot1 are distinct players on an offline-mode server.",
       "gridPos": {
         "h": 5,
         "w": 8,
@@ -165,15 +165,15 @@
         {
           "refId": "A",
           "queryType": "table",
-          "rawQueryText": "SELECT players_online FROM server ORDER BY wall_time DESC LIMIT 1"
+          "rawQueryText": "SELECT players_online, version, wall_time FROM server ORDER BY wall_time DESC LIMIT 1"
         }
       ]
     },
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Where the reward comes from (top sources, share of gross)",
-      "description": "The reward ledger's income statement. Shares are over ABSOLUTE amounts, so a source moving a lot of reward in either direction shows up. Source names were READ OFF THE LIVE RUN (symbols/magnet_seek/gaze/novelty/effort), not guessed \u2014 the first version named sources that do not exist and every series was empty. If a new source appears, add a json_extract line; the raw map is in reward_shares so nothing is lost meanwhile. First live reading: symbols 62%, magnet_seek 28%, gaze 3%, novelty 3%, effort 1%, hhi 0.46.",
+      "title": "Where the reward comes from (live, ~15s)",
+      "description": "Shares of |reward| by source, from the HEARTBEAT (~15s) not the segment record (~10 min). Previously this hardcoded six json_extract keys and silently dropped the rest -- which is why it never summed to 1 and why `imagination` was invisible while it took 69% of income during the cave incident. `other` is the residual: if it is non-zero, a reward source exists that this panel does not name.",
       "gridPos": {
         "h": 9,
         "w": 12,
@@ -191,7 +191,7 @@
           "timeColumns": [
             "time"
           ],
-          "rawQueryText": "SELECT wall_time AS time, json_extract(reward_shares,'$.symbols') AS symbols, json_extract(reward_shares,'$.magnet_seek') AS magnet_seek, json_extract(reward_shares,'$.gaze') AS gaze, json_extract(reward_shares,'$.novelty') AS novelty, json_extract(reward_shares,'$.effort') AS effort, json_extract(reward_shares,'$.log_break') AS log_break FROM segments ORDER BY wall_time"
+          "rawQueryText": "SELECT wall_time AS time, json_extract(income_now,'$.imagination') AS imagination, json_extract(income_now,'$.symbols') AS symbols, json_extract(income_now,'$.novelty') AS novelty, json_extract(income_now,'$.gaze') AS gaze, json_extract(income_now,'$.effort') AS effort, json_extract(income_now,'$.coverage') AS coverage, json_extract(income_now,'$.magnet_seek') AS magnet_seek, json_extract(income_now,'$.reach') AS reach, json_extract(income_now,'$.progress') AS progress, json_extract(income_now,'$.persistence') AS persistence, json_extract(income_now,'$.log_break') AS log_break, json_extract(income_now,'$.icm_base') AS icm_base, 1.0 - (COALESCE(json_extract(income_now,'$.imagination'),0) + COALESCE(json_extract(income_now,'$.symbols'),0) + COALESCE(json_extract(income_now,'$.novelty'),0) + COALESCE(json_extract(income_now,'$.gaze'),0) + COALESCE(json_extract(income_now,'$.effort'),0) + COALESCE(json_extract(income_now,'$.coverage'),0) + COALESCE(json_extract(income_now,'$.magnet_seek'),0) + COALESCE(json_extract(income_now,'$.reach'),0) + COALESCE(json_extract(income_now,'$.progress'),0) + COALESCE(json_extract(income_now,'$.persistence'),0) + COALESCE(json_extract(income_now,'$.log_break'),0) + COALESCE(json_extract(income_now,'$.icm_base'),0)) AS other FROM heartbeat WHERE income_now IS NOT NULL ORDER BY wall_time"
         }
       ]
     },

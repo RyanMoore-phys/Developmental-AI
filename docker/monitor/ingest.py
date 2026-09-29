@@ -90,7 +90,7 @@ def connect() -> sqlite3.Connection:
                "seq INTEGER PRIMARY KEY, wall_time REAL, "
                "total_timesteps INTEGER, uptime_s REAL, steps_per_s REAL, "
                "breaks_total INTEGER, logs INTEGER, attack_run REAL, "
-               "episodes INTEGER, gpu_mem_mb REAL)")
+               "episodes INTEGER, gpu_mem_mb REAL, income_now TEXT)")
 
     # ---- ADD-ONLY MIGRATION -------------------------------------------
     # `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a DB
@@ -112,6 +112,17 @@ def connect() -> sqlite3.Connection:
         if name not in have:
             cx.execute(f"ALTER TABLE segments ADD COLUMN {name} {typ}")
             print(f"migrate: added column {name} {typ}", flush=True)
+    # SAME ADD-ONLY MIGRATION FOR `heartbeat` (2026-09-28). The block above
+    # covers `segments` only. Adding heartbeat.income_now to a DB created
+    # before it exists makes EVERY heartbeat insert fail with "table
+    # heartbeat has no column named income_now" -- containers healthy, panels
+    # frozen, nothing in any log. Precisely the failure the note above
+    # describes, one table over.
+    have_hb = {r[1] for r in cx.execute("PRAGMA table_info(heartbeat)")}
+    for name, typ in [("income_now", "TEXT")]:
+        if name not in have_hb:
+            cx.execute(f"ALTER TABLE heartbeat ADD COLUMN {name} {typ}")
+            print(f"migrate: added heartbeat.{name} {typ}", flush=True)
     cx.commit()
     return cx
 
@@ -178,7 +189,11 @@ def ingest_server(cx: sqlite3.Connection, path: str) -> int:
 
 
 HB_COLS = ["seq", "wall_time", "total_timesteps", "uptime_s", "steps_per_s",
-           "breaks_total", "logs", "attack_run", "episodes", "gpu_mem_mb"]
+           "breaks_total", "logs", "attack_run", "episodes", "gpu_mem_mb",
+           # JSON, like reward_shares on `segments`: an open-ended map, so a
+           # NEW reward source appears without a schema migration. The panel
+           # must not hardcode its keys -- that is what hid `imagination`.
+           "income_now"]
 
 
 def ingest_heartbeat(cx: sqlite3.Connection, path: str) -> int:
@@ -198,7 +213,9 @@ def ingest_heartbeat(cx: sqlite3.Connection, path: str) -> int:
             except Exception:
                 continue                      # torn tail line; next pass gets it
             if isinstance(r, dict) and "seq" in r:
-                rows.append([r.get(c) for c in HB_COLS])
+                rows.append([json.dumps(r.get(c)) if c == "income_now"
+                             and isinstance(r.get(c), dict) else r.get(c)
+                             for c in HB_COLS])
     if rows:
         cur = cx.executemany(sql, rows)
         cx.commit()

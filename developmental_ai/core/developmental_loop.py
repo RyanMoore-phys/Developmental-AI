@@ -8533,6 +8533,28 @@ class DevelopmentalAI:
                 "attack_run": _wi.get("attack_run"),
                 "episodes": int(getattr(self, "total_episodes", 0)),
             }
+            # ---- LIVE INCOME SHARES (2026-09-28) ---------------------
+            # WHY HERE AND NOT THE SEGMENT RECORD. `reward_shares` already
+            # ships in the segment record, but that is emitted once per
+            # ~1024 steps -- so the dashboard panel updated every ~10 minutes
+            # and could only ever show the PREVIOUS segment. _income_now()
+            # was written for exactly this ("what is it being paid for RIGHT
+            # NOW") and was wired only to the live viewer, so nothing that
+            # persists ever saw it.
+            # top=12, not the default 7: truncation is why a share graph
+            # cannot sum to 1, and a hidden channel is precisely what we are
+            # trying to catch. `imagination` reached 69% of income during the
+            # cave incident and was not on the dashboard at all.
+            # Cost: one dict build + sort of ~10 floats, and only when the
+            # heartbeat actually writes. The "deliberately cheap" contract in
+            # this docstring still holds.
+            try:
+                _inc = self._income_now(top=12)
+                if _inc:
+                    rec["income_now"] = {n: round(share, 4)
+                                         for n, share, _v in _inc}
+            except Exception:
+                pass
             # torch's own allocator counter — a cheap read, unlike shelling
             # out to nvidia-smi on the hot path.
             try:
