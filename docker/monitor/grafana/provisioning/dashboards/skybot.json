@@ -165,7 +165,7 @@
         {
           "refId": "A",
           "queryType": "table",
-          "rawQueryText": "SELECT players_online, version, wall_time FROM server ORDER BY wall_time DESC LIMIT 1"
+          "rawQueryText": "SELECT players_online, version FROM server ORDER BY wall_time DESC LIMIT 1"
         }
       ]
     },
@@ -339,6 +339,32 @@
             "time"
           ],
           "rawQueryText": "SELECT wall_time AS time, episode_reward, intrinsic_reward, attack_run_max, attack_run_mean FROM segments ORDER BY wall_time"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Uptime \u2014 this run, and lifetime steps",
+      "description": "LEFT: uptime_s, seconds since THIS supervisor launch \u2014 it resets on every restart, so it measures the current run, not the brain's age. RIGHT: total_timesteps, which is restored from brain state on resume and so accumulates across runs. That is the closest thing to 'how much has this brain actually lived', and it is the number to judge progress by: wall-clock includes every hour spent crash-looping.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "skybot-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT wall_time AS time, uptime_s/3600.0 AS run_hours, total_timesteps AS lifetime_steps FROM heartbeat ORDER BY wall_time"
         }
       ]
     }

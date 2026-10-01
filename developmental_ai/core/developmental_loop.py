@@ -4097,6 +4097,18 @@ class DevelopmentalAI:
             off than before. It must never delay the barrier this whole
             function exists to protect.
             """
+            # LOCAL IMPORT, because `threading` is NOT imported at module
+            # scope in this file -- only inside __init__ (755) and
+            # _ensure_wm_trainer (7636). This cost 7 crashed runs:
+            #   File "developmental_loop.py", line 4108, in _reap
+            #     threading.Thread(target=_c, daemon=True,
+            #   NameError: name 'threading' is not defined
+            # I "verified" the import with ast.walk, which traverses the WHOLE
+            # tree and happily matched those two FUNCTION-LOCAL imports. The
+            # check passed and meant nothing. Module-level imports are
+            # `tree.body`, not `ast.walk(tree)`.
+            import threading
+
             def _c():
                 try:
                     old_env.close()
@@ -6093,7 +6105,18 @@ class DevelopmentalAI:
                 # Third time this session I sampled a hot loop at one point
                 # and reasoned off it (after the reward census and the action
                 # attribution), so every such readout is now a mean.
-                _rv = float(self._reach_now)
+                # getattr, LIKE EVERY OTHER READ OF THIS ATTRIBUTE (fixed
+                # 2026-10-01). `_reach_now` is only ASSIGNED inside
+                # conditionals (4860, 6035, 6087) -- and the comment 60 lines
+                # up already says "which this run never enters, so
+                # `_reach_now` stayed 0.0". When none of those paths run the
+                # attribute does not exist, and this bare read killed the
+                # whole run:
+                #   AttributeError: 'DevelopmentalAI' object has no attribute
+                #   '_reach_now'. Did you mean: '_reach_n'?
+                # Lines 1874, 6209 and 10673 all use getattr with a 0.0
+                # default; this was the only bare one.
+                _rv = float(getattr(self, "_reach_now", 0.0))
                 self._reachval_sum = getattr(self, "_reachval_sum", 0.0) + _rv
                 self._reachval_n = getattr(self, "_reachval_n", 0) + 1
                 if _rv > 0.5:
