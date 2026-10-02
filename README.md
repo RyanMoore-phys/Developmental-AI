@@ -154,6 +154,7 @@ nothing. That question has caught more bugs here than any other.
 
 ## License
 
-**Not yet declared.** Without a licence file, default copyright applies and
-nobody may legally reuse this. If you intend others to build on it, add one
-before publishing.
+MIT — see [`LICENSE`](LICENSE).
+
+The MineRL dependency and the Minecraft client it builds carry their own terms;
+this licence covers the code in this repository only.

@@ -43,7 +43,12 @@ on:
         default: ""
 
 jobs:
-  training host:
+  # JOB ID, NOT A LABEL. Was `pod:`; a 2026-10-01 terminology sweep
+  # rewrote the word `pod` everywhere and turned it into `training host`,
+  # which GitHub rejects: job ids must match [A-Za-z_][A-Za-z0-9_-]* and a
+  # space is not allowed. YAML parses it happily as a mapping key, so local
+  # validation passed and only Actions complained.
+  host:
     runs-on: self-hosted
     timeout-minutes: 120
     steps:
