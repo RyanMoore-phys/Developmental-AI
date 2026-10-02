@@ -1,4 +1,4 @@
-"""Curiosity-magnet grounding-input smoke (Mac- or pod-runnable, no Ollama).
+"""Curiosity-magnet grounding-input smoke (Mac- or training host-runnable, no Ollama).
 
 RETIRED July 2026: the old version drove llava on recorded MineRL frames to
 prove the vision scaffold's VLM could see trunks. The magnet redesign deleted
@@ -41,7 +41,7 @@ def main():
         assert cat in PREDICATES, f"magnet target {cat} not a grounded predicate"
         p = float(probs[PREDICATES.index(cat)])
         assert 0.0 <= p <= 1.0, f"{cat} prob out of range: {p}"
-    print(f"[pod-smoke] grounding head covers all {len(DEFAULT_TARGETS)} magnet "
+    print(f"[training host-smoke] grounding head covers all {len(DEFAULT_TARGETS)} magnet "
           f"targets with valid probabilities")
 
     # 2. the extraction the loop performs (mirrors _grounded_object_probs)
@@ -58,7 +58,7 @@ def main():
     assert np.isfinite(r), f"magnet produced non-finite shaping: {r}"
     st = mag.stats
     assert set(st["cat_lp"].keys()) == set(DEFAULT_TARGETS)
-    print(f"[pod-smoke] loop extraction -> magnet plumbing ok "
+    print(f"[training host-smoke] loop extraction -> magnet plumbing ok "
           f"(shaping={r:.4f}, stats={st})")
 
     # 3. an untrusted category (too few labels / low reliability) never becomes
@@ -72,8 +72,8 @@ def main():
                           label_counts={c: 0 for c in DEFAULT_TARGETS})    # no labels
     assert mag2._target is None, (
         f"magnet targeted an untrusted category: {mag2.stats}")
-    print("[pod-smoke] trust gate holds (no labels / zero reliability -> inert)")
-    print("[pod-smoke] ALL PASS")
+    print("[training host-smoke] trust gate holds (no labels / zero reliability -> inert)")
+    print("[training host-smoke] ALL PASS")
 
 
 if __name__ == "__main__":

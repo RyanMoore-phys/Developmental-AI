@@ -19,7 +19,7 @@ and can discover crafting itself. If any fail, we have a perception or control
 problem to solve rather than a search problem — and that is worth knowing
 BEFORE building on the assumption.
 
-Run ON THE POD:
+Run ON THE TRAINING HOST:
     DISPLAY=:77 MINERL_HEADLESS=1 ./venv_mc/bin/python scripts/probe_gui_capability.py
 """
 from __future__ import annotations

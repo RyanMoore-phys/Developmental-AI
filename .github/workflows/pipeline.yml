@@ -11,7 +11,7 @@
 #
 # SCHEDULED RUNS ARE HEALTH CHECKS ONLY, BY CONSTRUCTION. On a `schedule`
 # event the `inputs` context is empty, so every `if: inputs.X` is false and
-# only preflight + report run. Cron therefore reports on the pod; it cannot
+# only preflight + report run. Cron therefore reports on the training host; it cannot
 # deploy to it or start it. To change that you have to edit this file
 # deliberately, which is the point.
 #
@@ -40,7 +40,7 @@ on:
         type: boolean
         default: true
       deploy:
-        description: "sync code to the pod (runs pod-side smoke tests)"
+        description: "sync code to the training host (runs host-side smoke tests)"
         type: boolean
         default: true
       connect:
@@ -58,8 +58,8 @@ on:
     # 09:00 UTC daily — health report only, see the note above.
     - cron: "0 9 * * *"
 
-# One pipeline against one pod at a time. cancel-in-progress is FALSE:
-# cancelling mid-rsync would leave a half-synced tree on the pod.
+# One pipeline against one host at a time. cancel-in-progress is FALSE:
+# cancelling mid-rsync would leave a half-synced tree on the training host.
 concurrency:
   group: skybot-pipeline
   cancel-in-progress: false
@@ -73,13 +73,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pod reachable?
+      - name: Host reachable?
         run: |
           set -euo pipefail
-          bash scripts/host_exec.sh 'echo "pod: $(hostname)"' \
-            || { echo "::error::cannot reach the pod. MAIN_SSH_PORT rotates on every pod restart — update ~/actions-runner/.env and RESTART the runner (.env is only read at start)."; exit 1; }
+          bash scripts/host_exec.sh 'echo "training host: $(hostname)"' \
+            || { echo "::error::cannot reach the training host. MAIN_SSH_PORT rotates on every host restart — update ~/actions-runner/.env and RESTART the runner (.env is only read at start)."; exit 1; }
 
-      - name: Probe pod state
+      - name: Probe host state
         id: probe
         run: |
           set -euo pipefail
@@ -93,14 +93,14 @@ jobs:
           echo "$OUT"
           case "$OUT" in *LIVE*) L=true ;; *) L=false ;; esac
           echo "training_live=$L" >> "$GITHUB_OUTPUT"
-          echo "### Pod state" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Host state" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$OUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # THE MISSING STAGE (2026-09-04). `deploy` REFUSES while training is live,
   # and nothing in this pipeline could stop it — so the only route was a
-  # separate `pod` run, whose stop reported GREEN on timeout while the agent
+  # separate `training host` run, whose stop reported GREEN on timeout while the agent
   # was still going. The result was a hand-run loop: stop -> deploy fails ->
   # stop again -> deploy with allow_stop_live. That is a missing edge in the
   # graph, not user error, and `needs:` is exactly the thing that fixes it.
@@ -122,7 +122,7 @@ jobs:
           # Run unconditionally rather than trusting preflight's reading:
           # the script exits immediately when nothing is running, and both
           # launch paths `rm -f runlogs/STOP` before starting, so a STOP file
-          # written against an idle pod cannot strand the next launch.
+          # written against an idle host cannot strand the next launch.
           # Gating on a prior job's probe would only reintroduce a stale read.
           bash scripts/host_stop_wait.sh 1200
 
@@ -146,8 +146,8 @@ jobs:
             echo "::error::training is STILL LIVE. Re-run this pipeline with stop=true (it waits up to 20 min for a real exit). Do not reach for allow_stop_live unless you intend to discard the current segment."
             exit 1
           fi
-          echo "pod is idle — safe to sync"
-      - name: Sync + pod-side smoke tests
+          echo "host is idle — safe to sync"
+      - name: Sync + host-side smoke tests
         env:
           # Never launches from here — that is the `launch` job's decision.
           DEPLOY_LAUNCH: "0"
@@ -160,7 +160,7 @@ jobs:
     needs: [preflight, stop, deploy]
     # `stop` must not have FAILED. Without this, a stop that times out
     # skips deploy, and "deploy skipped" reads as permission to carry on —
-    # so connect/launch would proceed against a pod still running the OLD
+    # so connect/launch would proceed against a training host still running the OLD
     # code. A failed stop must stop the whole chain, not just one edge.
     if: >
       !cancelled() && inputs.connect &&
@@ -196,14 +196,14 @@ jobs:
         # BEFORE the stop stage, so its `training_live` is stale by the time
         # we get here: after a successful stop -> deploy, the stale `true`
         # would refuse the launch and break the very stop->deploy->launch
-        # chain this pipeline exists to provide. Ask the pod now.
+        # chain this pipeline exists to provide. Ask the training host now.
         run: |
           set -euo pipefail
           if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
             echo "::error::training is already LIVE. Relaunching would cost the run's continuity. Re-run with stop=true, which waits for a real exit."
             exit 1
           fi
-          echo "pod is idle — safe to launch"
+          echo "host is idle — safe to launch"
 
       - name: Start training
         env:
@@ -247,7 +247,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Final pod state
+      - name: Final host state
         run: |
           {
             echo "### Result"

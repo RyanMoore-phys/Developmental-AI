@@ -60,7 +60,7 @@ services:
     # mem_limit: 4g
 
     volumes:
-      # The pod SSH key, READ-ONLY. This is why the pipeline needs no GitHub
+      # The training host SSH key, READ-ONLY. This is why the pipeline needs no GitHub
       # secret at all: the credential stays on this host and is mounted in.
       - ${MAIN_SSH_KEY_HOST_PATH:?set MAIN_SSH_KEY_HOST_PATH in docker/runner/.env (the file MUST be named .env — see the env_file note above)}:/home/runner/.ssh/skybot_ed25519:ro
       # Persist registration + checkouts so a restart does not re-register or
@@ -78,7 +78,7 @@ services:
       # token anyway.
 
     # No ports published: the runner makes only OUTBOUND connections (to
-    # GitHub, and to the pod over ssh). Nothing needs to reach in.
+    # GitHub, and to the training host over ssh). Nothing needs to reach in.
 
 volumes:
   runner_work:

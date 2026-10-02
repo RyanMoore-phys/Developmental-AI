@@ -54,7 +54,7 @@ def test_discovery_spikes():
 
 
 def test_dug_hole_stops_paying():
-    # `dirt` named 4444 times (the real lifetime count from the pod)
+    # `dirt` named 4444 times (the real lifetime count from the training host)
     rarity = 1.0 / ((1.0 + 4444) ** 0.5)
     f = _factor(_sym_rarity_now=rarity, _sym_named_now=1)
     assert f < 0.02, f

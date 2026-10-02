@@ -10,7 +10,7 @@ THE CENTRAL CHECK IS 2.3 — every sensor must VARY. A constant sensor is the
 signature of this project's most expensive failure class: machinery that
 runs, logs, and does nothing.
 
-Run on the pod:
+Run on the training host:
     PYTHONPATH=. python scripts/host_stage2_integration.py --steps 500
 """
 import argparse

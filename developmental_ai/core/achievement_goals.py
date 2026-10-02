@@ -798,7 +798,7 @@ class AchievementGoalBroadcast:
             if _m is not None:
                 self._minted = _fit(_m, np.int64).astype(bool)
                 # ---- ONE-SHOT REPAIR of state written by the broken
-                # migration (2026-07-27). Live pod state had minted=48/48
+                # migration (2026-07-27). Live host state had minted=48/48
                 # against a 10-skill bank, permanently disabling minting.
                 # Re-derive ONCE from the bank, then stamp a flag so this
                 # never runs again — an unconditional every-load rewrite of
@@ -822,7 +822,7 @@ class AchievementGoalBroadcast:
                 # The old line was `self._minted = self._global_unlocks > 0`
                 # — "ever unlocked" equated with "ever minted". FALSE: minting
                 # also required the loop's mint block to run AND succeed.
-                # Measured consequence on the live pod: minted=48/48 while the
+                # Measured consequence on the live training host: minted=48/48 while the
                 # bank held 10 skills, so the repeatability gate was reached
                 # and PASSED four times in the stalled run and blocked every
                 # time by the latch. Zero skills could ever be minted again —

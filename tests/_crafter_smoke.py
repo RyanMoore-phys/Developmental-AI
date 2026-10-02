@@ -11,7 +11,7 @@ Verifies the full pixel pipeline on real Crafter frames, bottom-up:
   5. DevelopmentalAI end-to-end from configs/crafter.yaml (reduced sizes):
      real steps + a WM train call + no per-pixel fact/decoder taxes.
 
-CPU-sized: a few minutes on the Mac. Re-run on the pod with CUDA visible
+CPU-sized: a few minutes on the Mac. Re-run on the training host with CUDA visible
 to prove the GPU path (with _gpu_device_smoke.py).
 """
 import copy

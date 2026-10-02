@@ -14,7 +14,7 @@ THE BUG THIS ENCODES
          whole branch is skipped, and `mainhand` can never be anything but
          "none".
 
-    MEASURED on the live pod: `hand=none` in 160/160 samples across a
+    MEASURED on the live training host: `hand=none` in 160/160 samples across a
     7-hour run, while the agent carried 8+ items and spent 11% of its
     actions on `use`. Every consumer — the proprio has_tool sense, the
     chop-budget diagnosis, `tool_worn` — was reading a frozen constant.

@@ -1,4 +1,4 @@
-# Quality gate. Runs on the GitHub runner only — no pod, no tailnet, no GPU.
+# Quality gate. Runs on the GitHub runner only — no training host, no tailnet, no GPU.
 #
 # WHY A SUBSET BY DEFAULT: there are 91 `tests/_*_smoke.py` files and several
 # construct a full DevelopmentalAI. Running all of them costs ~45 min of a
@@ -33,7 +33,7 @@ on:
 jobs:
   smoke:
     # DEFAULTS TO A CLEAN GITHUB RUNNER ON PURPOSE, unlike deploy.yml/host.yml.
-    # This job needs NO secrets and never touches the pod, so it gains nothing
+    # This job needs NO secrets and never touches the training host, so it gains nothing
     # from being self-hosted — and it loses the one thing a throwaway box is
     # good for: a clean-room dependency check. A missing `crafter`/`minigrid`
     # surfaces as ModuleNotFoundError that reads exactly like a code failure,
@@ -42,15 +42,23 @@ jobs:
     # To move it onto the self-hosted runner anyway (e.g. to conserve metered
     # private-repo minutes), set the repository variable CI_RUNS_ON to
     # `self-hosted`. No secrets are involved either way.
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    # PINNED TO GITHUB-HOSTED (2026-10-01, for publishing).
+    # This was `${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}`. On a PUBLIC repo
+    # that is a footgun: this workflow triggers on `pull_request`, so ANYONE
+    # can open a PR -- and a repository variable set to `self-hosted` would
+    # silently run that stranger's code on node1, which holds the SSH key to
+    # the training host and the only copy of the brain state.
+    # The variable existed only to save private-repo minutes; public repos get
+    # hosted minutes free, so it buys nothing and risks everything.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      # 3.10 matches the pod's venv_mc. The MineRL chain is pinned to 3.10
+      # 3.10 matches the host's venv_mc. The MineRL chain is pinned to 3.10
       # (legacy gym + setuptools==65.5.1; 3.12 dropped stdlib distutils that
       # those builds still expect). CI does not build MineRL, but staying on
-      # the same interpreter keeps "passes in CI, fails on the pod" rare.
+      # the same interpreter keeps "passes in CI, fails on the training host" rare.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -61,36 +69,36 @@ jobs:
       #
       # NOT installing the full requirements.txt: neo4j, pykeen,
       # torch-geometric and stable-baselines3 are heavy and their imports are
-      # already guarded at runtime (the pod logs warn-and-continue for exactly
+      # already guarded at runtime (the training host logs warn-and-continue for exactly
       # these). crafter and minigrid ARE required — 20 smokes import them, and
       # a missing one surfaces as ModuleNotFoundError that reads like a code
-      # failure. That already cost a diagnostic cycle on the A4000 pod, which
+      # failure. That already cost a diagnostic cycle on the A4000 GPU host, which
       # is why requirements.txt carries a note about it.
-      # VERSIONS MIRROR THE POD, MEASURED FROM IT (2026-09-02).
+      # VERSIONS MIRROR THE TRAINING HOST, MEASURED FROM IT (2026-09-02).
       # The first version of this step installed UNPINNED latest and 6 of the
       # 12 core suites failed while all 12 passed locally — not six bugs, one
       # stack mismatch. requirements.txt specifies only FLOORS
       # (`torch>=2.0.0`, `numpy>=1.24.0`), so a fresh resolve pulls whatever
       # shipped this week and CI tests a configuration that exists nowhere.
       #
-      # THE VERSIONS BELOW WERE READ OFF THE RUNNING POD (`pip list` in
+      # THE VERSIONS BELOW WERE READ OFF THE RUNNING TRAINING HOST (`pip list` in
       # venv_mc), NOT GUESSED. That distinction cost a wrong fix: the first
       # attempt pinned `numpy<2` on the assumption that numpy 2 was the
-      # culprit. The pod actually runs numpy 2.2.6, and the failing suites
-      # were then re-run ON the pod against it — all passed. So numpy 2 is
+      # culprit. The training host actually runs numpy 2.2.6, and the failing suites
+      # were then re-run ON the training host against it — all passed. So numpy 2 is
       # production, and `numpy<2` would have made CI green for a stack that
-      # never ships. torch is the real difference: the pod is on 2.6.0 while
+      # never ships. torch is the real difference: the training host is on 2.6.0 while
       # an unpinned install pulls something far newer.
       #
-      # WHEN YOU BUMP THE POD, BUMP THESE IN THE SAME CHANGE — a CI that
-      # tests a stack the pod does not run is worse than no CI, because it
+      # WHEN YOU BUMP THE TRAINING HOST, BUMP THESE IN THE SAME CHANGE — a CI that
+      # tests a stack the training host does not run is worse than no CI, because it
       # reports green for a configuration nobody deploys. Re-read them with:
-      #   ssh <pod> 'cd /workspace/devai && ./venv_mc/bin/pip list'
-      - name: Install dependencies (mirrors the pod's venv_mc)
+      #   ssh <training host> 'cd /workspace/devai && ./venv_mc/bin/pip list'
+      - name: Install dependencies (mirrors the host's venv_mc)
         run: |
           python -m pip install -q --upgrade pip wheel setuptools
           # CPU build: the default index pulls ~2.5 GB of CUDA wheels a CPU
-          # runner can never use. Same 2.6.0 as the pod's 2.6.0+cu124.
+          # runner can never use. Same 2.6.0 as the host's 2.6.0+cu124.
           pip install -q "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
           # NO crafter, NO minigrid (removed 2026-09-02). They are OTHER
           # training environments (configs/crafter.yaml, minigrid_doorkey.yaml)
@@ -113,15 +121,15 @@ jobs:
           print("torch    ", torch.__version__)
           print("numpy    ", numpy.__version__)
           print("gymnasium", gymnasium.__version__)
-          # Guard the MIRROR, not a guessed value: these must match the pod.
+          # Guard the MIRROR, not a guessed value: these must match the training host.
           assert numpy.__version__ == "2.2.6", f"numpy drifted to {numpy.__version__}"
           assert torch.__version__.startswith("2.6.0"), f"torch drifted to {torch.__version__}"
           PY
-          # FULL RESOLVE, printed every run. The failing suites pass on the pod
+          # FULL RESOLVE, printed every run. The failing suites pass on the training host
           # (Linux, py3.10, torch 2.6.0, numpy 2.2.6) both on GPU and with
           # CUDA hidden, so device and those three versions are all ruled out.
           # Whatever differs is in here — most likely a transitive dep pulled
-          # in by crafter/minigrid that the pod's venv_mc does not have.
+          # in by crafter/minigrid that the host's venv_mc does not have.
           echo "----- pip freeze -----"
           pip freeze
 
@@ -136,11 +144,11 @@ jobs:
           else
             # SKYBOT-ONLY. This pipeline exists to deploy SkyBot to a
             # Minecraft server, so the gate is the suites that bear on that.
-            # Every one below was VERIFIED to pass on the pod's own venv_mc —
+            # Every one below was VERIFIED to pass on the host's own venv_mc —
             # Linux, python 3.10, torch 2.6.0, numpy 2.2.6, no crafter, no
             # minigrid, CUDA hidden — i.e. this exact dependency set.
             TESTS=(
-              # the four scripts/deploy_skybot.sh gates the pod launch on
+              # the four scripts/deploy_skybot.sh gates the training host launch on
               tests/_reward_fixes_smoke.py
               tests/_centering_drive_smoke.py
               tests/_resume_smoke.py
@@ -178,8 +186,8 @@ jobs:
             #                      crafter/minigrid were ever installed here.
             #   _remote_server_smoke, _minerl_smoke
             #                      import `minerl`, which needs Java + the
-            #                      built MCP-Reborn tree. Pod-only by nature;
-            #                      deploy_skybot.sh runs the pod-side gate.
+            #                      built MCP-Reborn tree. Training host-only by nature;
+            #                      deploy_skybot.sh runs the host-side gate.
             # (_skybot_boot_smoke was excluded while arch:rssm binding was
             #  broken; it is back in the list above now that it is built.)
           fi

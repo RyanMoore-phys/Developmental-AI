@@ -97,7 +97,7 @@ while true; do
     } >> "$CRASHLOG"
     # A DETERMINISTIC fault (one that fires on the first segment every time)
     # cannot resolve itself, and retrying it just walks the backoff to its cap
-    # and idles the pod while looking like progress. Stop loudly instead.
+    # and idles the training host while looking like progress. Stop loudly instead.
     SIG=$(tail -30 runlogs/minecraft_skybot_run.log 2>/dev/null \
           | grep -m1 -E "^[A-Za-z_.]*(Error|Exception)" | cut -c1-120)
     if [ -n "$SIG" ] && [ "$SIG" = "${LAST_SIG:-}" ]; then

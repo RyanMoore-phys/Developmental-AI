@@ -344,10 +344,10 @@ def test_loop_integration():
     print(f"  8. loop integration ok ({len(metas)} invocations, "
           f"{len(taus)} decisions over 80 env steps, telemetry live)")
 def test_full_construction_with_brain_viewer():
-    """REGRESSION (pod deploy 2026-07-19): brain_viewer.enabled constructs
+    """REGRESSION (host deploy 2026-07-19): brain_viewer.enabled constructs
     the emitter, which references skill_bank + broadcaster + option_executor.
     No smoke exercised that combination -> an init-ordering AttributeError
-    ('DevelopmentalAI has no attribute skill_bank') only surfaced on the pod.
+    ('DevelopmentalAI has no attribute skill_bank') only surfaced on the training host.
     This constructs the exact failing combination on Crafter."""
     import shutil as _sh
     import yaml as _yaml

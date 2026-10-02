@@ -17,9 +17,9 @@ runner on your own machine already has them:
 
 | Needed | Hosted runner | Self-hosted (this design) |
 |---|---|---|
-| SSH to the pod | private key uploaded to GitHub Secrets | `~/.ssh/skybot_ed25519`, already on disk |
-| Reach the pod | tailnet OAuth client | the machine can already reach it |
-| Which pod / server | repo variables | runner `.env`, a local file |
+| SSH to the training host | private key uploaded to GitHub Secrets | `~/.ssh/skybot_ed25519`, already on disk |
+| Reach the training host | tailnet OAuth client | the machine can already reach it |
+| Which host / server | repo variables | runner `.env`, a local file |
 
 `deploy.yml` and `host.yml` reference **zero** `secrets.*` — verified.
 
@@ -68,7 +68,7 @@ The runner reads `.env` from its own root and applies it to every job. **This
 file is never committed — it is not in the repo at all.**
 
 **This file is the ONLY place the training host is named.** Nothing in the
-tree hardcodes it, which is what made moving off the rented pod an `.env` edit
+tree hardcodes it, which is what made moving off the rented host an `.env` edit
 rather than a refactor. To move hosts again, edit this — not the repo.
 
 ```bash
@@ -86,7 +86,7 @@ MC_SERVER_TS_IP=192.168.1.XX     # the Paper server. LAN IP or tailnet IP —
 # --- optional ---
 # DEPLOY_TRANSPORT=tailscale     # use Tailscale SSH instead of ssh; needs the
                                  # ACL rule in section 4, and MAIN_HOST becomes
-                                 # the MagicDNS name (e.g. devai-pod-2)
+                                 # the MagicDNS name (e.g. devai-training host-2)
 # TS_AUTHKEY=tskey-auth-...      # lets `provision` join a fresh box to the
                                  # tailnet without a browser click
 EOF
@@ -117,7 +117,7 @@ is read at service start.
 
 ### The one thing you must keep updated
 
-**On a rented pod, `MAIN_SSH_PORT` changes every restart** (22655 → 22681 →
+**On a rented training host, `MAIN_SSH_PORT` changes every restart** (22655 → 22681 →
 34276 → 19983 → …). When a job fails at the preflight step with an ssh error,
 that is almost always why: update `.env`, restart the runner, re-run.
 
@@ -135,7 +135,7 @@ zero extra configuration.
 # 1. runner shows "Idle" under Settings -> Actions -> Runners
 # 2. transport works, straight from the runner host:
 MAIN_HOST=... MAIN_SSH_PORT=... bash scripts/host_exec.sh 'hostname'
-# 3. read-only workflow:  Actions -> pod -> Run workflow -> action=status
+# 3. read-only workflow:  Actions -> host -> Run workflow -> action=status
 # 4. then deploy, then connect, then launch.
 ```
 
@@ -165,13 +165,13 @@ Order for a fresh box:
 6. Only now push, or run `deploy.yml` with `launch=false` to sync and
    smoke-test without starting training.
 
-Do **not** test `action=provision` against a working pod: it does
+Do **not** test `action=provision` against a working training host: it does
 `rm -rf mc-build` and rebuilds MineRL (40–60 min). It is guarded behind typing
-`PROVISION`, which is a guard on your *pod*, not a branch policy.
+`PROVISION`, which is a guard on your *training host*, not a branch policy.
 
 ## 4. Optional — Tailscale SSH transport
 
-Only if you want to stop updating `MAIN_SSH_PORT`. On the pod, once:
+Only if you want to stop updating `MAIN_SSH_PORT`. On the training host, once:
 
 ```bash
 tailscale set --ssh=true
@@ -189,7 +189,7 @@ Use **`accept`**, not `check` — `check` requires interactive browser re-auth,
 which in CI does not fail, it **hangs** until timeout.
 
 Verified 2026-09-02: with `--ssh` on but no ACL rule, an inbound attempt
-reaches the pod and tailscaled replies *"tailnet policy does not permit you to
+reaches the training host and tailscaled replies *"tailnet policy does not permit you to
 SSH to this node"*. That message means the transport works and only policy is
 missing — the expected state before adding the rule.
 
@@ -197,7 +197,7 @@ missing — the expected state before adding the rule.
 
 ## Keeping CI honest
 
-`ci.yml` pins versions **read off the running pod**, not guessed:
+`ci.yml` pins versions **read off the running training host**, not guessed:
 
 ```
 python 3.10 · torch 2.6.0 · numpy 2.2.6 · gymnasium 1.3.0
@@ -206,18 +206,18 @@ python 3.10 · torch 2.6.0 · numpy 2.2.6 · gymnasium 1.3.0
 This matters: the first version installed unpinned latest and 6 of 12 suites
 failed while all 12 passed locally — one stack mismatch, not six bugs. The
 second attempt pinned `numpy<2` on the assumption numpy 2 was the culprit;
-the pod actually runs numpy **2.2.6**, and the failing suites were then re-run
-*on the pod* against it and all passed. Guessing was wrong twice; reading the
+the training host actually runs numpy **2.2.6**, and the failing suites were then re-run
+*on the training host* against it and all passed. Guessing was wrong twice; reading the
 versions off production was right.
 
-**When you upgrade the pod, update these pins in the same change.** Re-read
+**When you upgrade the training host, update these pins in the same change.** Re-read
 them with:
 
 ```bash
 bash scripts/host_exec.sh 'cd /workspace/devai && ./venv_mc/bin/pip list'
 ```
 
-A CI that tests a stack the pod does not run is worse than no CI — it reports
+A CI that tests a stack the training host does not run is worse than no CI — it reports
 green for a configuration nobody deploys.
 
 ---

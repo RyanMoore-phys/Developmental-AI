@@ -1,5 +1,5 @@
 #!/bin/bash
-# Provision a fresh RunPod for Developmental-AI Minecraft training.
+# Provision a fresh a rented GPU host for Developmental-AI Minecraft training.
 # Idempotent-ish; logs stage markers to stdout (redirect to provision.log).
 # Takes ~40-60 min (MineRL pip install runs a full gradle build, then we
 # patch MouseHelper and rebuild).
@@ -8,7 +8,7 @@
 #   nohup bash scripts/provision_host.sh > runlogs/provision.log 2>&1 &
 set -x
 # ---- ROOT vs SUDO (added 2026-09-22) --------------------------------------
-# On RunPod this always ran as root, so apt/dpkg/installers were bare. The
+# On a rented GPU host this always ran as root, so apt/dpkg/installers were bare. The
 # owned box `main` logs in as a normal account, so every privileged command
 # now goes through $SUDO -- EMPTY when we are already root, so the old path is
 # byte-for-byte unchanged and this cannot regress a root host.
@@ -35,7 +35,7 @@ $SUDO apt-get update -q
 # also removed stdlib distutils, which those builds still expect). Rather than
 # re-qualify the entire pinned stack on 3.12, pull 3.10 from deadsnakes —
 # verified to publish python3.10 for noble. 22.04 keeps its native path
-# untouched, so the proven RunPod recipe is unchanged.
+# untouched, so the proven a rented GPU host recipe is unchanged.
 . /etc/os-release
 if ! apt-cache policy python3.10-venv 2>/dev/null | grep -q "Candidate: [0-9]"; then
   echo "  python3.10 absent on ${PRETTY_NAME:-this release} -> adding deadsnakes"
@@ -58,7 +58,7 @@ echo "=== STAGE 1b: VirtualGL (GPU headless GL via EGL) ==="
 # Root cause (2026-07-23): under Xvfb SOFTWARE GL (llvmpipe) the MineRL client
 # hangs forever at "Reloading ResourceManager" (GPU idle, render thread starves
 # the game loop). VirtualGL's EGL back-end (`vglrun -d egl`) routes GL to the
-# NVIDIA GPU with no X server. Proven on the A4000 pod: glxinfo renderer flips
+# NVIDIA GPU with no X server. Proven on the A4000 GPU host: glxinfo renderer flips
 # from "llvmpipe" to "NVIDIA RTX A4000". The client boots to DORMANT and runs
 # missions. Xvfb (:77) is still required as the dummy 2D/window server for the
 # blit target — VGL renders on the GPU and the app reads pixels off-screen.
@@ -99,7 +99,7 @@ which vglrun || { echo "PROVISION-FAILED: virtualgl missing"; exit 1; }
 echo "=== STAGE 1c: Tailscale + socat (OPTIONAL — external-server play) ==="
 # Only needed to point env 0 at an EXTERNAL Minecraft server over a private
 # tailnet (configs/minecraft_skybot.yaml). Harmless for pure-MineRL runs.
-# tailscale runs USERSPACE (RunPod containers expose no /dev/net/tun), so a
+# tailscale runs USERSPACE (a rented GPU host containers expose no /dev/net/tun), so a
 # socat bridge makes the tunnel transparent to the java client. The `tailscale
 # up` LOGIN is interactive (device approval) and CANNOT be scripted — it is a
 # manual step, see scripts/connect_server.sh + docs/SERVER_CONNECTION.md.
@@ -114,7 +114,7 @@ which socat >/dev/null 2>&1 || $SUDO apt-get install -y -q socat || true
 which socat >/dev/null 2>&1 || { echo "PROVISION-FAILED: socat absent (needed by the server bridge)"; exit 1; }
 echo "tailscale: $(which tailscale 2>/dev/null || echo ABSENT) | socat: $(which socat 2>/dev/null || echo ABSENT)"
 # NON-INTERACTIVE TAILNET JOIN (2026-09-02). With TS_AUTHKEY exported, join
-# here so a CI provision produces a pod that is already reachable — otherwise
+# here so a CI provision produces a training host that is already reachable — otherwise
 # provisioning finishes and then blocks forever on a human clicking a URL,
 # which is exactly what made this stage un-automatable before.
 # Deliberately NOT fatal: a pure-MineRL run (no external server) does not need
@@ -211,8 +211,8 @@ if [ -f "$BG" ] && grep -qE "DEVAI:.*(plugin|block) (dropped|removed)" "$BG"; th
     chmod +x "$MCP/gradlew"
 else
     rm -rf mc-build
-    # NO git clone HERE — GitHub 401s git-upload-pack FROM POD IPs.
-    # Measured 2026-09-02 on an A4000 pod, with clean git
+    # NO git clone HERE — GitHub 401s git-upload-pack FROM TRAINING HOST IPs.
+    # Measured 2026-09-02 on an A4000 GPU host, with clean git
     # config (no credential helper, no .netrc, no proxy, no insteadOf):
     #     GET  /minerllabs/minerl.git/info/refs      -> 200   (ls-remote works)
     #     POST /minerllabs/minerl.git/git-upload-pack -> 401
@@ -293,7 +293,7 @@ MH="$MCP/src/main/java/net/minecraft/client/MouseHelper.java"
 cp "$MH" "$MH.orig"
 sed -i "s|if (this.minecraft.isGameFocused()) {|if (true \|\| this.minecraft.isGameFocused()) { // DEVAI: headless focus patch|" "$MH"
 sed -i "s|if (this.isMouseGrabbed() \&\& this.minecraft.isGameFocused()) {|if (true \|\| (this.isMouseGrabbed() \&\& this.minecraft.isGameFocused())) { // DEVAI: headless focus patch|" "$MH"
-# >=2 not ==2: the gate count varies by MCP-Reborn revision (old pod had 2
+# >=2 not ==2: the gate count varies by MCP-Reborn revision (old host had 2
 # gates, the v1.0.0 clone has 3). All matched gates are legitimately disabled.
 [ "$(grep -c DEVAI "$MH")" -ge 2 ] || { echo "PROVISION-FAILED: patch count"; exit 1; }
 # unpack_assets: setup.py copies downloadAssets' hashed objects into

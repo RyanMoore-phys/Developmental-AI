@@ -42,7 +42,7 @@ environment:
   # twice the world time — acceptable, and named here so it is not a surprise.
   action_repeat: 4
   # SKYBOT: the primary lifelong stream (env 0) joins the user's Paper
-  # server through the pod-local socat->tailscale bridge. Scouts stay in
+  # server through the training host-local socat->tailscale bridge. Scouts stay in
   # local generated worlds (scope: primary). "all" would put every
   # stream on the server.
   remote_server: "127.0.0.1:25565"
@@ -356,7 +356,7 @@ sensors:
     #   FlatInventoryObservation gives item->count with NO SLOT INDICES and
     #   `equipped_items` is dead in MineRL 1.0, so mainhand is derived from
     #   evidence — the HUD renders the answer every frame.
-    #   MEASURED 2026-09-19 ON THE POD: MineRL's POV does NOT include the
+    #   MEASURED 2026-09-19 ON THE TRAINING HOST: MineRL's POV does NOT include the
     #   HUD. The bottom band's pixel variance is 0.029 against 0.290
     #   mid-frame — an order of magnitude LESS structure where a rendered
     #   HUD would be an order of magnitude more. The frame is world-only.
@@ -424,7 +424,7 @@ sensors:
 #
 # ---- A NOTE ON THE GATE ---------------------------------------------
 # The roadmap gated this phase on the Wave 1/2 go/no-go (flow_loss falling
-# on LIVE pod frames), because G1 was specified as "expose the depth map"
+# on LIVE host frames), because G1 was specified as "expose the depth map"
 # and depth mode is still unvalidated. The implementation sidesteps that:
 # `probe_map` works in BOTH flow modes. Under `depth` the magnitude IS
 # inverse depth by construction; under `raw` it is whatever the head has
@@ -495,7 +495,7 @@ spatial:
 #
 # ---- SHIPPED OFF, AND THIS ONE IS NOT A PREFERENCE ------------------
 # Slots decode the flow field. Until `flow_loss` has been shown to FALL ON
-# LIVE POD FRAMES there is no reconstruction target, and this is a slot model
+# LIVE TRAINING HOST FRAMES there is no reconstruction target, and this is a slot model
 # trained on noise. SAVi's own stated limitation is that fully-unsupervised
 # decomposition "still fails to scale to diverse realistic data" — a warning
 # about exactly this situation. WorldModel also refuses to build the module
@@ -665,7 +665,7 @@ world_model:
   # LOST one. Kept on because it is cheap (1 + 1/4 the pixels), standard, and
   # the failure mode it addresses — large-displacement local minima — is
   # under-represented in a 32px synthetic and over-represented in a real
-  # 15-degree turn. The pod is the real test.
+  # 15-degree turn. The training host is the real test.
   flow_scales: [1, 2]
   # ---- LONGER BASELINES: SHIPPED OFF, AND WHY --------------------------
   # THE THEORY, which I proposed: depth resolution scales with baseline, and
@@ -720,7 +720,7 @@ world_model:
   # pose regression. It also yields a DEPTH MAP the rest of the system wants.
   #
   # SHIPPED AS `raw` ON PURPOSE. The Wave 1 go/no-go (flow_loss falling on
-  # LIVE pod frames) has not run yet, and a depth factorisation built on an
+  # LIVE host frames) has not run yet, and a depth factorisation built on an
   # objective that has never seen real Minecraft is exactly the bet this
   # project keeps losing. Flip this one line once the go/no-go passes.
   flow_mode: raw
@@ -847,7 +847,7 @@ world_model:
   #    past ~10% the trainer has stopped keeping up and this went too far.
   # ===== CAPACITY WAVE (2026-09-01) =====================================
   # Five sizing changes landed together. They are together because there was
-  # nothing to invalidate: no pod, no live brain, and skill_bank.storage_dir
+  # nothing to invalidate: no training host, no live brain, and skill_bank.storage_dir
   # was already repointed to an empty dir by the arch: rssm change. Two of
   # them are checkpoint-breaking, so doing them NOW is free and doing them
   # after a run would orphan accumulated state.
@@ -896,7 +896,7 @@ world_model:
   # output -- activations are recomputed in backward, not approximated. The
   # decoder is 71.7M of 120.5M params and BOTH fatal CUDA OOMs landed in
   # conv_transpose2d, so it is the right thing to trade.
-  # ESTIMATE, NOT MEASUREMENT: ~1.5-2.5 GiB. The pod profile that would settle
+  # ESTIMATE, NOT MEASUREMENT: ~1.5-2.5 GiB. The training host profile that would settle
   # it does not exist for this config yet.
   grad_checkpoint: true
   batch_size: 8
@@ -926,7 +926,7 @@ world_model:
   #    3.2 steps/s. Everything older was overwritten. For an agent whose
   #    whole premise is lifelong development, a ten-hour memory is the diet.
   #    1M -> 500k per stream ~ 43 h each. Cost at uint8 obs: ~49 GB of the
-  #    pod's 125 GB, against ~10 GB of non-buffer RSS. Comfortable.
+  #    host's 125 GB, against ~10 GB of non-buffer RSS. Comfortable.
   #    RAISE THIS WITH train_iters, never without: a high replay ratio over a
   #    ten-hour window is a recipe for overfitting the last ten hours.
   buffer_capacity: 1000000
@@ -1017,7 +1017,7 @@ world_model:
     # a small node is still protected; on a big node THIS is the ceiling.
     #
     # ---- 16 -> 2 (2026-09-22): THE SAME DECISION, ON A SMALLER BOX ------
-    # Training moved from the pod (125 GB RAM) to the main computer (16 GB).
+    # Training moved from the training host (125 GB RAM) to the main computer (16 GB).
     # 2 GB = ~40k transitions = ~2 hours of history at the measured rate.
     # That is small by replay standards and it is a real cost -- but the
     # argument recorded above cuts the same way it did at 16: this is a
@@ -1037,7 +1037,7 @@ world_model:
   #    a half-written buffer (world_model.pt's non-atomic write has already
   #    cost this project one silent partial restore).
   #    max_gb CAPS it PER STREAM: 8 GB ~ 162k transitions ~ 14 h each, which
-  #    keeps the write bounded and the volume safe. Raise once the pod's free
+  #    keeps the write bounded and the volume safe. Raise once the host's free
   #    disk is known — the instance footprint measured ~42 GB.
   buffer_persist: true
   buffer_persist_max_gb: 8.0
@@ -1058,7 +1058,7 @@ world_model:
   terminal_fraction: 0.05
   # THE MECHANISM THAT WAS BUILT FOR THIS AND LEFT OFF. Windows containing a
   # nonzero reward are the rarest and most valuable thing in the buffer here
-  # — the scoreboard is "399 breaks in pod history, exactly 1 log, ever". At
+  # — the scoreboard is "399 breaks in host history, exactly 1 log, ever". At
   # 0 the world model saw the log break with probability proportional to its
   # frequency, i.e. essentially never, which is the direct cause of it not
   # being able to predict the one event the whole run is about. Repeats ARE
@@ -1075,13 +1075,13 @@ parallel_envs:
   step_timeout_s: 120
   # 4 -> 2 (2026-08-17, MEASURED). Four clients on the shared server did
   # not work: 0 segments in 17 minutes, 9 client rebuilds, env 0 dying on
-  # `TimeoutError` reading its own trainer<->java socket. The pod was NOT
+  # `TimeoutError` reading its own trainer<->java socket. The training host was NOT
   # the constraint and this is worth recording, because every instinct says
   # otherwise — bridge 0.3% CPU, GPU 0-13%, load 4 of 48 cores, distinct
   # core pins, no duplicate-login kicks. Everything local was idle while
   # the clients starved, which leaves the one component not on this box:
   # the Minecraft server absorbing four simultaneous joins and four chunk
-  # streams. So the ceiling on peers is the SERVER's, not the pod's.
+  # streams. So the ceiling on peers is the SERVER's, not the host's.
   # 2 = slot 0 + one peer: the minimum that still makes social learning
   # possible, and only 2x the traffic of the known-good single client.
   num_envs: 2
@@ -1348,11 +1348,11 @@ curiosity:
   #
   # LEFT AT 1 (= exactly the old behaviour) because K>1 is not identical:
   # one Adam step on 4N samples is not four steps on N, and that cannot be
-  # validated without a live run. Raise to 4-8 when there is a pod to watch,
+  # validated without a live run. Raise to 4-8 when there is a training host to watch,
   # and check that `Curiosity (mean/step)` is unchanged — if it moves, this
   # is the first thing to revert.
   # HELD AT 1 — and as of 2026-09-02 this is SETTLED BY MEASUREMENT, not by
-  # caution. The pod run this comment used to ask for has now happened
+  # caution. The training host run this comment used to ask for has now happened
   # (RTX A4000, /tmp/inv_icm.py + /tmp/inv_lp.py). Both numbers:
   #
   #   SPEED   train_every=8 is a big win: 15.28 -> 2.59 ms per env step,
@@ -1386,7 +1386,7 @@ curiosity:
   #
   # AND THE OBVIOUS RESCUE DOES NOT WORK. The first version of this note
   # recommended "K=2 or K=4 with a compensating ICM lr raise". That was
-  # written before measuring it, and measuring it (inv_lp2.py, same pod,
+  # written before measuring it, and measuring it (inv_lp2.py, same training host,
   # same session) killed it. Scaling lr by K does not restore the signal, it
   # overshoots wildly and NON-MONOTONICALLY:
   #     K=2 lr x1 -47.8%  | lr x2  +168.8%
@@ -1642,7 +1642,7 @@ symbolic_grounding:
   # ("a dog", "YOUR INVESTMENT"). The saturated tree_visible that froze the
   # magnet's every gradient was the TEACHER's blindness, not the head's.
   # qwen2.5vl:7b scored 8/8 on the same battery at the same warm latency
-  # (~1.17s vs ~1.1s). Pulled on the pod 2026-08-06 (4.7GB, fits beside the
+  # (~1.17s vs ~1.1s). Pulled on the training host 2026-08-06 (4.7GB, fits beside the
   # rest in 16GB VRAM).
   # ---- 4-BIT (2026-09-01) ---------------------------------------------
   # The VLM is the largest single GPU tenant and is demonstrably on the
@@ -1687,7 +1687,7 @@ symbolic_grounding:
   # NO `-q4` SUFFIX — THE REGISTRY TAG IS ALREADY QUANTIZED (fix 2026-09-02).
   # This said `qwen2.5vl:3b-q4`, on the assumption that ollama ships an F16
   # base you quantize locally (the recipe in the comment above). Measured on
-  # the pod, that is wrong twice over:
+  # the training host, that is wrong twice over:
   #   * there is no `3b-q4` tag to pull — manifest 404;
   #   * building one fails anyway:
   #       Error: quantization is only supported for F16, BF16 and F32 models
@@ -1734,7 +1734,7 @@ symbolic_grounding:
   # at 60 the two channels together stay far under the worker's capacity.
   #
   # 60 -> 12 (2026-08-17), from MEASUREMENT rather than taste. On the live
-  # pod: one qwen2.5vl call is 1.55s median (both channels, shared GPU) and
+  # training host: one qwen2.5vl call is 1.55s median (both channels, shared GPU) and
   # the run steps at 3.41/s, so a query occupies 5.3 steps of the SINGLE
   # labelling worker. At fovea 60 + full 600 the worker was ~10% busy and
   # the GPU 1-6% — nine tenths of the teacher was idle. At 12 the fovea
@@ -2701,7 +2701,7 @@ skills_as_options:
 # enabled here; it was also only ever fed from the episodic loop path, so it
 # would have shown a black screen even if switched on. Both fixed.
 # Watch it with:
-#   ssh -N -L 8000:localhost:8000 -i ~/.ssh/skybot_ed25519 root@<pod>
+#   ssh -N -L 8000:localhost:8000 -i ~/.ssh/skybot_ed25519 root@<training host>
 #   then open http://localhost:8000
 viewer:
   enabled: true
@@ -2989,7 +2989,7 @@ lifelong:
 # and you have decided to trade the guarantee away.
 #
 # WHY ROTATION: runlogs/ollama.log reached 29 MB unattended in this project.
-# The tracker must not become the thing that fills the pod's disk.
+# The tracker must not become the thing that fills the host's disk.
 #
 # The collector on the mini tails this file and dedupes on `seq`; see
 # scripts/collect_metrics.sh. The raw JSONL is the system of record — the

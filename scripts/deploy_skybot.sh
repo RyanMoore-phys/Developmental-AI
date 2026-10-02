@@ -1,9 +1,9 @@
 #!/bin/bash
-# Sync this Mac's code to the pod and (re)launch SkyBot — one command.
+# Sync this Mac's code to the training host and (re)launch SkyBot — one command.
 #
-# WHY THIS EXISTS: the pod's SSH PORT ROTATES on every restart (22655 -> 22681
+# WHY THIS EXISTS: the host's SSH PORT ROTATES on every restart (22655 -> 22681
 # -> 34276 -> 19473 -> ...), so the rsync+launch recipe in docs/RUNNING.md goes
-# stale the moment the pod bounces and has to be retyped from two places.
+# stale the moment the training host bounces and has to be retyped from two places.
 # Pass the current host/port once and everything downstream is derived.
 #
 # Usage:
@@ -12,7 +12,7 @@
 #   bash scripts/deploy_skybot.sh 34276 1.2.3.4 4000000
 #
 #   # CI: over the tailnet, no key, no port, and DO NOT start training
-#   DEPLOY_TRANSPORT=tailscale DEPLOY_LAUNCH=0 MAIN_HOST=devai-pod-2 \
+#   DEPLOY_TRANSPORT=tailscale DEPLOY_LAUNCH=0 MAIN_HOST=devai-training host-2 \
 #     bash scripts/deploy_skybot.sh
 #
 # It refuses to launch if the pre-flight fails (dead tailscale/socat bridge or
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 # ---- WHO WE LOG IN AS (added 2026-09-22) ----------------------------------
-# Was hardcoded to root, because RunPod only ever gave you root. The owned box
+# Was hardcoded to root, because a rented GPU host only ever gave you root. The owned box
 # `main` is a normal Ubuntu machine with a normal account, so the user is now a
 # variable. Default stays `root` so nothing that used to work stops working.
 # NOTE: a non-root MAIN_USER needs passwordless sudo on the target -- provision
@@ -35,7 +35,7 @@ MAIN_USER="${MAIN_USER:-root}"
 #   tailscale — `tailscale ssh <user>@<magicdns-name>`. PORT and KEY are unused;
 #               HOST is the stable MagicDNS name, so the rotating-port problem
 #               this script was written to work around simply disappears.
-# The pod has no /dev/net/tun, so tailscaled is userspace-only and raw inbound
+# The training host has no /dev/net/tun, so tailscaled is userspace-only and raw inbound
 # TCP over the tailnet is NOT routable — Tailscale SSH is the only tailnet way
 # in. See scripts/connect_server.sh for the matching --ssh flag and ACL note.
 TRANSPORT="${DEPLOY_TRANSPORT:-ssh}"
@@ -52,7 +52,7 @@ if [ "$TRANSPORT" = "tailscale" ]; then
   RSH="tailscale ssh"
 else
   PORT="${1:?usage: deploy_skybot.sh <PORT> [HOST] [TIMESTEPS]}"
-  # No hardcoded IP default any more — it went stale on every pod rebuild and
+  # No hardcoded IP default any more — it went stale on every host rebuild and
   # put a real endpoint in the tree. MAIN_HOST is the single source of truth.
   HOST="${2:-${MAIN_HOST:?set MAIN_HOST or pass HOST as arg 2}}"
   TS="${3:-4000000}"
@@ -62,7 +62,7 @@ else
   # until a host with a different key, where this would silently ignore
   # the .env and fail with a bare "Permission denied (publickey)".
   KEY="${MAIN_SSH_KEYFILE:-${MAIN_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
-  # UserKnownHostsFile=/dev/null is REQUIRED: RunPod reuses IPs across pods, so
+  # UserKnownHostsFile=/dev/null is REQUIRED: a rented GPU host reuses IPs across hosts, so
   # the host key changes and plain ssh refuses with a HOST KEY CHANGED error.
   # BatchMode=yes IS LOAD-BEARING IN CI (added 2026-09-02).
   # ConnectTimeout only bounds the TCP connect, NOT authentication. Without
@@ -70,7 +70,7 @@ else
   # BLOCK forever on a password prompt no CI job can answer — the job dies at
   # its timeout-minutes with the step still showing "in progress" and no error
   # anywhere. With it, ssh exits immediately: "Permission denied (publickey)".
-  # ServerAlive* covers the other half: the pod-side smoke tests run for
+  # ServerAlive* covers the other half: the host-side smoke tests run for
   # minutes over one connection, and a silently dropped link would hang just
   # as long.
   SSH_OPTS="-p $PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
@@ -79,7 +79,7 @@ else
 fi
 
 echo "==> target ${MAIN_USER}@$HOST:$PORT via $TRANSPORT (launch=$LAUNCH)"
-$SSH_CMD "${MAIN_USER}@$HOST" 'echo "    pod reachable: $(hostname)"'
+$SSH_CMD "${MAIN_USER}@$HOST" 'echo "    host reachable: $(hostname)"'
 
 # NO-LAUNCH MUST ALSO MEAN NO-STOP (2026-09-02). The stop below runs
 # UNCONDITIONALLY and the DEPLOY_LAUNCH=0 early-exit is ~50 lines further
@@ -96,7 +96,7 @@ if [ "$LAUNCH" != "1" ]; then
     else
       echo "REFUSED: training is LIVE on $HOST and DEPLOY_LAUNCH=0."
       echo "  Syncing now would stop the run and leave it stopped."
-      echo "  Stop it deliberately first (pod.yml action=stop, or touch runlogs/STOP),"
+      echo "  Stop it deliberately first (host.yml action=stop, or touch runlogs/STOP),"
       echo "  or re-run with DEPLOY_ALLOW_STOP_LIVE=1 if that is really what you want."
       exit 1
     fi
@@ -141,7 +141,7 @@ $SSH_CMD "${MAIN_USER}@$HOST" '
 # rsync creates the LAST path component only, so a missing /workspace fails
 # with a bare `mkdir "/workspace/devai" failed: No such file or directory (2)`
 # and exit code 11 -- which reads like a permissions problem and is not one.
-# On RunPod /workspace was the platform-mounted network volume and always
+# On a rented GPU host /workspace was the platform-mounted network volume and always
 # existed; on the OWNED Ubuntu host (192.168.1.10, since 2026-09-22) NOTHING
 # creates it -- provision_host.sh itself opens with `cd /workspace/devai ||
 # exit 1`, so it cannot be what makes the directory either. Create it here and
@@ -176,7 +176,7 @@ rsync -rlptz --stats \
   developmental_ai configs scripts tests run_minecraft.py \
   "${MAIN_USER}@$HOST:/workspace/devai/"
 
-echo "==> smoke-testing ON THE POD (the only tree that matters)"
+echo "==> smoke-testing ON THE TRAINING HOST (the only tree that matters)"
 $SSH_CMD "${MAIN_USER}@$HOST" '
   cd /workspace/devai
   # A MISSING INTERPRETER IS NOT A FAILING TEST. Without this the next line
@@ -192,13 +192,13 @@ $SSH_CMD "${MAIN_USER}@$HOST" '
     && ./venv_mc/bin/python tests/_centering_drive_smoke.py \
     && ./venv_mc/bin/python tests/_resume_smoke.py \
     && ./venv_mc/bin/python tests/_stall_fixes_smoke.py' \
-  || { echo "REFUSED: pod-side smoke test failed — not launching"; exit 1; }
+  || { echo "REFUSED: host-side smoke test failed — not launching"; exit 1; }
 
 if [ "$LAUNCH" != "1" ]; then
   # DELIBERATE STOP-SHORT (DEPLOY_LAUNCH=0). The code is synced and the
-  # pod-side smokes passed, but nothing is started. Note the STOP-file is
+  # host-side smokes passed, but nothing is started. Note the STOP-file is
   # left in place from the stop step above, so the supervisor stays down and
-  # the pod sits idle until someone launches on purpose.
+  # the training host sits idle until someone launches on purpose.
   echo "==> DEPLOY_LAUNCH=0 — synced and smoke-tested, NOT launching."
   echo "    runlogs/STOP is still set; the supervisor will not come back by itself."
   echo "    launch with: DEPLOY_LAUNCH=1 bash scripts/deploy_skybot.sh $PORT $HOST $TS"

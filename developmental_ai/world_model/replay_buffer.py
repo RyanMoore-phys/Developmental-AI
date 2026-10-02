@@ -1130,7 +1130,7 @@ class ReplayBuffer:
                 raise FileNotFoundError(f"{path} is missing {k}.npy")
         cols = {k: np.load(os.path.join(path, k + ".npy")) for k in _BUF_ARRAYS}
         # `restarts` is NOT in _BUF_ARRAYS: it arrived 2026-09-01 and the live
-        # pod's persisted buffer predates it. Absent means "nothing is known
+        # host's persisted buffer predates it. Absent means "nothing is known
         # to be a rebuild splice", which is precisely the pre-change
         # behaviour — so an old buffer resumes identically rather than
         # refusing to load. Making a new column mandatory would have bricked
@@ -1140,7 +1140,7 @@ class ReplayBuffer:
                             else np.zeros(int(cols["observations"].shape[0]),
                                           dtype=bool))
         # `proprio` gets the SAME treatment as `restarts`, for the same
-        # reason: it arrived 2026-09-18 and the live pod's persisted buffer
+        # reason: it arrived 2026-09-18 and the live host's persisted buffer
         # predates it. Absent means "this experience carries no body sense",
         # which reads as neutral zeros — identical to how a scout stream is
         # stored. Making it mandatory would brick the only copy of the
@@ -1150,7 +1150,7 @@ class ReplayBuffer:
             _n0 = int(cols["observations"].shape[0])
             _saved_layout = str(meta.get("sensor_layout", ""))
             # An EMPTY layout on either side means "unknown", which is the
-            # pre-bus case and must still load — the pod's buffer is the only
+            # pre-bus case and must still load — the host's buffer is the only
             # copy of the agent's experience.
             _layout_ok = (not self.sensor_layout or not _saved_layout
                           or _saved_layout == self.sensor_layout)

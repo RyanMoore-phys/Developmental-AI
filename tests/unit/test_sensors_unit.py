@@ -5,7 +5,7 @@ cannot reach the policy, that a native crop recovers what downsampling
 destroys. This file checks the PARTS: every sensor's width, range, neutral
 value, and behaviour on the malformed inputs a live client actually produces
 (a frame that failed to render, a world dict missing a key, a wrong-shaped
-buffer). Those are the failures that happen at 3am on the pod, and none of
+buffer). Those are the failures that happen at 3am on the training host, and none of
 them are interesting enough to deserve a contract.
 
 Run: PYTHONPATH=. python tests/unit/test_sensors_unit.py

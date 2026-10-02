@@ -22,7 +22,7 @@ than raw pixels, (b) avoids the full pixel variant's non-square 130x110 frame
 (our CNN path is square-only) and its aggressive downsampling, and (c) reuses
 the well-worn MLP (vector) world-model path. Set pixel_obs=false in config.
 
-DEVICE NOTE: jaxlib on the pod is CPU-only, so Craftax steps on the CPU while
+DEVICE NOTE: jaxlib on the training host is CPU-only, so Craftax steps on the CPU while
 torch trains on the GPU — a clean split, no GPU contention, ~300+ steps/s.
 """
 

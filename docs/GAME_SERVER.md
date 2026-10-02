@@ -101,12 +101,12 @@ If not already running:
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up          # opens a login URL; sign in
-tailscale ip -4            # note this 100.x.y.z — the pod bridges to it
+tailscale ip -4            # note this 100.x.y.z — the training host bridges to it
 ```
 
-### A5. (recommended) Cage the pod with an ACL
+### A5. (recommended) Cage the agent with an ACL
 
-So a pod operator can never reach your other tailnet devices, set the tailnet
+So the agent can never reach your other tailnet devices, set the tailnet
 policy (admin console → Access Controls) to:
 
 ```json
@@ -120,7 +120,7 @@ policy (admin console → Access Controls) to:
 ```
 
 Rule 1 keeps your own devices talking to everything (unchanged); rule 2 lets
-anything tagged `tag:devai` reach ONLY the game port. After approving the pod
+anything tagged `tag:devai` reach ONLY the game port. After approving the host
 (next section), tag it `tag:devai` on the Machines page.
 
 ---
@@ -128,7 +128,7 @@ anything tagged `tag:devai` reach ONLY the game port. After approving the pod
 ## B. THE TRAINING HOST
 
 Since 2026-09-22 this is the user's own machine (Ubuntu Server, 192.168.1.10),
-not a rented pod — but it is installed at `/workspace/devai` and deployed to as
+the training host — installed at `/workspace/devai` and deployed to as
 `root@` exactly like one, so every command below is unchanged.
 
 Tailscale + socat are installed by provisioning (stage 1c).
@@ -145,7 +145,7 @@ bash scripts/connect_server.sh bridge 192.168.1.XX     # the server's LAN IP
 ```bash
 # Phase 1 — login. Prints an approval URL.
 bash scripts/connect_server.sh login
-#   Open the URL in a browser on YOUR tailnet, approve "devai-pod",
+#   Open the URL in a browser on YOUR tailnet, approve the host,
 #   then tag it tag:devai in the admin console (Machines page).
 
 # Phase 2 — bridge to the server's tailscale IP (from A4), and ping it.

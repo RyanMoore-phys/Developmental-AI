@@ -6,7 +6,7 @@ WHY THIS EXISTS (2026-09-19)
     and life stats were deliberately routed through `info` rather than the
     obs tensor precisely so "obs_dim is unchanged and every saved skill
     policy stays loadable". Wave 1 then added ONE side-channel — the 13-field
-    proprio column — with optional-on-load semantics so the pod's buffer
+    proprio column — with optional-on-load semantics so the host's buffer
     survived the schema change.
 
     That pattern works. It does not scale: every further sense (a foveal
@@ -240,7 +240,7 @@ class SensorBus:
 
         Deliberately NOT over `classification`: reclassifying a sensor from
         GREEN to AMBER changes whether it is enabled by default, not what the
-        stored bytes mean, and invalidating a pod buffer over a policy
+        stored bytes mean, and invalidating a training host buffer over a policy
         decision would be exactly the kind of cost this project does not pay.
         """
         h = hashlib.sha256()

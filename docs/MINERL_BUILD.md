@@ -1,4 +1,8 @@
-# Provisioning a fresh pod
+# Building MineRL — the traps
+
+`scripts/provision_host.sh` automates all of this. You should not need to run
+any of it by hand — but when a build fails, this is why. Every trap below
+breaks the build SILENTLY, which is what makes them expensive.
 
 MineRL v1.0.0 + MCP-Reborn is **notoriously fragile** to build. The authoritative
 script is `data/scripts/provision_host.sh` (also `scripts/provision_host.sh` in the
@@ -8,9 +12,10 @@ this when a step fails.
 
 ## When you need this
 
-Only when the pod's `/workspace/devai/venv_mc` or the built MineRL jar
+Only when the training host's `/workspace/devai/venv_mc` or the built MineRL jar
 (`venv_mc/lib/python3.10/site-packages/minerl/MCP-Reborn/build/libs/mcprec-6.13.jar`)
-is missing. Because `/workspace` is a **persistent network volume**, a pod
+is missing. `/workspace` is an ordinary directory on the training host that
+you create once (see REPLICATION.md); nothing in this repo creates it.
 stop/start normally KEEPS the venv + jar — you only re-provision on a genuinely
 fresh volume.
 

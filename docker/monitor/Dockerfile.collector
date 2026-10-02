@@ -17,8 +17,8 @@ FROM alpine:3.20
 
 RUN apk add --no-cache openssh-client rsync bash coreutils
 
-# StrictHostKeyChecking=no + /dev/null known_hosts: pod providers reuse IPs
-# across pods, so the host key changes and plain ssh refuses outright.
+# StrictHostKeyChecking=no + /dev/null known_hosts: host providers reuse IPs
+# across hosts, so the host key changes and plain ssh refuses outright.
 RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh \
     && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  BatchMode yes\n  ConnectTimeout 20\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n' \
        > /root/.ssh/config \

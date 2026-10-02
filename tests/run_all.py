@@ -1,4 +1,4 @@
-"""Run every offline suite. The entry point CI and the pod both use.
+"""Run every offline suite. The entry point CI and the training host both use.
 
 TIERS, because they have different costs and different meanings:
 
@@ -43,7 +43,7 @@ CONTRACT = [
     "tests/_imagination_curiosity_smoke.py",
 ]
 
-# These need the full stack (gymnasium / minerl) and so only run on the pod.
+# These need the full stack (gymnasium / minerl) and so only run on the training host.
 # ---- KEPT IN LOCKSTEP WITH .github/workflows/ci.yml (2026-09-20) ----
 # This list was hand-written and had SIX entries while CI gated on
 # THIRTEEN, so a push failed on `_reward_fixes_smoke` — a suite the
@@ -88,7 +88,7 @@ def run(path: str, timeout: int = 900):
         # gymnasium/minerl they abort at import, and reporting that as FAIL
         # is a lie in the opposite direction from the one this runner was
         # just fixed for: ten red lines that mean nothing, which trains the
-        # reader to ignore red. They DO run on CI and the pod, where the
+        # reader to ignore red. They DO run on CI and the training host, where the
         # deps exist, so the honest report is SKIP-with-a-reason here and a
         # real result there.
         #
@@ -153,7 +153,7 @@ def main(which: str = "all") -> int:
     if skipped:
         deps = sorted({d for _n, d in skipped})
         print(f"\nSKIPPED — {len(skipped)} suite(s) need {', '.join(deps)}, "
-              f"which this machine does not have. They RUN on CI and the pod; "
+              f"which this machine does not have. They RUN on CI and the training host; "
               f"a green result here does not cover them.")
     if failures:
         print(f"\n{len(failures)} suite(s) FAILED\n")

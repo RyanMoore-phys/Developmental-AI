@@ -20,7 +20,7 @@ this machine.
 | `deploy.yml`, `host.yml`, `pipeline.yml` | **this runner** |
 
 So the container needs `openssh-client` and `rsync` (it ssh/rsyncs to the
-training pod) and **not** a Python/ML stack. It is close to idle in steady
+training host) and **not** a Python/ML stack. It is close to idle in steady
 state; the CPU/memory caps exist to bound a runaway, not to size a workload.
 
 ---
@@ -38,7 +38,7 @@ Compose **v2**. Under the old v1 client it is silently ignored — if you end up
 on v1, use the commented `cpus:` / `mem_limit:` keys in the compose file
 instead, and confirm with `docker stats` rather than assuming.
 
-## 2. Put the pod SSH key on the mini
+## 2. Put the training host SSH key on the mini
 
 The container mounts it read-only; it is never baked into the image and never
 goes near GitHub.
@@ -56,7 +56,7 @@ wrong" from "container is wrong", which otherwise present identically.
 ## 3. Configure and start
 
 ```bash
-git clone https://github.com/<your-org>/Developmental-AI.git
+git clone https://github.com/<your-org>/<your-repo>.git
 cd Developmental-AI/docker/runner
 # THE NAME MUST BE `.env` — compose interpolates ${MAIN_SSH_KEY_HOST_PATH}
 # at parse time and only reads the shell or a file called exactly `.env`.
@@ -79,7 +79,7 @@ you wipe the volumes.
 docker compose exec runner bash -c 'ssh -i "$MAIN_SSH_KEYFILE" -p "$MAIN_SSH_PORT" root@"$MAIN_HOST" hostname'
 # 3. resource caps are actually applied:
 docker stats --no-stream skybot-runner
-# 4. Actions -> pod -> Run workflow -> action=status   (read-only)
+# 4. Actions -> host -> Run workflow -> action=status   (read-only)
 # 5. reboot the mini; the runner should return to Idle with no login
 sudo reboot
 ```
@@ -129,7 +129,7 @@ mode there is.
 |---|---|
 | Logs | `docker compose logs -f` |
 | Restart | `docker compose restart` |
-| Update `MAIN_SSH_PORT` after a pod restart | edit `.env`, then `docker compose up -d` |
+| Update `MAIN_SSH_PORT` after a training host restart | edit `.env`, then `docker compose up -d` |
 | Upgrade the runner | bump `RUNNER_VERSION` in the Dockerfile, `docker compose up -d --build` |
 | Full reset | `docker compose down -v` (wipes registration — needs a fresh token) |
 

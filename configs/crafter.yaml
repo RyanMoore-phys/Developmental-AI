@@ -36,7 +36,7 @@ world_model:
   batch_size: 16                     # 16 seqs x 32 steps of 12288-d obs per WM step
   sequence_length: 32                # longer than DoorKey's 15 — Crafter dynamics are slower
   train_iters: 8
-  # 20k transitions x 12288-d float32 ~= 1.0 GB — fits the pod (251 GB) and
+  # 20k transitions x 12288-d float32 ~= 1.0 GB — fits the training host (251 GB) and
   # the Mac (40 GB). Raising this needs the uint8-storage optimization first
   # (see NEXT_OBJECTIVES; the buffer stores flat float32 today).
   buffer_capacity: 20000

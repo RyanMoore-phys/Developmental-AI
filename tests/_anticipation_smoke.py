@@ -56,7 +56,7 @@ def _train_association(m, predicate="tree_visible", key=("break", "oak_log"),
     """Repeatedly co-occur a sighting with the event so assoc[p][key] clears
     the floor — the earned-linkage substrate every other test depends on.
 
-    ---- ABSENT PERIOD FIRST (added 2026-09-02, after this failed on the pod)
+    ---- ABSENT PERIOD FIRST (added 2026-09-02, after this failed on the training host)
     Association is LIFT: how much MORE present the predicate is when the
     effect fires than it is normally. `_base` initialises to the first
     observed probability, so a helper that only ever shows the predicate
@@ -65,7 +65,7 @@ def _train_association(m, predicate="tree_visible", key=("break", "oak_log"),
 
     That was the module behaving CORRECTLY on an input shape that cannot
     occur in a real run — `tree_visible` is false most of the time — and the
-    test asserting it must pay anyway. Measured on the pod: without the
+    test asserting it must pay anyway. Measured on the training host: without the
     absent period `assoc` converged to 0.038 (below any floor) and payout
     was 0; with it, `assoc` = 0.749 and payout = 0.748.
     """

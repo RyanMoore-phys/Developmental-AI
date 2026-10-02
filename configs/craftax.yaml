@@ -39,7 +39,7 @@ world_model:
   batch_size: 16
   sequence_length: 32                # Craftax dynamics unfold over many steps
   train_iters: 8
-  # 20k transitions x 8268-d float32 ~= 0.66 GB — comfortable on the pod.
+  # 20k transitions x 8268-d float32 ~= 0.66 GB — comfortable on the training host.
   buffer_capacity: 20000
   imagination_horizon: 15
   film_conditioning: true            # action-conditioning package (H1)

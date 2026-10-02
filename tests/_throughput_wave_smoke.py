@@ -131,7 +131,7 @@ def test_A1_no_duplicated_body_drift():
     assert k == 1, (
         f"train_every is {k}: K>1 is NOT identical (one Adam step on K*N "
         f"samples != K steps on N). This used to say it 'cannot be validated "
-        f"without a live run'. It has now BEEN validated, on an A4000 pod "
+        f"without a live run'. It has now BEEN validated, on an A4000 host "
         f"(2026-09-02), and K=8 FAILS: it saves 12.7 ms/step (83% of ICM "
         f"training cost) but halves the intrinsic drive — Curiosity "
         f"(mean/step) 0.00251 -> 0.00131, -47.9%. Reason: learning progress "
@@ -144,7 +144,7 @@ def test_A1_no_duplicated_body_drift():
         f"(K=2 lr x2 +168.8%, K=4 lr x4 +79.5%, K=8 lr x8 +388.9%) — big "
         f"error drops from optimizer thrash read as learning progress, "
         f"which is a curiosity farm, not a fix. No K is merely cheaper.")
-    print(f"  A1f. config ships train_every={k}; K=8 measured on pod: "
+    print(f"  A1f. config ships train_every={k}; K=8 measured on the training host: "
           f"-83% ICM cost but -47.9% curiosity — rejected on evidence")
 
 
@@ -170,7 +170,7 @@ def test_A3_single_sync_in_select_action():
         # ships. `select_action` survives it because it does .to(self.device)
         # internally; only this hand-rolled "long way" path was device-naive,
         # and it passed on the Mac purely because there was no CUDA to
-        # disagree with. Found on the A4000 pod, 2026-09-02.
+        # disagree with. Found on the A4000 GPU host, 2026-09-02.
         t = torch.FloatTensor(obs).unsqueeze(0).to(p.device)
         aug = p._augment(p._encode(t), p._prep_knowledge(None),
                          p._prep_proprio(None))

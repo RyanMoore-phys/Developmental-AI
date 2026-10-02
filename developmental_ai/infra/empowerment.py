@@ -256,7 +256,7 @@ class EmpowermentPotential:
         self._mu += self._beta * (score - self._mu)
         self._mad += self._beta * (_dev - self._mad)
         # SPREAD_K CALIBRATED, NOT GUESSED (2026-09-04). Swept against the
-        # scores measured live on the pod (0.337-0.443) plus realistic jitter,
+        # scores measured live on the training host (0.337-0.443) plus realistic jitter,
         # scoring each k by how well a genuine improvement (0.43 -> 0.55)
         # stands out from step-to-step noise:
         #     k=2  33% of readings railed at 0/1, signal:noise 0.92x

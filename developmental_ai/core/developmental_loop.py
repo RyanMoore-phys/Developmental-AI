@@ -2933,7 +2933,7 @@ class DevelopmentalAI:
         # consulted only on the `total_timesteps is None` (forever) branch,
         # while `should_stop()` itself returned False unless `forever` was set
         # — so for a budgeted run (`forever: false`, the mode actually used on
-        # the pod) touching `lifelong.stop_file` did NOTHING. The documented
+        # the training host) touching `lifelong.stop_file` did NOTHING. The documented
         # graceful-stop escape hatch silently no-op'd, leaving SIGKILL mid-write
         # as the only way to end a run. Both halves are fixed: `should_stop()`
         # now honours the stop-file whenever lifelong is enabled, and it is
@@ -4085,7 +4085,7 @@ class DevelopmentalAI:
             """Close an ABANDONED client in the background.
 
             The docstring above says the leaked worker thread "is harmless".
-            That was measured on the 125 GB pod. On `main` (15.3 GB, 2026-09-23)
+            That was measured on the 125 GB GPU host. On `main` (15.3 GB, 2026-09-23)
             it is NOT: the abandoned process is a full Minecraft JAVA CLIENT
             holding ~0.5-1 GB, nothing ever reaped it, and `status` showed
             `java clients: 3 (want 2)` while the box sat at 99% swap with the
@@ -7587,7 +7587,7 @@ class DevelopmentalAI:
             # ---- THIS WAS logger.debug UNTIL 2026-09-04 --------------------
             # MEASURED: 158,000 steps, 9 hours, and this handler fired on
             # EVERY block while emitting nothing a human could see, because
-            # debug is below the pod's log level. Downstream, the entire
+            # debug is below the host's log level. Downstream, the entire
             # developmental engine was blocked by it and said so in a way
             # that read like data rather than absence:
             #   stage: explore (WM-error=inf, slope=-inf)   <- the ONLY
@@ -8595,7 +8595,7 @@ class DevelopmentalAI:
 
         MEASURES NOTHING NEW. Every value here is already computed for the
         segment log; this only serialises it so a dashboard can read it and a
-        pod death cannot take it. Called from exactly one site (see §4.2 note
+        host death cannot take it. Called from exactly one site (see §4.2 note
         there) and asserted as such by tests/_metrics_sink_smoke.py.
 
         Defensive throughout: a monitoring path must never be able to kill the
@@ -8758,7 +8758,7 @@ class DevelopmentalAI:
 
         Holds _wm_param_lock: with the async trainer, a state_dict() walk
         mid-optimizer-step would persist TORN weights (mixed pre/post-update
-        tensors across modules) — poisoning the pod-restore path. Waiting one
+        tensors across modules) — poisoning the training host-restore path. Waiting one
         gradient step (<1s) buys a coherent snapshot. No-op cost sync mode.
         """
         with self._wm_param_lock:
@@ -8848,7 +8848,7 @@ class DevelopmentalAI:
             try:
                 # .get("mtime"): scripted (bootstrap) slots have no policy
                 # file, hence no mtime — b["mtime"] raised KeyError and
-                # aborted the WHOLE options_state save (2026-07-23 pod run).
+                # aborted the WHOLE options_state save (2026-07-23 host run).
                 _slot_tbl = [
                     None if b is None else {
                         "skill_id": b["skill_id"],

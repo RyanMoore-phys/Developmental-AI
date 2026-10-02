@@ -7,9 +7,9 @@
 #
 # WHAT THIS RUNNER ACTUALLY DOES: it does NOT run the test suite. That is
 # ci.yml, which runs on GitHub-hosted ubuntu-latest. This runner serves
-# deploy.yml / pod.yml / pipeline.yml, which ssh + rsync to the training pod.
+# deploy.yml / host.yml / pipeline.yml, which ssh + rsync to the training host.
 # So openssh-client and rsync are LOAD-BEARING, not conveniences: without them
-# scripts/pod_exec.sh and scripts/deploy_skybot.sh fail at the first step.
+# scripts/host_exec.sh and scripts/deploy_skybot.sh fail at the first step.
 FROM ubuntu:22.04
 
 ARG RUNNER_VERSION=2.337.0
@@ -49,8 +49,8 @@ USER runner
 # both succeed, so the container looks healthy right up until the first job.
 RUN mkdir -p /home/runner/_work
 
-# StrictHostKeyChecking=no + /dev/null known_hosts: pod providers reuse IPs
-# across pods, so the host key changes and plain ssh refuses outright. This is
+# StrictHostKeyChecking=no + /dev/null known_hosts: host providers reuse IPs
+# across hosts, so the host key changes and plain ssh refuses outright. This is
 # the same setting scripts/deploy_skybot.sh documents.
 RUN mkdir -p /home/runner/.ssh && chmod 700 /home/runner/.ssh \
     && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  ConnectTimeout 20\n' \

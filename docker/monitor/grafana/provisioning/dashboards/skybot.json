@@ -150,7 +150,7 @@
       "id": 3,
       "type": "stat",
       "title": "Players online (expect num_envs)",
-      "description": "-1 IS NOT A BUG. server_poll.py records -1 when the Paper server is UNREACHABLE, deliberately: 'a down server is a data point, not an error', and skipping the write would leave a gap indistinguishable from the poller dying. The REASON is in `version`, which reads 'unreachable: <ExceptionName>' -- that column was not shown, so -1 looked like a broken gauge. A sustained -1 usually means MC_HOST in the monitor .env is stale (it held the dead RunPod address until 2026-09-28). Expect 2 when healthy: SkyBot and SkyBot1 are distinct players on an offline-mode server.",
+      "description": "-1 IS NOT A BUG. server_poll.py records -1 when the Paper server is UNREACHABLE, deliberately: 'a down server is a data point, not an error', and skipping the write would leave a gap indistinguishable from the poller dying. The REASON is in `version`, which reads 'unreachable: <ExceptionName>' -- that column was not shown, so -1 looked like a broken gauge. A sustained -1 usually means MC_HOST in the monitor .env is stale (it held the dead a rented GPU host address until 2026-09-28). Expect 2 when healthy: SkyBot and SkyBot1 are distinct players on an offline-mode server.",
       "gridPos": {
         "h": 5,
         "w": 8,

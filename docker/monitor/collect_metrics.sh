@@ -1,9 +1,9 @@
 #!/bin/bash
-# Pull SkyBot's per-segment metrics from the pod to this host, durably.
+# Pull SkyBot's per-segment metrics from the training host to this host, durably.
 #
 # TWO MECHANISMS, BECAUSE NEITHER ALONE IS SUFFICIENT:
 #   tail -F   near-instant, but loses everything written while the ssh link
-#             was down — and a rotating pod file plus a flaky tailnet means
+#             was down — and a rotating host file plus a flaky tailnet means
 #             that WILL happen on a multi-day run.
 #   rsync     complete, but only as fresh as its interval.
 # Running both makes the local copy live AND complete. Duplicates are fine:
@@ -15,12 +15,12 @@
 #
 #   MAIN_HOST, MAIN_SSH_PORT, MAIN_SSH_KEYFILE   as in the runner .env
 #   OUT_DIR      where to write (default /data)
-#   REMOTE_PATH  pod-side metrics file
+#   REMOTE_PATH  host-side metrics file
 #   RSYNC_EVERY  seconds between backfills (default 300)
 set -uo pipefail
 
 # ---- WHO WE LOG IN AS (added 2026-09-22) ----------------------------------
-# Was hardcoded to root, because RunPod only ever gave you root. The owned box
+# Was hardcoded to root, because a rented GPU host only ever gave you root. The owned box
 # `main` is a normal Ubuntu machine with a normal account, so the user is now a
 # variable. Default stays `root` so nothing that used to work stops working.
 MAIN_USER="${MAIN_USER:-root}"
@@ -49,7 +49,7 @@ mkdir -p "$OUT_DIR"
 touch "$OUT"
 
 backfill() {
-  # -a without -z: these are small JSON lines and the pod link is local-ish;
+  # -a without -z: these are small JSON lines and the training host link is local-ish;
   # compression costs more CPU on a 2-core mini than it saves.
   if ! rsync -a -e "ssh ${SSH_OPTS[*]}" \
        "${MAIN_USER}@${MAIN_HOST}:${REMOTE_PATH}" \
@@ -105,7 +105,7 @@ backfill_hb() {
   rm -f "$OUT_DIR/.hb.jsonl"
 }
 
-echo "collector: pod=${MAIN_HOST}:${MAIN_SSH_PORT} -> ${OUT} (+ heartbeat)"
+echo "collector: training host=${MAIN_HOST}:${MAIN_SSH_PORT} -> ${OUT} (+ heartbeat)"
 backfill
 backfill_hb
 LAST_RSYNC=$(date +%s)
@@ -115,7 +115,7 @@ LAST_RSYNC=$(date +%s)
 LAST_HB=$(date +%s)
 
 while true; do
-  # `tail -F` (capital) follows across ROTATION — the pod rotates this file at
+  # `tail -F` (capital) follows across ROTATION — the training host rotates this file at
   # 64 MB, and lowercase -f would silently keep reading the old inode forever.
   ssh "${SSH_OPTS[@]}" "${MAIN_USER}@${MAIN_HOST}" \
       "tail -F -n 0 '${REMOTE_PATH}' 2>/dev/null" >> "$OUT" &

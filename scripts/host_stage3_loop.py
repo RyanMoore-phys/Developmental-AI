@@ -17,7 +17,7 @@ This is deliberately short (default 300 steps, one client). It answers "does
 the machinery carry real signal end to end", not "does the agent learn" —
 that is Stage 5 and takes days.
 
-Run on the pod:
+Run on the training host:
     PYTHONPATH=. python scripts/host_stage3_loop.py --steps 300
 """
 import argparse
@@ -101,7 +101,7 @@ def main():
     t1 = time.time()
     # `run`, not `train` — DevelopmentalAI has no train(). Checked against the
     # source rather than assumed, because a wrong entry point here costs a
-    # whole pod cycle to discover.
+    # whole host cycle to discover.
     agent.run(total_timesteps=a.steps, log_interval=1000, verbose=1)
     dt = time.time() - t1
     rate = a.steps / max(1e-6, dt)

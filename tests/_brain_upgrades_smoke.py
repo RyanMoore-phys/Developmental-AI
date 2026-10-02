@@ -1,7 +1,7 @@
 """Backfill + ghost-frontier + precondition-gating smoke (Mac-ok).
 
 Contracts:
-  1. LEGACY SKILLS STILL WORK: a bank built exactly like the pod's 16
+  1. LEGACY SKILLS STILL WORK: a bank built exactly like the host's 16
      (action_dim == P, 34-d one-hot context, placeholder name, no
      preconditions, RELATIVE policy_path) binds to option slots, has its
      path repaired, and executes.
@@ -33,7 +33,7 @@ KDIM = 34          # 2*16+2, matching goals.max_slots=16
 
 
 def _legacy_bank():
-    """Reproduce the pod's 16-skill shape as closely as possible."""
+    """Reproduce the host's 16-skill shape as closely as possible."""
     from developmental_ai.skill_bank.skill_bank import SkillBank
     from developmental_ai.policy.actor_critic import StandaloneActorCritic
     shutil.rmtree(SB, ignore_errors=True)

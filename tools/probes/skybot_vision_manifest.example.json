@@ -1,8 +1,8 @@
 {
   "_comment": [
     "EXAMPLE probe manifest for tools/teacher_probe.py — the image paths",
-    "below are POD-SIDE paths (/tmp/t_*.png), the probe screenshots used",
-    "live on the pod during the constant-'true' teacher incident. They do",
+    "below are TRAINING HOST-SIDE paths (/tmp/t_*.png), the probe screenshots used",
+    "live on the training host during the constant-'true' teacher incident. They do",
     "not exist on a dev machine: copy this file, point 'image' at real",
     "screenshots (or use --fake with canned responses) before running.",
     "Positives show a wooden trunk in view; negatives show only sky or",

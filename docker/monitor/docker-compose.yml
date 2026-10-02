@@ -23,7 +23,7 @@ name: skybot-monitor
 
 services:
 
-  # 1. Pull the pod's metrics here, live + complete. See the script header for
+  # 1. Pull the host's metrics here, live + complete. See the script header for
   #    why it runs BOTH a tail and a periodic rsync.
   collector:
     # BUILT, not `image: alpine` + a runtime install. The inline

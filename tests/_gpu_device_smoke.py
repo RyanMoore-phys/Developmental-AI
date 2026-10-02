@@ -6,7 +6,7 @@ smoke verifies the fix on WHATEVER device is available:
 
   - on the Mac (CPU-only) it proves the plumbing routes through
     `policy.device` and nothing regressed;
-  - on the pod, run WITH the GPU visible — it then proves the CUDA path
+  - on the training host, run WITH the GPU visible — it then proves the CUDA path
     end-to-end (constructor placement, select_action, train_step, the
     dream-distill mix of WM latents + dream actor + policy).
 

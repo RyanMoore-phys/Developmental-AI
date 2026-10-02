@@ -165,7 +165,7 @@ def make_fake_query_fn(responses: Dict[str, str]) -> QueryFn:
     """Query fn serving canned response strings from {image_path: text}.
 
     Lookup tries the manifest's literal path first, then the basename —
-    manifests are written with pod-side paths and replayed on machines
+    manifests are written with host-side paths and replayed on machines
     where only the filename survives.  A miss returns None (a query
     failure, surfaced as data), never a fabricated answer."""
     by_base = {}

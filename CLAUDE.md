@@ -49,7 +49,7 @@ when you are iterating:
 ```bash
 PYTHONPATH=. python tests/run_all.py unit       # parts: shapes, bounds, ~3s
 PYTHONPATH=. python tests/run_all.py contract   # design arguments, ~10s
-PYTHONPATH=. python tests/run_all.py legacy     # needs gymnasium -> pod only
+PYTHONPATH=. python tests/run_all.py legacy     # needs gymnasium -> host only
 PYTHONPATH=. python tests/run_all.py all        # exit code = failing suites
 ```
 
@@ -58,9 +58,9 @@ function. A `contract` failure means a DESIGN CLAIM stopped holding — those
 docstrings name the live incident and the measured numbers, and one going red
 is a finding, not a chore. A `.pth` file in the venv makes `import developmental_ai`
 work from any cwd, but prefix `PYTHONPATH=.` anyway — that's the documented form
-in every test docstring, and it's what works on the pod.
+in every test docstring, and it's what works on the training host.
 
-Training does **not** run on the Mac. It runs on a rented GPU pod
+Training does **not** run on the Mac. It runs on a rented GPU training host
 (`scripts/launch_skybot.sh`, kept alive by `scripts/supervise_skybot.sh`).
 See `host_repository/docs/RUNNING.md`.
 
@@ -77,8 +77,8 @@ Also note `pkill -f "tailscale nc <ip>"` will kill the **socat bridge** too
 
 - **No git commits, no branches, no deployment ceremony** unless explicitly
   asked. Work and edit in place. (The repo has exactly one commit by design.)
-- **Only commit pod-proven changes** — if it hasn't run live, it isn't proven.
-- **Never wipe `skill_bank_mc_curiosity/`** on the pod. It is the agent's
+- **Only commit training host-proven changes** — if it hasn't run live, it isn't proven.
+- **Never wipe `skill_bank_mc_curiosity/`** on the training host. It is the agent's
   accumulated developmental memory.
 - Peer learning between SkyBots is a *feature*, not contamination. Multiple
   agents on one server is a deliberate social-learning experiment.
@@ -195,7 +195,7 @@ reversing a principle requires deleting a test that explains itself, rather than
 quietly appending four lines of YAML.
 
 **Don't trust `STATE.md`.** It has been stale and sent a session chasing a
-terminated pod while the live one ran elsewhere. Verify against the running
+terminated host while the live one ran elsewhere. Verify against the running
 system.
 
 ---
@@ -203,13 +203,13 @@ system.
 ## 6. Live infrastructure
 
 - **Training host (since 2026-09-22): the user's own main computer**, not a
-  rented pod. Ubuntu Server at **192.168.1.10**, on the **LAN and the tailnet
+  rented training host. Ubuntu Server at **192.168.1.10**, on the **LAN and the tailnet
   at once**. RTX 5050 (8 GB), Ryzen 5 5500 (6c/12t), **16 GB RAM**, 256 GB NVMe
-  — far tighter than the pod it replaced (16 GB VRAM, 128 cores, 125 GB RAM),
+  — far tighter than the training host it replaced (16 GB VRAM, 128 cores, 125 GB RAM),
   and several config values were cut to fit (see below). Everything still
   installs at `/workspace/devai` and deploys as `root@`, deliberately: the box
-  is shaped like a pod so almost nothing needed changing. **One thing did, and
-  it cost a failed deploy (2026-09-22): `/workspace` itself.** On RunPod that
+  is shaped like a training host so almost nothing needed changing. **One thing did, and
+  it cost a failed deploy (2026-09-22): `/workspace` itself.** On a rented GPU host that
   was the platform-mounted network volume, present before any script ran —
   nothing in this repo has ever created it, and `provision_host.sh` opens with
   `cd /workspace/devai || exit 1`, so it cannot be what makes it either. On an
@@ -219,20 +219,20 @@ system.
   is not one.** `deploy_skybot.sh` now creates it and prints the filesystem and
   free space, because a silently-created `/workspace` on the root disk is also
   how you would learn far too late that a data volume failed to mount.
-  The old vast.ai pod is off. IPs in `host_repository/docs/RUNNING.md` are
-  **stale** (older RunPod box).
+  The old a rented GPU host host is off. IPs in `host_repository/docs/RUNNING.md` are
+  **stale** (older a rented GPU host box).
 - **Everything targets the host via the runner's `.env`**, never a value in the
   tree: `MAIN_HOST`, `MAIN_SSH_PORT`, `MAIN_SSH_KEYFILE`, `MAIN_USER`,
   `MC_SERVER_TS_IP`. To
   move hosts again, edit `.env` — not the repo. See `docs/CI_SETUP.md`.
   **These were `POD_*` until 2026-09-22** (138 occurrences across 14 files).
-  Renamed because the name had stopped describing the thing: there is no pod,
+  Renamed because the name had stopped describing the thing: there is no training host,
   the target is the owned box `main`, and the port no longer rotates. There is
   deliberately **no `POD_*` fallback** — every consumer guards with `:?` and
   names the missing variable, so a stale `.env` fails loudly at the preflight
   instead of expanding to `root@` and reporting `Could not resolve hostname`.
 - **`MAIN_USER` (added 2026-09-22) — the login account, was hardcoded `root`.**
-  RunPod only ever gave you root; `main` is a normal Ubuntu box, so it is
+  a rented GPU host only ever gave you root; `main` is a normal Ubuntu box, so it is
   `skybot`. Default stays `root`, so a root host is unchanged. **A non-root
   `MAIN_USER` REQUIRES PASSWORDLESS SUDO on the target** — provisioning installs
   apt packages and creates `/workspace` under `/`. `provision_host.sh` now routes
@@ -249,14 +249,14 @@ system.
   the `.env` on the address. To use the name there too, add
   `extra_hosts: ["main:192.168.1.10"]` to the runner service first.
 - **`podlogs/` is now `runlogs/`, and every `pod_*` file is `host_*` (2026-09-22).**
-  267 references across 61 files; `pod.yml` became `host.yml` (safe — `deploy.yml`
+  267 references across 61 files; `host.yml` became `host.yml` (safe — `deploy.yml`
   triggers on `workflows: ["ci"]`, never on this one). **THE TRAP IS BRAIN STATE,
   NOT CODE.** `break_memory_path` lives under that directory, so any backup taken
   before this rename carries `podlogs/` paths: restoring one onto a renamed tree
   silently starts the break memory EMPTY rather than erroring, and the agent
   re-opens every mastered block tier at full worth. On restore, `mv podlogs
   runlogs` FIRST. This was safe to do now only because `main` was unprovisioned
-  and the old pod was already off — there was no live state to orphan.
+  and the old host was already off — there was no live state to orphan.
 - **`workflow_run` RUNS THE WORKFLOW FILE FROM THE DEFAULT BRANCH (2026-09-22).**
   `deploy.yml` triggers on `workflow_run: workflows: ["ci"]`, so GitHub executes
   **`main`'s copy of `deploy.yml`**, never the branch you pushed. Its
@@ -296,8 +296,8 @@ system.
   training throughput.
 - **Backups:** brain state (`world_model.pt`, `symbolizer.pt`, `familiarity.pt`,
   `magnet.pt`, `knowledge_graph.json`, `options_state.json`, break memory, skill
-  bank) lives **only on the training host**. A pod died with ~11 days of
-  unbacked state. Moving to owned hardware removes the *pod-terminated* risk
+  bank) lives **only on the training host**. A training host died with ~11 days of
+  unbacked state. Moving to owned hardware removes the *training host-terminated* risk
   and replaces it with *disk failure* — 256 GB, one NVMe, no redundancy — so
   the habit still stands: **rsync the brain host→Mac periodically during long
   runs.** Code always flows Mac→host, so code is never at risk.
@@ -334,7 +334,7 @@ system.
 | Sensors, slots, action space | `docs/PLURALITY_ROADMAP.md` — phases 1-7 |
 | How any of it gets proven | `docs/TESTING_PLAN.md` — stages 0-5 |
 | What's next | `NEXT_OBJECTIVES.md`, `ROADMAP.md` |
-| Pod ops | `host_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
+| Host ops | `host_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
 | Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |
 
 ---
@@ -343,7 +343,7 @@ system.
 
 Keep this in view; it's the point of the project.
 
-- **399 blocks broken in pod history → exactly 1 log, ever.** Later runs reached
+- **399 blocks broken in host history → exactly 1 log, ever.** Later runs reached
   13,305 breaks with **35 logs**; all log skills sit at **0/20**.
 - Chopping a tree — the original objective — **has never been learned**.
 - Most historical "progress" was the agent finding a way to get paid for doing

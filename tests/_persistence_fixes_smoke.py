@@ -7,7 +7,7 @@ THE TWO LIVE FINDINGS THIS ENCODES
    map_location="cpu", while the live encoder sits on the run's device. So
    `to_delta`'s `w - b` raised "Expected all tensors to be on the same
    device", the caller caught it and stored the skill WHOLE. Measured on
-   the live pod: two failures in one run and 14 MB per skill — the entire
+   the live training host: two failures in one run and 14 MB per skill — the entire
    compression win absent on exactly the hardware that trains.
 
 2. THE MAGNET WAS AMNESIAC ACROSS RESTARTS. `reset()` preserves curiosity

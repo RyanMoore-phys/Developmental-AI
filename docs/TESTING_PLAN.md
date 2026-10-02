@@ -1,6 +1,6 @@
 # Testing plan — proving the new machinery works, and keeps working
 
-*2026-09-19. Covers Phases 1–7. Written to be executed on the pod, in order,
+*2026-09-19. Covers Phases 1–7. Written to be executed on the training host, in order,
 over days rather than in one pass.*
 
 ---
@@ -28,9 +28,9 @@ produced its numbers. A green test is not a result.
 |---|---|---|---|
 | **unit** (54 cases, 3 files) | Parts: shapes, bounds, neutrals, degenerate inputs | ~3 s | anywhere |
 | **contract** (5 suites) | Design: the arguments each wave was built on | ~7 s | anywhere |
-| **legacy** (6 suites) | Regression surface predating this work | ~60 s | needs gymnasium ⇒ pod |
-| **integration** (§4) | The stack boots and steps against real MineRL | minutes | pod |
-| **soak** (§5) | Behaviour over hours: does anything drift, latch or farm? | hours–days | pod |
+| **legacy** (6 suites) | Regression surface predating this work | ~60 s | needs gymnasium ⇒ host |
+| **integration** (§4) | The stack boots and steps against real MineRL | minutes | host |
+| **soak** (§5) | Behaviour over hours: does anything drift, latch or farm? | hours–days | host |
 
 ```bash
 PYTHONPATH=. python tests/run_all.py unit
@@ -48,7 +48,7 @@ MineRL that no amount of reading settles.
 
 | # | Question | How | If NO |
 |---|---|---|---|
-| 0.1 | Does MineRL build and step at all on this pod? | `scripts/host_stage0.py --boot` | **Stop.** Report. |
+| 0.1 | Does MineRL build and step at all on this training host? | `scripts/host_stage0.py --boot` | **Stop.** Report. |
 | 0.2 | Does the action space contain `hotbar.1-9`, `left`, `right`, `sprint`, `sneak`? | `_validate_macros` crashes at boot if not; `--dump-space` prints it | Remove those macros (append-only, so indices 0–20 survive) and re-run. Report the reduced set. |
 | 0.3 | Does POV include the HUD overlay? | `--dump-frame` writes a PNG; inspect the bottom 12% | A2 stays disabled permanently; A9 keeps the keys but the agent cannot see selection. Record it. |
 | 0.4 | Is there any audio handler? | `--probe-audio` lists observation handlers | Expected NO. M1 stays disabled; the Python half waits. |
@@ -58,7 +58,7 @@ let me know and stop"* is decided. It is deliberately first and cheap.
 
 ---
 
-## 3. Stage 1 — offline suites on the pod
+## 3. Stage 1 — offline suites on the training host
 
 Same code, real hardware, plus the six legacy suites that need the full
 stack and therefore have never run on a dev Mac.
@@ -195,10 +195,10 @@ history.** Watch it, not the reward number:
 
 Once a soak run is stable:
 
-- **Every commit:** `tests/run_all.py all` on the pod. Exit code gates.
+- **Every commit:** `tests/run_all.py all` on the training host. Exit code gates.
 - **Hourly:** per-sensor variance + the six falsifier plots.
-- **Daily:** scoreboard delta; `rsync` the brain pod→Mac (CLAUDE.md §6 — a
-  pod has already died with ~11 days of unbacked state).
+- **Daily:** scoreboard delta; `rsync` the brain training host→Mac (CLAUDE.md §6 — a
+  host has already died with ~11 days of unbacked state).
 - **Weekly:** re-run one ablation to confirm the conclusion still holds.
 
 **When something breaks, encode it as a test.** That is why every contract

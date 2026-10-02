@@ -674,16 +674,16 @@ by inverse loss only, CE inverse loss, post-normalization reward_scale).
 Lesson recorded twice over: a unit-verified reward change still needs a
 full-run canary, and the baseline arm IS the canary.
 
-### Rerun status (compute migrated to the RunPod pod, 2026-07-12 — 48 vCPU;
+### Rerun status (compute migrated to the a rented GPU host training host, 2026-07-12 — 48 vCPU;
 ### Mac runs stopped mid-flight, partials salvaged below; final artifacts land
-### in rung4_pod_s*/rung3_pod_s*/capstone_h2_s* on the pod)
+### in rung4_pod_s*/rung3_pod_s*/capstone_h2_s* on the training host)
 
 - **Rung 8 (counterfactual)** with the fixed WM: **DECISIVE PASS** — posterior
   matching **0.540** (chance 0.145, prior 0.211; bar was 0.245/0.291);
   abduction lesion −91% changed-dims error. First rung lifted by H1.
 - **Rung 9 (law induction)**: **DECISIVE PASS** — see the Rung 9 section.
 - **Rung 3 re-confirm**: **DECISIVE PASS under the final H3 normalization**
-  (2 seeds, pod + salvaged Mac). tv_frac LP vs novelty: seed 42 **0.008 vs
+  (2 seeds, host + salvaged Mac). tv_frac LP vs novelty: seed 42 **0.008 vs
   0.049**, seed 7 **0.002 vs 0.059** — LP ignores the noisy TV by ~30–45×;
   frontier coverage 1.00 for both arms both seeds. The median-center/
   clamp-at-zero curiosity change did NOT harm the autotelic result.
@@ -703,7 +703,7 @@ full-run canary, and the baseline arm IS the canary.
   fixed WM is the honest open follow-up (not run — reduced local protocol was
   5x5 only). The dream_off baseline (0.832/0.859) beats the historical ~0.74,
   confirming the fix stack improved base learning.
-- **Capstone H2 validation** (4 seeds, full arm, LLM OFF, on the pod):
+- **Capstone H2 validation** (4 seeds, full arm, LLM OFF, on the training host):
   **DECISIVE PASS — a CLEAN SWEEP.** All 4 seeds (42, 7, 123, 7777)
   final competence **[1.00, 1.00, 1.00]**, retention_drop **[0,0,0]**,
   **AUC 1.000** — every seed mastered all three envs AND retained perfectly.
@@ -930,7 +930,7 @@ crafting macros for real tech-tree depth (Treechop is a one-concept world).
 **Scaffold implementation (2026-07-16, post-pivot):** shipped and smoke-tested.
 `VisionScaffold` (`developmental_ai/llm/vision_scaffold.py`): llava:7b via
 local Ollama assesses the agent's own POV every 25 steps (async single-slot,
-1.0s/call on the pod GPU, stall-safe) → ANNEALED shaping = potential-based
+1.0s/call on the training host GPU, stall-safe) → ANNEALED shaping = potential-based
 approach term `w·(Φₜ−Φₜ₋₁)` + chop-while-aimed instinct bonus; `w` hits zero
 at 75k steps. Never selects actions. Shaped reward feeds learning (PPO mix +
 replay/WM reward head); the raw env reward stream (metrics, spike discovery,
@@ -958,12 +958,12 @@ throttled. All rung/parallel regressions clean.
 
 | Concern | File | Notes |
 |---|---|---|
-| Vision-LLM scaffold | `developmental_ai/llm/vision_scaffold.py` | instinct channel; config `llm.vision.*`; llava:7b on pod Ollama |
+| Vision-LLM scaffold | `developmental_ai/llm/vision_scaffold.py` | instinct channel; config `llm.vision.*`; llava:7b on the training host Ollama |
 | MineRL adapter | `developmental_ai/environments/minerl_env.py` | macros (60-tick chop `_ticks`), crash rebuild, custom-resolution spec |
 | Parallel collection | `developmental_ai/core/developmental_loop.py` | `_run_episode_parallel`, `_ensure_parallel_envs`, thread pool |
 | Stage gate fixes | `developmental_ai/core/glue_layer.py` | `_slope` window cap; `force_imagine_timestep` backstop |
 | Minecraft configs | `configs/minecraft_parallel.yaml`, `minecraft_200m.yaml`, `minecraft_128.yaml` | 12.5M / 200.6M / 200.6M@128px |
-| Launcher | `run_minecraft.py` | pod-only, xvfb; launch with `PYTHONUNBUFFERED=1` |
+| Launcher | `run_minecraft.py` | training host-only, xvfb; launch with `PYTHONUNBUFFERED=1` |
 
 ## Standing constraints
 

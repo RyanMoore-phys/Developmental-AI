@@ -55,7 +55,7 @@ crafter>=1.8.0
 #   _scouts_in_ppo_live_smoke    -> crafter   (already a hard dep above)
 # On a fresh box: `pip install -r requirements.txt && pip install minigrid`.
 # Both surface as ModuleNotFoundError, which reads exactly like a code
-# failure and cost a diagnostic cycle on the A4000 pod.
+# failure and cost a diagnostic cycle on the A4000 GPU host.
 
 # --- Utilities ---
 pyyaml>=6.0                # Configuration file parsing

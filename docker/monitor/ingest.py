@@ -10,7 +10,7 @@ THE RAW JSONL IS THE SYSTEM OF RECORD; THIS DB IS A VIEW.
 
 WHY seq AND NOT rowid/timestamp
     The collector runs a live `tail -F` AND a periodic rsync backfill, so the
-    same record legitimately arrives twice. `seq` is assigned by the pod-side
+    same record legitimately arrives twice. `seq` is assigned by the host-side
     sink, is strictly increasing, and survives a restart (it is persisted in a
     sidecar precisely so a rotation cannot rewind it). Two records with the
     same seq are the same record.

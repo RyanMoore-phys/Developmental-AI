@@ -1,95 +1,159 @@
-# Developmental AI
+# Developmental AI — SkyBot
 
-A curiosity-driven neurosymbolic RL agent that learns **Minecraft (MineRL
-Treechop) with no videos/demos** — Learning-Progress curiosity + a
-curiosity-ranked vision "magnet" + discovered goals → minted skills +
-DreamerV3-style world model + PPO + local-VLM symbolic grounding, run as a
-**lifelong continuous stream**.
+A curiosity-driven neurosymbolic reinforcement-learning agent that learns
+Minecraft **from scratch**. No demonstrations, no videos, no recipe book, no
+reward for things a human thinks are important.
 
-## Testing
+It gets pixels and buttons, and has to find out what they do.
 
-Three tiers, one runner. `tests/run_all.py` shells out to the same standalone
-`__main__` scripts the project has always used, so running one directly still
-works — the runner just gives CI and the pod a single exit code.
+---
+
+## The standing principle
+
+> **Meaning and skill are earned from experience, never declared.**
+
+This is a constraint, not a slogan. The build fails if a scripted macro appears
+in the config — `tests/_no_scripted_skills_smoke.py` enforces it. If you think
+you need to hand the agent a "chop tree" primitive, the answer is no, and the
+test will say so.
+
+The honest consequence: **chopping a tree has never been learned.** Across the
+project's history, 399 blocks broken produced exactly 1 log; a later run reached
+13,305 breaks and 35 logs, with every log-related skill still at 0/20. Most
+apparent "progress" turned out to be the agent finding a way to get paid for
+doing nothing — staring at the sky (96% of its drive), sitting in a villager's
+trade menu (77% of its income), holding attack against an unreachable trunk.
+
+That scoreboard is kept deliberately visible. It is the point of the project,
+and it is why every reward change here is judged against block counts rather
+than against the reward number — which has been wrong every single time.
+
+---
+
+## What's inside
+
+| piece | where | role |
+|---|---|---|
+| DreamerV3-style RSSM world model | `world_model/rssm.py` | predicts latents; the substrate for imagination |
+| PPO actor-critic | `policy/actor_critic.py` | the shared policy every skill copies from |
+| Options / SMDP | `policy/options.py` | skills as temporally-extended actions |
+| ICM + learning-progress curiosity | `curiosity/` | the intrinsic drive |
+| Imagination curiosity | `curiosity/imagination_curiosity.py` | the drive that survives a mastered world |
+| Vision magnet + fovea | `llm/vision_scaffold.py` | curiosity-ranked visual seeking |
+| Local VLM (optional) | `llm/vlm_symbolizer.py` | symbol grounding from pixels |
+| Knowledge graph | `knowledge_graph/` | asserted and retracted facts |
+| Sensor bus | `sensors/` | transducers that report, never classify |
+| Spatial memory | `spatial/` | egocentric occupancy, successor map |
+| The loop that owns all of it | `core/developmental_loop.py` | reward assembly, stepping, training |
+
+Two design rules worth knowing before reading the code:
+
+**Senses vs meanings.** A sense is a transducer reporting a physical quantity
+without naming it; a meaning classifies. Senses may feed the policy. Meanings
+are evaluation-only — the agent is never handed a label it did not earn.
+
+**Reward channels are not interchangeable.** `intrinsic` is zeroed while a GUI
+is open; any penalty placed there is erased exactly when it is needed. Before
+adding a reward term you must answer: which channel, is it gated, does it
+survive occlusion, and what does it pay while the agent does nothing?
+
+---
+
+## Quickstart
 
 ```bash
-PYTHONPATH=. python tests/run_all.py unit       # ~3s   parts: shapes, bounds, neutrals
-PYTHONPATH=. python tests/run_all.py contract   # ~10s  design arguments, with measured numbers
-PYTHONPATH=. python tests/run_all.py legacy     #       needs gymnasium -> pod only
-PYTHONPATH=. python tests/run_all.py all        # exit code = number of failing suites
+git clone <your-org>/<your-repo> && cd <your-repo>
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+
+PYTHONPATH=. ./venv/bin/python tests/run_all.py unit       # ~3s
+PYTHONPATH=. ./venv/bin/python tests/run_all.py contract   # ~10s
 ```
 
-**The tiers mean different things.** A `unit` failure is a bug in a function.
-A `contract` failure means a *design claim* stopped holding — those docstrings
-name the live incident and the numbers it was measured at, so one going red is
-a finding rather than a chore.
+Tests are standalone `__main__` scripts, not pytest. Each prints numbered
+contract lines and ends with `[name] ALL PASS`.
 
-| File | What it defends |
+The two tiers mean different things. A **unit** failure is a bug in a function.
+A **contract** failure means a design claim stopped holding — those docstrings
+name the live incident and the measured numbers, and one going red is a
+finding, not a chore.
+
+Training does not run on a laptop. See **[`docs/REPLICATION.md`](docs/REPLICATION.md)**.
+
+---
+
+## Hardware
+
+The reference deployment is deliberately modest, and every number below was
+measured rather than estimated:
+
+| | reference | note |
+|---|---|---|
+| GPU | 8 GB VRAM | tight. The world model peaks near 6.7 GB in fp32 |
+| RAM | 16 GB | forced `batch_size` 16 → 8 and made a local 3B VLM unaffordable |
+| Disk | 256 GB | all brain state lives here, unbacked |
+| CPU | 6 cores | the Minecraft clients compete with torch |
+
+**Throughput is the binding constraint**, not capability: ~0.6 environment
+steps/second against a ~10/s ceiling, which makes the configured 4M-step budget
+roughly 77 days. Spend better hardware on throughput first.
+
+---
+
+## Documentation
+
+| read this | for |
 |---|---|
-| `tests/unit/test_sensors_unit.py` | every sensor's width, range, neutral, and behaviour on malformed frames |
-| `tests/unit/test_world_model_unit.py` | flow head, warps, ego geometry, horizons, gradient reachability |
-| `tests/unit/test_spatial_slots_unit.py` | occupancy, successor, walkability, slots, buffer columns |
-| `tests/_perspective_smoke.py` | depth-from-motion: the identity warp, auto-masking, depth ordering |
-| `tests/_sensor_bus_smoke.py` | the sensor bus, and that RED never reaches the policy |
-| `tests/_oracle_isolation_smoke.py` | the privileged channel is evaluation-only, three ways |
-| `tests/_spatial_memory_smoke.py` | re-registration signs, memory decay, annotation-by-interaction |
-| `tests/_fine_aim_smoke.py` | the action space: aim resolution, append-only, no one-way doors |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | how the organism is wired — streams, subsystems, reward structure |
+| [`docs/REPLICATION.md`](docs/REPLICATION.md) | standing it up from bare machines |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | running it, reading status, crashes, backups |
+| [`docs/MONITORING.md`](docs/MONITORING.md) | the two metric stacks and how to extend them |
+| [`docs/GAME_SERVER.md`](docs/GAME_SERVER.md) | the Minecraft server side — version bridge, RCON, tailnet ACL |
+| [`docs/MINERL_BUILD.md`](docs/MINERL_BUILD.md) | why the MineRL build is the way it is; read when provisioning fails |
+| [`docs/TESTING_PLAN.md`](docs/TESTING_PLAN.md) | how any of it gets proven |
+| [`docs/PERSPECTIVE_LEARNING.md`](docs/PERSPECTIVE_LEARNING.md) | learning 3D structure from 2D motion |
+| [`docs/PLURALITY_ROADMAP.md`](docs/PLURALITY_ROADMAP.md) | richer observation structure, phases 1–7 |
+| [`docs/GENERAL_INFRASTRUCTURE.md`](docs/GENERAL_INFRASTRUCTURE.md) | domain-independent redesign |
+| [`CLAUDE.md`](CLAUDE.md) | **the incident record** — recurring bug classes, each paid for by a failed run |
 
-### On a pod
+If you read only one supporting document, make it `CLAUDE.md`. It is written
+for coding agents working on this repo, but it is the most useful thing here
+for a human too: every rule in it exists because something broke.
 
-```bash
-scripts/deploy_host.sh <user@host> [port]        # rsync + env + offline suites
-PYTHONPATH=. python scripts/host_stage0.py --all # BLOCKING MineRL feasibility
-PYTHONPATH=. python scripts/host_stage2_integration.py --steps 500
-PYTHONPATH=. python scripts/host_continuous.py --interval 1800   # ledger
-PYTHONPATH=. python scripts/host_falsifiers.py   # the paid-for-nothing checks
-```
-
-Staging, gates and what each stage proves: `docs/TESTING_PLAN.md`.
-
+---
 
 ## Repository layout
 
-| Path | What it is |
-|---|---|
-| **`developmental_ai/`** | The code package (the organism). All imports resolve here. |
-| **`configs/`** | Run configs. The live one is `configs/minecraft_skybot.yaml`. |
-| **`scripts/`** | Pod scripts: `provision_host.sh`, `launch_lifelong.sh` (MineRL), `launch_skybot.sh` + `connect_server.sh` (external Minecraft server over Tailscale), `mc_ping.py`, `rcon.py`. |
-| **`run_minecraft.py`** | Main entry point (synced to the pod, launched there). |
-| **`host_repository/`** | 📕 **Ops reference + rescued brain backup.** Start at `host_repository/README.md` for build/run/transfer docs; `host_repository/data/` holds the 3.5 GB skill-bank backup. |
-| **`tests/`** | All smoke/probe/unit tests (`_*_smoke.py`, probes, `test_components.py`). |
-| **`experiments/`** | Historical rung/ablation/capstone work — `scripts/` (runners) + `results/` (outputs). Not part of the current Minecraft workflow. |
-| **`docs/`** | Design docs, architecture diagrams (`arch*.mmd/png`, `FLOWMAPS.md`), historical audits. |
-| **`viewer/`** | Live brain viewer web assets. |
-| **`tools/`** | Dev utilities (`dream`, `visualize_world_model.py`, viewer launchers). |
-| **`assets/`** | Screenshots / images. |
-| **`archive/`** | Superseded scripts kept for reference. |
-| `skill_bank_data/`, `skill_bank_doorkey/`, `logs/` | Local data dirs referenced by non-Minecraft configs — **do not move** (config-referenced). |
-| `venv/` | Local Python 3.9 dev venv (the pod uses its own `venv_mc`). |
-| `AUDIT_FINDINGS.md`, `ROADMAP.md`, `NEXT_OBJECTIVES.md` | Active top-level docs. |
+```
+developmental_ai/     the agent
+  core/               the loop that owns everything
+  world_model/        RSSM, replay buffer
+  policy/             actor-critic, options
+  curiosity/          ICM, learning progress, imagination
+  sensors/  spatial/  slots/   perception and memory
+  environments/       Minecraft adapter (the only engine-specific file)
+  infra/              gates, ledger, empowerment, advisor
+configs/              minecraft_skybot.yaml is the one that matters
+tests/                standalone contract + unit suites
+scripts/              provisioning, deploy, launch, exporters
+docker/               CI runner and monitoring stacks
+docs/                 everything above
+```
 
-## Running things
+---
 
-**Scripts are run from the repo root**, e.g. `python tests/_vision_magnet_smoke.py`.
-The repo is made importable-from-any-cwd by a `.pth` file in the venv
-(`venv/.../site-packages/devai_repo_root.pth` → the repo root), which is why
-scripts in `tests/` and `experiments/` can `import developmental_ai` after being
-moved out of the root. (This is the local dev equivalent of `pip install -e .`;
-it only affects this Mac venv, not the pod.)
+## Contributing
 
-- **Run the smoke tests:** `python tests/<name>.py`
-- **Train on the pod:** see `host_repository/docs/RUNNING.md`
-- **Set up / move a pod:** see `host_repository/docs/PROVISIONING.md` and
-  `host_repository/docs/TRANSFER.md`
-- **Current state & what's next:** `host_repository/docs/STATE.md`
-- **General (domain-independent) infrastructure programme:**
-  `docs/GENERAL_INFRASTRUCTURE.md` — 57 proposed changes derived from measured
-  failures, each with problem/solution/reasoning, aimed at making the core work
-  in *any* environment (another game, a robot, a language stream) rather than
-  only in Minecraft.
+CI runs on GitHub-hosted runners for every push and pull request. Deployment
+workflows run on a self-hosted runner and are gated to the upstream repository
+— a fork's pull request cannot reach it.
 
-## The one rule
+If you change a reward term, say in the PR what it pays while the agent does
+nothing. That question has caught more bugs here than any other.
 
-**Never wipe `skill_bank_mc_curiosity/`** (on the pod) — it's the agent's
-accumulated developmental memory. Its verified backup is in
-`host_repository/data/`.
+---
+
+## License
+
+**Not yet declared.** Without a licence file, default copyright applies and
+nobody may legally reuse this. If you intend others to build on it, add one
+before publishing.

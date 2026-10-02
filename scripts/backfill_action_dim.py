@@ -10,7 +10,7 @@ real skills out of the bank.
 
 The backfill is safe precisely because of WHEN it runs: every skill currently
 in the bank was minted in the 10-action era — the widening does not exist on
-the pod yet. Writing `action_dim=10` records a historical fact, not a guess.
+the training host yet. Writing `action_dim=10` records a historical fact, not a guess.
 (Inferring `rows - k_slots` at bind time remains forbidden: k_slots is a
 config knob that has changed across eras. This script encodes era knowledge
 instead, once, explicitly, with a backup.)

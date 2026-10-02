@@ -4,7 +4,7 @@ WHY NOT PYTEST. Every test in this project is a standalone `__main__` that
 prints numbered contract lines and ends with "[name] ALL PASS". That
 convention exists so a test is readable as an ARGUMENT — the docstring names
 the live incident, the measured numbers and the contracts — and so it can be
-run on a pod with nothing installed. Adding a framework would trade that for
+run on a training host with nothing installed. Adding a framework would trade that for
 a dependency and a different output format.
 
 This gives the unit layer the same shape with ~40 lines: a `case`

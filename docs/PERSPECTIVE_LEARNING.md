@@ -196,7 +196,7 @@ inherited it.
 
 ## 5. Wave 2 — objectness, behind a go/no-go
 
-**Do not start this until both hold on live pod data:**
+**Do not start this until both hold on live host data:**
 
 1. `flow_loss` is measurably **decreasing** on live frames (not synthetic);
 2. `flow_fovea` correlates with real contact events (break events / `_reach_now`).
@@ -219,7 +219,7 @@ separate input change with its own blast radius.
 PYTHONPATH=. ./venv/bin/python tests/_perspective_smoke.py
 ```
 
-Nine contracts, all synthetic or static — **no pod run required**:
+Nine contracts, all synthetic or static — **no host run required**:
 
 | | Contract |
 |---|---|
@@ -238,7 +238,7 @@ ratio **1.40×** on a scene whose true shift ratio is 4×. Ordered correctly,
 under-separated — which is the honest reading of a small head trained for 400
 steps on eight frames.
 
-### 6.1 On the pod
+### 6.1 On the training host
 
 - `flow` loss must **fall** on live frames. That is the Wave 2 go/no-go.
 - WM block wall-time: expect +10–15%. **Revert trigger** if worse with no loss
@@ -402,13 +402,13 @@ magnitude the moment this ships, which is the live confirmation.
 accumulates per-phase wall clock and prints `Phase timing: … | UNACCOUNTED …`,
 and we are at ~3.4 steps/s against a 10 steps/s ceiling with the config's own
 finding that *our* Python is the binding constraint. But **there are no
-`runlogs` on this machine** and the pod is tailnet-only, so the read could not
+`runlogs` on this machine** and the training host is tailnet-only, so the read could not
 be performed. It remains the largest available multiplier and it needs no new
 ideas — just that line, off the running system.
 
 ## 13. Verification
 
-17 contracts, all passing, no pod required:
+17 contracts, all passing, no host required:
 
 - **A–I** — Wave 1, unchanged, now serving as the regression suite.
 - **J** — zero flow is the identity warp (the bug above).

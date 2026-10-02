@@ -158,7 +158,7 @@ def main() -> None:
     # exists); what is asserted here is that it remains a real bound, not that
     # it holds one particular value. The test was left at 200 after the config
     # moved, so this suite had been failing — and scripts/deploy_skybot.sh
-    # gates the pod launch on it, so the deploy gate was RED.
+    # gates the training host launch on it, so the deploy gate was RED.
     assert _cap <= 400, (
         f"log_tick_cap {_cap} is too loose to bound a runaway streak")
     # OFF by default so no other environment's reward changes
@@ -224,7 +224,7 @@ def main() -> None:
     # in the same loop body by the felt-reach block, so the first iteration
     # died with AttributeError on every launch — three identical crashes
     # before the supervisor's deterministic-fault guard stopped retrying.
-    # Neither the unit tests nor the pod-side deploy gate exercise
+    # Neither the unit tests nor the host-side deploy gate exercise
     # _collect_segment, so nothing caught it before it hit production.
     assert "self._last_world_info: Dict[str, Any] = {}" in loop_src, (
         "_last_world_info is not initialised at construction — it is read "

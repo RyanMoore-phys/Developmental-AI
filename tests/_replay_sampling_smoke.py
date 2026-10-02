@@ -2,7 +2,7 @@
 
 THE MEASURED FAILURE THIS ENCODES
 
-    Profiled on the pod, 2048 steps, two clients:
+    Profiled on the training host, 2048 steps, two clients:
 
         store_buf   605.6 ms  36.2%   <- waiting for the replay-buffer lock
         env         460.1 ms  27.5%
@@ -210,7 +210,7 @@ def test_gather_does_less_work_for_identical_values():
     IT IS NOT, HOWEVER, WHERE THE TIME GOES. Measured interleaved, min of 9
     runs at a 12,288-wide observation: 1.115 ms before, 1.140 ms after — no
     difference beyond noise. The fancy-index gather of scattered rows
-    dominates, not the copy. My original reading of the 2334 ms pod
+    dominates, not the copy. My original reading of the 2334 ms training host
     measurement attributed it to this copy, and that was wrong.
 
     So this contract asserts what is actually true: the same values, out of
@@ -246,7 +246,7 @@ def test_gather_does_less_work_for_identical_values():
 def test_add_does_not_queue_behind_a_sampler():
     """G. THE ACTUAL FIX, and the only one whose benefit is wall clock.
 
-    `add()` costs 0.094 ms. On the pod it spent ~605 ms per step QUEUEING,
+    `add()` costs 0.094 ms. On the training host it spent ~605 ms per step QUEUEING,
     because sample_sequences held the buffer lock across the whole gather and
     the learner called it 384 times per block. This measures exactly that:
     how long a write waits while a sampler hammers the buffer from another

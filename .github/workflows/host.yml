@@ -1,4 +1,4 @@
-# Manual pod operations. Nothing here is triggered by a push.
+# Manual host operations. Nothing here is triggered by a push.
 #
 # NO BRANCH PROTECTION, NO GITHUB SECRETS, NO TAILNET REQUIRED.
 # Every action runs through scripts/host_exec.sh, which defaults to plain SSH
@@ -20,12 +20,12 @@
 # repo. On a public repo any fork could run arbitrary code as the runner user.
 name: host
 
-# The run list showed five identical rows called "pod" with no way to tell a
+# The run list showed five identical rows called "training host" with no way to tell a
 # read-only `status` from a `launch` or a destructive `provision`. run-name is
 # evaluated per run, so the action (and the timestep budget, which is the only
 # other thing that changes what a launch DOES) goes in the title.
 run-name: >-
-  pod · ${{ inputs.action }}${{ inputs.action == 'launch' && format(' · {0} steps', inputs.timesteps) || '' }} · by @${{ github.actor }}
+  host · ${{ inputs.action }}${{ inputs.action == 'launch' && format(' · {0} steps', inputs.timesteps) || '' }} · by @${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -43,13 +43,13 @@ on:
         default: ""
 
 jobs:
-  pod:
+  training host:
     runs-on: self-hosted
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      # NOT branch protection — this guards YOUR POD. `provision` does
+      # NOT branch protection — this guards YOUR TRAINING HOST. `provision` does
       # `rm -rf mc-build` and rebuilds MineRL from scratch (40-60 min). Run by
       # accident against a working box it destroys an hour of build for
       # nothing. Delete this step if you would rather have the footgun.
@@ -61,11 +61,11 @@ jobs:
             exit 1
           fi
 
-      - name: Preflight — pod reachable
+      - name: Preflight — host reachable
         run: |
           set -euo pipefail
-          bash scripts/host_exec.sh 'echo "pod: $(hostname)"' \
-            || { echo "::error::cannot reach the pod. If using the default ssh transport, MAIN_SSH_PORT rotates on every pod restart — update the runner .env."; exit 1; }
+          bash scripts/host_exec.sh 'echo "training host: $(hostname)"' \
+            || { echo "::error::cannot reach the training host. If using the default ssh transport, MAIN_SSH_PORT rotates on every host restart — update the runner .env."; exit 1; }
 
       # ---------------------------------------------------------------- #
       - name: status
@@ -208,7 +208,7 @@ jobs:
           [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY"; exit 1; }
           SSH="ssh -p $MAIN_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
           # SUDO-AWARE: / is not writable by a non-root MAIN_USER, and on a
-          # fresh host /workspace does not exist at all (RunPod mounted it for
+          # fresh host /workspace does not exist at all (a rented GPU host mounted it for
           # free; an owned box does not). Create it, then hand it to the login
           # user so the rsync below can write into it.
           $SSH "${MAIN_USER:-root}@$MAIN_HOST" '
@@ -221,7 +221,7 @@ jobs:
             developmental_ai configs scripts tests run_minecraft.py requirements.txt \
             "${MAIN_USER:-root}@$MAIN_HOST:/workspace/devai/"
           # TS_AUTHKEY (optional, runner .env) lets stage 1c join the tailnet
-          # non-interactively so the pod comes out already reachable.
+          # non-interactively so the training host comes out already reachable.
           $SSH "${MAIN_USER:-root}@$MAIN_HOST" "cd /workspace/devai && TS_AUTHKEY='${TS_AUTHKEY:-}' \
             nohup bash scripts/provision_host.sh > runlogs/provision.log 2>&1 < /dev/null &
             echo started"

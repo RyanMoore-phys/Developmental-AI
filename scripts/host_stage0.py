@@ -6,7 +6,7 @@ decides whether a whole roadmap item is alive or dead. They are first, and
 cheap, deliberately: the alternative is discovering on hour six of a soak run
 that a third of the action space was being dropped at the socket.
 
-  0.1  Does MineRL build and step at all on this pod?
+  0.1  Does MineRL build and step at all on this training host?
   0.2  Does the action space contain the keys the new macros press —
        hotbar.1-9, left, right, sprint, sneak? A key the engine lacks is
        ACCEPTED SILENTLY by `act[k] = v` and dropped at the socket, so the
@@ -20,7 +20,7 @@ that a third of the action space was being dropped at the socket.
 Exit code 0 = go. Non-zero = stop and report, which is what the standing
 instruction asks for.
 
-Run on the pod:
+Run on the training host:
     PYTHONPATH=. python scripts/host_stage0.py --all
 """
 import argparse

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Bring up the pod->external-Minecraft-server tunnel, in two phases (the
+# Bring up the training host->external-Minecraft-server tunnel, in two phases (the
 # tailscale device-approval step is interactive and cannot be scripted).
 #
 #   Phase 1 (login):   bash scripts/connect_server.sh login
 #     -> starts tailscaled in USERSPACE mode and prints an approval URL.
-#        Open it in a browser signed into YOUR tailnet, approve "devai-pod",
+#        Open it in a browser signed into YOUR tailnet, approve "devai-training host",
 #        then (recommended) tag it tag:devai in the admin console so the ACL
 #        cages it to only the game port. See docs/SERVER_CONNECTION.md.
 #
@@ -36,10 +36,10 @@ case "${1:-}" in
   login)
     # AUTHKEY MODE (added 2026-09-02 for CI): `login --authkey <key>`, or set
     # TS_AUTHKEY in the environment. This is the ONLY way GitHub Actions can
-    # bring a pod onto the tailnet — the interactive branch below prints a URL
+    # bring a training host onto the tailnet — the interactive branch below prints a URL
     # a human must click, which in CI hangs the job until it times out.
     #
-    # --ssh IS LOAD-BEARING, not a nicety. This pod has no /dev/net/tun, so
+    # --ssh IS LOAD-BEARING, not a nicety. This host has no /dev/net/tun, so
     # tailscaled runs --tun=userspace-networking, and in that mode INBOUND raw
     # TCP to the tailnet IP is not routable — sshd listens on 0.0.0.0:22 but
     # nothing on the tailnet can reach it. Tailscale SSH is terminated inside
@@ -64,7 +64,7 @@ case "${1:-}" in
     if [ -n "$AUTHKEY" ]; then
       echo "tailscaled up (userspace). Non-interactive login (authkey)..."
       # --reset so a re-run cannot inherit stale flags from a previous `up`.
-      tailscale up --authkey="$AUTHKEY" --hostname=devai-pod --ssh \
+      tailscale up --authkey="$AUTHKEY" --hostname=devai-host --ssh \
         --advertise-tags=tag:devai --reset \
         || { echo "tailscale up FAILED (authkey expired/not tag-authorised?)"; exit 1; }
       tailscale status >/dev/null 2>&1 \
@@ -75,12 +75,12 @@ case "${1:-}" in
     fi
 
     echo "tailscaled up (userspace). Requesting login..."
-    tailscale up --hostname=devai-pod 2>&1 | tee /tmp/ts_up.log &
+    tailscale up --hostname=devai-host 2>&1 | tee /tmp/ts_up.log &
     sleep 8
     echo ""
     echo ">>> APPROVE THIS DEVICE (open in a browser on your tailnet):"
     grep -oE "https://login.tailscale.com/[a-zA-Z0-9/]+" /tmp/ts_up.log | head -1 \
-      || echo "    (no URL yet — run: tailscale up --hostname=devai-pod)"
+      || echo "    (no URL yet — run: tailscale up --hostname=devai-training host)"
     echo ">>> Then tag it tag:devai in the admin console (ACL cage), then run:"
     echo ">>>   bash scripts/connect_server.sh bridge <server-tailscale-ip>"
     ;;
@@ -91,8 +91,8 @@ case "${1:-}" in
     # 127.0.0.1:25565 — so nothing downstream has to know which way the packets
     # actually leave this box: not `environment.remote_server` in
     # configs/minecraft_skybot.yaml, not launch_skybot.sh's pre-flight, not
-    # pod.yml's `connect` action. Only the FAR side of the socat changes, which
-    # is why moving from a rented pod to a LAN machine needs no config edit and
+    # host.yml's `connect` action. Only the FAR side of the socat changes, which
+    # is why moving from a rented host to a LAN machine needs no config edit and
     # no workflow edit — just a different address in the runner .env.
     #
     # RFC1918 ADDRESSES GO OVER PLAIN TCP. `tailscale nc` speaks only to the

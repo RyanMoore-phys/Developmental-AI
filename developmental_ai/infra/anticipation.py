@@ -45,7 +45,7 @@ ASSOCIATION IS *LIFT*, AND THAT HAS A COUNTERINTUITIVE CONSEQUENCE
     the world.
 
     The consequence to know about (found 2026-09-02, when the smoke test
-    asserted otherwise and failed on the pod): a predicate held
+    asserted otherwise and failed on the training host): a predicate held
     CONTINUOUSLY present builds no association, so a very long
     uninterrupted sighting streak erodes the association it is
     accumulating toward. Measured: feeding only present-frames drove

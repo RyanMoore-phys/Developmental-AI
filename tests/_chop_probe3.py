@@ -14,7 +14,7 @@ Random biome risk is handled by walking far (~12 cycles) and jumping; a
 plains spawn may still miss trees — treat 'no trees seen in frames' as
 inconclusive rather than negative, so we also save frames every cycle.
 
-POD ONLY:  xvfb-run -a ./venv_mc/bin/python _chop_probe3.py
+TRAINING HOST ONLY:  xvfb-run -a ./venv_mc/bin/python _chop_probe3.py
 """
 import os
 import time

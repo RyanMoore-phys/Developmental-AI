@@ -33,7 +33,7 @@ is no filter to forget.
 
 ## 2. Validation status
 
-All on an RTX 2000 Ada pod against real MineRL, 2026-09-19/20.
+All on an RTX 2000 Ada training host against real MineRL, 2026-09-19/20.
 
 | | |
 |---|---|
@@ -112,7 +112,7 @@ macros, which are distinguished by `_ticks`, not by keys.
 
 ## 4. Measured resource profile
 
-Pod: RTX 2000 Ada (16 GB), 128 cores, 125 GB RAM, Ubuntu, Python 3.10.
+Training host: RTX 2000 Ada (16 GB), 128 cores, 125 GB RAM, Ubuntu, Python 3.10.
 
 ### 4.1 Brain (world model, live config)
 
@@ -159,7 +159,7 @@ sizing a long run.
 | **CPU** | 8 cores | **16+** | MineRL clients are CPU-bound; `taskset` pins one core per client |
 | **Brain storage** | — | **10 GB per archived brain** | 482 MB world model + symbolizer + magnet + familiarity + KG + skill bank + options, with headroom for several generations |
 
-**Back up the brain, not the buffer.** A pod has already died with ~11 days of
+**Back up the brain, not the buffer.** A training host has already died with ~11 days of
 unbacked state. The buffer is large and re-collectable; the brain is small and
 is not.
 

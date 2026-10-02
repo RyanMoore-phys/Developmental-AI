@@ -15,7 +15,7 @@ Through OUR adapter (new macro table, 128px agent obs, 512px render):
      few prototype buckets (not one-per-frame), and the reward call runs
      clean end-to-end on real data.
 
-POD ONLY (after provisioning):
+TRAINING HOST ONLY (after provisioning):
     DISPLAY=:77 PYTHONUNBUFFERED=1 ./venv_mc/bin/python _hold_probe.py
 """
 import os

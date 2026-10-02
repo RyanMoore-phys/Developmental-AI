@@ -40,7 +40,7 @@ BREAKS YET`. Zero blocks of any kind — not a log, not dirt — across ~125,000
 steps.** Meanwhile every subsystem repaired over the last two days reports
 healthy.
 
-All numbers below are measured from the live pod, not inferred.
+All numbers below are measured from the live training host, not inferred.
 
 ---
 
@@ -280,9 +280,9 @@ within noise; per-step torch CPU work is ~3% of a step) and
 **10 rebuilds in 121 segments**, against 1-in-76 on the best run. Each
 rebuild is a rejoin and a discontinuity in the lifelong stream.
 
-### 5.3 Peer count is bounded by the Minecraft server, not the pod
+### 5.3 Peer count is bounded by the Minecraft server, not the training host
 4 clients ⇒ 0 segments in 17 minutes, 9 rebuilds, `TimeoutError` on the
-trainer↔java socket — while the pod was idle (bridge 0.3% CPU, GPU 0–13%,
+trainer↔java socket — while the training host was idle (bridge 0.3% CPU, GPU 0–13%,
 load 4/48, distinct core pins). 2 clients are stable. Also: remote peers are
 *cheaper* than local scouts (generating a world costs more than receiving
 chunks).

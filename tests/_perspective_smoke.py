@@ -463,8 +463,8 @@ def test_buffer_proprio_column():
 
     THE PRECEDENT THIS FOLLOWS IS `restarts`. That column arrived 2026-09-01
     against a persisted buffer that predated it, and was made optional on load
-    for a reason worth restating: the pod's buffer is the ONLY copy of the
-    agent's experience, and a new column that refuses to load bricks it. A pod
+    for a reason worth restating: the host's buffer is the ONLY copy of the
+    agent's experience, and a new column that refuses to load bricks it. A training host
     has already died with ~11 days of unbacked state.
 
     The width check is the sharper hazard. If PROPRIO_KEYS ever changes, field

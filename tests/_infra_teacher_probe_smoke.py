@@ -16,7 +16,7 @@ Contracts:
   6. run_manifest carries the exit-code contract: any FAIL -> 1, all
      PASS -> 0, malformed manifest contained -> 1.
   7. The shipped example manifest is structurally valid and PASSes end
-     to end under a perfect fake teacher keyed by its pod-side paths.
+     to end under a perfect fake teacher keyed by its host-side paths.
   8. The CLI in --fake mode exits with run_manifest's code and never
      touches the network (host points at a dead port).
 """
@@ -191,12 +191,12 @@ def test_example_manifest():
     neg = [i for i in q["items"] if not i["expect"]]
     assert len(pos) == 3 and len(neg) == 2, (pos, neg)
     assert all(i["image"].startswith("/tmp/t_") for i in q["items"])
-    # a perfect fake teacher keyed by the pod paths PASSes end to end
+    # a perfect fake teacher keyed by the training host paths PASSes end to end
     canned = {i["image"]: json.dumps({"answer": i["expect"]})
               for i in q["items"]}
     rep = run_manifest(manifest, make_fake_query_fn(canned))
     assert rep["all_pass"] and rep["results"][0]["discrimination"] == 1.0
-    print(f"  7. example manifest: {len(pos)}+/{len(neg)}- pod-side items, "
+    print(f"  7. example manifest: {len(pos)}+/{len(neg)}- host-side items, "
           f"perfect fake -> PASS")
 
 

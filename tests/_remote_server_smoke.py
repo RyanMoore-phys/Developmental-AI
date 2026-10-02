@@ -7,9 +7,9 @@ Checks the three links of the chain that can be verified offline:
   3. make_env passes remote_server through to the adapter (signature check).
 
 The LIVE join is proven by tests/_remote_join_probe.py (launches a real
-client on the pod; needs the external server reachable + whitelist open).
+client on the training host; needs the external server reachable + whitelist open).
 
-Run: PYTHONPATH=. python tests/_remote_server_smoke.py   (venv_mc on pod)
+Run: PYTHONPATH=. python tests/_remote_server_smoke.py   (venv_mc on the training host)
 """
 import inspect
 import sys

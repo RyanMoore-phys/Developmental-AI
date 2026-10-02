@@ -218,7 +218,7 @@ def _read_screen_fx(ctx: Dict) -> Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 # Kept first in registration order so its offsets are byte-identical to the
 # Wave 1 column. A restored buffer written before the bus existed therefore
-# lines up field-for-field, which is what lets the pod keep its experience.
+# lines up field-for-field, which is what lets the training host keep its experience.
 
 def make_proprio_sensor(width: int, read) -> Sensor:
     return Sensor("proprio", width, read, classification=GREEN, version=1)
@@ -519,7 +519,7 @@ def _read_sky(ctx: Dict) -> Optional[np.ndarray]:
 #
 # SHIPPED DISABLED, and the reason is a fact I could not check rather than a
 # preference: it is unverified whether MineRL's POV includes the HUD overlay
-# at all. One frame dump from the pod settles it. If the HUD is not rendered
+# at all. One frame dump from the training host settles it. If the HUD is not rendered
 # this sensor reads a strip of world and is worse than nothing, so it stays
 # off until somebody looks.
 #

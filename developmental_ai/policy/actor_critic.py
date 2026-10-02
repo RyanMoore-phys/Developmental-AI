@@ -823,7 +823,7 @@ class StandaloneActorCritic:
         # inf. That value flows into _compute_gae as both `values` and the
         # bootstrap, so ONE diverging update turns every advantage into NaN,
         # NaNs the weights, and poisons the checkpoint — on a brain that
-        # lives only on the pod. Before symlog a divergence grew linearly and
+        # lives only on the training host. Before symlog a divergence grew linearly and
         # was survivable; this makes it exponential, so the bound comes with
         # it. Sizing: the largest single-row reward here is ~51 (a felled
         # log) and a discounted option-horizon return stays well under 1e3,

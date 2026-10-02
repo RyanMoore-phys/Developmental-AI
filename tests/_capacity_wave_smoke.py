@@ -12,7 +12,7 @@ WHY THESE FIVE, AND WHY TOGETHER
   4. prospection.horizon              15 -> 24
   5. world_model.encoder/decoder_hidden 512 -> 768
 
-They are together because there was NOTHING TO INVALIDATE: no pod, no live
+They are together because there was NOTHING TO INVALIDATE: no training host, no live
 brain, and skill_bank.storage_dir was already repointed to an empty directory
 by the arch: rssm change. Two of the five are checkpoint-breaking (3 orphans
 every stored skill, 5 orphans world_model.pt), so doing them now is free and
@@ -24,7 +24,7 @@ one-key ablation and a 1M-step run is a weekend on a Mac Mini.
 
 WHAT THIS FILE CAN AND CANNOT CHECK
 ================================================================================
-This machine has no GPU, no pod and no MineRL. So this asserts CONTRACTS and
+This machine has no GPU, no host and no MineRL. So this asserts CONTRACTS and
 SHAPES and prints MEASURED parameter counts — it does not and cannot measure
 VRAM high-water, WM block time, or step rate. Those have instruments now
 (`AsyncWM ... block ms/iter`, `Phase timing:`, `Curiosity (mean/step)`) and
@@ -63,7 +63,7 @@ def _mb(m):
 # ------------------------------------------------------------------ 1 -----
 def test_config_values():
     # 16 -> 8 (2026-09-24). The capacity wave raised this to 16 on a 16 GB
-    # pod. `main` has 7.56 GiB usable and the run DIED on it -- same CUDA OOM
+    # training host. `main` has 7.56 GiB usable and the run DIED on it -- same CUDA OOM
     # three times, supervisor self-stopped, torch holding 6.66 GiB. This is
     # the revert `_data_diet_smoke` named in advance as the first thing to
     # undo if the budget did not hold. The other four values below are
@@ -305,7 +305,7 @@ def test_dream_distill_is_visible():
 # ------------------------------------------------------------------ 9 -----
 def test_what_this_cannot_check():
     """Named explicitly so nobody reads ALL PASS as 'the wave is validated'."""
-    print("  17. NOT CHECKED HERE (no GPU/pod/MineRL on this machine) — read "
+    print("  17. NOT CHECKED HERE (no GPU/training host/MineRL on this machine) — read "
           "on the first cluster run:")
     for line in ("VRAM high-water",
                  "`AsyncWM ... block ms/iter` at batch 16",

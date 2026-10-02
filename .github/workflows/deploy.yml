@@ -1,4 +1,4 @@
-# Sync code to the pod. Runs automatically after `ci` succeeds, and can be run
+# Sync code to the training host. Runs automatically after `ci` succeeds, and can be run
 # by hand at any time from any branch.
 #
 # NO BRANCH PROTECTION IS ASSUMED (2026-09-02). This is a single-maintainer
@@ -12,7 +12,7 @@
 #
 # TRANSPORT defaults to plain SSH, NOT tailscale. The self-hosted runner is
 # the maintainer's own machine: it already holds ~/.ssh/skybot_ed25519 and can
-# reach the pod's public endpoint, so nothing extra needs configuring. Set
+# reach the host's public endpoint, so nothing extra needs configuring. Set
 # DEPLOY_TRANSPORT=tailscale in the runner's .env to switch — that path needs a
 # tailnet ACL rule (docs/CI_SETUP.md) and is strictly optional.
 #
@@ -21,7 +21,7 @@
 # the runner user, on your machine.
 name: deploy
 
-# Which commit went to the pod, and whether it was auto (after ci) or manual.
+# Which commit went to the training host, and whether it was auto (after ci) or manual.
 # `workflow_run` runs carry the triggering branch/sha in their own payload —
 # github.ref_name would say the DEFAULT branch, which is not necessarily what
 # was deployed.
@@ -49,10 +49,10 @@ on:
         type: boolean
         default: false
 
-# Two runs must not race a half-synced tree onto one pod. cancel-in-progress
+# Two runs must not race a half-synced tree onto one training host. cancel-in-progress
 # is FALSE on purpose: cancelling mid-rsync would leave exactly that.
 concurrency:
-  group: deploy-pod
+  group: deploy-training host
   cancel-in-progress: false
 
 jobs:
@@ -60,6 +60,17 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    # FORKS CANNOT REACH THIS RUNNER (2026-10-01, for publishing).
+    # `workflow_run` DOES fire for pull requests from forks, and it runs in
+    # the BASE repo context with full runner access -- the documented
+    # escalation path onto a self-hosted runner from a public repo. The job
+    # below ssh's into the training host, so this guard is the thing standing
+    # between a stranger's PR and the box.
+    # workflow_dispatch is unaffected: dispatching already requires write
+    # access, and head_repository is absent there, hence the || clause.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
@@ -79,7 +90,7 @@ jobs:
           echo "transport: ${DEPLOY_TRANSPORT:-ssh}"
           echo "launch:    ${{ github.event.inputs.launch || 'false' }}"
 
-      - name: Preflight — can we reach the pod at all?
+      - name: Preflight — can we reach the training host at all?
         run: |
           set -euo pipefail
           T="${DEPLOY_TRANSPORT:-ssh}"
@@ -88,7 +99,7 @@ jobs:
             command -v tailscale >/dev/null || { echo "::error::tailscale CLI not on the runner host"; exit 1; }
             # If this HANGS rather than fails, the tailnet ACL ssh rule is
             # action "check" (interactive re-auth) instead of "accept".
-            tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" 'echo "pod: $(hostname)"' \
+            tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" 'echo "training host: $(hostname)"' \
               || { echo "::error::Tailscale SSH to ${MAIN_HOST} failed — see docs/CI_SETUP.md"; exit 1; }
           else
             : "${MAIN_HOST:?MAIN_HOST not set in the runner .env (training-host IP for ssh transport)}"
@@ -97,16 +108,16 @@ jobs:
             [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY on the runner host"; exit 1; }
             ssh -p "$MAIN_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
-                "${MAIN_USER:-root}@$MAIN_HOST" 'echo "pod: $(hostname)"' \
-              || { echo "::error::ssh to $MAIN_HOST:$MAIN_SSH_PORT failed. The pod's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
+                "${MAIN_USER:-root}@$MAIN_HOST" 'echo "training host: $(hostname)"' \
+              || { echo "::error::ssh to $MAIN_HOST:$MAIN_SSH_PORT failed. The host's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
           fi
 
       # STEP-LEVEL TIMEOUT (added 2026-09-02). A hang here used to run until
       # the 30-minute JOB timeout, and GitHub marks the job failed while the
       # step still shows "in progress" with no error printed — the worst
-      # possible diagnostic. 12 minutes is generous for rsync + four pod-side
+      # possible diagnostic. 12 minutes is generous for rsync + four host-side
       # smoke suites; anything longer is a hang, not slow work.
-      - name: Sync code + pod-side smoke tests
+      - name: Sync code + host-side smoke tests
         timeout-minutes: 12
         env:
           # deploy_skybot.sh reads these; MAIN_HOST/MAIN_SSH_PORT/MAIN_SSH_KEYFILE
@@ -118,7 +129,7 @@ jobs:
           set -euo pipefail
           bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
 
-      - name: Report final pod state
+      - name: Report final host state
         run: |
           T="${DEPLOY_TRANSPORT:-ssh}"
           CMD='cd /workspace/devai 2>/dev/null || exit 0

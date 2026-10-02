@@ -23,7 +23,7 @@ around a metric read converts "this name is wrong" into "this number is zero".
 
 WHAT THIS TEST DOES
 -------------------
-It is a STATIC contract, deliberately: it needs no torch, no env and no pod,
+It is a STATIC contract, deliberately: it needs no torch, no env and no training host,
 so it can run on the Mac before every deploy. It asserts that every attribute
 and dict key the emitter reads actually exists on the class that provides it,
 and that new counters are declared where they are written.
@@ -148,7 +148,7 @@ def test_swallowed_world_model_failure_is_loud():
     """A silent `except` held the entire developmental ladder down.
 
     MEASURED 2026-09-04: `_train_world_model` hit its ValueError handler on
-    every block for 158,000 steps while logging at DEBUG — below the pod's
+    every block for 158,000 steps while logging at DEBUG — below the host's
     level, so it printed nothing. Downstream: no reconstruction error -> the
     stage controller stuck at `explore` with WM-error=inf -> IMAGINE
     unreachable -> the dream never ran -> no goal unlocks -> nothing minted.
@@ -164,7 +164,7 @@ def test_swallowed_world_model_failure_is_loud():
                      if not ln.lstrip().startswith("#"))
     assert "logger.debug" not in body, (
         "the world-model failure is logged at DEBUG again — it will be "
-        "invisible on the pod, exactly as it was for 158k steps")
+        "invisible on the training host, exactly as it was for 158k steps")
     assert "logger.warning" in body, "must log at warning or above"
     assert "exc_info=True" in body, (
         "without exc_info the traceback is lost, and 'training never started' "

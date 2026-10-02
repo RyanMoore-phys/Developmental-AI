@@ -1274,7 +1274,7 @@ class SkillBank:
             # while `enc` is the LIVE encoder on the run's device — so on a
             # GPU box this subtraction used to raise a device mismatch,
             # which was caught below and answered by storing the skill
-            # whole. Measured on the live pod: 14 MB per skill and the
+            # whole. Measured on the live training host: 14 MB per skill and the
             # compression win absent on exactly the hardware that trains.
             # Matching the base's device here also keeps CUDA tensors out
             # of the checkpoint file. to_delta aligns devices defensively

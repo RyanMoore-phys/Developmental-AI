@@ -19,7 +19,7 @@ Prints every reward event with its tick. Verdict:
   reward > 0  -> mechanism WORKS; failures are exploration/guidance.
   reward == 0 -> mechanism (or reward wiring) is BROKEN — env-level bug.
 
-POD ONLY, ~6-8 min:  xvfb-run -a ./venv_mc/bin/python _chop_probe.py
+TRAINING HOST ONLY, ~6-8 min:  xvfb-run -a ./venv_mc/bin/python _chop_probe.py
 """
 import time
 

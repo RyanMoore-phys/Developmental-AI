@@ -4,7 +4,7 @@
 # Run it from anywhere:   bash scripts/setup_runner.sh
 #
 # It will prompt for a REGISTRATION TOKEN, which you get here:
-#   https://github.com/<your-org>/Developmental-AI/settings/actions/runners/new
+#   https://github.com/<your-org>/<your-repo>/settings/actions/runners/new
 # Copy only the token itself — the long string after `--token` in the snippet
 # GitHub shows. It expires after ~1 hour and is single-use; if this script
 # fails partway, just fetch a fresh one.
@@ -18,11 +18,11 @@
 # the repo at all is the real fix.
 set -euo pipefail
 
-REPO_URL="https://github.com/<your-org>/Developmental-AI"
+REPO_URL="https://github.com/<your-org>/<your-repo>"
 RUNNER_VERSION="2.337.0"
 RUNNER_DIR="$HOME/actions-runner"
 RUNNER_NAME="${RUNNER_NAME:-skybot-$(hostname -s)}"
-# LABEL IS LOAD-BEARING: .github/workflows/{deploy,pod}.yml target
+# LABEL IS LOAD-BEARING: .github/workflows/{deploy,training host}.yml target
 # `runs-on: [self-hosted, skybot]`. Without `skybot` the jobs queue forever
 # with no error — GitHub simply never finds a matching runner.
 LABELS="skybot"
@@ -75,7 +75,7 @@ echo "==> configuring as '${RUNNER_NAME}' with labels: self-hosted,${ARCH},${LAB
 unset TOKEN
 
 # ---- the .env the workflows read ------------------------------------------
-# Values are NOT secrets, but they live here rather than in the repo so a pod
+# Values are NOT secrets, but they live here rather than in the repo so a training host
 # rebuild is a one-file edit and nothing connection-specific is ever committed.
 if [ -f "$RUNNER_DIR/.env" ]; then
   echo "==> .env already exists, leaving it alone"
@@ -87,8 +87,8 @@ else
 
 # --- required ---
 # THE TRAINING HOST. Since 2026-09-22 this is the owned Ubuntu box `main` on
-# the LAN, NOT a rented pod -- which is why these are MAIN_* and not POD_*.
-# The port no longer rotates (that was RunPod remapping 22 on every restart);
+# the LAN, NOT a rented host -- which is why these are MAIN_* and not POD_*.
+# The port no longer rotates (that was a rented GPU host remapping 22 on every restart);
 # it is a fixed sshd on a fixed address, so this file should now be stable.
 MAIN_HOST=192.168.1.10
 MAIN_SSH_PORT=22
@@ -97,7 +97,7 @@ MAIN_SSH_PORT=22
 MAIN_USER=skybot
 MAIN_SSH_KEYFILE=$HOME/.ssh/id_ed25519
 
-# --- required for: pod.yml action=connect ---
+# --- required for: host.yml action=connect ---
 MC_SERVER_TS_IP=100.64.0.11
 
 # --- optional ---
@@ -128,9 +128,9 @@ Runner installed.
 
 CHECK IT:
   1. ${REPO_URL}/settings/actions/runners  -> should show "Idle"
-  2. bash scripts/host_exec.sh 'hostname'   -> should print the pod hostname
+  2. bash scripts/host_exec.sh 'hostname'   -> should print the training host hostname
      (run with the same env: set -a; . ~/actions-runner/.env; set +a)
-  3. Actions -> pod -> Run workflow -> action=status
+  3. Actions -> host -> Run workflow -> action=status
 
 macOS CAVEAT: svc.sh installs a LaunchAgent, so the runner only runs while
 you are LOGGED IN and the Mac is AWAKE. If it sleeps, queued jobs simply wait.

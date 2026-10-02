@@ -3,11 +3,11 @@
 Written after the H1–H5 audit packages landed. Prerequisite state: WM
 action-causality fixed (rung 8 ✅), rung 9 law-induction ✅, curiosity
 normalization settled, honest-eval machinery (H4) in place, compute moved to
-the RunPod pod (48 vCPU + RTX 4000 Ada 20GB; see memory/vm notes — run CPU
+the a rented GPU host host (48 vCPU + RTX 4000 Ada 20GB; see memory/vm notes — run CPU
 mode until Objective 2 lands). Ordered by leverage; each has a falsifiable
 deliverable, per house rules.
 
-## 0. Close out the audit validation (IN FLIGHT on the pod)
+## 0. Close out the audit validation (IN FLIGHT on the training host)
 Capstone H2 validation (4 seeds, LLM-off; pass = 0/4 collapses AND AUC ≥
 vanilla's ~0.71), rung 4 full rerun (does dreaming help now that the WM is
 causal — or only stop hurting?), rung 3 final artifact. When these land,
@@ -77,7 +77,7 @@ demands cumulative learning — the claim MiniGrid could never test.
 > fact extraction) is now gated by `_skip_perdim_symbolic = pixel_obs OR
 > obs_dim>2000` — so it auto-skips on Craftax's 8268-d obs (would've been 8268
 > heads) while low-dim MiniGrid (151-d) is unchanged. Smoke-verified
-> (`_craftax_smoke.py`, 4/4 on the pod) + full regression green on Mac AND pod
+> (`_craftax_smoke.py`, 4/4 on the training host) + full regression green on Mac AND training host
 > (CPU + CUDA). Probe: 84 steps/s GPU (10.4M-param MLP WM; JAX-on-CPU env +
 > torch-on-GPU learning, clean split). **Real 1M-step run DONE (2026-07-14,
 > GPU L4, 2.27h, ~123 st/s effective).** Clean — no NaN/crash, 0 KG facts (gate
@@ -91,13 +91,13 @@ demands cumulative learning — the claim MiniGrid could never test.
 > (achievements/inventory via the rulebook) instead of the auto-skipped per-dim
 > path; the pixel variant (non-square 130×110, needs square-resize).
 
-## 2. Fix the GPU device bug — **FIXED (2026-07-14); CUDA-verified on pod**
+## 2. Fix the GPU device bug — **FIXED (2026-07-14); CUDA-verified on the training host**
 `StandaloneActorCritic` now takes `device` (threaded from the loop), moves
 actor/critic/conditioner to it, and creates every input tensor on it;
 `train_step` keeps a CPU numpy copy for GAE (a CUDA tensor's `.numpy()` would
 raise). Verified on CPU: `_gpu_device_smoke.py` (placement, select_action,
 train_step, dream actor, end-to-end distill graph) + full regression green.
-**First step of the next pod session: run `_gpu_device_smoke.py` and
+**First step of the next host session: run `_gpu_device_smoke.py` and
 `_crafter_smoke.py` with the GPU visible — that's the CUDA proof — then
 launch Crafter training** (1M steps; ~32h on Mac CPU at 8.7 steps/s, the
 RTX 4000 should cut that several-fold).
@@ -123,7 +123,7 @@ rung-7 5-check bar, unchanged — it refused a false pass once already.
 If Objective 0's 4-seed capstone is stable: extend to 8 seeds, add the
 vanilla arm, bootstrap CIs (stats.py), seeded argmax eval (H4) — turning
 "H2 fixed the collapse" into a defensible claim. Optionally revive LLM
-shaping on the pod (Ollama fits comfortably in 251GB RAM / 48 cores — use
+shaping on the training host (Ollama fits comfortably in 251GB RAM / 48 cores — use
 llama3.2:3b, cadence-capped) to test whether it adds ANYTHING post-H2; if
 yes, distill its judgments into a tiny reward MLP (amortized shaping).
 
@@ -134,7 +134,7 @@ prescribed (e.g. interference pairs: task B's optimal policy punishes task
 A's habits). **Falsifiable:** intact allocation beats uniform where practice
 is NOT fungible; scramble still craters.
 
-## 7. Legacy-rung statistics upgrade (cheap, pod-parallel)
+## 7. Legacy-rung statistics upgrade (cheap, training host-parallel)
 Re-run the decisive rungs (3, 6, 8, 9) at 6–8 seeds with H4 protocol
 (seeded argmax eval, CIs, artifacts) — 48 cores make this an afternoon.
 Turns every headline claim into a re-derivable artifact. Enable

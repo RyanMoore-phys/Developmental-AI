@@ -1,7 +1,7 @@
 """VLM wiring smoke (2026-09-20).
 
 THE LIVE FAILURE THIS ENCODES
-    `ollama list` showed `qwen2.5vl:3b` present on the pod. Every run logged
+    `ollama list` showed `qwen2.5vl:3b` present on the training host. Every run logged
 
         VLM MODEL NOT FOUND: 'qwen2.5vl:3b' is not on the Ollama server.
         Available: ["model='qwen2.5vl", "model='qwen2.5vl:3b' modified_at=..."]

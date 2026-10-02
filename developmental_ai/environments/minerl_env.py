@@ -1,6 +1,6 @@
 """MineRL (Minecraft) → Gymnasium adapter.
 
-Real Minecraft, via MineRL 1.0 (master). Verified on the pod against
+Real Minecraft, via MineRL 1.0 (master). Verified on the training host against
 MineRLTreechop-v0:
   * obs: dict with "pov" = (64, 64, 3) uint8 HWC — IDENTICAL shape to
     Crafter, so the validated pixel pipeline (CNN encoder/decoder, uint8

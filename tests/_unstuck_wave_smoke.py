@@ -1,6 +1,6 @@
 """Unstuck wave smoke (2026-08-16).
 
-THE LIVE FINDINGS THIS ENCODES (vast.ai pod, run of 2026-08-16)
+THE LIVE FINDINGS THIS ENCODES (a rented GPU host training host, run of 2026-08-16)
     1. The agent stood at ONE coordinate for 2+ hours re-emitting help
        requests nobody read: the help channel was write-only (#51 emit,
        #46 deferred).

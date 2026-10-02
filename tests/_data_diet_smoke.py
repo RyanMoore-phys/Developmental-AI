@@ -83,7 +83,7 @@ def test_W1_sequence_spans_a_tree_break():
     # mastery's fidelity ratio.
     #
     # BE HONEST ABOUT WHAT IS AND IS NOT MEASURED. The 1.59 GB figure was a
-    # real measurement on the pod; the ~3.2 GB is arithmetic, and there is no
+    # real measurement on the training host; the ~3.2 GB is arithmetic, and there is no
     # GPU on the machine this was changed from. So this is a BUDGET CHANGE
     # TAKEN ON PURPOSE, not a verified one — `AsyncWM ... block ms/iter` and
     # the VRAM high-water on the first cluster run are what settle it, and

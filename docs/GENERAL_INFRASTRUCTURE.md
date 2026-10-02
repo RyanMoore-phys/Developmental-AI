@@ -1512,7 +1512,7 @@ watching a co-present adult demonstrate — was invisible. Now:
   cold-start 0.5) at user request — all still telescoping-only.
 
 ### Fourth wave (2026-08-10): pre-boot points 1–4 — implemented local-only
-(pod terminated; this wave ships with the next VM)
+(host terminated; this wave ships with the next VM)
 
 The pre-boot assessment named four structural issues in how SkyBot learns;
 all four are now code, smoke-tested (`tests/_preboot_wave_smoke.py`, 8
@@ -1559,11 +1559,11 @@ contracts) with the full local regression sweep green:
   option value still govern firing. The gate MECHANISM is untouched and
   test-pinned against the historical 0.25 for configs that still want it.
 
-### Fifth wave (2026-08-16): the unstuck wave — DEPLOYED to the vast.ai pod
+### Fifth wave (2026-08-16): the unstuck wave — DEPLOYED to the a rented GPU host training host
 (synced + relaunched the same night; the prior run had confirmed the latch
 live twice, once per clamp)
 
-Live diagnosis on the running pod found the agent parked at one coordinate
+Live diagnosis on the running host found the agent parked at one coordinate
 for 2+ hours, gaze pinned at +90, every vision predicate DEGENERATE, magnet
 at w=0/target=None, seg extrinsic 0, help requests unanswered. After the
 first fixes were staged, the SAME run flipped to the −90 clamp (sky), which
@@ -1610,13 +1610,13 @@ green:
 * **(ops) ollama log cap.** 581 MB in 5 days at llama-server verbosity 4.
   Launch scripts now start ollama with append-mode redirect + a reusable
   `scripts/cap_log.sh` watchdog (du-based — apparent size lies for sparse
-  files); the live pod got an equivalent crontab entry and an immediate
+  files); the live host got an equivalent crontab entry and an immediate
   truncate (10 MB tail kept).
 
 ### Persistence fixes (2026-08-17) — deployed with the fifth wave
 
 Two restart/storage defects found while auditing what actually learns
-(`tests/_persistence_fixes_smoke.py`; verified on the pod GPU):
+(`tests/_persistence_fixes_smoke.py`; verified on the training host GPU):
 
 * **Skill deltas were never compressed on a GPU box.** The bank writes its
   shared base encoder with `.cpu()` and reads it back with

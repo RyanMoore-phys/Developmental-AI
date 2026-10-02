@@ -15,7 +15,7 @@ human can see whether trunks visibly break.
   inventory flat, frames show broken logs -> stage B broken
   inventory flat, trunks never break      -> stage A broken
 
-POD ONLY:  xvfb-run -a ./venv_mc/bin/python _chop_probe2.py
+TRAINING HOST ONLY:  xvfb-run -a ./venv_mc/bin/python _chop_probe2.py
 """
 import os
 import time

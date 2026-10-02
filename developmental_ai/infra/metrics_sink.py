@@ -9,7 +9,7 @@ WHY THIS EXISTS
 
     This module does not measure anything new. It serialises what the loop has
     already computed into one JSON object per segment, so a dashboard can read
-    it and a pod death cannot take it with it.
+    it and a training host death cannot take it with it.
 
 WHY fsync, NOT JUST flush
     `flush()` only pushes bytes out of Python's buffer into the OS page cache.
@@ -24,7 +24,7 @@ WHY ROTATION IS NOT OPTIONAL
     `runlogs/ollama.log` reached 29 MB unattended in this project, and the VLM
     chatter that filled it needed a dedicated capper script. A per-segment
     record on a multi-day run does the same more slowly. Rotating here means
-    the tracker cannot be the thing that fills the pod's disk.
+    the tracker cannot be the thing that fills the host's disk.
 
 DEFENSIVE CONTRACT (identical to infra/consequence.py and infra/anticipation.py)
     never raises, bounded memory, records its own errors for inspection. A

@@ -93,7 +93,7 @@ pgrep -x ollama >/dev/null || { OLLAMA_DEBUG=0 nohup ollama serve >> runlogs/oll
 pgrep -f "cap_log[.]sh runlogs/ollama[.]log" >/dev/null || \
   { nohup bash scripts/cap_log.sh runlogs/ollama.log >> runlogs/cap_log.log 2>&1 < /dev/null & }
 rm -rf runlogs/brain
-# OMP_NUM_THREADS 16 -> 6 (2026-09-22): the pod had 128 cores, this box
+# OMP_NUM_THREADS 16 -> 6 (2026-09-22): the training host had 128 cores, this box
 # has 6/12 and two of them are pinned to Minecraft clients by the
 # launchClient taskset wrap. Oversubscribing torch against that costs
 # throughput rather than buying it.

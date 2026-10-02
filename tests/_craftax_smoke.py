@@ -1,6 +1,6 @@
 """Craftax integration smoke (NEXT_OBJECTIVES.md — the deeper env).
 
-Runs on the POD ONLY (Craftax needs Python 3.10+ and JAX). Verifies the full
+Runs on the TRAINING HOST ONLY (Craftax needs Python 3.10+ and JAX). Verifies the full
 Craftax-Symbolic pipeline bottom-up:
   1. Adapter API: gymnasium 5-tuple/2-tuple, gymnasium Box(8268)/Discrete(43),
      NO jax arrays leak into obs/reward/info, seeded reset, terminated split.

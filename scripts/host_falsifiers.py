@@ -7,7 +7,7 @@ a wage for standing still, a sky exploit, a guard that became a latch. They
 are checked against the metrics dump rather than live so they can be re-run
 on any archived run.
 
-Run on the pod:
+Run on the training host:
     PYTHONPATH=. python scripts/host_falsifiers.py --metrics runlogs/metrics.json
 """
 import argparse

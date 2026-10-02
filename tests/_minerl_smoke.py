@@ -1,4 +1,4 @@
-"""Minecraft integration smoke — POD ONLY, under xvfb, in venv_mc.
+"""Minecraft integration smoke — TRAINING HOST ONLY, under xvfb, in venv_mc.
 
     xvfb-run -a -s "-screen 0 640x480x24" ./venv_mc/bin/python _minerl_smoke.py
 

@@ -1,7 +1,7 @@
 """SKILLS AS DELTAS — a skill is a modulation of a shared base, not a copy.
 
 THE PROBLEM THIS SOLVES
-  A minted skill is a byte copy of the whole policy. Measured on the pod bank:
+  A minted skill is a byte copy of the whole policy. Measured on the training host bank:
   25 skills at ~115 MB each whose first-layer weights are 0.82-0.995 cosine
   similar to one another. That is one network stored twenty-five times. It is
   also the wrong idea: learning to chop wood does not clone your visual
@@ -18,7 +18,7 @@ THE REPRESENTATION
 WHAT THE DATA ACTUALLY SAYS — low rank was the obvious guess, and it is WRONG
   The plausible story was that skills descend from one policy and differ by a
   few coordinated behavioural adjustments, i.e. a low-rank update. Measured on
-  the real pod bank (16 same-shape skills, `actor.shared.0.weight`):
+  the real host bank (16 same-shape skills, `actor.shared.0.weight`):
 
         rank   1   rel err 0.371
         rank  16   rel err 0.156
@@ -152,7 +152,7 @@ def to_delta(base: Dict[str, torch.Tensor],
         # run's device, so on ANY GPU box this subtraction raised "Expected
         # all tensors to be on the same device" — which the caller caught
         # and answered by storing the skill in FULL. Measured on the live
-        # pod: every minted skill 14 MB instead of a delta, i.e. the whole
+        # training host: every minted skill 14 MB instead of a delta, i.e. the whole
         # compression win silently absent on exactly the hardware that
         # trains. Subtracting two tensors is not the place to care where
         # they live; align here so no caller can re-set the trap.
@@ -163,7 +163,7 @@ def to_delta(base: Dict[str, torch.Tensor],
         if f is None:
             if float(d.abs().max()) == 0.0:
                 continue                  # exactly the base: store nothing
-            # MEASURED (2026-08-01, on the real pod bank): skill deltas here
+            # MEASURED (2026-08-01, on the real host bank): skill deltas here
             # are essentially FULL RANK — rank 64 still carries 7.8% relative
             # error, rank 128 3.8%, exactness needs all 256. The spectrum
             # barely decays, which is what accumulated SGD noise looks like,

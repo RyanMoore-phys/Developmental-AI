@@ -73,7 +73,7 @@ def test_round_trip_and_behaviour():
     assert worst_kl < 1e-3, f"action distribution moved (KL {worst_kl})"
     # The jitter here is iid Gaussian, i.e. FULL RANK by construction — which
     # is also what real skill deltas measured as (rank 128 still 3.8% error on
-    # the pod bank). So the expected saving is the int8 dense path's ~4x, NOT
+    # the training host bank). So the expected saving is the int8 dense path's ~4x, NOT
     # a rank win. Asserting a rank win here would be asserting a property the
     # real data does not have, and would only be satisfiable by loosening the
     # fidelity gate — i.e. by damaging the skills.

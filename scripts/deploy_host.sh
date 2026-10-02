@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Push this tree to a RunPod box and set it up. Idempotent; safe to re-run.
+# Push this tree to a a rented GPU host box and set it up. Idempotent; safe to re-run.
 #
 # NEVER TOUCHES skill_bank_mc_curiosity/ OR runlogs/ (CLAUDE.md 3 and 6):
 # the skill bank is the agent's accumulated developmental memory and runlogs
-# is the only record of what happened. Code flows Mac -> pod; brain state
-# flows pod -> Mac, and only via pull_brain.sh.
+# is the only record of what happened. Code flows Mac -> training host; brain state
+# flows host -> Mac, and only via pull_brain.sh.
 #
 #   scripts/deploy_host.sh <ssh-target> [ssh-port]
 #   scripts/deploy_host.sh <user>@<ssh-host>

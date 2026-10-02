@@ -95,7 +95,7 @@ def main() -> None:
     # discounting every single time.
     #
     # The test was left asserting the old ladder, so it had been failing — and
-    # since scripts/deploy_skybot.sh gates the pod launch on this suite, the
+    # since scripts/deploy_skybot.sh gates the training host launch on this suite, the
     # deploy gate was RED and would have refused to launch. The contract below
     # is the same protective intent (ground must never out-pay the goal),
     # stated against the economy that actually ships.

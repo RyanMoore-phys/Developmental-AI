@@ -14,7 +14,7 @@
 # was reported as a GREEN CHECK. The tick meant "STOP file written", not
 # "training stopped".
 #
-# And five minutes was never enough. Measured on the live pod:
+# And five minutes was never enough. Measured on the live training host:
 #   * finishing the current segment: 2048 steps at ~6.8 steps/s  ~= 5 min
 #   * writing the replay buffer:     325,096 transitions in 513.5s ~= 8.5 min
 # so an honest graceful shutdown takes ~13 minutes. The old budget expired

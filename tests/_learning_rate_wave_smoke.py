@@ -444,7 +444,7 @@ def test_F4_wm_batch_composition():
     print(f"  21. terminal_fraction={wm['terminal_fraction']} (was an unpassed "
           f"0.25), goal_replay_fraction={wm['goal_replay_fraction']} (was 0)")
 
-    # 22. an old persisted buffer still loads (the pod's is the only copy)
+    # 22. an old persisted buffer still loads (the host's is the only copy)
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "buf")
@@ -488,15 +488,15 @@ def test_F5_phase_timing():
     print("  25. per-dim symbolic work gated in both bodies, with the "
           "corrected justification (lock + glue forward, not Welford) in situ")
 
-    # 26. the ICM batching knob stays at its tested value until a pod says
+    # 26. the ICM batching knob stays at its tested value until a training host says
     #     otherwise — this wave deliberately did NOT flip it
     k = int(yaml.safe_load(open(CFG))["curiosity"]["train_every"])
     assert k == 1, (
         "train_every > 1 is forbidden by _throughput_wave_smoke::A1f until "
-        "validated on a live pod; this wave records the analysis and leaves "
+        "validated on a live training host; this wave records the analysis and leaves "
         "the knob alone")
     print("  26. curiosity.train_every held at 1 — the analysis is recorded "
-          "in the config, the flip waits for a pod to watch")
+          "in the config, the flip waits for a training host to watch")
 
 
 if __name__ == "__main__":

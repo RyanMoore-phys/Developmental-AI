@@ -50,7 +50,7 @@ _work/
 
 # ---- LEARNED WEIGHTS -------------------------------------------------------
 # Regenerable, and enormous: a single flat-arch skill's policy.pt is ~115 MB
-# (three near-duplicate 49250-wide input layers). The pod bank alone is 3.4 GB
+# (three near-duplicate 49250-wide input layers). The training host bank alone is 3.4 GB
 # of files that are 0.82-0.995 cosine-identical to each other. Git is the
 # wrong tool; GitHub LFS gives 1 GB free, which one skill would nearly fill.
 host_repository/data/
@@ -61,7 +61,7 @@ host_repository/data/
 # .py files were silently never committed.
 #
 # It hid for a long time because it is invisible everywhere except a clean
-# checkout: the dev Mac has the files on disk, and the pod is rsynced by path
+# checkout: the dev Mac has the files on disk, and the training host is rsynced by path
 # rather than cloned, so both work. Only CI, which has nothing but `git
 # checkout`, failed — with `ModuleNotFoundError: No module named
 # 'developmental_ai.skill_bank'` on every suite that imports DevelopmentalAI.

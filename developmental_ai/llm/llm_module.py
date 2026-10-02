@@ -215,7 +215,7 @@ def probe_ollama_model(model: str, deep: bool = True) -> bool:
         # which never equals "qwen2.5vl:3b".
         #
         # MEASURED CONSEQUENCE, and it is exactly the failure this whole
-        # function was written to prevent: on a pod where `ollama list` showed
+        # function was written to prevent: on a training host where `ollama list` showed
         # qwen2.5vl:3b present, every run logged VLM MODEL NOT FOUND and
         # proceeded with the labeller disabled — while Ollama kept 4.2 GB of
         # VRAM resident for a model nothing ever called. Zero labels, full

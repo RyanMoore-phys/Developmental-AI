@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring a bare Ubuntu RunPod box to the point where the offline suites run,
+# Bring a bare Ubuntu a rented GPU host box to the point where the offline suites run,
 # and report honestly on whether MineRL is usable.
 #
 # TWO TIERS ON PURPOSE. The offline suites need only numpy/torch/yaml and

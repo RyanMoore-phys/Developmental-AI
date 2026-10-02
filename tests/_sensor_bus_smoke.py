@@ -6,7 +6,7 @@ WHY THE BUS EXISTS
     life stats were routed through `info` rather than the obs tensor
     precisely so "obs_dim is unchanged and every saved skill policy stays
     loadable". Wave 1 added ONE side-channel, the 13-field proprio column,
-    with optional-on-load semantics so the pod's buffer survived.
+    with optional-on-load semantics so the host's buffer survived.
 
     That does not scale. Every further sense would repeat the migration
     against the buffer, the world model and BOTH loop bodies. The bus turns
@@ -138,7 +138,7 @@ def test_buffer_restores_neutral_on_layout_change():
     """C. A layout change must degrade to neutral, never to misalignment.
 
     The precedent is Wave 1's proprio width guard and, before it, `restarts`
-    being optional on load. The pod's buffer is the only copy of the agent's
+    being optional on load. The host's buffer is the only copy of the agent's
     experience; a new column that refuses to load bricks it.
     """
     import tempfile

@@ -1,7 +1,7 @@
 """Independent server-side truth: is SkyBot actually on the server?
 
 THIS IS A FALSIFIER, NOT A SECOND COLLECTOR.
-    The pod already knows more about the agent than the server does — break
+    The training host already knows more about the agent than the server does — break
     counts by type, crafts, positions, option activity. Duplicating that here
     would create two sources that can disagree, and CLAUDE.md §5 records where
     that leads ("the `places` counter... the heuristic is garbage").

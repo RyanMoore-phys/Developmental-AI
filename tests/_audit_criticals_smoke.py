@@ -10,7 +10,7 @@ incumbent; a weaker challenger LOSES and the good policy is preserved.
 this test proves a skill saved post-construction is picked into an empty slot.
 
 (#1, the crash-rebuilt-client reset, needs a live MineRL client and is validated
-on the pod; here it is covered by compile + the ADVANCE-block code review.)
+on the training host; here it is covered by compile + the ADVANCE-block code review.)
 """
 import tempfile
 

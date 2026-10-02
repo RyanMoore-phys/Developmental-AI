@@ -1,4 +1,4 @@
-"""World-model telemetry smoke (Mac-ok; no torch, no env, no pod).
+"""World-model telemetry smoke (Mac-ok; no torch, no env, no training host).
 
     PYTHONPATH=. ./venv/bin/python tests/_wm_telemetry_smoke.py
 

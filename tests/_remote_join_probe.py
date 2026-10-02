@@ -5,7 +5,7 @@ path with remote_server set — the mission XML carries <RemoteServer>, so the
 client joins the server instead of generating a world — then steps the env
 and reports what flows back (obs, inventory, mine_block stats, reward).
 
-Run on the pod (server must be reachable and its whitelist open):
+Run on the training host (server must be reachable and its whitelist open):
   cd /workspace/devai && DISPLAY=:77 MINERL_HEADLESS=1 PYTHONPATH=. \
     ./venv_mc/bin/python tests/_remote_join_probe.py 127.0.0.1:25565
 """

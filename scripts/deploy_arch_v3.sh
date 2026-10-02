@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy arch v3 to the pod: stop cleanly, sync, verify, relaunch, PROVE it.
+# Deploy arch v3 to the training host: stop cleanly, sync, verify, relaunch, PROVE it.
 #
 # LESSONS BAKED IN (both cost a wasted deploy earlier today):
 #   * the stop file is `runlogs/STOP` — NOT `STOP_LIFELONG`, which does not
@@ -35,8 +35,8 @@ print('  arch mix:', {a: sum(1 for s in sk if (s.get('arch') or 'flat')==a) for 
 assert len(sk)>0, 'SKILL BANK EMPTY — ABORT'
 " || exit 1
 
-echo "=== contract + arch-v3 smokes on the pod ==="
-# A MISSING OPTIONAL DEPENDENCY IS NOT A FAILING TEST. The pod has no
+echo "=== contract + arch-v3 smokes on the training host ==="
+# A MISSING OPTIONAL DEPENDENCY IS NOT A FAILING TEST. The training host has no
 # `crafter` package, so _options_smoke (which builds a Crafter env for its
 # integration half) can never pass there — and gating the relaunch on it
 # stopped the run and refused to bring it back, for a reason unrelated to
@@ -52,7 +52,7 @@ for t in _no_scripted_skills_smoke _conv_encoder_smoke _mastery_wiring_smoke \
     echo "  FAIL $t"; echo "$out" | tail -3 | sed "s/^/        /"; fail=$((fail+1))
   fi
 done
-[ "$fail" -gt 0 ] && { echo "*** $fail pod smoke failure(s) — NOT relaunching ***"; exit 1; }
+[ "$fail" -gt 0 ] && { echo "*** $fail host smoke failure(s) — NOT relaunching ***"; exit 1; }
 
 echo "=== relaunch ==="
 mv -f runlogs/minecraft_lifelong_run.log runlogs/run_pre_archv3.log 2>/dev/null

@@ -78,7 +78,7 @@ bodies.
 | Property | Why |
 |---|---|
 | **Layout hash** over `(name, width, version, kind, shape)` in order | Width alone is not enough — two sensor sets can match in width and mean entirely different things field-for-field. Mismatch restores **neutral**, never misaligned. |
-| **Optional on load** | Follows the `restarts` precedent. The pod's buffer is the only copy of the agent's experience; a column that refuses to load bricks it. |
+| **Optional on load** | Follows the `restarts` precedent. The host's buffer is the only copy of the agent's experience; a column that refuses to load bricks it. |
 | **`proprio` stays first at offset 0** | Every row written before the bus existed still lines up. |
 | **Neutral is not always zero** | A ratio whose midpoint is 0.5 reads 0.5 when absent. Zero would be a *claim*. |
 | **Vector vs image kinds** | The foveal crop is 3,072 numbers against 13 body scalars. Flat concatenation would drown the body at 236:1, so image sensors get their own conv encoder. Live: **4,144 transport → 176 encoded.** |
@@ -326,7 +326,7 @@ does take one, because it must turn a heading into a direction in the world.
 
 ---
 
-## 13. Stage 0 results — MEASURED 2026-09-19 on an RTX 2000 Ada pod
+## 13. Stage 0 results — MEASURED 2026-09-19 on an RTX 2000 Ada training host
 
 Three of the five open questions are now closed, against real MineRL.
 
