@@ -107,9 +107,73 @@ services:
       resources:
         limits: {cpus: "1.0", memory: 512M}
 
+  # ---- RACK HOST METRICS (committed 2026-10-01) ------------------------
+  # These three ran on node1 for weeks and existed in NO repo. Everything
+  # below this line is now version-controlled; `.env` (secrets) and the named
+  # volumes (state) deliberately are not.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    # The hostname node-exporter reports. PARAMETERISED (was hardcoded
+    # `node1`): the whole point of committing this file is that it can be
+    # deployed somewhere else, and a second host silently reporting as "node1"
+    # would be worse than no metrics at all.
+    hostname: ${MONITOR_HOSTNAME:-node1}
+    restart: unless-stopped
+    pid: host                    # so metrics are the HOST's, not the container's
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - node_textfile:/textfile
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      # picks up gpu.prom from the gpu-metrics container below
+      - '--collector.textfile.directory=/textfile'
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 128M}
+
+  # INTEL iGPU ONLY — this is node1's integrated graphics via /dev/dri. It has
+  # never measured main's RTX 5050; that is nvidia_gpu_exporter on main:9835,
+  # installed by scripts/install_host_exporters.sh. Confusing the two cost a
+  # day of assuming main's GPU was being watched when nothing was.
+  gpu-metrics:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu_metrics
+    container_name: gpu-metrics
+    restart: unless-stopped
+    privileged: true            # intel_gpu_top needs perf-event access
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - node_textfile:/textfile
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 128M}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
 volumes:
   # Shared so the collector writes, ingest reads, Grafana reads the DB.
   # A named volume rather than a bind mount: this is the durable artifact and
   # it should not depend on a host path that might be moved.
   metrics_data:
   grafana_data:
+  # textfile drop-box: gpu-metrics writes, node-exporter reads
+  node_textfile:
+  prometheus_data:

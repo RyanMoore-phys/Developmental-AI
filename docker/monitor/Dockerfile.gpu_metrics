@@ -1,0 +1,17 @@
+# Intel iGPU metrics for THIS HOST (node1), written as a Prometheus textfile
+# that node-exporter picks up. See gpu_metrics.sh for why it is a textfile and
+# not an exporter with its own port.
+#
+# COMMITTED 2026-10-01. This existed only on node1, in no repo, alongside
+# gpu_metrics.sh, prometheus.yml and the Prometheus datasource. One disk
+# failure and the monitoring setup was gone.
+#
+# NOTE ON SCOPE: intel_gpu_top reads /dev/dri — node1's INTEGRATED graphics.
+# It has never measured main's RTX 5050. Main is covered separately by
+# scripts/install_host_exporters.sh (nvidia_gpu_exporter on :9835).
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    intel-gpu-tools jq && rm -rf /var/lib/apt/lists/*
+COPY gpu_metrics.sh /opt/gpu_metrics.sh
+RUN chmod +x /opt/gpu_metrics.sh
+ENTRYPOINT ["/opt/gpu_metrics.sh"]

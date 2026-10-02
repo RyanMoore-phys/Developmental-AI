@@ -1,0 +1,13 @@
+apiVersion: 1
+
+# The rack's Prometheus: node1, node2, paper-server and main (see
+# ../../../prometheus.yml for the scrape targets). Distinct from the SkyBot
+# SQLite datasource alongside it — that one holds the AGENT's own metrics
+# (segments, heartbeat); this one holds HOST metrics for every machine.
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: rack-prometheus
+    url: http://prometheus:9090
+    access: proxy
+    isDefault: false
