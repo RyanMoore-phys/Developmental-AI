@@ -1,7 +1,7 @@
 # Architecture — the Developmental-AI organism
 
 A curiosity-driven neurosymbolic RL agent that learns Minecraft Treechop with no
-demonstrations. Runs as a **lifelong continuous stream**: 4 parallel MineRL envs,
+demonstrations. Runs as a **lifelong continuous stream**: 2 parallel MineRL envs,
 stepped in 1024-step "segments" (what the logs call "episodes"). Code lives in
 `developmental_ai/` in the parent repo.
 
