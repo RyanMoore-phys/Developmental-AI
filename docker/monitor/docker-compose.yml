@@ -161,6 +161,10 @@ services:
     restart: unless-stopped
     ports:
       - "9090:9090"
+    # prometheus.yml scrapes `main`; the address comes from MAIN_HOST in the
+    # gitignored ./.env (compose interpolation), so no LAN IP is committed.
+    extra_hosts:
+      - "main:${MAIN_HOST:?set MAIN_HOST in docker/monitor/.env}"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus

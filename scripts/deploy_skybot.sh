@@ -142,7 +142,7 @@ $SSH_CMD "${MAIN_USER}@$HOST" '
 # with a bare `mkdir "/workspace/devai" failed: No such file or directory (2)`
 # and exit code 11 -- which reads like a permissions problem and is not one.
 # On a rented GPU host /workspace was the platform-mounted network volume and always
-# existed; on the OWNED Ubuntu host (192.168.1.10, since 2026-09-22) NOTHING
+# existed; on the OWNED Ubuntu host `main` (since 2026-09-22) NOTHING
 # creates it -- provision_host.sh itself opens with `cd /workspace/devai ||
 # exit 1`, so it cannot be what makes the directory either. Create it here and
 # SAY SO, because a silently-created /workspace on the root filesystem is also

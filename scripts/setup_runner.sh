@@ -90,7 +90,7 @@ else
 # the LAN, NOT a rented host -- which is why these are MAIN_* and not POD_*.
 # The port no longer rotates (that was a rented GPU host remapping 22 on every restart);
 # it is a fixed sshd on a fixed address, so this file should now be stable.
-MAIN_HOST=192.168.1.10
+MAIN_HOST=CHANGE_ME   # the training host's LAN IP. Never commit the real value.
 MAIN_SSH_PORT=22
 # The login account on `main`. A NON-ROOT user needs PASSWORDLESS SUDO there:
 # provisioning installs apt packages and creates /workspace under /.

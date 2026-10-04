@@ -74,7 +74,7 @@ rather than a refactor. To move hosts again, edit this — not the repo.
 ```bash
 cat > ~/actions-runner/.env <<'EOF'
 # --- required ---
-MAIN_HOST=192.168.1.10           # the main computer, on the LAN
+MAIN_HOST=CHANGE_ME           # the main computer, on the LAN
 MAIN_SSH_PORT=22                  # a fixed box: this no longer rotates
 MAIN_SSH_KEYFILE=/Users/rimac/.ssh/id_ed25519
 

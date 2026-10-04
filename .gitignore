@@ -110,3 +110,9 @@ id_rsa*
 skybot_ed25519*
 broadcaster_state.json
 registry.json
+
+# Local-only notes for Claude Code (real LAN addresses etc.). Never commit.
+CLAUDE.local.md
+
+# node2 brain mirror: real host addresses live only in this file (public repo).
+scripts/brain_mirror/brain_mirror.env

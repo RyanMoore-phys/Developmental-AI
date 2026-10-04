@@ -203,7 +203,8 @@ system.
 ## 6. Live infrastructure
 
 - **Training host (since 2026-09-22): the user's own main computer**, not a
-  rented training host. Ubuntu Server at **192.168.1.10**, on the **LAN and the tailnet
+  rented training host. Ubuntu Server at its LAN address (`MAIN_HOST` in the runner `.env`;
+  real IPs live in the untracked `CLAUDE.local.md`, never in this public repo), on the **LAN and the tailnet
   at once**. RTX 5050 (8 GB), Ryzen 5 5500 (6c/12t), **16 GB RAM**, 256 GB NVMe
   — far tighter than the training host it replaced (16 GB VRAM, 128 cores, 125 GB RAM),
   and several config values were cut to fit (see below). Everything still
@@ -247,7 +248,7 @@ system.
   resolves perfectly in your shell fails inside the container as `Could not
   resolve hostname`. Use `skybot@main` freely in hand-typed commands; leave
   the `.env` on the address. To use the name there too, add
-  `extra_hosts: ["main:192.168.1.10"]` to the runner service first.
+  `extra_hosts: ["main:${MAIN_HOST}"]` to the runner service first.
 - **`podlogs/` is now `runlogs/`, and every `pod_*` file is `host_*` (2026-09-22).**
   267 references across 61 files; `host.yml` became `host.yml` (safe — `deploy.yml`
   triggers on `workflows: ["ci"]`, never on this one). **THE TRAP IS BRAIN STATE,
@@ -269,7 +270,7 @@ system.
   new names in the runner `.env`; the fix is merging the workflow to `main`.
 - **The runner lives on `node1`, a DIFFERENT machine from the training host.**
   `node1` runs the self-hosted Actions runner and holds the only `.env`; `main`
-  (192.168.1.10) is the box everything deploys to. Its `hostname` really does
+  (address: runner `.env`) is the box everything deploys to. Its `hostname` really does
   print `main`, which is the quickest way to tell which one you are sitting on.
 - **Game server:** the user's own Paper server, on **another LAN machine**,
   reached through `socat` → `127.0.0.1:25565` exactly as before. The bridge now

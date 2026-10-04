@@ -127,7 +127,7 @@ anything tagged `tag:devai` reach ONLY the game port. After approving the host
 
 ## B. THE TRAINING HOST
 
-Since 2026-09-22 this is the user's own machine (Ubuntu Server, 192.168.1.10),
+Since 2026-09-22 this is the user's own machine (Ubuntu Server; address in the runner `.env` as `MAIN_HOST`),
 the training host — installed at `/workspace/devai` and deployed to as
 `root@` exactly like one, so every command below is unchanged.
 

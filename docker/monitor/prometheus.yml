@@ -23,7 +23,10 @@ scrape_configs:
           # by hand over ssh.
           # LAN ADDRESS, not tailnet, unlike the two above: main is on the same
           # wire as node1, and the exporters are bound to this address only.
-          - 192.168.1.10:9100      # main (training host)
+          # `main` resolves via extra_hosts in docker-compose.yml, fed by
+          # MAIN_HOST in the gitignored docker/monitor/.env -- no address
+          # is committed (public repo).
+          - main:9100      # main (training host)
 
   # GPU metrics for main's RTX 5050 -- VRAM used/total, utilisation, temp,
   # power, per-process. SEPARATE JOB because it is a different exporter
@@ -34,4 +37,4 @@ scrape_configs:
   - job_name: gpu
     static_configs:
       - targets:
-          - 192.168.1.10:9835      # main RTX 5050
+          - main:9835      # main RTX 5050
