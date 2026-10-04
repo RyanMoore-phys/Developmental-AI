@@ -9786,8 +9786,12 @@ class DevelopmentalAI:
     # 21.6% of the step there and nothing in that window accounts for it.
     # `store` now holds only what the sub-buckets do not, so the four plus
     # `store` still sum to the original bucket.
+    # "shadow" (2026-10-04): the foundation shadow recorder marks its own
+    # phase in both live bodies; without it here its cost was folded into
+    # UNACCOUNTED and the one number that says what it costs live was hidden.
     _PHASES = ("act", "env", "goals", "curiosity", "world", "vlm",
-               "store_buf", "store_ppo", "store_reset", "store", "ppo")
+               "store_buf", "store_ppo", "store_reset", "store", "ppo",
+               "shadow")
 
     def _frames_per(self, decisions: int) -> int:
         """Convert a threshold expressed in DECISIONS into env FRAMES.

@@ -106,6 +106,11 @@ DEFAULTS = {
     "max_ms_single_step": 2000.0,
     "predict": True,
     "fsync": False,
+    # Max wait for the world model's param lock before SKIPPING one
+    # prediction (2026-10-04). The async WM trainer holds that lock while it
+    # updates; a blocking acquire made the ACTING thread wait on every
+    # sampled step and tripped the budget live (5.13 ms/step vs 0.7 on CPU).
+    "predict_lock_timeout_ms": 1.0,
 }
 
 GREEN_ORIGIN = "live_transport"
@@ -188,6 +193,8 @@ class ShadowRecorder:
         self.max_ms_single = float(sc["max_ms_single_step"])
         self.window = max(1, int(sc["budget_window"]))
         self.do_predict = bool(sc["predict"])
+        self.lock_timeout_s = max(0.0, float(sc["predict_lock_timeout_ms"])) / 1000.0
+        self.t = collections.defaultdict(float)   # ms: lock_wait, predict, write
         self.bus = bus
         self.layout_hash = layout_hash if bus is not None else None
         self.action_dim = None if action_dim is None else int(action_dim)
@@ -267,10 +274,31 @@ class ShadowRecorder:
                        f"{self.max_ms_single:.1f}")
         elif len(self._ms) >= self.window:
             mean = float(np.mean(self._ms))
-            if mean > self.max_ms:
+            if mean > self.max_ms and self.do_predict:
+                # DEGRADE BEFORE DYING (2026-10-04). The prediction is the
+                # expensive part (lock + GPU forward); observations, actions
+                # and outcomes are cheap and are the evidence itself. Drop
+                # predictions, start a fresh window, and only disable the
+                # whole recorder if it is STILL over budget.
+                self.do_predict = False
+                self.warnings += 1
+                self._ms.clear()
+                logger.warning(
+                    "foundation.shadow: predictions OFF for the rest of this "
+                    "run (mean %.3f ms/step over %d steps > max_ms_per_step "
+                    "%.3f; totals ms: lock_wait %.0f, predict %.0f, write "
+                    "%.0f; %d predictions skipped on a busy lock). Still "
+                    "recording observations, actions and outcomes.",
+                    mean, self.window, self.max_ms, self.t["lock_wait"],
+                    self.t["predict"], self.t["write"],
+                    self.n["skipped_lock_busy"])
+            elif mean > self.max_ms:
                 self._fail(f"mean shadow cost {mean:.3f} ms/step over the "
                            f"last {len(self._ms)} steps > max_ms_per_step "
-                           f"{self.max_ms:.3f}")
+                           f"{self.max_ms:.3f} (predictions already off; "
+                           f"totals ms: lock_wait {self.t['lock_wait']:.0f}, "
+                           f"predict {self.t['predict']:.0f}, write "
+                           f"{self.t['write']:.0f})")
 
     # ------------------------------------------------------- records
     def _green(self, st: _Stream, vec, seq: int, t_wall: float):
@@ -391,7 +419,6 @@ class ShadowRecorder:
             return "unknown"
 
     def _predict(self, ready, rssm_state, actions, lock, world_model) -> None:
-        import contextlib
         import torch
         from ..contracts import Prediction
         r = world_model.rssm
@@ -413,7 +440,19 @@ class ShadowRecorder:
                 a[i, c] = 1.0
             else:
                 a[i, :] = np.asarray(c, np.float32).reshape(-1)[:ad]
-        with (lock if lock is not None else contextlib.nullcontext()):
+        # NEVER BLOCK THE ACTING THREAD ON THE TRAINER'S LOCK. Bounded wait,
+        # then skip this one prediction (obs/action/outcome still recorded).
+        tw = time.perf_counter()
+        got = True
+        if lock is not None:
+            got = (lock.acquire(timeout=self.lock_timeout_s)
+                   if self.lock_timeout_s > 0 else lock.acquire(blocking=False))
+        tp = time.perf_counter()
+        self.t["lock_wait"] += (tp - tw) * 1000.0
+        if not got:
+            self.n["skipped_lock_busy"] += 1
+            return
+        try:
             with torch.no_grad():
                 h0 = rssm_state["h"]
                 idx = torch.as_tensor([st.idx for st in rows], device=h0.device,
@@ -422,6 +461,11 @@ class ShadowRecorder:
                                          rssm_state["z"].index_select(0, idx),
                                          a)
             version = self._model_version(world_model)
+        finally:
+            if lock is not None:
+                lock.release()
+        tw2 = time.perf_counter()
+        self.t["predict"] += (tw2 - tp) * 1000.0
         snap = f"{self.run_id}:world_model.rssm@{version}"
         t_pred = time.time()
         for i, st in enumerate(rows):
@@ -441,6 +485,7 @@ class ShadowRecorder:
             self.store.log_prediction(pred, ctx.ref())
             st.pid = pid
             self.n["predictions"] += 1
+        self.t["write"] += (time.perf_counter() - tw2) * 1000.0
 
     def after_step(self, step_infos, actions, rewards, dones, restarted,
                    ends, t_dispatch, prim_extrinsic=None, intrinsic=None,
@@ -542,6 +587,8 @@ class ShadowRecorder:
         ms = np.asarray(self.ms_hist, np.float64)
         return {"enabled": self.enabled, "disabled_reason": self.disabled_reason,
                 "warnings": self.warnings, "counts": dict(self.n),
+                "predicting": self.do_predict,
+                "ms_totals": {k: round(v, 1) for k, v in self.t.items()},
                 "ms_per_step_mean": float(ms.mean()) if ms.size else 0.0,
                 "ms_per_step_p95": (float(np.percentile(ms, 95))
                                     if ms.size else 0.0),

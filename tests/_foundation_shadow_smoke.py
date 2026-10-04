@@ -552,12 +552,16 @@ def test_self_disable():
             budget_window=3), segments=2)
     finally:
         _release(h)
+    # DEGRADE, THEN DIE (2026-10-04): window 1 over budget -> predictions
+    # off (warning 1); window 2 still over -> recorder off (warning 2).
     assert not sh.enabled and "max_ms_per_step" in sh.disabled_reason
-    assert len(h.msgs) == 1, h.msgs
-    assert sh.n["steps"] == 3, sh.n          # stopped at the window
+    assert "predictions already off" in sh.disabled_reason
+    assert len(h.msgs) == 2 and "predictions OFF" in h.msgs[0], h.msgs
+    assert sh.n["steps"] == 6, sh.n          # two windows of 3
     assert ai.total_timesteps == 2 * 40 * 2  # the loop kept collecting
-    print(f"  E. budget overrun -> disabled after {sh.n['steps']} steps with "
-          f"1 warning; loop finished all {ai.total_timesteps} transitions")
+    print(f"  E. budget overrun -> predictions off after 3 steps, recorder "
+          f"off after {sh.n['steps']} (2 warnings); loop finished all "
+          f"{ai.total_timesteps} transitions")
 
     # an exception inside the recorder
     dl = _patch_make_env()
@@ -664,6 +668,7 @@ def main():
     try:
         test_disabled()
         test_source()
+        test_busy_lock()
         if importlib.util.find_spec("gymnasium") is None:
             print("  C-F. SKIPPED: gymnasium absent here (they drive the real "
                   "loop; CI and the host run them). A-B are the local "
@@ -677,6 +682,66 @@ def main():
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print("[foundation_shadow] ALL PASS")
+
+
+# ------------------------------------------------- G. busy lock never blocks
+def test_busy_lock():
+    """LIVE INCIDENT 2026-10-04: the first live run disabled the shadow after
+    one minute (5.127 ms/step > 5.0) — the moment the async WM trainer
+    started. `_predict` did `with lock:` on the world model's param lock,
+    which the trainer holds while it updates, so the ACTING thread waited on
+    every sampled step. A held lock must cost at most the bounded timeout,
+    skip only the prediction, and leave obs/action/outcome recorded."""
+    import threading
+    import torch
+    from developmental_ai.foundation.runtime import ShadowRecorder
+    from developmental_ai.world_model.rssm import WorldModel
+    wm = WorldModel(obs_dim=4, action_dim=2, stochastic_size=8,
+                    stochastic_classes=8, deterministic_size=32,
+                    hidden_dim=32)
+    rec = ShadowRecorder.from_config(
+        {"foundation": {"shadow": _shadow_cfg(
+            os.path.join(TMP, "store_lock"), predict_lock_timeout_ms=2.0)}},
+        bus=None, action_dim=2, is_discrete=True, num_streams=1,
+        environment="fake")
+    lock = threading.RLock()
+    held, release = threading.Event(), threading.Event()
+
+    def trainer():                      # holds the lock like the WM trainer
+        with lock:
+            held.set()
+            release.wait(10)
+    th = threading.Thread(target=trainer, daemon=True)
+    s = wm.rssm.initial_state(1, torch.device("cpu"))
+    info = {"proprio": np.ones(3, np.float32)}
+    rec.before_step(s, [0], lock, wm)            # no context yet (step 0)
+    rec.after_step([info], [0], [1.0], [False], [False],
+                   [(False, False, time.time())], time.time())
+    th.start()
+    held.wait(5)
+    try:
+        worst = 0.0
+        for k in range(5):
+            t0 = time.perf_counter()
+            rec.before_step(s, [k % 2], lock, wm)
+            worst = max(worst, time.perf_counter() - t0)
+            rec.after_step([info], [k % 2], [1.0], [False], [False],
+                           [(False, False, time.time())], time.time())
+    finally:
+        release.set()
+        th.join(5)
+    n = rec.stats()["counts"]
+    assert rec.enabled, rec.disabled_reason
+    assert n["skipped_lock_busy"] == 5 and n.get("predictions", 0) == 0, n
+    assert n.get("outcomes", n.get("evidence", 1)) >= 1, n
+    assert worst < 0.25, f"before_step blocked {worst*1e3:.0f} ms on a held lock"
+    # lock free again -> predictions resume
+    rec.before_step(s, [1], lock, wm)
+    assert rec.stats()["counts"]["predictions"] == 1, rec.stats()["counts"]
+    rec.close()
+    print(f"  G. trainer holding the WM lock: 5/5 predictions skipped, worst "
+          f"before_step {worst*1e3:.1f} ms (timeout 2 ms), recording kept; "
+          f"lock free -> predictions resume")
 
 
 if __name__ == "__main__":
