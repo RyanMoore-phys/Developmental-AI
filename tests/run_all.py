@@ -14,10 +14,16 @@ Exit code is the number of failing suites, so a shell can gate on it.
 
 Run: PYTHONPATH=. python tests/run_all.py [unit|contract|legacy|all]
 """
+import functools
 import os
 import subprocess
 import sys
 import time
+
+# FLUSH EVERY LINE (2026-10-04). Piped stdout (CI, `| tee`, nohup) is
+# block-buffered, so a multi-minute tier printed NOTHING until exit and a
+# healthy CI step looked hung. One line per suite, visible as it finishes.
+print = functools.partial(print, flush=True)  # noqa: A001
 
 sys.path.insert(0, ".")
 

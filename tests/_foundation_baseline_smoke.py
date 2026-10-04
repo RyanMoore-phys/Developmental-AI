@@ -246,11 +246,25 @@ def test_register_matches_live():
 
 
 def test_baseline_report():
+    # A TRAINING-FREE runlogs dir of our own (2026-10-04). This used the
+    # repo's `runlogs/`, which is GITIGNORED: it existed on the dev Mac and
+    # not in CI's fresh checkout, so CI died on "runlogs dir not found" while
+    # every local run was green. A test must not depend on untracked state.
+    empty = os.path.join(TMP, "runlogs_empty")
+    os.makedirs(empty)
     p = subprocess.run([sys.executable, "tools/baseline_report.py",
-                        "runlogs"], capture_output=True, text=True,
+                        empty], capture_output=True, text=True,
                        env=dict(os.environ, PYTHONPATH="."))
     assert p.returncode == 0, p.stderr
     assert "unknown" in p.stdout and "error_by_horizon: unknown" in p.stdout
+    # A MISSING dir is an error, not a report of unknowns: a typo'd path must
+    # not read as "nothing was logged".
+    p = subprocess.run([sys.executable, "tools/baseline_report.py",
+                        os.path.join(TMP, "no_such_runlogs")],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, PYTHONPATH="."))
+    assert p.returncode != 0 and "not found" in (p.stderr + p.stdout), \
+        (p.returncode, p.stderr[-300:])
     # Synthetic host-layout logs.
     from developmental_ai.foundation.runtime.baseline import baseline_report
     d = os.path.join(TMP, "runlogs")

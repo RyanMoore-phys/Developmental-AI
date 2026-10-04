@@ -139,8 +139,12 @@ jobs:
       # were gated locally only. The runner is the single list; this step
       # just calls it. Exit code = number of failing suites.
       - name: Run unit + contract tiers
+        timeout-minutes: 30
         env:
           PYTHONPATH: .
+          # Unbuffered, or the step log stays EMPTY for the whole tier
+          # (minutes) and a working run is indistinguishable from a hang.
+          PYTHONUNBUFFERED: "1"
         run: |
           python tests/run_all.py unit
           python tests/run_all.py contract
