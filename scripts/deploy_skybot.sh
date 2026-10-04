@@ -171,9 +171,12 @@ $SSH_CMD "${MAIN_USER}@$HOST" '
 
 echo "==> syncing code (-rlptz, NOT -az: the network volume forbids chown)"
 # --stats, NOT --info=stats1: macOS ships rsync 2.6.9, which predates --info=
+# tools/ + experiments/ (2026-10-03): tests/_foundation_{baseline,ab_verify,
+# ab_verify9_11}_smoke import or exec them; without them `run_all.py` on the
+# host FAILS those suites on ModuleNotFoundError, which reads like a code bug.
 rsync -rlptz --stats \
   -e "$RSH" \
-  developmental_ai configs scripts tests run_minecraft.py \
+  developmental_ai configs scripts tests tools experiments run_minecraft.py \
   "${MAIN_USER}@$HOST:/workspace/devai/"
 
 echo "==> smoke-testing ON THE TRAINING HOST (the only tree that matters)"

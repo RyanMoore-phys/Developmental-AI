@@ -158,6 +158,22 @@ def test_ledger_segment_has_one_consumer():
                     continue
                 if ".segment()" in stripped:
                     hits.append(f"{path}:{i}")
+    # ONE NARROW EXEMPTION (2026-10-03): the foundation experiment selector
+    # books its own score terms into a ledger it CONSTRUCTS and never accepts
+    # from outside, so its segment() can only consume its own statement.
+    # The exemption holds only while that stays structurally true.
+    sel = os.path.join("developmental_ai", "foundation", "experiments",
+                       "selection.py")
+    sel_hits = [h for h in hits if h.startswith(sel + ":")]
+    if sel_hits:
+        sel_src = open(sel, encoding="utf-8").read()
+        init = sel_src[sel_src.index("class InfraSink"):]
+        init = init[init.index("def __init__"):init.index("def record")]
+        assert "ledger" not in init.split(")")[0] and \
+            "self.ledger = RewardLedger()" in init, (
+            "InfraSink must own a PRIVATE RewardLedger and take no ledger "
+            "argument; otherwise its segment() can consume the live one.")
+        hits = [h for h in hits if h not in sel_hits]
     assert len(hits) == 1, (
         f"RewardLedger.segment() is called from {len(hits)} places: {hits}. "
         f"It CLOSES AND RESETS the segment, so a second consumer receives an "

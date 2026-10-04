@@ -25,6 +25,18 @@ UNIT = [
     "tests/unit/test_sensors_unit.py",
     "tests/unit/test_world_model_unit.py",
     "tests/unit/test_spatial_slots_unit.py",
+    # foundation/ (improvement plan, 2026-10-03)
+    "tests/unit/test_foundation_contracts_unit.py",
+    "tests/unit/test_foundation_geometry_unit.py",
+    "tests/unit/test_foundation_runtime_unit.py",
+    "tests/unit/test_foundation_experience_unit.py",
+    "tests/unit/test_foundation_mechanisms_unit.py",
+    "tests/unit/test_foundation_inference_unit.py",
+    "tests/unit/test_foundation_perception_unit.py",
+    "tests/unit/test_foundation_ab_unit.py",
+    "tests/unit/test_foundation_discovery_unit.py",
+    "tests/unit/test_foundation_selection_unit.py",
+    "tests/unit/test_foundation_planning_unit.py",
 ]
 
 CONTRACT = [
@@ -41,6 +53,27 @@ CONTRACT = [
     # "uncertainty must out-pay a dreamed jackpot"; all real contracts that
     # were simply switched off. Same gap class as _vision_host_smoke.py.
     "tests/_imagination_curiosity_smoke.py",
+    # foundation/ (improvement plan, 2026-10-03). Design claims for the new
+    # learning core; see each docstring for the stage it gates.
+    "tests/_foundation_contracts_smoke.py",
+    "tests/_foundation_geometry_smoke.py",
+    "tests/_foundation_baseline_smoke.py",
+    "tests/_collection_path_smoke.py",
+    "tests/_foundation_experience_smoke.py",
+    "tests/_foundation_mechanisms_smoke.py",
+    "tests/_foundation_inference_smoke.py",
+    "tests/_foundation_perception_smoke.py",
+    "tests/_foundation_ab_smoke.py",
+    "tests/_foundation_transfer_smoke.py",
+    "tests/_foundation_discovery_smoke.py",
+    "tests/_foundation_selection_smoke.py",
+    "tests/_foundation_planning_smoke.py",
+    "tests/_foundation_shadow_smoke.py",
+    # Independent verifier: asserts the A/B PROTOCOL ran (verdicts, no
+    # silent arm failures), never a winner. Results live in
+    # experiments/foundation_ab/.
+    "tests/_foundation_ab_verify_smoke.py",
+    "tests/_foundation_ab_verify9_11_smoke.py",
 ]
 
 # These need the full stack (gymnasium / minerl) and so only run on the training host.
@@ -119,7 +152,10 @@ def _ci_parity():
     block = ci[ci.index("TESTS=("):]
     block = block[:block.index("\n            )")] if "\n            )" in block else block
     want = set(re.findall(r"tests/_\w+\.py", block))
-    return sorted(want - set(LEGACY))
+    # Compare against EVERY tier: a CI suite registered under `contract`
+    # is gated by `all`, and flagging it as drift trains the reader to
+    # ignore this warning.
+    return sorted(want - set(UNIT + CONTRACT + LEGACY))
 
 
 def main(which: str = "all") -> int:

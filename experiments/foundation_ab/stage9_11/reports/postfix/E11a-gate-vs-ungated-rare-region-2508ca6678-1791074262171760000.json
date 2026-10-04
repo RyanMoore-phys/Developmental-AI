@@ -1,0 +1,1054 @@
+{
+  "prereg": {
+    "ablation_arm": "fallback",
+    "acceptance_rule": "accept iff gated beats ungated on mean_dist (lower is better, basis=final) by mean >= 0.02 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.02 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": "gated_true",
+    "baseline_arm": "ungated",
+    "basis": "final",
+    "candidate_arm": "gated",
+    "delta": 0.02,
+    "direction": "lower",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071311533654000,
+    "frozen_hash": "2508ca66784621cd22a863aa39b90c23b4880862f4f933f4a316fbf4fe8c002e",
+    "hypothesis": "with a model wrong only inside a rarely visited disc (claims boost, truth is mud), the reliability gate lowers real mean distance to the goal versus the ungated planner by >= 0.02 m",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E11a-gate-vs-ungated-rare-region",
+    "notes": "",
+    "primary_metric": "mean_dist",
+    "resource_budget": {
+      "max_wall_seconds": 120.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_fingerprints": [
+      "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a"
+    ]
+  },
+  "results": {
+    "arms": [
+      "fallback",
+      "gated",
+      "ungated",
+      "gated_true",
+      "gated_global"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791074262171760000,
+    "prereg": {
+      "ablation_arm": "fallback",
+      "acceptance_rule": "accept iff gated beats ungated on mean_dist (lower is better, basis=final) by mean >= 0.02 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.02 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": "gated_true",
+      "baseline_arm": "ungated",
+      "basis": "final",
+      "candidate_arm": "gated",
+      "delta": 0.02,
+      "direction": "lower",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071311533654000,
+      "frozen_hash": "2508ca66784621cd22a863aa39b90c23b4880862f4f933f4a316fbf4fe8c002e",
+      "hypothesis": "with a model wrong only inside a rarely visited disc (claims boost, truth is mud), the reliability gate lowers real mean distance to the goal versus the ungated planner by >= 0.02 m",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E11a-gate-vs-ungated-rare-region",
+      "notes": "",
+      "primary_metric": "mean_dist",
+      "resource_budget": {
+        "max_wall_seconds": 120.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split_fingerprints": [
+        "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a"
+      ]
+    },
+    "prereg_hash": "2508ca66784621cd22a863aa39b90c23b4880862f4f933f4a316fbf4fe8c002e",
+    "runs": [
+      {
+        "arm": "fallback",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074222618356000,
+          "data_fp": "0e8bb21b9699fe3f",
+          "frac_steps_in_mud": 0.2375,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 0,
+          "planner_share": 0.0,
+          "planner_steps_in_mud": 0
+        },
+        "model_updates": null,
+        "primary": 0.7467001305048335,
+        "process_peak_rss_mb": 83.21875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074222618397000,
+        "wall_seconds": 0.03593349998118356
+      },
+      {
+        "arm": "gated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074226149640000,
+          "data_fp": "0e8bb21b9699fe3f",
+          "frac_steps_in_mud": 0.21041666666666667,
+          "gate_closes": 1,
+          "planner_entries_into_mud": 1,
+          "planner_share": 0.6979166666666666,
+          "planner_steps_in_mud": 1
+        },
+        "model_updates": null,
+        "primary": 0.6421796133043287,
+        "process_peak_rss_mb": 93.640625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074226149754000,
+        "wall_seconds": 3.5312135409913026
+      },
+      {
+        "arm": "ungated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074227808884000,
+          "data_fp": "0e8bb21b9699fe3f",
+          "frac_steps_in_mud": 0.38958333333333334,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 7,
+          "planner_share": 0.9979166666666667,
+          "planner_steps_in_mud": 183
+        },
+        "model_updates": null,
+        "primary": 0.7511782484947128,
+        "process_peak_rss_mb": 94.0625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074227808925000,
+        "wall_seconds": 1.659100791963283
+      },
+      {
+        "arm": "gated_true",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074229292813000,
+          "data_fp": "0e8bb21b9699fe3f",
+          "frac_steps_in_mud": 0.14166666666666666,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 1,
+          "planner_share": 0.99375,
+          "planner_steps_in_mud": 69
+        },
+        "model_updates": null,
+        "primary": 0.5309142335759595,
+        "process_peak_rss_mb": 94.15625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074229292851000,
+        "wall_seconds": 1.4838699579704553
+      },
+      {
+        "arm": "gated_global",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074230156741000,
+          "data_fp": "0e8bb21b9699fe3f",
+          "frac_steps_in_mud": 0.3145833333333333,
+          "gate_closes": 6,
+          "planner_entries_into_mud": 3,
+          "planner_share": 0.5541666666666667,
+          "planner_steps_in_mud": 6
+        },
+        "model_updates": null,
+        "primary": 0.706964381909016,
+        "process_peak_rss_mb": 94.203125,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074230156780000,
+        "wall_seconds": 0.8638807499664836
+      },
+      {
+        "arm": "gated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074233365788000,
+          "data_fp": "b117f7718eeeaaae",
+          "frac_steps_in_mud": 0.22708333333333333,
+          "gate_closes": 1,
+          "planner_entries_into_mud": 1,
+          "planner_share": 0.7,
+          "planner_steps_in_mud": 1
+        },
+        "model_updates": null,
+        "primary": 0.760851033292176,
+        "process_peak_rss_mb": 96.03125,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074233365863000,
+        "wall_seconds": 3.2089712920133024
+      },
+      {
+        "arm": "ungated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074235036549000,
+          "data_fp": "b117f7718eeeaaae",
+          "frac_steps_in_mud": 0.4166666666666667,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 7,
+          "planner_share": 0.9979166666666667,
+          "planner_steps_in_mud": 194
+        },
+        "model_updates": null,
+        "primary": 0.8540553315140808,
+        "process_peak_rss_mb": 96.359375,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074235036595000,
+        "wall_seconds": 1.6706598330056295
+      },
+      {
+        "arm": "gated_true",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074236554027000,
+          "data_fp": "b117f7718eeeaaae",
+          "frac_steps_in_mud": 0.2708333333333333,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 4,
+          "planner_share": 0.99375,
+          "planner_steps_in_mud": 127
+        },
+        "model_updates": null,
+        "primary": 0.6868002511087753,
+        "process_peak_rss_mb": 96.453125,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074236554070000,
+        "wall_seconds": 1.5174108750070445
+      },
+      {
+        "arm": "gated_global",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074237278671000,
+          "data_fp": "b117f7718eeeaaae",
+          "frac_steps_in_mud": 0.41458333333333336,
+          "gate_closes": 7,
+          "planner_entries_into_mud": 5,
+          "planner_share": 0.45208333333333334,
+          "planner_steps_in_mud": 7
+        },
+        "model_updates": null,
+        "primary": 0.8372742190760304,
+        "process_peak_rss_mb": 96.46875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074237278709000,
+        "wall_seconds": 0.7245949169737287
+      },
+      {
+        "arm": "fallback",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074237314246000,
+          "data_fp": "b117f7718eeeaaae",
+          "frac_steps_in_mud": 0.4166666666666667,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 0,
+          "planner_share": 0.0,
+          "planner_steps_in_mud": 0
+        },
+        "model_updates": null,
+        "primary": 0.9166579104873603,
+        "process_peak_rss_mb": 96.46875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074237314282000,
+        "wall_seconds": 0.03554041695315391
+      },
+      {
+        "arm": "ungated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074238808226000,
+          "data_fp": "c082b91ca4d206fa",
+          "frac_steps_in_mud": 0.38333333333333336,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 7,
+          "planner_share": 0.9979166666666667,
+          "planner_steps_in_mud": 177
+        },
+        "model_updates": null,
+        "primary": 0.9126440268267934,
+        "process_peak_rss_mb": 96.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074238808268000,
+        "wall_seconds": 1.4939251250470988
+      },
+      {
+        "arm": "gated_true",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074240298622000,
+          "data_fp": "c082b91ca4d206fa",
+          "frac_steps_in_mud": 0.25833333333333336,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 4,
+          "planner_share": 0.99375,
+          "planner_steps_in_mud": 120
+        },
+        "model_updates": null,
+        "primary": 0.7842381624606259,
+        "process_peak_rss_mb": 96.609375,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074240298664000,
+        "wall_seconds": 1.4903370409738272
+      },
+      {
+        "arm": "gated_global",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074241085196000,
+          "data_fp": "c082b91ca4d206fa",
+          "frac_steps_in_mud": 0.40208333333333335,
+          "gate_closes": 6,
+          "planner_entries_into_mud": 5,
+          "planner_share": 0.475,
+          "planner_steps_in_mud": 7
+        },
+        "model_updates": null,
+        "primary": 0.9570031579358703,
+        "process_peak_rss_mb": 96.609375,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074241085237000,
+        "wall_seconds": 0.7865245830034837
+      },
+      {
+        "arm": "fallback",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074241119958000,
+          "data_fp": "c082b91ca4d206fa",
+          "frac_steps_in_mud": 0.30416666666666664,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 0,
+          "planner_share": 0.0,
+          "planner_steps_in_mud": 0
+        },
+        "model_updates": null,
+        "primary": 0.9728458662609962,
+        "process_peak_rss_mb": 96.609375,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074241119982000,
+        "wall_seconds": 0.03472237498499453
+      },
+      {
+        "arm": "gated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074244457598000,
+          "data_fp": "c082b91ca4d206fa",
+          "frac_steps_in_mud": 0.23541666666666666,
+          "gate_closes": 4,
+          "planner_entries_into_mud": 2,
+          "planner_share": 0.6645833333333333,
+          "planner_steps_in_mud": 3
+        },
+        "model_updates": null,
+        "primary": 0.8956323634961227,
+        "process_peak_rss_mb": 96.734375,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074244457640000,
+        "wall_seconds": 3.3375717920134775
+      },
+      {
+        "arm": "gated_true",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074246151303000,
+          "data_fp": "eaa90ddcfc3ac922",
+          "frac_steps_in_mud": 0.3729166666666667,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 5,
+          "planner_share": 0.99375,
+          "planner_steps_in_mud": 174
+        },
+        "model_updates": null,
+        "primary": 0.7300147877631213,
+        "process_peak_rss_mb": 96.890625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074246151342000,
+        "wall_seconds": 1.6936413330258802
+      },
+      {
+        "arm": "gated_global",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074246823631000,
+          "data_fp": "eaa90ddcfc3ac922",
+          "frac_steps_in_mud": 0.4666666666666667,
+          "gate_closes": 5,
+          "planner_entries_into_mud": 4,
+          "planner_share": 0.41458333333333336,
+          "planner_steps_in_mud": 5
+        },
+        "model_updates": null,
+        "primary": 0.8735659355311637,
+        "process_peak_rss_mb": 96.890625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074246823669000,
+        "wall_seconds": 0.6722839580033906
+      },
+      {
+        "arm": "fallback",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074246870262000,
+          "data_fp": "eaa90ddcfc3ac922",
+          "frac_steps_in_mud": 0.3875,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 0,
+          "planner_share": 0.0,
+          "planner_steps_in_mud": 0
+        },
+        "model_updates": null,
+        "primary": 0.8748779841861165,
+        "process_peak_rss_mb": 96.890625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074246870304000,
+        "wall_seconds": 0.046597749984357506
+      },
+      {
+        "arm": "gated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074250217864000,
+          "data_fp": "eaa90ddcfc3ac922",
+          "frac_steps_in_mud": 0.26875,
+          "gate_closes": 1,
+          "planner_entries_into_mud": 1,
+          "planner_share": 0.6708333333333333,
+          "planner_steps_in_mud": 1
+        },
+        "model_updates": null,
+        "primary": 0.7478097321857169,
+        "process_peak_rss_mb": 98.796875,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074250217942000,
+        "wall_seconds": 3.34752416604897
+      },
+      {
+        "arm": "ungated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074252064074000,
+          "data_fp": "eaa90ddcfc3ac922",
+          "frac_steps_in_mud": 0.5375,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 9,
+          "planner_share": 0.9979166666666667,
+          "planner_steps_in_mud": 251
+        },
+        "model_updates": null,
+        "primary": 0.9293788147993066,
+        "process_peak_rss_mb": 98.8125,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074252064114000,
+        "wall_seconds": 1.8461032909690402
+      },
+      {
+        "arm": "gated_global",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074252773913000,
+          "data_fp": "84c6377cc00fe05f",
+          "frac_steps_in_mud": 0.4479166666666667,
+          "gate_closes": 7,
+          "planner_entries_into_mud": 7,
+          "planner_share": 0.40208333333333335,
+          "planner_steps_in_mud": 7
+        },
+        "model_updates": null,
+        "primary": 0.9404171789155039,
+        "process_peak_rss_mb": 98.8125,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074252773954000,
+        "wall_seconds": 0.7097919999505393
+      },
+      {
+        "arm": "fallback",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074252813631000,
+          "data_fp": "84c6377cc00fe05f",
+          "frac_steps_in_mud": 0.4395833333333333,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 0,
+          "planner_share": 0.0,
+          "planner_steps_in_mud": 0
+        },
+        "model_updates": null,
+        "primary": 1.0088299944064698,
+        "process_peak_rss_mb": 98.8125,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074252813661000,
+        "wall_seconds": 0.0396797499852255
+      },
+      {
+        "arm": "gated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074258380003000,
+          "data_fp": "84c6377cc00fe05f",
+          "frac_steps_in_mud": 0.29583333333333334,
+          "gate_closes": 2,
+          "planner_entries_into_mud": 2,
+          "planner_share": 0.6395833333333333,
+          "planner_steps_in_mud": 2
+        },
+        "model_updates": null,
+        "primary": 0.9297103550274682,
+        "process_peak_rss_mb": 101.59375,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074258380098000,
+        "wall_seconds": 5.566285332955886
+      },
+      {
+        "arm": "ungated",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074260396741000,
+          "data_fp": "84c6377cc00fe05f",
+          "frac_steps_in_mud": 0.4583333333333333,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 8,
+          "planner_share": 0.9979166666666667,
+          "planner_steps_in_mud": 211
+        },
+        "model_updates": null,
+        "primary": 0.9467103817410935,
+        "process_peak_rss_mb": 101.828125,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074260396784000,
+        "wall_seconds": 2.016610957973171
+      },
+      {
+        "arm": "gated_true",
+        "curve": [],
+        "error": null,
+        "interactions": 480,
+        "metrics": {
+          "computed_at_ns": 1791074262156113000,
+          "data_fp": "84c6377cc00fe05f",
+          "frac_steps_in_mud": 0.13541666666666666,
+          "gate_closes": 0,
+          "planner_entries_into_mud": 4,
+          "planner_share": 0.99375,
+          "planner_steps_in_mud": 61
+        },
+        "model_updates": null,
+        "primary": 0.6299488166184333,
+        "process_peak_rss_mb": 101.90625,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "6355b7d644820266b981a890a310fa9faad27f3b3cf18403c1a156eb5ccfc68a",
+        "split_id": "e11:mud#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074262156157000,
+        "wall_seconds": 1.7593077920028009
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_ids": [
+      "e11:mud#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791074222582434000,
+    "warnings": [
+      "exploratory arms not in the prereg (reported, never decisive): ['gated_global']"
+    ]
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff gated beats ungated on mean_dist (lower is better, basis=final) by mean >= 0.02 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.02 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "fallback": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 2400,
+        "mean": 0.9039823771691552,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.10183398612672631,
+        "wall_seconds_total": 0.192473791888915
+      },
+      "gated": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 2400,
+        "mean": 0.7952366194611625,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.1172823689690885,
+        "wall_seconds_total": 18.99156612402294
+      },
+      "gated_global": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 2400,
+        "mean": 0.8630449746735168,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.09993819601430831,
+        "wall_seconds_total": 3.757076207897626
+      },
+      "gated_true": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 2400,
+        "mean": 0.6723832503053829,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.09728171623163172,
+        "wall_seconds_total": 7.944566998980008
+      },
+      "ungated": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 2400,
+        "mean": 0.8787933606751974,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.07939626008498205,
+        "wall_seconds_total": 8.686399998958223
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "ungated",
+        "b": "gated",
+        "basis": "equal_interactions",
+        "ci_high": 0.1648095891983706,
+        "ci_low": 0.0023038932296991915,
+        "mean_diff": 0.08355674121403489,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.7511782484947128,
+            "b": 0.6421796133043287,
+            "budget": 480,
+            "diff": 0.10899863519038411,
+            "seed": 0,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.8540553315140808,
+            "b": 0.760851033292176,
+            "budget": 480,
+            "diff": 0.09320429822190479,
+            "seed": 1,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9126440268267934,
+            "b": 0.8956323634961227,
+            "budget": 480,
+            "diff": 0.017011663330670612,
+            "seed": 2,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9293788147993066,
+            "b": 0.7478097321857169,
+            "budget": 480,
+            "diff": 0.18156908261358973,
+            "seed": 3,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9467103817410935,
+            "b": 0.9297103550274682,
+            "budget": 480,
+            "diff": 0.017000026713625216,
+            "seed": 4,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "equal_time": {
+        "a": "ungated",
+        "b": "gated",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e11:mud#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e11:mud#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e11:mud#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            3,
+            "e11:mud#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            4,
+            "e11:mud#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "ungated",
+        "b": "gated",
+        "basis": "final",
+        "ci_high": 0.1648095891983706,
+        "ci_low": 0.0023038932296991915,
+        "mean_diff": 0.08355674121403489,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.7511782484947128,
+            "b": 0.6421796133043287,
+            "budget": null,
+            "diff": 0.10899863519038411,
+            "seed": 0,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.8540553315140808,
+            "b": 0.760851033292176,
+            "budget": null,
+            "diff": 0.09320429822190479,
+            "seed": 1,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9126440268267934,
+            "b": 0.8956323634961227,
+            "budget": null,
+            "diff": 0.017011663330670612,
+            "seed": 2,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9293788147993066,
+            "b": 0.7478097321857169,
+            "budget": null,
+            "diff": 0.18156908261358973,
+            "seed": 3,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9467103817410935,
+            "b": 0.9297103550274682,
+            "budget": null,
+            "diff": 0.017000026713625216,
+            "seed": 4,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 0.08356 >= delta 0.02, CI [0.002304, 0.1648] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "fallback",
+        "b": "gated",
+        "basis": "final",
+        "ci_high": 0.1499020464905574,
+        "ci_low": 0.06866914392763142,
+        "mean_diff": 0.10874575770799277,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.7467001305048335,
+            "b": 0.6421796133043287,
+            "budget": null,
+            "diff": 0.10452051720050481,
+            "seed": 0,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9166579104873603,
+            "b": 0.760851033292176,
+            "budget": null,
+            "diff": 0.15580687719518438,
+            "seed": 1,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.9728458662609962,
+            "b": 0.8956323634961227,
+            "budget": null,
+            "diff": 0.07721350276487349,
+            "seed": 2,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.8748779841861165,
+            "b": 0.7478097321857169,
+            "budget": null,
+            "diff": 0.12706825200039962,
+            "seed": 3,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0088299944064698,
+            "b": 0.9297103550274682,
+            "budget": null,
+            "diff": 0.07911963937900157,
+            "seed": 4,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "alternative_arm": {
+        "a": "gated_true",
+        "b": "gated",
+        "basis": "final",
+        "ci_high": -0.009939865531920028,
+        "ci_low": -0.27185177257883214,
+        "mean_diff": -0.12285336915577945,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.5309142335759595,
+            "b": 0.6421796133043287,
+            "budget": null,
+            "diff": -0.11126537972836925,
+            "seed": 0,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.6868002511087753,
+            "b": 0.760851033292176,
+            "budget": null,
+            "diff": -0.07405078218340067,
+            "seed": 1,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.7842381624606259,
+            "b": 0.8956323634961227,
+            "budget": null,
+            "diff": -0.1113942010354968,
+            "seed": 2,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.7300147877631213,
+            "b": 0.7478097321857169,
+            "budget": null,
+            "diff": -0.01779494442259555,
+            "seed": 3,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.6299488166184333,
+            "b": 0.9297103550274682,
+            "budget": null,
+            "diff": -0.29976153840903497,
+            "seed": 4,
+            "split": "e11:mud#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}

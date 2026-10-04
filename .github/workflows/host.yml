@@ -223,7 +223,7 @@ jobs:
             [ -w /workspace/devai ] || { echo "NOT WRITABLE by $(whoami)"; exit 1; }
             df -h /workspace/devai | tail -1'
           rsync -rlptz -e "$SSH" \
-            developmental_ai configs scripts tests run_minecraft.py requirements.txt \
+            developmental_ai configs scripts tests tools experiments run_minecraft.py requirements.txt \
             "${MAIN_USER:-root}@$MAIN_HOST:/workspace/devai/"
           # TS_AUTHKEY (optional, runner .env) lets stage 1c join the tailnet
           # non-interactively so the training host comes out already reachable.

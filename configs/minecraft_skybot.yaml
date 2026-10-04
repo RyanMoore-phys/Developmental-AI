@@ -169,7 +169,12 @@ environment:
   # so the menu was paying 77% of all income. The agent was not choosing the
   # menu over the world; the menu simply paid better. With that leak closed
   # and `gui_dwell_weight` supplying a gradient toward the door, a menu now
-  # pays strictly <= 0 while the world pays > 0.
+  # pays strictly <= 0 while the world pays > 0 (crafting's extrinsic tier
+  # aside). TRUE ONLY SINCE 2026-10-03: until then stream 0's dwell term sat
+  # inside the vision-scaffold block, and `llm.vision.enabled: false` below
+  # meant stream 0 — the one PPO trains on — paid NO dwell cost while the
+  # scouts did (docs/foundation/BASELINE_AUDIT.md §3). It now runs on every
+  # waking step, scaffold or not; tests/_gui_farm_smoke.py contract D.
   #
   # This is the macro-6 lesson verbatim: "Removing the capability was the
   # blunt fix. The right fix was already in place... The agent is taught the
@@ -1192,8 +1197,10 @@ curiosity:
   # gives no reason to LEAVE, and it had already trained `inventory` — the
   # only button that closes a screen — to zero probability (0 presses in a
   # whole run at 92%-of-max entropy), because pressing it opens a screen
-  # that pays nothing. Telescoping Phi = -min(1, gui_run/steps): dwelling
-  # costs once, leaving refunds it, a cycle nets ~0. Small on purpose — it
+  # that pays nothing. Plain-difference Phi = -min(1, gui_run/steps) (NOT
+  # gamma-telescoped — that pays a wage while pinned, CLAUDE.md §4.3):
+  # dwelling costs once, leaving refunds it, pinned pays exactly 0, a cycle
+  # nets 0. Stream 0 and every scout alike. Small on purpose — it
   # is a nudge toward the door, not a punishment for opening one, and
   # crafting still earns its extrinsic tier inside the menu.
   gui_dwell_weight: 0.05
@@ -3041,3 +3048,34 @@ prospection:
   # REVERT IF: `Phase timing: act` rises materially (prospection runs in the
   # decision path, so this is the line that would show it).
   horizon: 24
+
+# ---- Foundation SHADOW recorder (plan §8 step 2, 2026-10-03) ----
+# ON since 2026-10-03 (user decision): its job is to collect the REAL SkyBot
+# evidence the foundation models (stages 6-7) must be compared on before any
+# of them may influence behaviour. Every `every_n_steps`-th step of BOTH live bodies is filed as
+# foundation records in an EvidenceStore under `root`: the GREEN sensor
+# transport (RED oracle readings only in the evaluator partition), the
+# executed action with its real dispatch/complete times, the world model's
+# one-step prediction logged BEFORE env.step, and how each episode ended.
+# It reads only and draws no random numbers, so it cannot change actions,
+# rewards, replay, normalisation or RNG (tests/_foundation_shadow_smoke.py C).
+# It never raises into the loop: an error or a budget overrun disables it for
+# the rest of the run with ONE warning; relaunch to re-enable.
+#   max_bytes          on-disk cap; oldest evidence is evicted first. 1 GiB on
+#                      a 256 GB single NVMe (CLAUDE.md §6).
+#   every_n_steps      16 => ~0.2 sampled steps/s at the live ~3.4 steps/s.
+#   max_ms_per_step    amortised shadow ms per loop step over budget_window
+#                      steps; 5 ms is ~1.7% of a ~300 ms live step.
+#   max_ms_single_step one pathological stall (fsync on a failing disk).
+foundation:
+  shadow:
+    enabled: true
+    root: runlogs/foundation_shadow
+    max_bytes: 1073741824
+    chunk_bytes: 1048576
+    every_n_steps: 16
+    max_ms_per_step: 5.0
+    budget_window: 256
+    max_ms_single_step: 2000.0
+    predict: true
+    fsync: false

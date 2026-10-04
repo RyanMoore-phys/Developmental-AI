@@ -1,0 +1,851 @@
+{
+  "prereg": {
+    "ablation_arm": "entropy",
+    "acceptance_rule": "accept iff info_joint beats random on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": "icm",
+    "baseline_arm": "random",
+    "basis": "final",
+    "candidate_arm": "info_joint",
+    "delta": 1.0,
+    "direction": "lower",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071214609095000,
+    "frozen_hash": "dffe2f0284544963fc03d9ca42d8eef4afaac8333d6a7b506b011ca8572a485c",
+    "hypothesis": "with FOUR coin-flip TVs (K=6, noise 0.35, budget 60), info-gain identifies the shift in >= 1 fewer interactions than random",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E10b-four-noisy-TVs",
+    "notes": "",
+    "primary_metric": "interactions_to_identify",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_fingerprints": [
+      "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21"
+    ]
+  },
+  "results": {
+    "arms": [
+      "info_joint",
+      "random",
+      "icm",
+      "entropy",
+      "lp"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791071220574669000,
+    "prereg": {
+      "ablation_arm": "entropy",
+      "acceptance_rule": "accept iff info_joint beats random on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": "icm",
+      "baseline_arm": "random",
+      "basis": "final",
+      "candidate_arm": "info_joint",
+      "delta": 1.0,
+      "direction": "lower",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071214609095000,
+      "frozen_hash": "dffe2f0284544963fc03d9ca42d8eef4afaac8333d6a7b506b011ca8572a485c",
+      "hypothesis": "with FOUR coin-flip TVs (K=6, noise 0.35, budget 60), info-gain identifies the shift in >= 1 fewer interactions than random",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E10b-four-noisy-TVs",
+      "notes": "",
+      "primary_metric": "interactions_to_identify",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "split_fingerprints": [
+        "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21"
+      ]
+    },
+    "prereg_hash": "dffe2f0284544963fc03d9ca42d8eef4afaac8333d6a7b506b011ca8572a485c",
+    "runs": [
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 28,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219046843000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "636fb4c3150a9a8d",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            7,
+            6,
+            6,
+            6,
+            3
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 5.6,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 5.6,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219046915000,
+        "wall_seconds": 0.03624958300497383
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 65,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219068163000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "636fb4c3150a9a8d",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            8,
+            26,
+            9,
+            12,
+            10
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 13.0,
+          "tv_fraction": 0.3539316239316239
+        },
+        "model_updates": null,
+        "primary": 13.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219068224000,
+        "wall_seconds": 0.021262708003632724
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 63,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219092656000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "636fb4c3150a9a8d",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            7,
+            12,
+            11,
+            7,
+            26
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 12.6,
+          "tv_fraction": 0.3325674325674326
+        },
+        "model_updates": null,
+        "primary": 12.6,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219092720000,
+        "wall_seconds": 0.024449625052511692
+      },
+      {
+        "arm": "entropy",
+        "curve": [],
+        "error": null,
+        "interactions": 300,
+        "metrics": {
+          "censored": 1.0,
+          "computed_at_ns": 1791071219456022000,
+          "confident": 0.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "636fb4c3150a9a8d",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            61,
+            61,
+            61,
+            61,
+            61
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 61.0,
+          "tv_fraction": 0.97
+        },
+        "model_updates": null,
+        "primary": 61.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219456093000,
+        "wall_seconds": 0.3633203330100514
+      },
+      {
+        "arm": "lp",
+        "curve": [],
+        "error": null,
+        "interactions": 68,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219486564000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "636fb4c3150a9a8d",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            7,
+            18,
+            16,
+            7,
+            20
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 13.6,
+          "tv_fraction": 0.3268253968253968
+        },
+        "model_updates": null,
+        "primary": 13.6,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219486647000,
+        "wall_seconds": 0.030495749961119145
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 101,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219525071000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.2,
+          "data_fp": "aa256ad502dd41cd",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            25,
+            31,
+            12,
+            20,
+            13
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 16.8,
+          "tv_fraction": 0.4589181141439206
+        },
+        "model_updates": null,
+        "primary": 20.2,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219525150000,
+        "wall_seconds": 0.03844137495616451
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 94,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219560592000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "aa256ad502dd41cd",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            21,
+            5,
+            36,
+            22,
+            10
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 18.8,
+          "tv_fraction": 0.4904906204906204
+        },
+        "model_updates": null,
+        "primary": 18.8,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219560654000,
+        "wall_seconds": 0.03545762499561533
+      },
+      {
+        "arm": "entropy",
+        "curve": [],
+        "error": null,
+        "interactions": 300,
+        "metrics": {
+          "censored": 1.0,
+          "computed_at_ns": 1791071219965451000,
+          "confident": 0.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "aa256ad502dd41cd",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            61,
+            61,
+            61,
+            61,
+            61
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 61.0,
+          "tv_fraction": 0.9800000000000001
+        },
+        "model_updates": null,
+        "primary": 61.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219965531000,
+        "wall_seconds": 0.4048198750242591
+      },
+      {
+        "arm": "lp",
+        "curve": [],
+        "error": null,
+        "interactions": 60,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071219995098000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "aa256ad502dd41cd",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            21,
+            5,
+            10,
+            14,
+            10
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 12.0,
+          "tv_fraction": 0.2942857142857143
+        },
+        "model_updates": null,
+        "primary": 12.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071219995174000,
+        "wall_seconds": 0.029587041004560888
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 25,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071220035351000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "aa256ad502dd41cd",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            4,
+            5,
+            3,
+            6,
+            7
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 5.0,
+          "tv_fraction": 0.02857142857142857
+        },
+        "model_updates": null,
+        "primary": 5.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220035429000,
+        "wall_seconds": 0.040196500020101666
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 101,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071220080397000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.2,
+          "data_fp": "e128b96864bb98ff",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            32,
+            24,
+            9,
+            27,
+            9
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 19.0,
+          "tv_fraction": 0.4770833333333333
+        },
+        "model_updates": null,
+        "primary": 20.2,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220080456000,
+        "wall_seconds": 0.04497566696954891
+      },
+      {
+        "arm": "entropy",
+        "curve": [],
+        "error": null,
+        "interactions": 300,
+        "metrics": {
+          "censored": 1.0,
+          "computed_at_ns": 1791071220437015000,
+          "confident": 0.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "e128b96864bb98ff",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            61,
+            61,
+            61,
+            61,
+            61
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 61.0,
+          "tv_fraction": 0.97
+        },
+        "model_updates": null,
+        "primary": 61.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220437086000,
+        "wall_seconds": 0.3565768339904025
+      },
+      {
+        "arm": "lp",
+        "curve": [],
+        "error": null,
+        "interactions": 185,
+        "metrics": {
+          "censored": 0.4,
+          "computed_at_ns": 1791071220506349000,
+          "confident": 0.6,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "e128b96864bb98ff",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            61,
+            47,
+            9,
+            61,
+            9
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 37.4,
+          "tv_fraction": 0.5876359338061465
+        },
+        "model_updates": null,
+        "primary": 37.4,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220506433000,
+        "wall_seconds": 0.06928895803866908
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 40,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071220555833000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "e128b96864bb98ff",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            3,
+            6,
+            11,
+            15,
+            5
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 8.0,
+          "tv_fraction": 0.013333333333333332
+        },
+        "model_updates": null,
+        "primary": 8.0,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220555900000,
+        "wall_seconds": 0.04941650002729148
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 57,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791071220574561000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "e128b96864bb98ff",
+          "lamp_fraction": 0.0,
+          "per_scenario": [
+            5,
+            17,
+            12,
+            17,
+            6
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 11.4,
+          "tv_fraction": 0.3449019607843137
+        },
+        "model_updates": null,
+        "primary": 11.4,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "ede2223c372ffb3f0d3fbb045b02324417ab6fe77b42c67abdece5d4caa66e21",
+        "split_id": "e10:tv4#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071220574617000,
+        "wall_seconds": 0.018673834041692317
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_ids": [
+      "e10:tv4#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791071219010620000,
+    "warnings": [
+      "exploratory arms not in the prereg (reported, never decisive): ['lp']"
+    ]
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff info_joint beats random on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "entropy": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 900,
+        "mean": 61.0,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.0,
+        "wall_seconds_total": 1.124717042024713
+      },
+      "icm": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 258,
+        "mean": 17.2,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 4.044749683231337,
+        "wall_seconds_total": 0.10488291701767594
+      },
+      "info_joint": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 93,
+        "mean": 6.2,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 1.5874507866387546,
+        "wall_seconds_total": 0.12586258305236697
+      },
+      "lp": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 313,
+        "mean": 21.0,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 14.225329521666625,
+        "wall_seconds_total": 0.1293717490043491
+      },
+      "random": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 223,
+        "mean": 14.866666666666667,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 4.687572221665852,
+        "wall_seconds_total": 0.07837791700148955
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "random",
+        "b": "info_joint",
+        "basis": "equal_interactions",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            1,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            2,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ]
+        ],
+        "units": []
+      },
+      "equal_time": {
+        "a": "random",
+        "b": "info_joint",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e10:tv4#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "random",
+        "b": "info_joint",
+        "basis": "final",
+        "ci_high": 26.23391326903979,
+        "ci_low": -5.494685186266773,
+        "mean_diff": 8.666666666666666,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 13.0,
+            "b": 5.6,
+            "budget": null,
+            "diff": 7.4,
+            "seed": 0,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 20.2,
+            "b": 5.0,
+            "budget": null,
+            "diff": 15.2,
+            "seed": 1,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 11.4,
+            "b": 8.0,
+            "budget": null,
+            "diff": 3.4000000000000004,
+            "seed": 2,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "inconclusive",
+    "notes": [
+      "criterion unmet: baseline 'random' is preserved",
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "CI [-5.495, 26.23] with mean 8.667 neither meets nor rules out delta 1"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "entropy",
+        "b": "info_joint",
+        "basis": "final",
+        "ci_high": 58.02663713104812,
+        "ci_low": 49.96004430342781,
+        "mean_diff": 54.800000000000004,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 61.0,
+            "b": 5.6,
+            "budget": null,
+            "diff": 55.4,
+            "seed": 0,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 61.0,
+            "b": 5.0,
+            "budget": null,
+            "diff": 56.0,
+            "seed": 1,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 61.0,
+            "b": 8.0,
+            "budget": null,
+            "diff": 53.0,
+            "seed": 2,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "alternative_arm": {
+        "a": "icm",
+        "b": "info_joint",
+        "basis": "final",
+        "ci_high": 18.528819972445635,
+        "ci_low": 0.24454289650624617,
+        "mean_diff": 11.0,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 12.6,
+            "b": 5.6,
+            "budget": null,
+            "diff": 7.0,
+            "seed": 0,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 18.8,
+            "b": 5.0,
+            "budget": null,
+            "diff": 13.8,
+            "seed": 1,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          },
+          {
+            "a": 20.2,
+            "b": 8.0,
+            "budget": null,
+            "diff": 12.2,
+            "seed": 2,
+            "split": "e10:tv4#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "inconclusive"
+  }
+}

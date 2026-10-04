@@ -1,0 +1,770 @@
+{
+  "prereg": {
+    "ablation_arm": "heavy_tail_chunk8",
+    "acceptance_rule": "accept iff heavy_tail beats constant on overrun_fraction (higher is better, basis=final) by mean >= 0.01 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.01 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": null,
+    "baseline_arm": "constant",
+    "basis": "final",
+    "candidate_arm": "heavy_tail",
+    "delta": 0.01,
+    "direction": "higher",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071311533965000,
+    "frozen_hash": "b02fc1205e18649b4ab7d6b1e735b81520ef7b1860d3f8371cefdc9be3f31db1",
+    "hypothesis": "with a model whose call latency is heavy-tailed (2% of calls take 30 ms) under a 10 ms deadline, >= 1% more decisions take over TWICE the deadline than with a constant-latency model of equal mean: the 'hard' deadline is bounded only by one chunk's worst case",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E11c-deadline-heavy-tailed-model",
+    "notes": "",
+    "primary_metric": "overrun_fraction",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_fingerprints": [
+      "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d"
+    ]
+  },
+  "results": {
+    "arms": [
+      "constant",
+      "heavy_tail",
+      "heavy_tail_chunk8"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791074278013865000,
+    "prereg": {
+      "ablation_arm": "heavy_tail_chunk8",
+      "acceptance_rule": "accept iff heavy_tail beats constant on overrun_fraction (higher is better, basis=final) by mean >= 0.01 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.01 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": null,
+      "baseline_arm": "constant",
+      "basis": "final",
+      "candidate_arm": "heavy_tail",
+      "delta": 0.01,
+      "direction": "higher",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071311533965000,
+      "frozen_hash": "b02fc1205e18649b4ab7d6b1e735b81520ef7b1860d3f8371cefdc9be3f31db1",
+      "hypothesis": "with a model whose call latency is heavy-tailed (2% of calls take 30 ms) under a 10 ms deadline, >= 1% more decisions take over TWICE the deadline than with a constant-latency model of equal mean: the 'hard' deadline is bounded only by one chunk's worst case",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E11c-deadline-heavy-tailed-model",
+      "notes": "",
+      "primary_metric": "overrun_fraction",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split_fingerprints": [
+        "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d"
+      ]
+    },
+    "prereg_hash": "b02fc1205e18649b4ab7d6b1e735b81520ef7b1860d3f8371cefdc9be3f31db1",
+    "runs": [
+      {
+        "arm": "constant",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074263272573000,
+          "data_fp": "07ca808ac5ebf1e9",
+          "late_chunks": 5,
+          "late_fraction": 0.08,
+          "max_latency_over_deadline": 4.13071250077337,
+          "median_latency_ms": 6.1769790190737695,
+          "p99_latency_ms": 11.165065405657502,
+          "planner_fraction": 0.9733333333333334,
+          "probes": 0,
+          "timeout_fraction": 0.02666666666666667
+        },
+        "model_updates": null,
+        "primary": 0.006666666666666667,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074263272672000,
+        "wall_seconds": 1.0907289170427248
+      },
+      {
+        "arm": "heavy_tail",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074264011341000,
+          "data_fp": "07ca808ac5ebf1e9",
+          "late_chunks": 15,
+          "late_fraction": 0.11333333333333333,
+          "max_latency_over_deadline": 1.0770209017209709,
+          "median_latency_ms": 2.031625044764951,
+          "p99_latency_ms": 10.425510205095632,
+          "planner_fraction": 0.7,
+          "probes": 0,
+          "timeout_fraction": 0.3
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074264011398000,
+        "wall_seconds": 0.7386670000269078
+      },
+      {
+        "arm": "heavy_tail_chunk8",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074264030891000,
+          "data_fp": "07ca808ac5ebf1e9",
+          "late_chunks": 1,
+          "late_fraction": 0.006666666666666667,
+          "max_latency_over_deadline": 1.032770803431049,
+          "median_latency_ms": 0.057145487517118454,
+          "p99_latency_ms": 0.08367398811969906,
+          "planner_fraction": 0.0,
+          "probes": 0,
+          "timeout_fraction": 1.0
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074264030931000,
+        "wall_seconds": 0.019499042013194412
+      },
+      {
+        "arm": "heavy_tail",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074264831180000,
+          "data_fp": "d3581b98b018938c",
+          "late_chunks": 17,
+          "late_fraction": 0.11333333333333333,
+          "max_latency_over_deadline": 1.0412792034912854,
+          "median_latency_ms": 2.5143329985439777,
+          "p99_latency_ms": 10.345595158287324,
+          "planner_fraction": 0.6666666666666666,
+          "probes": 0,
+          "timeout_fraction": 0.3333333333333333
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074264831240000,
+        "wall_seconds": 0.8002529170480557
+      },
+      {
+        "arm": "heavy_tail_chunk8",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074266288091000,
+          "data_fp": "d3581b98b018938c",
+          "late_chunks": 36,
+          "late_fraction": 0.25333333333333335,
+          "max_latency_over_deadline": 1.0662209009751678,
+          "median_latency_ms": 9.616687544621527,
+          "p99_latency_ms": 10.57698534335941,
+          "planner_fraction": 0.3933333333333333,
+          "probes": 0,
+          "timeout_fraction": 0.6066666666666667
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074266288181000,
+        "wall_seconds": 1.4568534159916453
+      },
+      {
+        "arm": "constant",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074267511858000,
+          "data_fp": "d3581b98b018938c",
+          "late_chunks": 7,
+          "late_fraction": 0.06666666666666667,
+          "max_latency_over_deadline": 1.9574167032260448,
+          "median_latency_ms": 8.540249982615933,
+          "p99_latency_ms": 16.028189588687354,
+          "planner_fraction": 0.9066666666666666,
+          "probes": 1,
+          "timeout_fraction": 0.09333333333333334
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074267511895000,
+        "wall_seconds": 1.2236575829447247
+      },
+      {
+        "arm": "heavy_tail_chunk8",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074268991665000,
+          "data_fp": "74527aeb10eb792a",
+          "late_chunks": 37,
+          "late_fraction": 0.28,
+          "max_latency_over_deadline": 1.6762749990448356,
+          "median_latency_ms": 9.740229492308572,
+          "p99_latency_ms": 12.057237052358657,
+          "planner_fraction": 0.4266666666666667,
+          "probes": 1,
+          "timeout_fraction": 0.5733333333333334
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074268991701000,
+        "wall_seconds": 1.4797537080012262
+      },
+      {
+        "arm": "constant",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074270153926000,
+          "data_fp": "74527aeb10eb792a",
+          "late_chunks": 10,
+          "late_fraction": 0.08,
+          "max_latency_over_deadline": 2.4563707993365824,
+          "median_latency_ms": 8.623166504548863,
+          "p99_latency_ms": 15.474219914758546,
+          "planner_fraction": 0.9466666666666667,
+          "probes": 0,
+          "timeout_fraction": 0.05333333333333334
+        },
+        "model_updates": null,
+        "primary": 0.006666666666666667,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074270153997000,
+        "wall_seconds": 1.1622292500105686
+      },
+      {
+        "arm": "heavy_tail",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074271085096000,
+          "data_fp": "74527aeb10eb792a",
+          "late_chunks": 23,
+          "late_fraction": 0.18,
+          "max_latency_over_deadline": 1.1769625009037554,
+          "median_latency_ms": 7.313687528949231,
+          "p99_latency_ms": 11.342606921680265,
+          "planner_fraction": 0.6466666666666666,
+          "probes": 0,
+          "timeout_fraction": 0.35333333333333333
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074271085131000,
+        "wall_seconds": 0.9310874580405653
+      },
+      {
+        "arm": "constant",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074272279133000,
+          "data_fp": "8fcfc1852034dbff",
+          "late_chunks": 12,
+          "late_fraction": 0.09333333333333334,
+          "max_latency_over_deadline": 1.640833297278732,
+          "median_latency_ms": 8.741958503378555,
+          "p99_latency_ms": 14.801951418048692,
+          "planner_fraction": 0.92,
+          "probes": 0,
+          "timeout_fraction": 0.08
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074272279173000,
+        "wall_seconds": 1.193991084001027
+      },
+      {
+        "arm": "heavy_tail",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074272952613000,
+          "data_fp": "8fcfc1852034dbff",
+          "late_chunks": 15,
+          "late_fraction": 0.1,
+          "max_latency_over_deadline": 1.0262000025250018,
+          "median_latency_ms": 1.4734169817529619,
+          "p99_latency_ms": 10.242214319296181,
+          "planner_fraction": 0.7266666666666667,
+          "probes": 0,
+          "timeout_fraction": 0.2733333333333333
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074272952653000,
+        "wall_seconds": 0.6734393749502487
+      },
+      {
+        "arm": "heavy_tail_chunk8",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074274421268000,
+          "data_fp": "8fcfc1852034dbff",
+          "late_chunks": 35,
+          "late_fraction": 0.25333333333333335,
+          "max_latency_over_deadline": 1.0353916033636779,
+          "median_latency_ms": 9.688562509836629,
+          "p99_latency_ms": 10.34408993087709,
+          "planner_fraction": 0.37333333333333335,
+          "probes": 0,
+          "timeout_fraction": 0.6266666666666667
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074274421307000,
+        "wall_seconds": 1.4686011669691652
+      },
+      {
+        "arm": "heavy_tail",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074275208272000,
+          "data_fp": "8e7c6653d6f5cc35",
+          "late_chunks": 17,
+          "late_fraction": 0.13333333333333333,
+          "max_latency_over_deadline": 1.314383395947516,
+          "median_latency_ms": 1.551916473545134,
+          "p99_latency_ms": 10.810966240242124,
+          "planner_fraction": 0.6533333333333333,
+          "probes": 0,
+          "timeout_fraction": 0.3466666666666667
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074275208337000,
+        "wall_seconds": 0.7869693749817088
+      },
+      {
+        "arm": "heavy_tail_chunk8",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074276664450000,
+          "data_fp": "8e7c6653d6f5cc35",
+          "late_chunks": 35,
+          "late_fraction": 0.24666666666666667,
+          "max_latency_over_deadline": 1.8177459016442299,
+          "median_latency_ms": 9.619229502277449,
+          "p99_latency_ms": 10.93534724495839,
+          "planner_fraction": 0.3933333333333333,
+          "probes": 0,
+          "timeout_fraction": 0.6066666666666667
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074276664494000,
+        "wall_seconds": 1.4560945000266656
+      },
+      {
+        "arm": "constant",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "computed_at_ns": 1791074278013793000,
+          "data_fp": "8e7c6653d6f5cc35",
+          "late_chunks": 2,
+          "late_fraction": 0.013333333333333334,
+          "max_latency_over_deadline": 1.0089999996125698,
+          "median_latency_ms": 8.946146030211821,
+          "p99_latency_ms": 9.973725500167346,
+          "planner_fraction": 1.0,
+          "probes": 0,
+          "timeout_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 0.0,
+        "process_peak_rss_mb": 103.5625,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "4d2b6e8c75f095a11b1d816892162adb57d5b3df701c5e6ab46b52121816b77d",
+        "split_id": "e11:deadline#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791074278013832000,
+        "wall_seconds": 1.3492867500171997
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_ids": [
+      "e11:deadline#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791074262181860000,
+    "warnings": []
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff heavy_tail beats constant on overrun_fraction (higher is better, basis=final) by mean >= 0.01 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.01 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "constant": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 750,
+        "mean": 0.002666666666666667,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.0036514837167011074,
+        "wall_seconds_total": 6.019893584016245
+      },
+      "heavy_tail": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 750,
+        "mean": 0.0,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.0,
+        "wall_seconds_total": 3.9304161250474863
+      },
+      "heavy_tail_chunk8": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 750,
+        "mean": 0.0,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.0,
+        "wall_seconds_total": 5.880801833001897
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "constant",
+        "b": "heavy_tail",
+        "basis": "equal_interactions",
+        "ci_high": 0.0015560807617142737,
+        "ci_low": -0.006889414095047608,
+        "mean_diff": -0.002666666666666667,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.006666666666666667,
+            "b": 0.0,
+            "budget": 150,
+            "diff": -0.006666666666666667,
+            "seed": 0,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": 150,
+            "diff": 0.0,
+            "seed": 1,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.006666666666666667,
+            "b": 0.0,
+            "budget": 150,
+            "diff": -0.006666666666666667,
+            "seed": 2,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": 150,
+            "diff": 0.0,
+            "seed": 3,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": 150,
+            "diff": 0.0,
+            "seed": 4,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "equal_time": {
+        "a": "constant",
+        "b": "heavy_tail",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e11:deadline#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e11:deadline#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e11:deadline#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            3,
+            "e11:deadline#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            4,
+            "e11:deadline#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "constant",
+        "b": "heavy_tail",
+        "basis": "final",
+        "ci_high": 0.0015560807617142737,
+        "ci_low": -0.006889414095047608,
+        "mean_diff": -0.002666666666666667,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.006666666666666667,
+            "b": 0.0,
+            "budget": null,
+            "diff": -0.006666666666666667,
+            "seed": 0,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 1,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.006666666666666667,
+            "b": 0.0,
+            "budget": null,
+            "diff": -0.006666666666666667,
+            "seed": 2,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 3,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 4,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "reject",
+    "notes": [
+      "criterion unmet: baseline 'constant' is preserved",
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "CI upper bound 0.001556 < delta 0.01: the hypothesised effect is ruled out"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "heavy_tail_chunk8",
+        "b": "heavy_tail",
+        "basis": "final",
+        "ci_high": 0.0,
+        "ci_low": 0.0,
+        "mean_diff": 0.0,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 0,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 1,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 2,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 3,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.0,
+            "b": 0.0,
+            "budget": null,
+            "diff": 0.0,
+            "seed": 4,
+            "split": "e11:deadline#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "reject"
+  }
+}

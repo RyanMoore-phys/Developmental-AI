@@ -1,0 +1,1758 @@
+{
+  "prereg": {
+    "ablation_arm": "in_noedges",
+    "acceptance_rule": "accept iff in beats mlp_flops on nll1 (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": "mlp128",
+    "baseline_arm": "mlp_flops",
+    "basis": "final",
+    "candidate_arm": "in",
+    "delta": 0.05,
+    "direction": "lower",
+    "failure_conditions": [
+      "any arm raises",
+      "non-finite metric",
+      "loss does not fall"
+    ],
+    "frozen_at_ns": 1791071610496847000,
+    "frozen_hash": "6b41c0914428598a2d787a75b6b7a3eaf417468905c0090f825b6e65ea5a02b3",
+    "hypothesis": "At equal FLOPs/sample, equal data and equal epochs, the relational IN has lower held-out 1-step Gaussian NLL (ball dims) than an MLP on the same structured inputs",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E1a-IN-vs-flopmatched-MLP-nll1",
+    "notes": "scale=full; flop match {'hidden': 661, 'in_flops': 1076544, 'mlp_flops': 1078752}; torch threads 4; tracemalloc off (timing fidelity); arm results cached across the E1 preregs, all of which were frozen before any arm ran",
+    "primary_metric": "nll1",
+    "resource_budget": {
+      "max_wall_seconds": 300.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "split_fingerprints": [
+      "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f"
+    ]
+  },
+  "results": {
+    "arms": [
+      "in",
+      "mlp_flops",
+      "mlp128",
+      "in_noedges",
+      "in_norel"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791072057353761000,
+    "prereg": {
+      "ablation_arm": "in_noedges",
+      "acceptance_rule": "accept iff in beats mlp_flops on nll1 (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": "mlp128",
+      "baseline_arm": "mlp_flops",
+      "basis": "final",
+      "candidate_arm": "in",
+      "delta": 0.05,
+      "direction": "lower",
+      "failure_conditions": [
+        "any arm raises",
+        "non-finite metric",
+        "loss does not fall"
+      ],
+      "frozen_at_ns": 1791071610496847000,
+      "frozen_hash": "6b41c0914428598a2d787a75b6b7a3eaf417468905c0090f825b6e65ea5a02b3",
+      "hypothesis": "At equal FLOPs/sample, equal data and equal epochs, the relational IN has lower held-out 1-step Gaussian NLL (ball dims) than an MLP on the same structured inputs",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E1a-IN-vs-flopmatched-MLP-nll1",
+      "notes": "scale=full; flop match {'hidden': 661, 'in_flops': 1076544, 'mlp_flops': 1078752}; torch threads 4; tracemalloc off (timing fidelity); arm results cached across the E1 preregs, all of which were frozen before any arm ran",
+      "primary_metric": "nll1",
+      "resource_budget": {
+        "max_wall_seconds": 300.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "split_fingerprints": [
+        "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f"
+      ]
+    },
+    "prereg_hash": "6b41c0914428598a2d787a75b6b7a3eaf417468905c0090f825b6e65ea5a02b3",
+    "runs": [
+      {
+        "arm": "in",
+        "curve": [
+          [
+            1760,
+            13.536651750036981,
+            -0.5352651931676948
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071628751050000,
+          "cov50_1": 0.7216517857142857,
+          "cov90_1": 0.9334077380952381,
+          "cov90_10": 0.9225,
+          "crps1": 0.3373452206185368,
+          "curve_points": 1,
+          "data_fp": "48e64930ceb56c2f",
+          "drift10": 1.5539052897898364,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.143750130046498,
+          "loss_last": -15.565731256658381,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 31.25247730243836,
+          "nll_event": 0.35654530264564466,
+          "params": 20507,
+          "predict_ms_per64": 2.9995000222697854,
+          "refused10": 130,
+          "rmse1": 1.3969970771205011,
+          "rmse10": 2.2995250876693323,
+          "rmse1_contact": 2.3319566244475043,
+          "rmse1_free": 0.392601859165543,
+          "torch_threads": 4,
+          "train_seconds": 13.536651750036981,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": -0.5352651931676948,
+        "process_peak_rss_mb": 625.421875,
+        "py_alloc_peak_mb": null,
+        "seed": 11,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071628751179000,
+        "wall_seconds": 18.253824750019703
+      },
+      {
+        "arm": "mlp_flops",
+        "curve": [
+          [
+            1760,
+            7.19598204101203,
+            2.638090404426453
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071639665363000,
+          "cov50_1": 0.5667410714285714,
+          "cov90_1": 0.8409970238095238,
+          "cov90_10": 0.8845833333333334,
+          "crps1": 0.3335506769622278,
+          "curve_points": 1,
+          "data_fp": "48e64930ceb56c2f",
+          "drift10": 1.5057012274853026,
+          "epochs": 60,
+          "flops_per_sample": 1078752,
+          "loss_first": 6.141795193065296,
+          "loss_last": -15.791833946921608,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 19.207743504319957,
+          "nll_event": 0.43790650045705876,
+          "params": 540775,
+          "predict_ms_per64": 1.1222499888390303,
+          "refused10": 130,
+          "rmse1": 1.5273217060844289,
+          "rmse10": 2.3945820555729087,
+          "rmse1_contact": 2.602190333968534,
+          "rmse1_free": 0.21046911843109473,
+          "torch_threads": 4,
+          "train_seconds": 7.19598204101203,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 2.638090404426453,
+        "process_peak_rss_mb": 627.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 11,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071639665459000,
+        "wall_seconds": 10.914133374986704
+      },
+      {
+        "arm": "mlp128",
+        "curve": [
+          [
+            1760,
+            2.2426571249961853,
+            3.6355251316807706
+          ],
+          [
+            1760,
+            3.9419642090215348,
+            38.05610538757427
+          ],
+          [
+            1760,
+            7.91336487501394,
+            153.90432137860685
+          ],
+          [
+            1760,
+            21.989520416012965,
+            167.09847790225805
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071679752031000,
+          "cov50_1": 0.6055059523809524,
+          "cov90_1": 0.8494791666666667,
+          "cov90_10": 0.8366666666666667,
+          "crps1": 0.3499349173872637,
+          "curve_points": 4,
+          "data_fp": "48e64930ceb56c2f",
+          "drift10": 1.6640913020276684,
+          "epochs": 60,
+          "flops_per_sample": 72448,
+          "loss_first": 6.9525154157118365,
+          "loss_last": -14.538491491837934,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 57.84260838730682,
+          "nll_event": 0.42776004294986836,
+          "params": 36557,
+          "predict_ms_per64": 0.985249993391335,
+          "refused10": 130,
+          "rmse1": 1.6390670842938624,
+          "rmse10": 2.7896177909897424,
+          "rmse1_contact": 2.7981702623009874,
+          "rmse1_free": 0.1868058858884897,
+          "torch_threads": 4,
+          "train_seconds": 2.2426571249961853,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 3.6355251316807706,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 11,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071679752219000,
+        "wall_seconds": 40.08635395899182
+      },
+      {
+        "arm": "in_noedges",
+        "curve": [
+          [
+            1760,
+            6.556434249971062,
+            0.30896620240793166
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071692131103000,
+          "cov50_1": 0.8314732142857143,
+          "cov90_1": 0.9320684523809524,
+          "cov90_10": 0.75875,
+          "crps1": 0.4252076788546383,
+          "curve_points": 1,
+          "data_fp": "48e64930ceb56c2f",
+          "drift10": 1.6863547543844022,
+          "epochs": 60,
+          "flops_per_sample": 149856,
+          "loss_first": 5.7535592165860265,
+          "loss_last": -5.896035402471369,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 363.77638063834485,
+          "nll_event": 0.5081472654203392,
+          "params": 20507,
+          "predict_ms_per64": 2.4190000258386135,
+          "refused10": 130,
+          "rmse1": 1.5603675553233967,
+          "rmse10": 2.6992752700194376,
+          "rmse1_contact": 2.567050342268706,
+          "rmse1_free": 0.5409143195003718,
+          "torch_threads": 4,
+          "train_seconds": 6.556434249971062,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.30896620240793166,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 11,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071692131242000,
+        "wall_seconds": 12.378832458052784
+      },
+      {
+        "arm": "in_norel",
+        "curve": [
+          [
+            1760,
+            19.03519716701703,
+            0.2792956758185747
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071718402558000,
+          "cov50_1": 0.8416666666666667,
+          "cov90_1": 0.9412946428571428,
+          "cov90_10": 0.7908333333333334,
+          "crps1": 0.42630789456824936,
+          "curve_points": 1,
+          "data_fp": "48e64930ceb56c2f",
+          "drift10": 1.647530559020162,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.147728904810819,
+          "loss_last": -8.5441651170904,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 215.31828110970704,
+          "nll_event": 0.49954459840020843,
+          "params": 20507,
+          "predict_ms_per64": 5.829582980368286,
+          "refused10": 130,
+          "rmse1": 1.5629030524928513,
+          "rmse10": 2.6555158189859975,
+          "rmse1_contact": 2.5405732961959426,
+          "rmse1_free": 0.6118103940131175,
+          "torch_threads": 4,
+          "train_seconds": 19.03519716701703,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.2792956758185747,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 11,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071718402684000,
+        "wall_seconds": 26.271169874991756
+      },
+      {
+        "arm": "mlp_flops",
+        "curve": [
+          [
+            1760,
+            14.147236375021748,
+            1.3848628418147635
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071738666744000,
+          "cov50_1": 0.6545386904761905,
+          "cov90_1": 0.9,
+          "cov90_10": 0.8883333333333333,
+          "crps1": 0.33294425942751954,
+          "curve_points": 1,
+          "data_fp": "3665a578c80e2c5d",
+          "drift10": 1.8909312833031506,
+          "epochs": 60,
+          "flops_per_sample": 1078752,
+          "loss_first": 7.087441763010892,
+          "loss_last": -15.160859645496716,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 15.110549786532756,
+          "nll_event": 0.4436230299496693,
+          "params": 540775,
+          "predict_ms_per64": 2.1559579763561487,
+          "refused10": 130,
+          "rmse1": 1.4558055190808343,
+          "rmse10": 2.6771445325443177,
+          "rmse1_contact": 2.457293703515357,
+          "rmse1_free": 0.3014562635836781,
+          "torch_threads": 4,
+          "train_seconds": 14.147236375021748,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 1.3848628418147635,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 12,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071738666909000,
+        "wall_seconds": 20.26397404097952
+      },
+      {
+        "arm": "mlp128",
+        "curve": [
+          [
+            1760,
+            4.160250666958746,
+            2.102070010422376
+          ],
+          [
+            1760,
+            8.405109582992736,
+            14.091694814457744
+          ],
+          [
+            1760,
+            17.026651874999516,
+            28.857850826909843
+          ],
+          [
+            1760,
+            27.010159166005906,
+            208.51077151324708
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071800608065000,
+          "cov50_1": 0.6330357142857143,
+          "cov90_1": 0.8652529761904761,
+          "cov90_10": 0.8579166666666667,
+          "crps1": 0.35153949050698313,
+          "curve_points": 4,
+          "data_fp": "3665a578c80e2c5d",
+          "drift10": 1.968461428522311,
+          "epochs": 60,
+          "flops_per_sample": 72448,
+          "loss_first": 7.071605727889321,
+          "loss_last": -14.713409198414196,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 35.44627814077595,
+          "nll_event": 0.4324066718738838,
+          "params": 36557,
+          "predict_ms_per64": 0.5264580249786377,
+          "refused10": 130,
+          "rmse1": 1.6155119761408134,
+          "rmse10": 3.1137563908460724,
+          "rmse1_contact": 2.750742339303242,
+          "rmse1_free": 0.21027003246816928,
+          "torch_threads": 4,
+          "train_seconds": 4.160250666958746,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 2.102070010422376,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 12,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071800608218000,
+        "wall_seconds": 61.94074512500083
+      },
+      {
+        "arm": "in_noedges",
+        "curve": [
+          [
+            1760,
+            3.4594429589924403,
+            0.02483838761481609
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071807648987000,
+          "cov50_1": 0.8636160714285714,
+          "cov90_1": 0.9462797619047619,
+          "cov90_10": 0.74625,
+          "crps1": 0.43905565891157367,
+          "curve_points": 1,
+          "data_fp": "3665a578c80e2c5d",
+          "drift10": 1.9627853000988138,
+          "epochs": 60,
+          "flops_per_sample": 149856,
+          "loss_first": 5.832407720522447,
+          "loss_last": -5.316780857606368,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 202.03169978247732,
+          "nll_event": 0.49741255790382133,
+          "params": 20507,
+          "predict_ms_per64": 0.8542080176994205,
+          "refused10": 130,
+          "rmse1": 1.5521301157694662,
+          "rmse10": 2.9363863503044536,
+          "rmse1_contact": 2.4747351576630487,
+          "rmse1_free": 0.6971805952565326,
+          "torch_threads": 4,
+          "train_seconds": 3.4594429589924403,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.02483838761481609,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 12,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071807649065000,
+        "wall_seconds": 7.040735125017818
+      },
+      {
+        "arm": "in_norel",
+        "curve": [
+          [
+            1760,
+            10.028607290994842,
+            0.32578124012236337
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071822231199000,
+          "cov50_1": 0.7852678571428572,
+          "cov90_1": 0.9260416666666667,
+          "cov90_10": 0.7716666666666666,
+          "crps1": 0.42508975480738864,
+          "curve_points": 1,
+          "data_fp": "3665a578c80e2c5d",
+          "drift10": 2.0841026305456447,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.136534270373258,
+          "loss_last": -7.590346943248402,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 249.72423575621676,
+          "nll_event": 0.5034814422952952,
+          "params": 20507,
+          "predict_ms_per64": 2.764709002804011,
+          "refused10": 130,
+          "rmse1": 1.5612520050842231,
+          "rmse10": 3.1504042221297004,
+          "rmse1_contact": 2.534837335337765,
+          "rmse1_free": 0.6109943927855396,
+          "torch_threads": 4,
+          "train_seconds": 10.028607290994842,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.32578124012236337,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 12,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071822231291000,
+        "wall_seconds": 14.582061207969673
+      },
+      {
+        "arm": "in",
+        "curve": [
+          [
+            1760,
+            16.12040141702164,
+            -0.3568411630990265
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071843110280000,
+          "cov50_1": 0.5642857142857143,
+          "cov90_1": 0.8637648809523809,
+          "cov90_10": 0.8491666666666666,
+          "crps1": 0.29504126789939394,
+          "curve_points": 1,
+          "data_fp": "3665a578c80e2c5d",
+          "drift10": 2.034534466156251,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 3.781324284726923,
+          "loss_last": -17.944499865445223,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 57.36058617040695,
+          "nll_event": 0.3300862791429191,
+          "params": 20507,
+          "predict_ms_per64": 3.7515839794650674,
+          "refused10": 130,
+          "rmse1": 1.3638320133714645,
+          "rmse10": 2.744370636003598,
+          "rmse1_contact": 2.2723026632556196,
+          "rmse1_free": 0.38754141956613214,
+          "torch_threads": 4,
+          "train_seconds": 16.12040141702164,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": -0.3568411630990265,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 12,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071843110382000,
+        "wall_seconds": 20.878874916990753
+      },
+      {
+        "arm": "mlp128",
+        "curve": [
+          [
+            1760,
+            2.7015839999658056,
+            2.156859468529944
+          ],
+          [
+            1760,
+            5.193470874975901,
+            16.451007044589417
+          ],
+          [
+            1760,
+            9.805903790984303,
+            17.422074690065617
+          ],
+          [
+            1760,
+            18.246391666994896,
+            277.51288031476264
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071883048136000,
+          "cov50_1": 0.6520089285714286,
+          "cov90_1": 0.8632440476190476,
+          "cov90_10": 0.8541666666666666,
+          "crps1": 0.3594389731132158,
+          "curve_points": 4,
+          "data_fp": "26026ec2a9554a35",
+          "drift10": 1.678638555963284,
+          "epochs": 60,
+          "flops_per_sample": 72448,
+          "loss_first": 6.750752631100741,
+          "loss_last": -14.851709972728383,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 56.722090666493635,
+          "nll_event": 0.45444124017890425,
+          "params": 36557,
+          "predict_ms_per64": 0.5681249895133078,
+          "refused10": 130,
+          "rmse1": 1.5757199430535453,
+          "rmse10": 2.8619114738629308,
+          "rmse1_contact": 2.6161337273951926,
+          "rmse1_free": 0.20266317544050427,
+          "torch_threads": 4,
+          "train_seconds": 2.7015839999658056,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 2.156859468529944,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 13,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071883048224000,
+        "wall_seconds": 39.937480958004016
+      },
+      {
+        "arm": "in_noedges",
+        "curve": [
+          [
+            1760,
+            3.4649435830069706,
+            0.14396113701224925
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071890138097000,
+          "cov50_1": 0.8610119047619048,
+          "cov90_1": 0.9315476190476191,
+          "cov90_10": 0.78875,
+          "crps1": 0.4163447055335455,
+          "curve_points": 1,
+          "data_fp": "26026ec2a9554a35",
+          "drift10": 1.7975673957688423,
+          "epochs": 60,
+          "flops_per_sample": 149856,
+          "loss_first": 5.659857879985463,
+          "loss_last": -6.278703607212414,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 262.30062402187116,
+          "nll_event": 0.5184339607127069,
+          "params": 20507,
+          "predict_ms_per64": 1.0240410338155925,
+          "refused10": 130,
+          "rmse1": 1.507077778724042,
+          "rmse10": 2.9251275120018803,
+          "rmse1_contact": 2.4337592124329652,
+          "rmse1_free": 0.476052584537092,
+          "torch_threads": 4,
+          "train_seconds": 3.4649435830069706,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.14396113701224925,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 13,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071890138180000,
+        "wall_seconds": 7.0898488750099204
+      },
+      {
+        "arm": "in_norel",
+        "curve": [
+          [
+            1760,
+            10.561819583002944,
+            0.9364082922826941
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071905388495000,
+          "cov50_1": 0.7207589285714285,
+          "cov90_1": 0.8863839285714286,
+          "cov90_10": 0.795,
+          "crps1": 0.41572478678186703,
+          "curve_points": 1,
+          "data_fp": "26026ec2a9554a35",
+          "drift10": 1.9200757081109012,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 3.7864139903675427,
+          "loss_last": -8.363638106259433,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 219.89553738910672,
+          "nll_event": 0.5278719730312166,
+          "params": 20507,
+          "predict_ms_per64": 1.9939999911002815,
+          "refused10": 130,
+          "rmse1": 1.5104047251861599,
+          "rmse10": 3.086354290755273,
+          "rmse1_contact": 2.40771360557617,
+          "rmse1_free": 0.5593632394071558,
+          "torch_threads": 4,
+          "train_seconds": 10.561819583002944,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.9364082922826941,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 13,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071905388714000,
+        "wall_seconds": 15.250258415995631
+      },
+      {
+        "arm": "in",
+        "curve": [
+          [
+            1760,
+            7.392994082998484,
+            0.4964115047857685
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071916419871000,
+          "cov50_1": 0.7720238095238096,
+          "cov90_1": 0.9425595238095238,
+          "cov90_10": 0.9183333333333333,
+          "crps1": 0.34549536873475295,
+          "curve_points": 1,
+          "data_fp": "26026ec2a9554a35",
+          "drift10": 1.8103485432597992,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 3.8543074651197955,
+          "loss_last": -12.185616952722723,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 27.570655381104377,
+          "nll_event": 0.43074580458111433,
+          "params": 20507,
+          "predict_ms_per64": 2.204374992288649,
+          "refused10": 130,
+          "rmse1": 1.3558730543894313,
+          "rmse10": 2.5911804590456105,
+          "rmse1_contact": 2.193835489765893,
+          "rmse1_free": 0.41592139818608326,
+          "torch_threads": 4,
+          "train_seconds": 7.392994082998484,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.4964115047857685,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 13,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071916419941000,
+        "wall_seconds": 11.03108849999262
+      },
+      {
+        "arm": "mlp_flops",
+        "curve": [
+          [
+            1760,
+            5.1250130840344355,
+            4.16047576575746
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071924354456000,
+          "cov50_1": 0.5709821428571429,
+          "cov90_1": 0.8523809523809524,
+          "cov90_10": 0.8408333333333333,
+          "crps1": 0.3410941490802623,
+          "curve_points": 1,
+          "data_fp": "26026ec2a9554a35",
+          "drift10": 1.6137329733909234,
+          "epochs": 60,
+          "flops_per_sample": 1078752,
+          "loss_first": 5.4724747614427045,
+          "loss_last": -15.641693357987837,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 33.68728738036269,
+          "nll_event": 0.46903618089355187,
+          "params": 540775,
+          "predict_ms_per64": 0.7267919718287885,
+          "refused10": 130,
+          "rmse1": 1.4743747230266029,
+          "rmse10": 2.591484816040276,
+          "rmse1_contact": 2.441808394744861,
+          "rmse1_free": 0.22926056393998587,
+          "torch_threads": 4,
+          "train_seconds": 5.1250130840344355,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 4.16047576575746,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 13,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071924354531000,
+        "wall_seconds": 7.93448024999816
+      },
+      {
+        "arm": "in_noedges",
+        "curve": [
+          [
+            1760,
+            2.9992229160270654,
+            0.511457261181732
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071930320272000,
+          "cov50_1": 0.8151041666666666,
+          "cov90_1": 0.932514880952381,
+          "cov90_10": 0.7033333333333334,
+          "crps1": 0.4959608260780925,
+          "curve_points": 1,
+          "data_fp": "05adfad483698ec7",
+          "drift10": 1.5193214524858405,
+          "epochs": 60,
+          "flops_per_sample": 149856,
+          "loss_first": 6.078356430747292,
+          "loss_last": -5.324561483209783,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 310.8957705441622,
+          "nll_event": 0.5639473610877156,
+          "params": 20507,
+          "predict_ms_per64": 0.9910000371746719,
+          "refused10": 130,
+          "rmse1": 1.7620499258759104,
+          "rmse10": 2.869402838408471,
+          "rmse1_contact": 2.609710639324572,
+          "rmse1_free": 0.9204792721254574,
+          "torch_threads": 4,
+          "train_seconds": 2.9992229160270654,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.511457261181732,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 14,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071930320353000,
+        "wall_seconds": 5.96571258403128
+      },
+      {
+        "arm": "in_norel",
+        "curve": [
+          [
+            1760,
+            7.288616291014478,
+            2.9284061396034615
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071941268752000,
+          "cov50_1": 0.752529761904762,
+          "cov90_1": 0.9108630952380953,
+          "cov90_10": 0.7783333333333333,
+          "crps1": 0.4727222648233347,
+          "curve_points": 1,
+          "data_fp": "05adfad483698ec7",
+          "drift10": 1.6865712474050154,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.375355505943299,
+          "loss_last": -7.616787407614968,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 143.92743687898871,
+          "nll_event": 0.569952381100622,
+          "params": 20507,
+          "predict_ms_per64": 2.0667919889092445,
+          "refused10": 130,
+          "rmse1": 1.7512061263809486,
+          "rmse10": 3.1780956677016485,
+          "rmse1_contact": 2.7293365442530417,
+          "rmse1_free": 0.6299924564886917,
+          "torch_threads": 4,
+          "train_seconds": 7.288616291014478,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 2.9284061396034615,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 14,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071941268823000,
+        "wall_seconds": 10.94834245799575
+      },
+      {
+        "arm": "in",
+        "curve": [
+          [
+            1760,
+            6.927005833014846,
+            0.525614627886584
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071951497061000,
+          "cov50_1": 0.6566220238095238,
+          "cov90_1": 0.9023809523809524,
+          "cov90_10": 0.8583333333333333,
+          "crps1": 0.3312538728680839,
+          "curve_points": 1,
+          "data_fp": "05adfad483698ec7",
+          "drift10": 1.7113616619558814,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.074605898423628,
+          "loss_last": -17.68273776661266,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 82.12107143752797,
+          "nll_event": 0.37576988969295366,
+          "params": 20507,
+          "predict_ms_per64": 1.9601249950937927,
+          "refused10": 130,
+          "rmse1": 1.5704148393979727,
+          "rmse10": 2.8265319539623803,
+          "rmse1_contact": 2.488970010654581,
+          "rmse1_free": 0.44119595372155357,
+          "torch_threads": 4,
+          "train_seconds": 6.927005833014846,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.525614627886584,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 14,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071951497140000,
+        "wall_seconds": 10.228186917025596
+      },
+      {
+        "arm": "mlp_flops",
+        "curve": [
+          [
+            1760,
+            5.041829916997813,
+            3.6587074345857324
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071959272886000,
+          "cov50_1": 0.6329613095238096,
+          "cov90_1": 0.8709077380952381,
+          "cov90_10": 0.88625,
+          "crps1": 0.385404403505523,
+          "curve_points": 1,
+          "data_fp": "05adfad483698ec7",
+          "drift10": 1.6119348225223449,
+          "epochs": 60,
+          "flops_per_sample": 1078752,
+          "loss_first": 5.566179988600991,
+          "loss_last": -15.300588156960227,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 24.430872017456668,
+          "nll_event": 0.5404355937915901,
+          "params": 540775,
+          "predict_ms_per64": 0.71237504016608,
+          "refused10": 130,
+          "rmse1": 1.653961972844466,
+          "rmse10": 2.8338443408090828,
+          "rmse1_contact": 2.6654879194150345,
+          "rmse1_free": 0.27179393591387396,
+          "torch_threads": 4,
+          "train_seconds": 5.041829916997813,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 3.6587074345857324,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 14,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071959272955000,
+        "wall_seconds": 7.775710624991916
+      },
+      {
+        "arm": "mlp128",
+        "curve": [
+          [
+            1760,
+            1.4763947500032373,
+            5.382739094254425
+          ],
+          [
+            1760,
+            2.867561459017452,
+            28.212931318240976
+          ],
+          [
+            1760,
+            7.154236000031233,
+            105.37355593527612
+          ],
+          [
+            1760,
+            16.794472375011537,
+            19.841822397939023
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791071990341010000,
+          "cov50_1": 0.6401041666666667,
+          "cov90_1": 0.8564732142857143,
+          "cov90_10": 0.8816666666666667,
+          "crps1": 0.41336834774782727,
+          "curve_points": 4,
+          "data_fp": "05adfad483698ec7",
+          "drift10": 1.5804277879382727,
+          "epochs": 60,
+          "flops_per_sample": 72448,
+          "loss_first": 6.976477048613808,
+          "loss_last": -14.575967233831232,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 46.97555651196413,
+          "nll_event": 0.4765225969265506,
+          "params": 36557,
+          "predict_ms_per64": 0.4789580125361681,
+          "refused10": 130,
+          "rmse1": 1.8176953608669795,
+          "rmse10": 3.1022906277879634,
+          "rmse1_contact": 2.941095495915039,
+          "rmse1_free": 0.21735176043713803,
+          "torch_threads": 4,
+          "train_seconds": 1.4763947500032373,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 5.382739094254425,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 14,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071990341097000,
+        "wall_seconds": 31.067860374983866
+      },
+      {
+        "arm": "in_norel",
+        "curve": [
+          [
+            1760,
+            8.572178124974016,
+            0.8990826584390096
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791072003411677000,
+          "cov50_1": 0.8129464285714286,
+          "cov90_1": 0.9318452380952381,
+          "cov90_10": 0.8179166666666666,
+          "crps1": 0.4570266041852619,
+          "curve_points": 1,
+          "data_fp": "c9b331240ce9067f",
+          "drift10": 1.8783010187705662,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.035172276063399,
+          "loss_last": -7.1502054127779875,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 120.44895404225724,
+          "nll_event": 0.5485194207436045,
+          "params": 20507,
+          "predict_ms_per64": 2.6293330010958016,
+          "refused10": 130,
+          "rmse1": 1.6728720016140954,
+          "rmse10": 3.250964085637203,
+          "rmse1_contact": 2.6013103065898333,
+          "rmse1_free": 0.7057688232004106,
+          "torch_threads": 4,
+          "train_seconds": 8.572178124974016,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.8990826584390096,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 15,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791072003411802000,
+        "wall_seconds": 13.07052437501261
+      },
+      {
+        "arm": "in",
+        "curve": [
+          [
+            1760,
+            7.823803667037282,
+            -0.2463004710462805
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791072015136386000,
+          "cov50_1": 0.6243303571428571,
+          "cov90_1": 0.8745535714285714,
+          "cov90_10": 0.9004166666666666,
+          "crps1": 0.33226540195427956,
+          "curve_points": 1,
+          "data_fp": "c9b331240ce9067f",
+          "drift10": 1.805126761376764,
+          "epochs": 60,
+          "flops_per_sample": 1076544,
+          "loss_first": 4.045440758358349,
+          "loss_last": -18.327848746559837,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 31.681337070720076,
+          "nll_event": 0.34589388544901695,
+          "params": 20507,
+          "predict_ms_per64": 2.5064999936148524,
+          "refused10": 130,
+          "rmse1": 1.5685450258430822,
+          "rmse10": 2.8820471499962714,
+          "rmse1_contact": 2.5633918406744596,
+          "rmse1_free": 0.2782720997854348,
+          "torch_threads": 4,
+          "train_seconds": 7.823803667037282,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": -0.2463004710462805,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 15,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791072015136470000,
+        "wall_seconds": 11.724523000011686
+      },
+      {
+        "arm": "mlp_flops",
+        "curve": [
+          [
+            1760,
+            5.377007915987633,
+            1.8281680531114055
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791072023508151000,
+          "cov50_1": 0.6508928571428572,
+          "cov90_1": 0.8857142857142857,
+          "cov90_10": 0.8983333333333333,
+          "crps1": 0.36444318622842814,
+          "curve_points": 1,
+          "data_fp": "c9b331240ce9067f",
+          "drift10": 1.7716820659269215,
+          "epochs": 60,
+          "flops_per_sample": 1078752,
+          "loss_first": 6.329150065508756,
+          "loss_last": -15.758748522671786,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 19.966291313157033,
+          "nll_event": 0.5077503180387747,
+          "params": 540775,
+          "predict_ms_per64": 0.7081669755280018,
+          "refused10": 130,
+          "rmse1": 1.585748250712707,
+          "rmse10": 2.85786414182366,
+          "rmse1_contact": 2.5912676305308957,
+          "rmse1_free": 0.28259500672041615,
+          "torch_threads": 4,
+          "train_seconds": 5.377007915987633,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 1.8281680531114055,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 15,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791072023508226000,
+        "wall_seconds": 8.371641790959984
+      },
+      {
+        "arm": "mlp128",
+        "curve": [
+          [
+            1760,
+            1.4446387910284102,
+            1.8140229173242597
+          ],
+          [
+            1760,
+            4.214046499982942,
+            13.69916943053488
+          ],
+          [
+            1760,
+            7.8567526250262745,
+            106.45929058440254
+          ],
+          [
+            1760,
+            12.491661000007298,
+            121.38707709729628
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791072052194632000,
+          "cov50_1": 0.6811755952380952,
+          "cov90_1": 0.887797619047619,
+          "cov90_10": 0.91125,
+          "crps1": 0.3928381107238002,
+          "curve_points": 4,
+          "data_fp": "c9b331240ce9067f",
+          "drift10": 1.8393634603112667,
+          "epochs": 60,
+          "flops_per_sample": 72448,
+          "loss_first": 6.9275766697796906,
+          "loss_last": -15.140259447964755,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 14.56871925929209,
+          "nll_event": 0.4572140460049307,
+          "params": 36557,
+          "predict_ms_per64": 0.3600419731810689,
+          "refused10": 130,
+          "rmse1": 1.7355100519994462,
+          "rmse10": 3.2476585040545345,
+          "rmse1_contact": 2.852443895019912,
+          "rmse1_free": 0.20349308493120924,
+          "torch_threads": 4,
+          "train_seconds": 1.4446387910284102,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 1.8140229173242597,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 15,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791072052194855000,
+        "wall_seconds": 28.6862919589621
+      },
+      {
+        "arm": "in_noedges",
+        "curve": [
+          [
+            1760,
+            2.5166920829797164,
+            0.23675672923897503
+          ]
+        ],
+        "error": null,
+        "interactions": 1760,
+        "metrics": {
+          "computed_at_ns": 1791072057320180000,
+          "cov50_1": 0.8580357142857142,
+          "cov90_1": 0.9398809523809524,
+          "cov90_10": 0.7929166666666667,
+          "crps1": 0.46745301264296696,
+          "curve_points": 1,
+          "data_fp": "c9b331240ce9067f",
+          "drift10": 1.7726583539679361,
+          "epochs": 60,
+          "flops_per_sample": 149856,
+          "loss_first": 5.8597761977802625,
+          "loss_last": -5.446453441273082,
+          "n_heldout": 1120,
+          "n_train": 1760,
+          "nll10": 171.1580495735277,
+          "nll_event": 0.5439451691118427,
+          "params": 20507,
+          "predict_ms_per64": 0.9538329904899001,
+          "refused10": 130,
+          "rmse1": 1.6590648967886574,
+          "rmse10": 3.051344282918543,
+          "rmse1_contact": 2.589809705944662,
+          "rmse1_free": 0.6782661760192129,
+          "torch_threads": 4,
+          "train_seconds": 2.5166920829797164,
+          "windows10": 200
+        },
+        "model_updates": 1680,
+        "primary": 0.23675672923897503,
+        "process_peak_rss_mb": 627.578125,
+        "py_alloc_peak_mb": null,
+        "seed": 15,
+        "split_fingerprint": "34613cdf9888954da3dce4cc87d815049d00e6f6e0a86d0d03eef69814efe20f",
+        "split_id": "box2d:e1#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791072057320246000,
+        "wall_seconds": 5.125292083015665
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "split_ids": [
+      "box2d:e1#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791071610497147000,
+    "warnings": [
+      "exploratory arms not in the prereg (reported, never decisive): ['in_norel']"
+    ]
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff in beats mlp_flops on nll1 (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "in": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 8800,
+        "mean": -0.023276138928129863,
+        "model_updates_total": 8400,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.4986217480844951,
+        "wall_seconds_total": 72.11649808404036
+      },
+      "in_noedges": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 8800,
+        "mean": 0.24519594349114077,
+        "model_updates_total": 8400,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.1829199920952085,
+        "wall_seconds_total": 37.60042112512747
+      },
+      "in_norel": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 8800,
+        "mean": 1.0737948012532208,
+        "model_updates_total": 8400,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 1.0816348448047517,
+        "wall_seconds_total": 80.12235633196542
+      },
+      "mlp128": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 8800,
+        "mean": 3.0182433244423548,
+        "model_updates_total": 8400,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 1.5002816029395325,
+        "wall_seconds_total": 201.71873237594264
+      },
+      "mlp_flops": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 8800,
+        "mean": 2.7340608999391627,
+        "model_updates_total": 8400,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 1.1768409163360445,
+        "wall_seconds_total": 55.259940081916284
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "mlp_flops",
+        "b": "in",
+        "basis": "equal_interactions",
+        "ci_high": 3.714184368201675,
+        "ci_low": 1.7078526404442391,
+        "mean_diff": 2.757337038867292,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 2.638090404426453,
+            "b": -0.5352651931676948,
+            "budget": 1760,
+            "diff": 3.1733555975941474,
+            "seed": 11,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.3848628418147635,
+            "b": -0.3568411630990265,
+            "budget": 1760,
+            "diff": 1.74170400491379,
+            "seed": 12,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 4.16047576575746,
+            "b": 0.4964115047857685,
+            "budget": 1760,
+            "diff": 3.6640642609716916,
+            "seed": 13,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 3.6587074345857324,
+            "b": 0.525614627886584,
+            "budget": 1760,
+            "diff": 3.1330928066991484,
+            "seed": 14,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.8281680531114055,
+            "b": -0.2463004710462805,
+            "budget": 1760,
+            "diff": 2.074468524157686,
+            "seed": 15,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "equal_time": {
+        "a": "mlp_flops",
+        "b": "in",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            11,
+            "box2d:e1#skybot-foundation-split-v1",
+            "no curve point at common budget 7.19598"
+          ],
+          [
+            12,
+            "box2d:e1#skybot-foundation-split-v1",
+            "no curve point at common budget 14.1472"
+          ],
+          [
+            13,
+            "box2d:e1#skybot-foundation-split-v1",
+            "no curve point at common budget 5.12501"
+          ],
+          [
+            14,
+            "box2d:e1#skybot-foundation-split-v1",
+            "no curve point at common budget 5.04183"
+          ],
+          [
+            15,
+            "box2d:e1#skybot-foundation-split-v1",
+            "no curve point at common budget 5.37701"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "mlp_flops",
+        "b": "in",
+        "basis": "final",
+        "ci_high": 3.714184368201675,
+        "ci_low": 1.7078526404442391,
+        "mean_diff": 2.757337038867292,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 2.638090404426453,
+            "b": -0.5352651931676948,
+            "budget": null,
+            "diff": 3.1733555975941474,
+            "seed": 11,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.3848628418147635,
+            "b": -0.3568411630990265,
+            "budget": null,
+            "diff": 1.74170400491379,
+            "seed": 12,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 4.16047576575746,
+            "b": 0.4964115047857685,
+            "budget": null,
+            "diff": 3.6640642609716916,
+            "seed": 13,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 3.6587074345857324,
+            "b": 0.525614627886584,
+            "budget": null,
+            "diff": 3.1330928066991484,
+            "seed": 14,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.8281680531114055,
+            "b": -0.2463004710462805,
+            "budget": null,
+            "diff": 2.074468524157686,
+            "seed": 15,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 2.757 >= delta 0.05, CI [1.708, 3.714] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "in_noedges",
+        "b": "in",
+        "basis": "final",
+        "ci_high": 0.8049393103855702,
+        "ci_low": -0.3430276723929536,
+        "mean_diff": 0.2684720824192707,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.30896620240793166,
+            "b": -0.5352651931676948,
+            "budget": null,
+            "diff": 0.8442313955756264,
+            "seed": 11,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.02483838761481609,
+            "b": -0.3568411630990265,
+            "budget": null,
+            "diff": 0.38167955071384263,
+            "seed": 12,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.14396113701224925,
+            "b": 0.4964115047857685,
+            "budget": null,
+            "diff": -0.35245036777351924,
+            "seed": 13,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.511457261181732,
+            "b": 0.525614627886584,
+            "budget": null,
+            "diff": -0.014157366704852015,
+            "seed": 14,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.23675672923897503,
+            "b": -0.2463004710462805,
+            "budget": null,
+            "diff": 0.48305720028525556,
+            "seed": 15,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "alternative_arm": {
+        "a": "mlp128",
+        "b": "in",
+        "basis": "final",
+        "ci_high": 4.722323936584112,
+        "ci_low": 1.3607149901568583,
+        "mean_diff": 3.041519463370485,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 3.6355251316807706,
+            "b": -0.5352651931676948,
+            "budget": null,
+            "diff": 4.170790324848466,
+            "seed": 11,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 2.102070010422376,
+            "b": -0.3568411630990265,
+            "budget": null,
+            "diff": 2.4589111735214026,
+            "seed": 12,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 2.156859468529944,
+            "b": 0.4964115047857685,
+            "budget": null,
+            "diff": 1.6604479637441756,
+            "seed": 13,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 5.382739094254425,
+            "b": 0.525614627886584,
+            "budget": null,
+            "diff": 4.857124466367841,
+            "seed": 14,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.8140229173242597,
+            "b": -0.2463004710462805,
+            "budget": null,
+            "diff": 2.06032338837054,
+            "seed": 15,
+            "split": "box2d:e1#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}

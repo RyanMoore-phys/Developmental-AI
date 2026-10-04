@@ -294,6 +294,19 @@ class DevelopmentalAI:
         # The full LifelongController + parallel-requirement check comes later.
         self._lifelong = bool(
             self.config.get("lifelong", {}).get("enabled", False))
+        # ---- COLLECTION PATH, DECIDED BEFORE THE ENV BOOTS (2026-10-03) ----
+        # num_envs <= 1 used to drop SILENTLY into _run_episode, the unwired
+        # pre-Wave-1 body (CLAUDE.md §4.2) — a "smaller" SkyBot run was a
+        # different agent. select_collection_path raises for Minecraft
+        # configs and for a requested-but-downgraded parallel config; the
+        # escape is parallel_envs.allow_legacy_single_env: true. Non-Minecraft
+        # configs that never asked for parallel keep the historical default.
+        # tests/_collection_path_smoke.py holds the rule.
+        from developmental_ai.foundation.runtime.collection_path import (
+            select_collection_path)
+        self._collection_path = select_collection_path(self.config)
+        logger.info("collection path: %s (%s)", self._collection_path.path,
+                    self._collection_path.reason)
         self.image_size = env_cfg.get("image_size", 64)
         # Game ticks per agent decision. Cached so anything whose MEANING is
         # in game time (not decision count) can be expressed in ticks and
@@ -683,8 +696,39 @@ class DevelopmentalAI:
         self._num_envs = max(1, int(par_cfg.get("num_envs", 1)))
         if self._num_envs <= 1:
             self._use_parallel_envs = False
+        # The early decision and this reading must agree, or the two readers
+        # of parallel_envs have drifted and the guard above guards nothing.
+        if bool(self._use_parallel_envs) != (
+                self._collection_path.path != "single_env_legacy"):
+            raise RuntimeError(
+                "collection-path decision disagrees with _use_parallel_envs "
+                f"({self._collection_path.path} vs {self._use_parallel_envs})")
         self._parallel_envs: List[Any] = []
         self._parallel_curricula: List[Any] = []
+
+        # ---- FOUNDATION SHADOW RECORDER (plan §8 step 2, 2026-10-03) ----
+        # OFF unless foundation.shadow.enabled (from_config returns None).
+        # When on, it files each live step as foundation records (sensor
+        # transport, executed action with its real timing, the world model's
+        # prediction logged BEFORE env.step, episode endings) in an
+        # EvidenceStore. It READS ONLY and draws no random numbers, so it
+        # cannot move actions, rewards, replay, normalisation or RNG; it
+        # never raises into the loop (one warning, then self-disabled for
+        # the run; relaunch to re-enable). Wired into _run_episode_parallel
+        # and _collect_segment with identical call text; NOT into
+        # _run_episode. tests/_foundation_shadow_smoke.py holds all of this.
+        from developmental_ai.foundation.runtime.shadow import ShadowRecorder
+        self._shadow = ShadowRecorder.from_config(
+            self.config, bus=self._sensor_bus, action_dim=self.action_dim,
+            is_discrete=self.is_discrete, num_streams=self._num_envs,
+            environment=self.env_name,
+            layout_hash=getattr(self, "_sensor_layout_hash", None),
+            action_repeat=int(env_cfg.get("action_repeat", 1) or 1))
+        if (self._shadow is not None
+                and self._collection_path.path == "single_env_legacy"):
+            logger.warning("foundation.shadow is enabled but the single-env "
+                           "body (_run_episode) is not wired to it: nothing "
+                           "will be recorded on this path")
 
         # Replay buffer for world model training
         per_cfg = self.config.get("prioritized_replay", {})
@@ -799,7 +843,7 @@ class DevelopmentalAI:
         self._pitch_level_weight = float(_cur_cfg.get("pitch_level_weight",
                                                       0.0))
         self._pitch_level_phi = None
-        # GUI-DWELL potential (telescoping; see its use site). Zeroing income
+        # GUI-DWELL cost (plain difference; see its use site). Zeroing income
         # inside a menu stops the FARM but supplies no gradient OUT, and it
         # trained the one escape button to ~zero probability.
         self._gui_dwell_weight = float(_cur_cfg.get("gui_dwell_weight", 0.0))
@@ -2815,6 +2859,8 @@ class DevelopmentalAI:
 
     def close(self) -> None:
         """Clean up resources (Neo4j connections, LLM threads, etc.)."""
+        if getattr(self, "_shadow", None) is not None:
+            self._shadow.close()      # never raises; logs its summary
         if hasattr(self.knowledge_graph, "close"):
             self.knowledge_graph.close()
         if hasattr(self, "llm") and self.llm is not None:
@@ -4303,6 +4349,14 @@ class DevelopmentalAI:
             # old distance across a world change would pay (or charge) for a
             # move the agent never made. Same discipline the scaffold uses.
             self.infra.approach_reset()
+        # Re-adopt the stream-0 COST potentials at the boundary (2026-10-03).
+        # _collect_segment does this on a client rebuild; this body never
+        # did, so an episode that ended inside a menu (Phi = -1) handed the
+        # next one a phantom +w refund on its first step. None = "first
+        # sample, charge nothing" — the sentinel both cost potentials use.
+        self._pitch_level_phi = None
+        self._gui_run = 0
+        self._gui_dwell_phi = None
         if self.symbolizer is not None:
             self._prev_mine.clear()   # counts restart at 0 in a fresh world
         # per-env break high-water also restarts (new world every reset)
@@ -4455,6 +4509,13 @@ class DevelopmentalAI:
                     ).to(self.device)
 
             _pt = self._phase_mark("act", _pt)
+            # FOUNDATION SHADOW (off unless foundation.shadow.enabled): obs t
+            # and the world model's prediction for the chosen action, logged
+            # BEFORE env.step so the store can prove it preceded the outcome.
+            if self._shadow is not None:
+                self._shadow.before_step(rssm_state, env_actions,
+                                         self._wm_param_lock, self.world_model)
+                _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
             from concurrent.futures import TimeoutError as _FTimeout
@@ -4473,6 +4534,7 @@ class DevelopmentalAI:
             futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
                     for e_i in range(n)]
             next_obs_list, rewards, dones = [], [], []
+            _sh_ends = []   # shadow: (terminated, truncated, t_result) per env
             # Whether this step's `done` is a CLIENT REBUILD rather than a
             # real terminal. The episodic body needs it for the same reason
             # the lifelong one does: the world model must not be taught the
@@ -4518,6 +4580,7 @@ class DevelopmentalAI:
                     rew, term, trunc, _rst = 0.0, False, True, True
                 next_obs_list.append(np.asarray(nobs, dtype=np.float32))
                 rewards.append(float(rew))
+                _sh_ends.append((bool(term), bool(trunc), time.time()))
                 restarted.append(_rst)
                 dones.append(bool(term or trunc))
             # envs step CONCURRENTLY, so this is the wait for the SLOWEST
@@ -4979,26 +5042,37 @@ class DevelopmentalAI:
                         self.infra, "last_approach_reward", 0.0) or 0.0)
                     if _ar:
                         prim_extrinsic = prim_extrinsic + _ar
-                # ---- GETTING OUT MUST PAY -------------------------------
-                # Zeroing income inside a menu removes the FARM but leaves
-                # no gradient toward the exit — and it did something worse:
-                # because pressing `inventory` OPENS a screen that pays 0,
-                # the policy trained that action to ~zero probability
-                # (measured: 0 presses in an entire run at 92%-of-max
-                # entropy). So when a wandering villager's trade screen
-                # opened via `use`, the agent had already unlearned the only
-                # button that closes one, and sat there 10,149+ consecutive
-                # steps. Guard-becomes-latch, again.
-                # Telescoping potential on dwell: Phi = -min(1, run/N).
-                # Sitting accrues the cost once; leaving collects it back;
-                # an open/close cycle nets ~0, so this cannot be farmed in
-                # either direction. Paid into prim_EXTRINSIC on purpose —
-                # the intrinsic channel is zeroed while a GUI is open, so a
-                # cost placed there would be erased by the very guard it is
-                # meant to complement.
+            # ---- GETTING OUT MUST PAY -----------------------------------
+            # Zeroing income inside a menu removes the FARM but leaves
+            # no gradient toward the exit — and it did something worse:
+            # because pressing `inventory` OPENS a screen that pays 0,
+            # the policy trained that action to ~zero probability
+            # (measured: 0 presses in an entire run at 92%-of-max
+            # entropy). So when a wandering villager's trade screen
+            # opened via `use`, the agent had already unlearned the only
+            # button that closes one, and sat there 10,149+ consecutive
+            # steps. Guard-becomes-latch, again.
+            # Plain-difference state cost on dwell: Phi = -min(1, run/N).
+            # Sitting accrues the cost once; leaving collects it back;
+            # an open/close cycle nets 0, so this cannot be farmed in
+            # either direction. Paid into prim_EXTRINSIC on purpose —
+            # the intrinsic channel is zeroed while a GUI is open, so a
+            # cost placed there would be erased by the very guard it is
+            # meant to complement.
+            # NOT INSIDE THE VISION-SCAFFOLD BLOCK (2026-10-03, see
+            # docs/foundation/BASELINE_AUDIT.md §3). It used to be, and the
+            # live config runs `llm.vision.enabled: false` — so the scaffold
+            # was None, stream 0 (the ONLY stream PPO trains on) paid NO
+            # dwell cost, every scout (_scout_mixed_reward) did, and the
+            # yaml's "a menu now pays strictly <= 0" rested on a term that
+            # never ran. The gui flag is read from env info here — the same
+            # source as the scout path and the intrinsic-zeroing guard — so
+            # this runs exactly once per waking step, scaffold or not.
+            if not use_dream_actor:
+                _gui_dw = bool((step_infos[0] or {}).get("gui_open"))
                 _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
                 if _gdw > 0.0:
-                    self._gui_run = (self._gui_run + 1) if _gui_now2 else 0
+                    self._gui_run = (self._gui_run + 1) if _gui_dw else 0
                     _gphi = -min(1.0, self._gui_run
                                  / max(1.0, self._gui_dwell_steps))
                     _gprev = getattr(self, "_gui_dwell_phi", None)
@@ -5323,6 +5397,18 @@ class DevelopmentalAI:
                         knowledge=primary_kv, feats=self._feats_row(0))
 
             _pt = self._phase_mark("store_ppo", _pt)
+            # FOUNDATION SHADOW: action t, obs t+1 and the evidence linking
+            # them, AFTER reward assembly (final values) and BEFORE the
+            # advance below reassigns obs/resets envs. Episodic: a primary
+            # done re-resets the WHOLE fleet at the next call, so every
+            # stream's episode ends here.
+            _sh_fleet_reset = bool(dones[0])
+            if self._shadow is not None:
+                self._shadow.after_step(
+                    step_infos, env_actions, rewards, dones, restarted,
+                    _sh_ends, _t_env0, prim_extrinsic, intrinsic,
+                    _sh_fleet_reset, use_dream_actor)
+                _pt = self._phase_mark("shadow", _pt)
 
             # ---- 6. ADVANCE / AUTORESET ----
             primary_done = dones[0]
@@ -5619,6 +5705,13 @@ class DevelopmentalAI:
                     ).to(self.device)
 
             _pt = self._phase_mark("act", _pt)
+            # FOUNDATION SHADOW (off unless foundation.shadow.enabled): obs t
+            # and the world model's prediction for the chosen action, logged
+            # BEFORE env.step so the store can prove it preceded the outcome.
+            if self._shadow is not None:
+                self._shadow.before_step(rssm_state, env_actions,
+                                         self._wm_param_lock, self.world_model)
+                _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
             from concurrent.futures import TimeoutError as _FTimeout
@@ -5637,6 +5730,7 @@ class DevelopmentalAI:
             futs = [self._env_pool.submit(envs[e_i].step, env_actions[e_i])
                     for e_i in range(n)]
             next_obs_list, rewards, dones = [], [], []
+            _sh_ends = []   # shadow: (terminated, truncated, t_result) per env
             terminateds, restarted = [], []   # LIFELONG: terminal vs restart
             prim_info: Dict[str, Any] = {}
             step_infos: List[Dict[str, Any]] = [None] * n
@@ -5679,6 +5773,7 @@ class DevelopmentalAI:
                     rew, term, trunc, _rst = 0.0, False, True, True
                 next_obs_list.append(np.asarray(nobs, dtype=np.float32))
                 rewards.append(float(rew))
+                _sh_ends.append((bool(term), bool(trunc), time.time()))
                 terminateds.append(bool(term))
                 restarted.append(_rst)
                 # LIFELONG: the STORED done is the TERM-FLAG (real terminal or
@@ -6566,26 +6661,37 @@ class DevelopmentalAI:
                         self.infra, "last_approach_reward", 0.0) or 0.0)
                     if _ar:
                         prim_extrinsic = prim_extrinsic + _ar
-                # ---- GETTING OUT MUST PAY -------------------------------
-                # Zeroing income inside a menu removes the FARM but leaves
-                # no gradient toward the exit — and it did something worse:
-                # because pressing `inventory` OPENS a screen that pays 0,
-                # the policy trained that action to ~zero probability
-                # (measured: 0 presses in an entire run at 92%-of-max
-                # entropy). So when a wandering villager's trade screen
-                # opened via `use`, the agent had already unlearned the only
-                # button that closes one, and sat there 10,149+ consecutive
-                # steps. Guard-becomes-latch, again.
-                # Telescoping potential on dwell: Phi = -min(1, run/N).
-                # Sitting accrues the cost once; leaving collects it back;
-                # an open/close cycle nets ~0, so this cannot be farmed in
-                # either direction. Paid into prim_EXTRINSIC on purpose —
-                # the intrinsic channel is zeroed while a GUI is open, so a
-                # cost placed there would be erased by the very guard it is
-                # meant to complement.
+            # ---- GETTING OUT MUST PAY -----------------------------------
+            # Zeroing income inside a menu removes the FARM but leaves
+            # no gradient toward the exit — and it did something worse:
+            # because pressing `inventory` OPENS a screen that pays 0,
+            # the policy trained that action to ~zero probability
+            # (measured: 0 presses in an entire run at 92%-of-max
+            # entropy). So when a wandering villager's trade screen
+            # opened via `use`, the agent had already unlearned the only
+            # button that closes one, and sat there 10,149+ consecutive
+            # steps. Guard-becomes-latch, again.
+            # Plain-difference state cost on dwell: Phi = -min(1, run/N).
+            # Sitting accrues the cost once; leaving collects it back;
+            # an open/close cycle nets 0, so this cannot be farmed in
+            # either direction. Paid into prim_EXTRINSIC on purpose —
+            # the intrinsic channel is zeroed while a GUI is open, so a
+            # cost placed there would be erased by the very guard it is
+            # meant to complement.
+            # NOT INSIDE THE VISION-SCAFFOLD BLOCK (2026-10-03, see
+            # docs/foundation/BASELINE_AUDIT.md §3). It used to be, and the
+            # live config runs `llm.vision.enabled: false` — so the scaffold
+            # was None, stream 0 (the ONLY stream PPO trains on) paid NO
+            # dwell cost, every scout (_scout_mixed_reward) did, and the
+            # yaml's "a menu now pays strictly <= 0" rested on a term that
+            # never ran. The gui flag is read from env info here — the same
+            # source as the scout path and the intrinsic-zeroing guard — so
+            # this runs exactly once per waking step, scaffold or not.
+            if not use_dream_actor:
+                _gui_dw = bool((step_infos[0] or {}).get("gui_open"))
                 _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
                 if _gdw > 0.0:
-                    self._gui_run = (self._gui_run + 1) if _gui_now2 else 0
+                    self._gui_run = (self._gui_run + 1) if _gui_dw else 0
                     _gphi = -min(1.0, self._gui_run
                                  / max(1.0, self._gui_dwell_steps))
                     _gprev = getattr(self, "_gui_dwell_phi", None)
@@ -7067,6 +7173,15 @@ class DevelopmentalAI:
             # but the mission only launches inside reset()) — that stream must be
             # reset here or it wedges on a stale frame forever (audit critical).
             _pt = self._phase_mark("store_ppo", _pt)
+            # FOUNDATION SHADOW (see the episodic body). Lifelong: a stream's
+            # episode ends only on its OWN boundary; there is no fleet reset.
+            _sh_fleet_reset = False
+            if self._shadow is not None:
+                self._shadow.after_step(
+                    step_infos, env_actions, rewards, dones, restarted,
+                    _sh_ends, _t_env0, prim_extrinsic, intrinsic,
+                    _sh_fleet_reset, use_dream_actor)
+                _pt = self._phase_mark("shadow", _pt)
             _reset_to = float(self.config.get("parallel_envs", {}).get(
                 "reset_timeout_s", 300))
             for e_i in range(n):

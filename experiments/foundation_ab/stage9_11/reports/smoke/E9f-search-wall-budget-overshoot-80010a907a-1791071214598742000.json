@@ -1,0 +1,528 @@
+{
+  "prereg": {
+    "ablation_arm": "hung_fitter",
+    "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": null,
+    "baseline_arm": "small_table",
+    "basis": "final",
+    "candidate_arm": "large_table",
+    "delta": 0.5,
+    "direction": "higher",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071193521481000,
+    "frozen_hash": "80010a907a6f033dc07239e80ebb44dfa5c0a4f2b59cee7d9e1df1c1391c8398",
+    "hypothesis": "search() under wall_s = 0.25 s overshoots its budget by > 50% (elapsed/wall_s - small-table ratio >= 0.5) on a large table (150 variables x 60000 rows) \u2014 work outside the guarded fits is unbudgeted",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E9f-search-wall-budget-overshoot",
+    "notes": "",
+    "primary_metric": "overshoot_ratio",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_fingerprints": [
+      "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e"
+    ]
+  },
+  "results": {
+    "arms": [
+      "small_table",
+      "large_table",
+      "hung_fitter"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791071214598742000,
+    "prereg": {
+      "ablation_arm": "hung_fitter",
+      "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": null,
+      "baseline_arm": "small_table",
+      "basis": "final",
+      "candidate_arm": "large_table",
+      "delta": 0.5,
+      "direction": "higher",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071193521481000,
+      "frozen_hash": "80010a907a6f033dc07239e80ebb44dfa5c0a4f2b59cee7d9e1df1c1391c8398",
+      "hypothesis": "search() under wall_s = 0.25 s overshoots its budget by > 50% (elapsed/wall_s - small-table ratio >= 0.5) on a large table (150 variables x 60000 rows) \u2014 work outside the guarded fits is unbudgeted",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E9f-search-wall-budget-overshoot",
+      "notes": "",
+      "primary_metric": "overshoot_ratio",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "split_fingerprints": [
+        "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e"
+      ]
+    },
+    "prereg_hash": "80010a907a6f033dc07239e80ebb44dfa5c0a4f2b59cee7d9e1df1c1391c8398",
+    "runs": [
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071199299071000,
+          "data_fp": "81b93365d10ae877",
+          "elapsed": 0.11653766699600965,
+          "evaluated": 51,
+          "internal_elapsed": 0.11635591700905934,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.4661506679840386,
+        "process_peak_rss_mb": 67.203125,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071199299241000,
+        "wall_seconds": 0.11812591704074293
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071203919801000,
+          "data_fp": "62534534b133e897",
+          "elapsed": 4.378656249959022,
+          "evaluated": 1,
+          "internal_elapsed": 4.373902874998748,
+          "leaked_threads": 0,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 17.514624999836087,
+        "process_peak_rss_mb": 227.78125,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071203919993000,
+        "wall_seconds": 4.6205760830198415
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071204174919000,
+          "data_fp": "81b93365d10ae877",
+          "elapsed": 0.2531247080187313,
+          "evaluated": 1,
+          "internal_elapsed": 0.25306866597384214,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0124988320749253,
+        "process_peak_rss_mb": 227.78125,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071204175135000,
+        "wall_seconds": 0.2549629170098342
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071209108934000,
+          "data_fp": "fa2010041fdd2f33",
+          "elapsed": 4.684517708024941,
+          "evaluated": 1,
+          "internal_elapsed": 4.678257332998328,
+          "leaked_threads": -1,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 18.738070832099766,
+        "process_peak_rss_mb": 308.046875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071209109135000,
+        "wall_seconds": 4.933811417024117
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071209364796000,
+          "data_fp": "cecb6eb742545d98",
+          "elapsed": 0.2539639170281589,
+          "evaluated": 1,
+          "internal_elapsed": 0.2539165000198409,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0158556681126356,
+        "process_peak_rss_mb": 308.078125,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071209364982000,
+        "wall_seconds": 0.2556832919945009
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071209479714000,
+          "data_fp": "cecb6eb742545d98",
+          "elapsed": 0.11306708300253376,
+          "evaluated": 51,
+          "internal_elapsed": 0.11294825002551079,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.45226833201013505,
+        "process_peak_rss_mb": 308.25,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071209479880000,
+        "wall_seconds": 0.1147514579934068
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071209736996000,
+          "data_fp": "cbc33d9332031957",
+          "elapsed": 0.2555517089786008,
+          "evaluated": 1,
+          "internal_elapsed": 0.2555054580443539,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0222068359144032,
+        "process_peak_rss_mb": 308.3125,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071209737148000,
+        "wall_seconds": 0.25713279197225347
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071209852663000,
+          "data_fp": "cbc33d9332031957",
+          "elapsed": 0.11371612502261996,
+          "evaluated": 51,
+          "internal_elapsed": 0.11359416699269786,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.45486450009047985,
+        "process_peak_rss_mb": 308.65625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071209852829000,
+        "wall_seconds": 0.11551299999700859
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071214598473000,
+          "data_fp": "df94b697f743b028",
+          "elapsed": 4.50116824998986,
+          "evaluated": 1,
+          "internal_elapsed": 4.495647999981884,
+          "leaked_threads": -2,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 18.00467299995944,
+        "process_peak_rss_mb": 317.546875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071214598665000,
+        "wall_seconds": 4.745663708948996
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_ids": [
+      "e9:budget#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791071199180975000,
+    "warnings": []
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "hung_fitter": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 1.0168537787006546,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.004930365422183863,
+        "wall_seconds_total": 0.7677790009765886
+      },
+      "large_table": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 18.085789610631764,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.615743334934342,
+        "wall_seconds_total": 14.300051208992954
+      },
+      "small_table": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 0.4577611666948845,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.0073805705122225425,
+        "wall_seconds_total": 0.34839037503115833
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "equal_interactions",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            1,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            2,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ]
+        ],
+        "units": []
+      },
+      "equal_time": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "final",
+        "ci_high": 19.39669360512238,
+        "ci_low": 16.069686096016426,
+        "mean_diff": 17.62802844393688,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.4661506679840386,
+            "b": 17.514624999836087,
+            "budget": null,
+            "diff": 17.04847433185205,
+            "seed": 0,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.45226833201013505,
+            "b": 18.738070832099766,
+            "budget": null,
+            "diff": 18.28580250008963,
+            "seed": 1,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.45486450009047985,
+            "b": 18.00467299995944,
+            "budget": null,
+            "diff": 17.54980849986896,
+            "seed": 2,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 17.63 >= delta 0.5, CI [16.07, 19.4] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "hung_fitter",
+        "b": "large_table",
+        "basis": "final",
+        "ci_high": 18.825515290063002,
+        "ci_low": 15.544861574724715,
+        "mean_diff": 17.06893583193111,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 1.0124988320749253,
+            "b": 17.514624999836087,
+            "budget": null,
+            "diff": 16.502126167761162,
+            "seed": 0,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0158556681126356,
+            "b": 18.738070832099766,
+            "budget": null,
+            "diff": 17.72221516398713,
+            "seed": 1,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0222068359144032,
+            "b": 18.00467299995944,
+            "budget": null,
+            "diff": 16.982466164045036,
+            "seed": 2,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}

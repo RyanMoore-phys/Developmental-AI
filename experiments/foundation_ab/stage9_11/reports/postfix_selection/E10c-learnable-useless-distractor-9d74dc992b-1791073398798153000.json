@@ -1,0 +1,1179 @@
+{
+  "prereg": {
+    "ablation_arm": "random",
+    "acceptance_rule": "accept iff info_marginal beats info_joint on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": "icm",
+    "baseline_arm": "info_joint",
+    "basis": "final",
+    "candidate_arm": "info_marginal",
+    "delta": 1.0,
+    "direction": "lower",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071277578320000,
+    "frozen_hash": "9d74dc992b8552d50c6d864778f9a492e46f540f9ba9064de2b55889f08f4e11",
+    "hypothesis": "with a deterministic 4-bit lamp the task does not need (joint shift x lamp hypotheses), info-gain on the JOINT set wastes interactions on the lamp: task-marginal info-gain identifies the shift in >= 1 fewer interactions",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E10c-learnable-useless-distractor",
+    "notes": "",
+    "primary_metric": "interactions_to_identify",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_fingerprints": [
+      "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79"
+    ]
+  },
+  "results": {
+    "arms": [
+      "info_joint",
+      "info_marginal",
+      "random",
+      "icm"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791073398798153000,
+    "prereg": {
+      "ablation_arm": "random",
+      "acceptance_rule": "accept iff info_marginal beats info_joint on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": "icm",
+      "baseline_arm": "info_joint",
+      "basis": "final",
+      "candidate_arm": "info_marginal",
+      "delta": 1.0,
+      "direction": "lower",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071277578320000,
+      "frozen_hash": "9d74dc992b8552d50c6d864778f9a492e46f540f9ba9064de2b55889f08f4e11",
+      "hypothesis": "with a deterministic 4-bit lamp the task does not need (joint shift x lamp hypotheses), info-gain on the JOINT set wastes interactions on the lamp: task-marginal info-gain identifies the shift in >= 1 fewer interactions",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E10c-learnable-useless-distractor",
+      "notes": "",
+      "primary_metric": "interactions_to_identify",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split_fingerprints": [
+        "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79"
+      ]
+    },
+    "prereg_hash": "9d74dc992b8552d50c6d864778f9a492e46f540f9ba9064de2b55889f08f4e11",
+    "runs": [
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 89,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397658631000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "de1aee0061551089",
+          "lamp_fraction": 0.4410195707070707,
+          "per_scenario": [
+            11,
+            6,
+            8,
+            16,
+            10,
+            12,
+            18,
+            8
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 11.125,
+          "tv_fraction": 0.010416666666666666
+        },
+        "model_updates": null,
+        "primary": 11.125,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397658670000,
+        "wall_seconds": 0.0800900420290418
+      },
+      {
+        "arm": "info_marginal",
+        "curve": [],
+        "error": null,
+        "interactions": 54,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397774282000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "de1aee0061551089",
+          "final_states": {
+            "misspecified": 0,
+            "open": 0,
+            "provisional": 8,
+            "resolved": 0
+          },
+          "flag_before_confidence": 0.0,
+          "lamp_fraction": 0.046875,
+          "per_scenario": [
+            3,
+            6,
+            4,
+            10,
+            6,
+            8,
+            14,
+            3
+          ],
+          "posterior_confident_wrong": 0.0,
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 6.75,
+          "tv_fraction": 0.015625
+        },
+        "model_updates": null,
+        "primary": 6.75,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397774332000,
+        "wall_seconds": 0.11562479101121426
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 124,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397808926000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "de1aee0061551089",
+          "lamp_fraction": 0.37378181743776817,
+          "per_scenario": [
+            18,
+            43,
+            9,
+            17,
+            9,
+            13,
+            3,
+            12
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 15.5,
+          "tv_fraction": 0.08052281735592268
+        },
+        "model_updates": null,
+        "primary": 15.5,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397808964000,
+        "wall_seconds": 0.03460229199845344
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 175,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397857051000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "de1aee0061551089",
+          "lamp_fraction": 0.2818720291146762,
+          "per_scenario": [
+            15,
+            24,
+            16,
+            9,
+            24,
+            48,
+            22,
+            17
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 21.875,
+          "tv_fraction": 0.1602096330956625
+        },
+        "model_updates": null,
+        "primary": 21.875,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397857085000,
+        "wall_seconds": 0.048095749982167035
+      },
+      {
+        "arm": "info_marginal",
+        "curve": [],
+        "error": null,
+        "interactions": 43,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397951973000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "25575d83d298abd1",
+          "final_states": {
+            "misspecified": 0,
+            "open": 0,
+            "provisional": 8,
+            "resolved": 0
+          },
+          "flag_before_confidence": 0.0,
+          "lamp_fraction": 0.017857142857142856,
+          "per_scenario": [
+            6,
+            5,
+            15,
+            2,
+            2,
+            2,
+            7,
+            4
+          ],
+          "posterior_confident_wrong": 0.125,
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 4.5,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 5.375,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397952022000,
+        "wall_seconds": 0.09490141703281552
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 184,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073397997073000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "25575d83d298abd1",
+          "lamp_fraction": 0.27796337434495333,
+          "per_scenario": [
+            12,
+            27,
+            42,
+            3,
+            20,
+            38,
+            20,
+            22
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 23.0,
+          "tv_fraction": 0.08029116351484772
+        },
+        "model_updates": null,
+        "primary": 23.0,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073397997120000,
+        "wall_seconds": 0.04506029200274497
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 127,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398036447000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "25575d83d298abd1",
+          "lamp_fraction": 0.27898478835978835,
+          "per_scenario": [
+            30,
+            21,
+            14,
+            8,
+            5,
+            27,
+            14,
+            8
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 15.875,
+          "tv_fraction": 0.10127314814814814
+        },
+        "model_updates": null,
+        "primary": 15.875,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398036488000,
+        "wall_seconds": 0.03933649999089539
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 87,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398110090000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "25575d83d298abd1",
+          "lamp_fraction": 0.3973193473193473,
+          "per_scenario": [
+            11,
+            15,
+            9,
+            13,
+            9,
+            11,
+            9,
+            10
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 10.875,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 10.875,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398110125000,
+        "wall_seconds": 0.0736107500270009
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 184,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398154018000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "348a9d4d7df916b7",
+          "lamp_fraction": 0.41292726370851374,
+          "per_scenario": [
+            24,
+            15,
+            12,
+            22,
+            32,
+            42,
+            28,
+            9
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 23.0,
+          "tv_fraction": 0.07032941017316018
+        },
+        "model_updates": null,
+        "primary": 23.0,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398154048000,
+        "wall_seconds": 0.04389945900766179
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 150,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398196751000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "348a9d4d7df916b7",
+          "lamp_fraction": 0.31257076257076255,
+          "per_scenario": [
+            11,
+            8,
+            8,
+            8,
+            28,
+            28,
+            39,
+            20
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 18.75,
+          "tv_fraction": 0.08638965201465201
+        },
+        "model_updates": null,
+        "primary": 18.75,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398196786000,
+        "wall_seconds": 0.042711791989859194
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 96,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398276113000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.125,
+          "data_fp": "348a9d4d7df916b7",
+          "lamp_fraction": 0.44087301587301586,
+          "per_scenario": [
+            11,
+            9,
+            7,
+            10,
+            9,
+            22,
+            6,
+            22
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 10.5,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 12.0,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398276149000,
+        "wall_seconds": 0.07933583395788446
+      },
+      {
+        "arm": "info_marginal",
+        "curve": [],
+        "error": null,
+        "interactions": 35,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398354917000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "348a9d4d7df916b7",
+          "final_states": {
+            "misspecified": 0,
+            "open": 0,
+            "provisional": 8,
+            "resolved": 0
+          },
+          "flag_before_confidence": 0.0,
+          "lamp_fraction": 0.017857142857142856,
+          "per_scenario": [
+            4,
+            4,
+            7,
+            5,
+            2,
+            6,
+            3,
+            4
+          ],
+          "posterior_confident_wrong": 0.0,
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 4.375,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 4.375,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398354955000,
+        "wall_seconds": 0.0787799580139108
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 106,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398389074000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "19aa294723c0a1b3",
+          "lamp_fraction": 0.2482905982905983,
+          "per_scenario": [
+            8,
+            13,
+            9,
+            6,
+            21,
+            20,
+            21,
+            8
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 13.25,
+          "tv_fraction": 0.13857600732600733
+        },
+        "model_updates": null,
+        "primary": 13.25,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398389107000,
+        "wall_seconds": 0.0341271249926649
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 83,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398459380000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "19aa294723c0a1b3",
+          "lamp_fraction": 0.45948180109364317,
+          "per_scenario": [
+            6,
+            11,
+            12,
+            10,
+            7,
+            19,
+            10,
+            8
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 10.375,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 10.375,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398459414000,
+        "wall_seconds": 0.07028116600122303
+      },
+      {
+        "arm": "info_marginal",
+        "curve": [],
+        "error": null,
+        "interactions": 46,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398558198000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "19aa294723c0a1b3",
+          "final_states": {
+            "misspecified": 0,
+            "open": 0,
+            "provisional": 8,
+            "resolved": 0
+          },
+          "flag_before_confidence": 0.0,
+          "lamp_fraction": 0.017857142857142856,
+          "per_scenario": [
+            6,
+            7,
+            11,
+            3,
+            7,
+            2,
+            4,
+            6
+          ],
+          "posterior_confident_wrong": 0.0,
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 5.75,
+          "tv_fraction": 0.0
+        },
+        "model_updates": null,
+        "primary": 5.75,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398558239000,
+        "wall_seconds": 0.09879662503954023
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 140,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398595070000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "19aa294723c0a1b3",
+          "lamp_fraction": 0.4105839932126697,
+          "per_scenario": [
+            13,
+            39,
+            17,
+            12,
+            15,
+            15,
+            16,
+            13
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 17.5,
+          "tv_fraction": 0.0776465874811463
+        },
+        "model_updates": null,
+        "primary": 17.5,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398595104000,
+        "wall_seconds": 0.03683975001331419
+      },
+      {
+        "arm": "info_joint",
+        "curve": [],
+        "error": null,
+        "interactions": 69,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398655974000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "0655a2b885562fc9",
+          "lamp_fraction": 0.4714285714285714,
+          "per_scenario": [
+            8,
+            10,
+            7,
+            8,
+            8,
+            10,
+            8,
+            10
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 8.625,
+          "tv_fraction": 0.015625
+        },
+        "model_updates": null,
+        "primary": 8.625,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398656014000,
+        "wall_seconds": 0.06087825004942715
+      },
+      {
+        "arm": "info_marginal",
+        "curve": [],
+        "error": null,
+        "interactions": 27,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398719820000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "0655a2b885562fc9",
+          "final_states": {
+            "misspecified": 0,
+            "open": 0,
+            "provisional": 8,
+            "resolved": 0
+          },
+          "flag_before_confidence": 0.0,
+          "lamp_fraction": 0.05952380952380952,
+          "per_scenario": [
+            7,
+            2,
+            3,
+            4,
+            3,
+            2,
+            3,
+            3
+          ],
+          "posterior_confident_wrong": 0.0,
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 3.375,
+          "tv_fraction": 0.03125
+        },
+        "model_updates": null,
+        "primary": 3.375,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398719861000,
+        "wall_seconds": 0.06381854199571535
+      },
+      {
+        "arm": "random",
+        "curve": [],
+        "error": null,
+        "interactions": 156,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398759503000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "0655a2b885562fc9",
+          "lamp_fraction": 0.256688847787919,
+          "per_scenario": [
+            19,
+            22,
+            38,
+            20,
+            17,
+            14,
+            12,
+            14
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 19.5,
+          "tv_fraction": 0.08543450873172234
+        },
+        "model_updates": null,
+        "primary": 19.5,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398759539000,
+        "wall_seconds": 0.03965037496527657
+      },
+      {
+        "arm": "icm",
+        "curve": [],
+        "error": null,
+        "interactions": 127,
+        "metrics": {
+          "censored": 0.0,
+          "computed_at_ns": 1791073398798080000,
+          "confident": 1.0,
+          "confident_wrong_unflagged": 0.0,
+          "data_fp": "0655a2b885562fc9",
+          "lamp_fraction": 0.30977783790283786,
+          "per_scenario": [
+            27,
+            16,
+            20,
+            9,
+            11,
+            12,
+            18,
+            14
+          ],
+          "ppc_flagged": 0.0,
+          "time_to_confidence": 15.875,
+          "tv_fraction": 0.15624624218374217
+        },
+        "model_updates": null,
+        "primary": 15.875,
+        "process_peak_rss_mb": 86.0,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "73f93b7e6c7ed5f3e1a38a84fe82203d3507b807e94dd65219dbac8cc4e5dc79",
+        "split_id": "e10:lamp#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791073398798120000,
+        "wall_seconds": 0.03855029202532023
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_ids": [
+      "e10:lamp#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791073397578553000,
+    "warnings": []
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff info_marginal beats info_joint on interactions_to_identify (lower is better, basis=final) by mean >= 1 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 1 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "icm": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 685,
+        "mean": 17.125,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 3.2917985205659233,
+        "wall_seconds_total": 0.20282145898090675
+      },
+      "info_joint": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 424,
+        "mean": 10.6,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 1.2512493756242198,
+        "wall_seconds_total": 0.36419604206457734
+      },
+      "info_marginal": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 205,
+        "mean": 5.125,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 1.2960275845829825,
+        "wall_seconds_total": 0.45192133309319615
+      },
+      "random": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 788,
+        "mean": 19.7,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 3.3279122584587473,
+        "wall_seconds_total": 0.20005216798745096
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "info_joint",
+        "b": "info_marginal",
+        "basis": "equal_interactions",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            1,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            2,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            3,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            4,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ]
+        ],
+        "units": []
+      },
+      "equal_time": {
+        "a": "info_joint",
+        "b": "info_marginal",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            3,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            4,
+            "e10:lamp#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "info_joint",
+        "b": "info_marginal",
+        "basis": "final",
+        "ci_high": 7.1772950570660665,
+        "ci_low": 4.128009550775053,
+        "mean_diff": 5.475,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 11.125,
+            "b": 6.75,
+            "budget": null,
+            "diff": 4.375,
+            "seed": 0,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 10.875,
+            "b": 5.375,
+            "budget": null,
+            "diff": 5.5,
+            "seed": 1,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 12.0,
+            "b": 4.375,
+            "budget": null,
+            "diff": 7.625,
+            "seed": 2,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 10.375,
+            "b": 5.75,
+            "budget": null,
+            "diff": 4.625,
+            "seed": 3,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 8.625,
+            "b": 3.375,
+            "budget": null,
+            "diff": 5.25,
+            "seed": 4,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 5.475 >= delta 1, CI [4.128, 7.177] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "random",
+        "b": "info_marginal",
+        "basis": "final",
+        "ci_high": 19.563120399774988,
+        "ci_low": 8.636761428839302,
+        "mean_diff": 14.575,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 15.5,
+            "b": 6.75,
+            "budget": null,
+            "diff": 8.75,
+            "seed": 0,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 23.0,
+            "b": 5.375,
+            "budget": null,
+            "diff": 17.625,
+            "seed": 1,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 23.0,
+            "b": 4.375,
+            "budget": null,
+            "diff": 18.625,
+            "seed": 2,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 17.5,
+            "b": 5.75,
+            "budget": null,
+            "diff": 11.75,
+            "seed": 3,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 19.5,
+            "b": 3.375,
+            "budget": null,
+            "diff": 16.125,
+            "seed": 4,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "alternative_arm": {
+        "a": "icm",
+        "b": "info_marginal",
+        "basis": "final",
+        "ci_high": 15.642119656978561,
+        "ci_low": 8.23416703945561,
+        "mean_diff": 12.0,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 21.875,
+            "b": 6.75,
+            "budget": null,
+            "diff": 15.125,
+            "seed": 0,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 15.875,
+            "b": 5.375,
+            "budget": null,
+            "diff": 10.5,
+            "seed": 1,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 18.75,
+            "b": 4.375,
+            "budget": null,
+            "diff": 14.375,
+            "seed": 2,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 13.25,
+            "b": 5.75,
+            "budget": null,
+            "diff": 7.5,
+            "seed": 3,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          },
+          {
+            "a": 15.875,
+            "b": 3.375,
+            "budget": null,
+            "diff": 12.5,
+            "seed": 4,
+            "split": "e10:lamp#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}

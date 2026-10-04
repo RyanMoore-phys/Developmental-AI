@@ -1,0 +1,754 @@
+{
+  "prereg": {
+    "ablation_arm": "hung_fitter",
+    "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": null,
+    "baseline_arm": "small_table",
+    "basis": "final",
+    "candidate_arm": "large_table",
+    "delta": 0.5,
+    "direction": "higher",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071242885185000,
+    "frozen_hash": "3acd1592f6c9c76f03c6e37c9268c30c00d31ff06f1c49cb1773896f93a5a5a1",
+    "hypothesis": "search() under wall_s = 0.25 s overshoots its budget by > 50% (elapsed/wall_s - small-table ratio >= 0.5) on a large table (150 variables x 60000 rows) \u2014 work outside the guarded fits is unbudgeted",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E9f-search-wall-budget-overshoot",
+    "notes": "",
+    "primary_metric": "overshoot_ratio",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_fingerprints": [
+      "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e"
+    ]
+  },
+  "results": {
+    "arms": [
+      "small_table",
+      "large_table",
+      "hung_fitter"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791071277567846000,
+    "prereg": {
+      "ablation_arm": "hung_fitter",
+      "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": null,
+      "baseline_arm": "small_table",
+      "basis": "final",
+      "candidate_arm": "large_table",
+      "delta": 0.5,
+      "direction": "higher",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071242885185000,
+      "frozen_hash": "3acd1592f6c9c76f03c6e37c9268c30c00d31ff06f1c49cb1773896f93a5a5a1",
+      "hypothesis": "search() under wall_s = 0.25 s overshoots its budget by > 50% (elapsed/wall_s - small-table ratio >= 0.5) on a large table (150 variables x 60000 rows) \u2014 work outside the guarded fits is unbudgeted",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E9f-search-wall-budget-overshoot",
+      "notes": "",
+      "primary_metric": "overshoot_ratio",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split_fingerprints": [
+        "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e"
+      ]
+    },
+    "prereg_hash": "3acd1592f6c9c76f03c6e37c9268c30c00d31ff06f1c49cb1773896f93a5a5a1",
+    "runs": [
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071252301828000,
+          "data_fp": "81b93365d10ae877",
+          "elapsed": 0.11633329198230058,
+          "evaluated": 51,
+          "internal_elapsed": 0.11623987497296184,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.4653331679292023,
+        "process_peak_rss_mb": 67.65625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071252301990000,
+        "wall_seconds": 0.1179993330151774
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071256856476000,
+          "data_fp": "62534534b133e897",
+          "elapsed": 4.309037874976639,
+          "evaluated": 1,
+          "internal_elapsed": 4.302751041948795,
+          "leaked_threads": 0,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 17.236151499906555,
+        "process_peak_rss_mb": 229.625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071256856676000,
+        "wall_seconds": 4.554508958011866
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071257118552000,
+          "data_fp": "81b93365d10ae877",
+          "elapsed": 0.2602574580232613,
+          "evaluated": 1,
+          "internal_elapsed": 0.260209541011136,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0410298320930451,
+        "process_peak_rss_mb": 229.625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071257118730000,
+        "wall_seconds": 0.26189637498464435
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071261948922000,
+          "data_fp": "fa2010041fdd2f33",
+          "elapsed": 4.598013709008228,
+          "evaluated": 1,
+          "internal_elapsed": 4.591624749999028,
+          "leaked_threads": 0,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 18.392054836032912,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071261949132000,
+        "wall_seconds": 4.830229583021719
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071262210762000,
+          "data_fp": "cecb6eb742545d98",
+          "elapsed": 0.2601868340279907,
+          "evaluated": 1,
+          "internal_elapsed": 0.26014487497741356,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0407473361119628,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071262210910000,
+        "wall_seconds": 0.2616461670259014
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071262303956000,
+          "data_fp": "cecb6eb742545d98",
+          "elapsed": 0.09162429202115163,
+          "evaluated": 51,
+          "internal_elapsed": 0.09152766695478931,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.36649716808460653,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071262304106000,
+        "wall_seconds": 0.09306404099334031
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071262566496000,
+          "data_fp": "cbc33d9332031957",
+          "elapsed": 0.26093820796813816,
+          "evaluated": 1,
+          "internal_elapsed": 0.2608900830382481,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0437528318725526,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071262566646000,
+        "wall_seconds": 0.26240783400135115
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071262678711000,
+          "data_fp": "cbc33d9332031957",
+          "elapsed": 0.11072699999203905,
+          "evaluated": 51,
+          "internal_elapsed": 0.11061620898544788,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.4429079999681562,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071262678884000,
+        "wall_seconds": 0.11208674998488277
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071267599891000,
+          "data_fp": "df94b697f743b028",
+          "elapsed": 4.67956141702598,
+          "evaluated": 1,
+          "internal_elapsed": 4.672095542016905,
+          "leaked_threads": -2,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 18.71824566810392,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071267600089000,
+        "wall_seconds": 4.9210314999800175
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071267767804000,
+          "data_fp": "c16e8eb0883846a9",
+          "elapsed": 0.16611337498761714,
+          "evaluated": 51,
+          "internal_elapsed": 0.16598987497854978,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.6644534999504685,
+        "process_peak_rss_mb": 271.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071267767943000,
+        "wall_seconds": 0.16772404103539884
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071272630099000,
+          "data_fp": "56491897ad03515d",
+          "elapsed": 4.5504350830451585,
+          "evaluated": 1,
+          "internal_elapsed": 4.5462857079692185,
+          "leaked_threads": 0,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 18.201740332180634,
+        "process_peak_rss_mb": 310.421875,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071272630286000,
+        "wall_seconds": 4.862179332994856
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071272892082000,
+          "data_fp": "c16e8eb0883846a9",
+          "elapsed": 0.26020641601644456,
+          "evaluated": 1,
+          "internal_elapsed": 0.2601653749588877,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.0408256640657783,
+        "process_peak_rss_mb": 310.46875,
+        "py_alloc_peak_mb": null,
+        "seed": 3,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071272892219000,
+        "wall_seconds": 0.2618106249719858
+      },
+      {
+        "arm": "large_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071277215386000,
+          "data_fp": "abb71be9b970972f",
+          "elapsed": 4.099604875023942,
+          "evaluated": 1,
+          "internal_elapsed": 4.095166374987457,
+          "leaked_threads": 0,
+          "rows": 60000,
+          "stopped": "wall",
+          "vars": 150,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 16.39841950009577,
+        "process_peak_rss_mb": 362.875,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071277215571000,
+        "wall_seconds": 4.323182624997571
+      },
+      {
+        "arm": "hung_fitter",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071277477389000,
+          "data_fp": "2b71adebb9dd948c",
+          "elapsed": 0.26021204103017226,
+          "evaluated": 1,
+          "internal_elapsed": 0.2601649580174126,
+          "leaked_threads": 1,
+          "rows": 2000,
+          "stopped": "wall",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 1.040848164120689,
+        "process_peak_rss_mb": 362.921875,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071277477543000,
+        "wall_seconds": 0.26183566701365635
+      },
+      {
+        "arm": "small_table",
+        "curve": [],
+        "error": null,
+        "interactions": null,
+        "metrics": {
+          "computed_at_ns": 1791071277567667000,
+          "data_fp": "2b71adebb9dd948c",
+          "elapsed": 0.08884300000499934,
+          "evaluated": 51,
+          "internal_elapsed": 0.08876937499735504,
+          "leaked_threads": 0,
+          "rows": 2000,
+          "stopped": "exhausted",
+          "vars": 5,
+          "wall_s": 0.25
+        },
+        "model_updates": null,
+        "primary": 0.35537200001999736,
+        "process_peak_rss_mb": 363.1875,
+        "py_alloc_peak_mb": null,
+        "seed": 4,
+        "split_fingerprint": "47beeed63d8710ffb2b5458232a522888424c464f951eb5c4496c1eff162cb9e",
+        "split_id": "e9:budget#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071277567792000,
+        "wall_seconds": 0.09013725002296269
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "split_ids": [
+      "e9:budget#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791071252183856000,
+    "warnings": []
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff large_table beats small_table on overshoot_ratio (higher is better, basis=final) by mean >= 0.5 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.5 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "hung_fitter": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 1.0414407656528055,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.0012966194180807917,
+        "wall_seconds_total": 1.309596667997539
+      },
+      "large_table": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 17.789322367263956,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.953530584187965,
+        "wall_seconds_total": 23.49113199900603
+      },
+      "small_table": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 0,
+        "mean": 0.4589127671904862,
+        "model_updates_total": 0,
+        "ok": 5,
+        "py_alloc_peak_mb_max": null,
+        "runs": 5,
+        "std": 0.1243037613744544,
+        "wall_seconds_total": 0.581011415051762
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "equal_interactions",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            1,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            2,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            3,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ],
+          [
+            4,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown interactions"
+          ]
+        ],
+        "units": []
+      },
+      "equal_time": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            3,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            4,
+            "e9:budget#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "small_table",
+        "b": "large_table",
+        "basis": "final",
+        "ci_high": 18.43477296538611,
+        "ci_low": 16.15019513528727,
+        "mean_diff": 17.330409600073473,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.4653331679292023,
+            "b": 17.236151499906555,
+            "budget": null,
+            "diff": 16.770818331977352,
+            "seed": 0,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.36649716808460653,
+            "b": 18.392054836032912,
+            "budget": null,
+            "diff": 18.025557667948306,
+            "seed": 1,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.4429079999681562,
+            "b": 18.71824566810392,
+            "budget": null,
+            "diff": 18.275337668135762,
+            "seed": 2,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.6644534999504685,
+            "b": 18.201740332180634,
+            "budget": null,
+            "diff": 17.537286832230166,
+            "seed": 3,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.35537200001999736,
+            "b": 16.39841950009577,
+            "budget": null,
+            "diff": 16.043047500075772,
+            "seed": 4,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 17.33 >= delta 0.5, CI [16.15, 18.43] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "hung_fitter",
+        "b": "large_table",
+        "basis": "final",
+        "ci_high": 17.847835730828397,
+        "ci_low": 15.442968772217487,
+        "mean_diff": 16.74788160161115,
+        "n_pairs": 5,
+        "skipped": [],
+        "units": [
+          {
+            "a": 1.0410298320930451,
+            "b": 17.236151499906555,
+            "budget": null,
+            "diff": 16.19512166781351,
+            "seed": 0,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0407473361119628,
+            "b": 18.392054836032912,
+            "budget": null,
+            "diff": 17.35130749992095,
+            "seed": 1,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0437528318725526,
+            "b": 18.71824566810392,
+            "budget": null,
+            "diff": 17.674492836231366,
+            "seed": 2,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.0408256640657783,
+            "b": 18.201740332180634,
+            "budget": null,
+            "diff": 17.160914668114856,
+            "seed": 3,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.040848164120689,
+            "b": 16.39841950009577,
+            "budget": null,
+            "diff": 15.35757133597508,
+            "seed": 4,
+            "split": "e9:budget#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}

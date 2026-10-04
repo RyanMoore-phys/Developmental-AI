@@ -133,6 +133,18 @@ jobs:
           echo "----- pip freeze -----"
           pip freeze
 
+      # UNIT + CONTRACT TIERS (added 2026-10-03). tests/run_all.py has listed
+      # these since 2026-09-19 but CI never ran them, so the foundation/
+      # suites (improvement plan stages 1-12) and the older contract suites
+      # were gated locally only. The runner is the single list; this step
+      # just calls it. Exit code = number of failing suites.
+      - name: Run unit + contract tiers
+        env:
+          PYTHONPATH: .
+        run: |
+          python tests/run_all.py unit
+          python tests/run_all.py contract
+
       - name: Run smoke suite
         env:
           PYTHONPATH: .

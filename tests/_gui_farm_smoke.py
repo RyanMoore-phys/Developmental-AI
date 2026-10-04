@@ -33,6 +33,26 @@ Contracts:
        seek/centring potentials re-adopt so closing pays no windfall.
     C. The dwell cost lands in the EXTRINSIC channel — the intrinsic one is
        zeroed inside a GUI, which would erase the cost entirely.
+    D. THE TERM RUNS ON STREAM 0 WITHOUT THE VISION SCAFFOLD (2026-10-03,
+       docs/foundation/BASELINE_AUDIT.md §3). The stream-0 dwell block sat
+       INSIDE `if not use_dream_actor and self.vision_scaffold is not None:`
+       in BOTH live bodies, and the live config runs `llm.vision.enabled:
+       false` — so the one stream PPO trains on paid NO dwell cost (measured
+       on the old code: every recorded stream-0 extrinsic 0.0 through a
+       30-step menu), while every scout paid it via _scout_mixed_reward, and
+       the yaml's "a menu now pays strictly <= 0" rested on a term that
+       never ran. Drives the REAL _collect_segment (lifelong) and
+       _run_episode_parallel (episodic) on a zero-reward fake env whose
+       stream 0 opens a GUI for 30 steps, and records the extrinsic handed
+       to the primary reward_mixer.mix call:
+         D1 scaffold None: entry costs (-w/N per step, -w in total), pinned
+            pays EXACTLY 0 per step, the close step refunds +w, the cycle
+            nets 0, and the sequence equals the plain-difference reference.
+         D2 scaffold present (stub, magnet paying 0): the IDENTICAL sequence
+            — applied exactly once per step, never twice.
+         D3 control: gui_dwell_weight 0 records all zeros, so D1 is
+            measuring the dwell term and nothing else in the channel.
+       Needs gymnasium (legacy tier); A-C run without it.
 
 Run: PYTHONPATH=. python tests/_gui_farm_smoke.py
 """
@@ -146,8 +166,226 @@ def test_no_one_way_doors():
           f"an entrance is never offered without its exit")
 
 
+# ---- D. drive the REAL collection bodies -----------------------------------
+GUI_OPEN_AT, GUI_LEN = 5, 30          # stream 0: closed, 30 steps open, closed
+DWELL_W, DWELL_N = 0.05, 10.0         # saturates after 10 -> 20 pinned steps
+
+
+def _gui_env(idx):
+    """Zero-reward, never-terminating (truncates at 70) 4-d env. Stream 0 reports
+    info["gui_open"] on steps [GUI_OPEN_AT, GUI_OPEN_AT + GUI_LEN); scouts
+    never do. Every step's flag is logged so the recorded rewards can be
+    aligned against what the env actually said."""
+    import gymnasium as gym
+    import numpy as np
+
+    class GuiEnv(gym.Env):
+        observation_space = gym.spaces.Box(-1.0, 1.0, (4,), np.float32)
+        action_space = gym.spaces.Discrete(2)
+
+        def __init__(self):
+            self.idx, self.t = idx, 0
+            self.rng = np.random.default_rng(idx)
+            GUI_LOG[idx] = []
+
+        def _obs(self):
+            return self.rng.uniform(-1, 1, 4).astype(np.float32)
+
+        def reset(self, seed=None, options=None):
+            return self._obs(), {"gui_open": False}
+
+        def step(self, a):
+            g = (self.idx == 0
+                 and GUI_OPEN_AT <= self.t < GUI_OPEN_AT + GUI_LEN)
+            self.t += 1
+            GUI_LOG[self.idx].append(bool(g))
+            # truncates at 70 so the EPISODIC body ends; the lifelong
+            # segment (60 steps) never reaches it, so no reset intervenes
+            return (self._obs(), 0.0, False, self.t >= 70,
+                    {"gui_open": bool(g)})
+
+    return GuiEnv()
+
+
+GUI_LOG = {}
+
+
+def _drive(lifelong, weight, scaffold):
+    """Run one real body; return (stream-0 gui flags, stream-0 extrinsic
+    handed to the PRIMARY reward_mixer.mix) step-aligned."""
+    import tempfile
+    import yaml
+    import developmental_ai.core.developmental_loop as dl
+    from developmental_ai.environments.wrappers import DevelopmentalEnvWrapper
+
+    tmp = tempfile.mkdtemp(prefix="gui_farm_")
+    state = {"n": 0}
+
+    def fake(*a, **k):
+        i = state["n"]
+        state["n"] += 1
+        return DevelopmentalEnvWrapper(_gui_env(i), normalize_obs=False), None
+    _orig = dl.make_env
+    dl.make_env = fake
+    GUI_LOG.clear()
+    cfg = yaml.safe_load(open(os.path.join("configs", "default.yaml")))
+    cfg["seed"] = 0
+    cfg["world_model"].update({
+        "stochastic_size": 8, "stochastic_classes": 8,
+        "deterministic_size": 32, "encoder_hidden": 32,
+        "decoder_hidden": 32, "batch_size": 4, "sequence_length": 8,
+        "train_iters": 1, "buffer_capacity": 2000})
+    cfg["parallel_envs"] = {"enabled": True, "num_envs": 2}
+    cfg["policy"].update({"n_steps": 200, "minibatch_size": 16,
+                          "n_epochs": 1})
+    cfg["environment"]["max_episode_steps"] = 70
+    if lifelong:
+        cfg["lifelong"] = {"enabled": True, "forever": False,
+                           "segment_len": 60, "wm_train_every": 10 ** 6,
+                           "goal_horizon": 10 ** 9, "state_decay": 1.0,
+                           "reset_on_death_only": True,
+                           "stop_file": os.path.join(tmp, "STOP")}
+    cfg.setdefault("loop", {})["verbose"] = 0
+    cfg.setdefault("llm", {})["enabled"] = False
+    cfg.setdefault("skill_bank", {})["storage_dir"] = os.path.join(tmp, "sb")
+    ai = dl.DevelopmentalAI(config=cfg)
+    try:
+        assert ai.vision_scaffold is None, "fixture must start scaffold-less"
+        ai._gui_dwell_weight = float(weight)
+        ai._gui_dwell_steps = DWELL_N
+        if scaffold:
+            ai.vision_scaffold = _StubScaffold()
+            ai._magnet_step_shaping = lambda *a, **k: 0.0
+        rec = []
+        _mix = ai.reward_mixer.mix
+
+        def spy(i, e, update_stats=True):
+            if update_stats:              # the PRIMARY call; scouts pass False
+                rec.append(float(e))
+            return _mix(i, e, update_stats=update_stats)
+        ai.reward_mixer.mix = spy
+        if lifelong:
+            ai._collect_segment()
+        else:
+            ai._run_episode_parallel(use_dream_actor=False)
+        if scaffold:
+            ai.vision_scaffold = None     # the stub has nothing to close
+        flags = list(GUI_LOG[0])
+        assert len(flags) == len(rec) >= GUI_OPEN_AT + GUI_LEN + 3, (
+            len(flags), len(rec))
+        return flags, rec
+    finally:
+        dl.make_env = _orig
+        ai.close()
+
+
+class _StubScaffold:
+    """Enough of VisionScaffold for the scaffold block to RUN (its magnet
+    call is patched to pay 0) — so D2 isolates 'is the dwell term applied
+    once or twice', not magnet arithmetic."""
+    stats = {}
+    target_categories = []
+    _seek_cats = []
+    cold_start_weight = 0.0
+    seek_nudge_budget = 0
+    _phi_prev = None
+    _seek_prob_prev = None
+
+    def reset(self):
+        pass
+
+    def wants_step(self, *_a):
+        return False
+
+    def social_prime(self, *_a, **_k):
+        return False
+
+    def propose_category(self, *_a, **_k):
+        return None
+
+    def set_deficit_source(self, *_a, **_k):
+        pass
+
+
+def _reference(flags, w, n):
+    """The plain-difference potential, independently: Phi=-min(1, run/n),
+    pay w*(Phi' - Phi), first sample charges nothing."""
+    out, run, prev = [], 0, None
+    for g in flags:
+        run = run + 1 if g else 0
+        phi = -min(1.0, run / n)
+        out.append(0.0 if prev is None else w * (phi - prev))
+        prev = phi
+    return out
+
+
+def test_stream0_dwell_without_scaffold():
+    import importlib.util
+    if importlib.util.find_spec("gymnasium") is None:
+        raise ImportError("No module named 'gymnasium'")   # runner: SKIP
+    for lifelong, label in ((True, "_collect_segment"),
+                            (False, "_run_episode_parallel")):
+        flags, pay = _drive(lifelong, DWELL_W, scaffold=False)
+        o = flags.index(True)
+        c = o + flags[o:].index(False)
+        assert c - o == GUI_LEN, (o, c)
+        n = int(DWELL_N)
+        entry = pay[o:o + n]
+        pinned = pay[o + n:c]
+        exit_ = pay[c]
+        assert all(abs(x + DWELL_W / DWELL_N) < 1e-9 for x in entry), (
+            f"{label}: stream 0 paid no dwell cost on entry with the vision "
+            f"scaffold OFF (the live config) — entry steps {entry}")
+        assert pinned and all(x == 0.0 for x in pinned), (
+            f"{label}: pinned in a menu must pay EXACTLY 0/step: {pinned}")
+        assert abs(exit_ - DWELL_W) < 1e-9, (label, exit_)
+        assert abs(sum(pay)) < 1e-9, (label, sum(pay))
+        assert all(x == 0.0 for k, x in enumerate(pay)
+                   if k < o or k > c), (label, pay)
+        ref = _reference(flags, DWELL_W, DWELL_N)
+        assert max(abs(a - b) for a, b in zip(pay, ref)) < 1e-9, label
+        print(f"  D1. {label}, scaffold None: entry {sum(entry):+.4f} "
+              f"({len(entry)} x {entry[0]:+.4f}), pinned {len(pinned)} "
+              f"steps at exactly 0.0, exit {exit_:+.4f}, cycle "
+              f"{sum(pay):+.2e}")
+
+        flags2, pay2 = _drive(lifelong, DWELL_W, scaffold=True)
+        assert flags2 == flags
+        assert max(abs(a - b) for a, b in zip(pay2, pay)) < 1e-12, (
+            f"{label}: with the scaffold present the dwell term must be "
+            f"applied exactly ONCE per step (double-charge or missing): "
+            f"{pay2[o:o + 3]} vs {pay[o:o + 3]}")
+        print(f"  D2. {label}, scaffold present: identical sequence — "
+              f"applied once per step, entry {sum(pay2[o:o + n]):+.4f}")
+
+        flags0, pay0 = _drive(lifelong, 0.0, scaffold=False)
+        assert all(x == 0.0 for x in pay0), (label, pay0)
+        print(f"  D3. {label}, weight 0: all {len(pay0)} stream-0 "
+              f"extrinsics 0.0 — D1 measures the dwell term alone")
+
+
+
+def test_episodic_boundary_readopts_cost_potentials():
+    """The episodic body must reset the stream-0 cost potentials at each
+    episode start (2026-10-03). Without it, an episode ending inside a menu
+    (Phi = -1) pays the next episode a phantom +w refund on step one — the
+    same boundary bug _collect_segment already fixes on a client rebuild."""
+    src = open(os.path.join("developmental_ai", "core",
+                            "developmental_loop.py")).read()
+    body = src[src.index("    def _run_episode_parallel("):
+               src.index("    def _start_stream(")]
+    head = body[:body.index("self._parallel_reset(envs)") + 2000]
+    for line in ("self._gui_dwell_phi = None", "self._gui_run = 0",
+                 "self._pitch_level_phi = None"):
+        assert line in head, f"episodic body does not re-adopt: {line}"
+    print("  E. episodic body re-adopts the gui-dwell and pitch-level cost "
+          "potentials at episode start (no phantom refund across a reset)")
+
+
 if __name__ == "__main__":
     test_state_cost_must_not_pay_while_pinned()
     test_source_contracts()
     test_no_one_way_doors()
+    test_stream0_dwell_without_scaffold()
+    test_episodic_boundary_readopts_cost_potentials()
     print("[gui-farm] ALL PASS")

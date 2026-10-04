@@ -57,9 +57,11 @@ concurrency:
 
 jobs:
   deploy:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    # ONE `if:` (2026-10-03). The publishing pass added the fork guard below
+    # as a SECOND `if:` key on this job; a duplicate key is invalid workflow
+    # syntax, so GitHub rejected the whole file ("Line 71: 'if' is already
+    # defined") and NOTHING has deployed since. Both conditions are kept,
+    # ANDed: CI must have passed AND the code must come from this repository.
     # FORKS CANNOT REACH THIS RUNNER (2026-10-01, for publishing).
     # `workflow_run` DOES fire for pull requests from forks, and it runs in
     # the BASE repo context with full runner access -- the documented
@@ -70,7 +72,8 @@ jobs:
     # access, and head_repository is absent there, hence the || clause.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.head_repository.full_name == github.repository
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: self-hosted
     timeout-minutes: 30
     steps:

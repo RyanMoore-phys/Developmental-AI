@@ -1,0 +1,600 @@
+{
+  "prereg": {
+    "ablation_arm": "full_eps0",
+    "acceptance_rule": "accept iff full_robust beats refit_only on nll_gauss (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+    "alternative_arm": null,
+    "baseline_arm": "refit_only",
+    "basis": "final",
+    "candidate_arm": "full_robust",
+    "delta": 0.05,
+    "direction": "lower",
+    "failure_conditions": [
+      "any arm raises"
+    ],
+    "frozen_at_ns": 1791071193516331000,
+    "frozen_hash": "1a0c1c6a001d0d143fc80eb0d839d8cbd719716f091aa377a5366d245c2f9b63",
+    "hypothesis": "a change touching only 1% of rows (y += 3 when r == 1) is found by the full language: held-out GAUSSIAN NLL beats REFIT-only by >= 0.05 nats/row (if the 1% outlier component hides the misfit, this fails while the eps~0 ablation succeeds)",
+    "max_candidate_failure_fraction": 0.0,
+    "n_bootstrap": 4000,
+    "name": "E9e-rare-misfit-f0.01",
+    "notes": "",
+    "primary_metric": "nll_gauss",
+    "resource_budget": {
+      "max_wall_seconds": 60.0
+    },
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_fingerprints": [
+      "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af"
+    ]
+  },
+  "results": {
+    "arms": [
+      "refit_only",
+      "full_robust",
+      "full_eps0"
+    ],
+    "environment": {
+      "numpy": "1.26.4",
+      "platform": "macOS-26.4.1-arm64-arm-64bit",
+      "python": "3.12.7"
+    },
+    "finished_at_ns": 1791071199174233000,
+    "prereg": {
+      "ablation_arm": "full_eps0",
+      "acceptance_rule": "accept iff full_robust beats refit_only on nll_gauss (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+      "alternative_arm": null,
+      "baseline_arm": "refit_only",
+      "basis": "final",
+      "candidate_arm": "full_robust",
+      "delta": 0.05,
+      "direction": "lower",
+      "failure_conditions": [
+        "any arm raises"
+      ],
+      "frozen_at_ns": 1791071193516331000,
+      "frozen_hash": "1a0c1c6a001d0d143fc80eb0d839d8cbd719716f091aa377a5366d245c2f9b63",
+      "hypothesis": "a change touching only 1% of rows (y += 3 when r == 1) is found by the full language: held-out GAUSSIAN NLL beats REFIT-only by >= 0.05 nats/row (if the 1% outlier component hides the misfit, this fails while the eps~0 ablation succeeds)",
+      "max_candidate_failure_fraction": 0.0,
+      "n_bootstrap": 4000,
+      "name": "E9e-rare-misfit-f0.01",
+      "notes": "",
+      "primary_metric": "nll_gauss",
+      "resource_budget": {
+        "max_wall_seconds": 60.0
+      },
+      "schema_version": 1,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "split_fingerprints": [
+        "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af"
+      ]
+    },
+    "prereg_hash": "1a0c1c6a001d0d143fc80eb0d839d8cbd719716f091aa377a5366d245c2f9b63",
+    "runs": [
+      {
+        "arm": "refit_only",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 0,
+          "best_op": "none",
+          "captured_r": false,
+          "complexity": 3,
+          "computed_at_ns": 1791071197893866000,
+          "cusum_alarms_on_change": 10,
+          "data_fp": "c907cfa5d5917d8b",
+          "deps": "x",
+          "evaluated": 1,
+          "n_deps": 1,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": 113.7125695163696,
+          "nll_robust": -0.12308915605595347,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 10,
+          "search_seconds": 0.00297054200200364,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": 0.506631953046438,
+        "process_peak_rss_mb": 67.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071197893961000,
+        "wall_seconds": 0.02956254204036668
+      },
+      {
+        "arm": "full_robust",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 1,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071198049334000,
+          "cusum_alarms_on_change": 10,
+          "data_fp": "c907cfa5d5917d8b",
+          "deps": "r,x",
+          "evaluated": 65,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.40310905360338095,
+          "nll_robust": -0.17597709646443424,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 10,
+          "search_seconds": 0.13085324998246506,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.18045368856496016,
+        "process_peak_rss_mb": 67.0,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198049417000,
+        "wall_seconds": 0.15539354196516797
+      },
+      {
+        "arm": "full_eps0",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 1,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071198187562000,
+          "cusum_alarms_on_change": 10,
+          "data_fp": "c907cfa5d5917d8b",
+          "deps": "r,x",
+          "evaluated": 65,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.40310905360338095,
+          "nll_robust": -0.17597709646443424,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 10,
+          "search_seconds": 0.11222770804306492,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.18045368856496016,
+        "process_peak_rss_mb": 67.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 0,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198187650000,
+        "wall_seconds": 0.13816941599361598
+      },
+      {
+        "arm": "full_robust",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 1,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071198326446000,
+          "cusum_alarms_on_change": 5,
+          "data_fp": "92f2d6f2c0155bf0",
+          "deps": "r,x",
+          "evaluated": 65,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.5342814089860186,
+          "nll_robust": -0.17219262840890084,
+          "rare_rows_heldout": 4,
+          "rare_rows_search": 5,
+          "search_seconds": 0.11405312502756715,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.17601715484971517,
+        "process_peak_rss_mb": 67.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198326539000,
+        "wall_seconds": 0.13881654100259766
+      },
+      {
+        "arm": "full_eps0",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 6,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071198582996000,
+          "cusum_alarms_on_change": 5,
+          "data_fp": "92f2d6f2c0155bf0",
+          "deps": "r,x",
+          "evaluated": 131,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.5342814089860186,
+          "nll_robust": -0.17219262840890084,
+          "rare_rows_heldout": 4,
+          "rare_rows_search": 5,
+          "search_seconds": 0.23158487502951175,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.17601715484971517,
+        "process_peak_rss_mb": 67.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198583085000,
+        "wall_seconds": 0.25647991604637355
+      },
+      {
+        "arm": "refit_only",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 0,
+          "best_op": "none",
+          "captured_r": false,
+          "complexity": 3,
+          "computed_at_ns": 1791071198610513000,
+          "cusum_alarms_on_change": 5,
+          "data_fp": "92f2d6f2c0155bf0",
+          "deps": "x",
+          "evaluated": 1,
+          "n_deps": 1,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": 106.88425285627571,
+          "nll_robust": -0.06661062742877813,
+          "rare_rows_heldout": 4,
+          "rare_rows_search": 5,
+          "search_seconds": 0.002554417005740106,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": 1.1159382864280163,
+        "process_peak_rss_mb": 67.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 1,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198610593000,
+        "wall_seconds": 0.027451500005554408
+      },
+      {
+        "arm": "full_eps0",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 4,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071198872151000,
+          "cusum_alarms_on_change": 4,
+          "data_fp": "2a9956f267628e95",
+          "deps": "r,x",
+          "evaluated": 129,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.5666197809881894,
+          "nll_robust": -0.22757645269729512,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 4,
+          "search_seconds": 0.237110624962952,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.2333992950059296,
+        "process_peak_rss_mb": 67.015625,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198872287000,
+        "wall_seconds": 0.2615929580060765
+      },
+      {
+        "arm": "refit_only",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 0,
+          "best_op": "none",
+          "captured_r": false,
+          "complexity": 3,
+          "computed_at_ns": 1791071198899980000,
+          "cusum_alarms_on_change": 4,
+          "data_fp": "2a9956f267628e95",
+          "deps": "x",
+          "evaluated": 1,
+          "n_deps": 1,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": 119.80313415894787,
+          "nll_robust": -0.1681905662615856,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 4,
+          "search_seconds": 0.0030909579945728183,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": 0.49637948170504387,
+        "process_peak_rss_mb": 67.03125,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071198900065000,
+        "wall_seconds": 0.027705583022907376
+      },
+      {
+        "arm": "full_robust",
+        "curve": [],
+        "error": null,
+        "interactions": 600,
+        "metrics": {
+          "accepted": 3,
+          "best_op": "ADD_DEPENDENCY",
+          "captured_r": true,
+          "complexity": 4,
+          "computed_at_ns": 1791071199174086000,
+          "cusum_alarms_on_change": 4,
+          "data_fp": "2a9956f267628e95",
+          "deps": "r,x",
+          "evaluated": 129,
+          "n_deps": 2,
+          "n_distractor_deps": 0,
+          "nll_gauss_rare_rows": -0.5666197809881894,
+          "nll_robust": -0.22757645269729512,
+          "rare_rows_heldout": 2,
+          "rare_rows_search": 4,
+          "search_seconds": 0.24802712496602908,
+          "stopped": "exhausted"
+        },
+        "model_updates": null,
+        "primary": -0.2333992950059296,
+        "process_peak_rss_mb": 67.03125,
+        "py_alloc_peak_mb": null,
+        "seed": 2,
+        "split_fingerprint": "2c612471b7f6a6dfec23778ec8128df315c7eb59b5eb23a8c7fb7c2df56b54af",
+        "split_id": "e9:rare0.01#skybot-foundation-split-v1",
+        "status": "ok",
+        "t_recorded_ns": 1791071199174172000,
+        "wall_seconds": 0.2740443750517443
+      }
+    ],
+    "schema_version": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "split_ids": [
+      "e9:rare0.01#skybot-foundation-split-v1"
+    ],
+    "started_at_ns": 1791071197864338000,
+    "warnings": []
+  },
+  "verdict": {
+    "acceptance_rule": "accept iff full_robust beats refit_only on nll_gauss (lower is better, basis=final) by mean >= 0.05 with the paired bootstrap 95% CI (small-sample expanded) excluding 0, across >= 3 seeds; reject iff the CI upper bound < 0.05 or candidate failures exceed 0; else inconclusive",
+    "arms": {
+      "full_eps0": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 1800,
+        "mean": -0.19662337947353495,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.03192603452178166,
+        "wall_seconds_total": 0.656242290046066
+      },
+      "full_robust": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 1800,
+        "mean": -0.19662337947353495,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.03192603452178166,
+        "wall_seconds_total": 0.5682544580195099
+      },
+      "refit_only": {
+        "budget_exceeded": 0,
+        "failed": 0,
+        "interactions_total": 1800,
+        "mean": 0.7063165737264994,
+        "model_updates_total": 0,
+        "ok": 3,
+        "py_alloc_peak_mb_max": null,
+        "runs": 3,
+        "std": 0.35477984572061666,
+        "wall_seconds_total": 0.08471962506882846
+      }
+    },
+    "candidate_failure_fraction": 0.0,
+    "comparisons": {
+      "equal_interactions": {
+        "a": "refit_only",
+        "b": "full_robust",
+        "basis": "equal_interactions",
+        "ci_high": 1.9489498018536235,
+        "ci_low": 0.32253700597609625,
+        "mean_diff": 0.9029399532000344,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.506631953046438,
+            "b": -0.18045368856496016,
+            "budget": 600,
+            "diff": 0.6870856416113982,
+            "seed": 0,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.1159382864280163,
+            "b": -0.17601715484971517,
+            "budget": 600,
+            "diff": 1.2919554412777314,
+            "seed": 1,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.49637948170504387,
+            "b": -0.2333992950059296,
+            "budget": 600,
+            "diff": 0.7297787767109735,
+            "seed": 2,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          }
+        ]
+      },
+      "equal_time": {
+        "a": "refit_only",
+        "b": "full_robust",
+        "basis": "equal_time",
+        "ci_high": null,
+        "ci_low": null,
+        "mean_diff": null,
+        "n_pairs": 0,
+        "skipped": [
+          [
+            0,
+            "e9:rare0.01#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            1,
+            "e9:rare0.01#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ],
+          [
+            2,
+            "e9:rare0.01#skybot-foundation-split-v1",
+            "no curve and unequal/unknown time"
+          ]
+        ],
+        "units": []
+      },
+      "final": {
+        "a": "refit_only",
+        "b": "full_robust",
+        "basis": "final",
+        "ci_high": 1.9489498018536235,
+        "ci_low": 0.32253700597609625,
+        "mean_diff": 0.9029399532000344,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": 0.506631953046438,
+            "b": -0.18045368856496016,
+            "budget": null,
+            "diff": 0.6870856416113982,
+            "seed": 0,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": 1.1159382864280163,
+            "b": -0.17601715484971517,
+            "budget": null,
+            "diff": 1.2919554412777314,
+            "seed": 1,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": 0.49637948170504387,
+            "b": -0.2333992950059296,
+            "budget": null,
+            "diff": 0.7297787767109735,
+            "seed": 2,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "label": "accept",
+    "notes": [
+      "few seeds: three seeds are not a guarantee of statistical reliability (plan \u00a77.2.6)"
+    ],
+    "qualifier": null,
+    "reasons": [
+      "mean improvement 0.9029 >= delta 0.05, CI [0.3225, 1.949] excludes 0"
+    ],
+    "secondary": {
+      "ablation_arm": {
+        "a": "full_eps0",
+        "b": "full_robust",
+        "basis": "final",
+        "ci_high": 0.0,
+        "ci_low": 0.0,
+        "mean_diff": 0.0,
+        "n_pairs": 3,
+        "skipped": [],
+        "units": [
+          {
+            "a": -0.18045368856496016,
+            "b": -0.18045368856496016,
+            "budget": null,
+            "diff": -0.0,
+            "seed": 0,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": -0.17601715484971517,
+            "b": -0.17601715484971517,
+            "budget": null,
+            "diff": -0.0,
+            "seed": 1,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          },
+          {
+            "a": -0.2333992950059296,
+            "b": -0.2333992950059296,
+            "budget": null,
+            "diff": -0.0,
+            "seed": 2,
+            "split": "e9:rare0.01#skybot-foundation-split-v1"
+          }
+        ]
+      }
+    },
+    "verdict": "accept"
+  }
+}
