@@ -321,7 +321,14 @@ def test_deadline():
     Slow.delay = 0.0                         # the slowness was transient
     assert ctl.planner.wait_idle(1.0)        # the abandoned call returns
     resumed = [ctl.decide(s, DT, obs).source for _ in range(3)]
-    assert ctl.planner.stats["probes"] >= 1 and "planner" in resumed, resumed
+    # THE CONTRACT IS "NOT LATCHED OUT": once the slowness passes the planner
+    # takes control again. Whether it gets there through a forced re-probe or
+    # because its cost estimate already fits is RUNNER-SPEED dependent — the
+    # same commit (bcc846e) passed on one CI run and failed `probes >= 1` on
+    # the next. The re-probe escape itself is pinned on a fake clock in
+    # tests/unit/test_foundation_planning_unit.py
+    # (deadline_discard_preempt_and_reprobe), so it is not re-asserted here.
+    assert "planner" in resumed, (resumed, ctl.planner.stats)
     p = acf.action_probs(policy_vector(obs))
     assert int(np.argmax(p)) == later[0].command and abs(p.sum() - 1) < 1e-6
     print(f"  C. deadline {deadline * 1e3:.0f} ms, chunk >= {chunk * 1e3:.1f} ms: first call "
