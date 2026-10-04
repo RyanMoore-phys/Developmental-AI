@@ -80,6 +80,9 @@ CONTRACT = [
     # experiments/foundation_ab/.
     "tests/_foundation_ab_verify_smoke.py",
     "tests/_foundation_ab_verify9_11_smoke.py",
+    # node2 brain mirror (scripts/brain_mirror/): pull, verify, retention,
+    # latch escapes. Needs only rsync + stdlib.
+    "tests/_brain_mirror_smoke.py",
 ]
 
 # These need the full stack (gymnasium / minerl) and so only run on the training host.
