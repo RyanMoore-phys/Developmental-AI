@@ -116,3 +116,7 @@ CLAUDE.local.md
 
 # node2 brain mirror: real host addresses live only in this file (public repo).
 scripts/brain_mirror/brain_mirror.env
+
+# Claude Code per-machine settings (may hold local paths/permissions). Was only
+# ignored by a personal global gitignore, so CI saw it as publishable.
+.claude/settings.local.json
