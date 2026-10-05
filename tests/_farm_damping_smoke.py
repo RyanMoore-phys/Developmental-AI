@@ -35,7 +35,9 @@ CONTRACTS
      condition is an action the AGENT can take.
   4. Damping is applied to SHAPING ONLY — real environment reward is never
      multiplied (asserted against the shipped loop source).
-  5. Applied in BOTH stepping bodies (§4.2 duplicated-body drift).
+  5. Applied in BOTH stepping bodies (§4.2 duplicated-body drift) — to the
+     magnet shaping AND (2026-10-04) to stream-0 intrinsic, since the magnet
+     channel is dead on the live config.
   6. Never raises, and never returns a non-finite or out-of-range factor.
 """
 import math
@@ -147,7 +149,15 @@ def test_applied_in_both_bodies():
         f"_collect_segment, found {n}. _collect_segment is the one SkyBot "
         f"actually runs, so a single-site edit would look correct and do "
         f"nothing live.")
-    print(f"[farm-damp] 5. damp present in {n}/2 stepping bodies")
+    # 2026-10-04: `_sr` is always 0 on the live config (vision off), so the
+    # damp must ALSO reach stream-0 intrinsic — in both bodies, identically
+    # (behaviour driven for real in _gui_farm_smoke contract F).
+    m = LOOP_SRC.count("_ldi = self._loop_damp_factor()")
+    k = LOOP_SRC.count("intrinsic[0] = intrinsic[0] * _ldi")
+    assert m == 2 and k == 2, (
+        f"intrinsic loop damp must be in BOTH bodies: factor {m}, apply {k}")
+    print(f"[farm-damp] 5. damp present in {n}/2 stepping bodies (shaping) "
+          f"and {k}/2 (stream-0 intrinsic)")
 
 
 def test_never_raises_and_stays_in_range():

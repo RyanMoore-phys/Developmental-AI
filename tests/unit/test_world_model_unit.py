@@ -160,21 +160,66 @@ def range_scale_widens_the_bound():
 
 # ----------------------------------------------------------------- geometry
 
+def _ego_row(yaw, pitch=0.5, moved=0.0):
+    """A proprio row encoded EXACTLY as minerl_env._proprio writes it:
+    head_sin = 0.5*sin(yaw)+0.5, head_cos = 0.5*cos(yaw)+0.5 (all of
+    proprio lives in [0, 1]). Unit sin/cos here would test a format the env
+    never produces — which is how the decoding bug went unseen."""
+    v = torch.zeros(1, 13)
+    v[0, LAYOUT["pitch"]] = pitch
+    v[0, LAYOUT["moved"]] = moved
+    v[0, LAYOUT["head_sin"]] = 0.5 * np.sin(yaw) + 0.5
+    v[0, LAYOUT["head_cos"]] = 0.5 * np.cos(yaw) + 0.5
+    return v
+
+
 @case
 def ego_from_proprio_fields():
-    def row(yaw, pitch=0.5, moved=0.0):
-        v = torch.zeros(1, 13)
-        v[0, LAYOUT["pitch"]] = pitch
-        v[0, LAYOUT["moved"]] = moved
-        v[0, LAYOUT["head_sin"]] = np.sin(yaw)
-        v[0, LAYOUT["head_cos"]] = np.cos(yaw)
-        return v
+    row = _ego_row
     e = ego_from_proprio(row(0.0), row(np.pi / 2), LAYOUT)
     close(float(e[0, 0]), np.pi / 2, 1e-5, "quarter turn")
     e = ego_from_proprio(row(np.radians(350)), row(np.radians(10)), LAYOUT)
     close(float(e[0, 0]), np.radians(20), 1e-5, "wrap-around")
     raises(lambda: ego_from_proprio(row(0.0), row(0.0), {"pitch": 0}),
            ValueError, "incomplete layout")
+
+
+@case
+def ego_from_proprio_known_headings_clockwise_yaw():
+    """Known Minecraft headings through the env's own [0,1] encoding.
+    Minecraft yaw grows CLOCKWISE seen from above (0 = +z south, 90 = -x
+    west, DeadReckoner / _oracle_isolation_smoke F), so d_yaw > 0 must mean
+    yaw grew = a RIGHT turn. Fails on the pre-2026-10-04 decoding, which fed
+    the rescaled pair in as unit sin/cos (0 -> 90 read as ~36.9 deg)."""
+    from developmental_ai.sensors import DeadReckoner
+
+    def facing(yaw_deg):
+        d = DeadReckoner()
+        d.step(1.0, 0.0, float(yaw_deg))
+        return d.x, d.z
+
+    for y0, y1, want in ((0, 90, 90), (90, 0, -90), (0, 180, 180),
+                         (270, 0, 90), (0, 270, -90), (45, 60, 15),
+                         (170, -170, 20), (359, 1, 2), (123, 123, 0)):
+        e = ego_from_proprio(_ego_row(np.radians(y0)),
+                             _ego_row(np.radians(y1)), LAYOUT)
+        got = float(np.degrees(float(e[0, 0])))
+        if abs(want) == 180:
+            close(abs(got), 180.0, 1e-3, f"{y0}->{y1}")
+        else:
+            close(got, float(want), 1e-3, f"{y0}->{y1}")
+        # the world's own answer: right of facing f=(x,z) is (-z, x)
+        # (south (0,1) -> right is west (-1,0)); a right turn moves the new
+        # facing onto that side
+        fx0, fz0 = facing(y0)
+        fx1, fz1 = facing(y1)
+        side = fx1 * (-fz0) + fz1 * fx0
+        if abs(side) > 1e-6:
+            assert (got > 0) == (side > 0), (y0, y1, got, side)
+    # unknown heading (the env writes 0.5/0.5) decodes to no rotation
+    u = torch.zeros(1, 13)
+    u[0, LAYOUT["head_sin"]] = u[0, LAYOUT["head_cos"]] = 0.5
+    close(float(ego_from_proprio(u, u, LAYOUT)[0, 0]), 0.0, 1e-9, "unknown")
 
 
 @case

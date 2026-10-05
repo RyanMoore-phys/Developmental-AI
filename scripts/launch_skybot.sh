@@ -106,6 +106,17 @@ rm -rf runlogs/brain
 # contiguous block. This does NOT create memory: it is worth ~a few hundred MB
 # of headroom, and the real fix for this box is the VLM KV-cache cap in
 # configs (symbolic_grounding.num_ctx). Keep both.
+# KEEP THE PREVIOUS RUNS' LOGS (2026-10-04). The `>` below truncates, so
+# every launch -- including each supervisor relaunch after a crash -- erased
+# the last run's log, and there was no earlier `Loop timing` to compare a
+# slow run against. Rotate the last 3 instead. The supervisor reads the
+# crashed log's tail BEFORE it calls this script, so it still sees it.
+for i in 2 1; do
+  [ -f "runlogs/minecraft_skybot_run.log.$i" ] && \
+    mv -f "runlogs/minecraft_skybot_run.log.$i" "runlogs/minecraft_skybot_run.log.$((i + 1))"
+done
+[ -f runlogs/minecraft_skybot_run.log ] && \
+  mv -f runlogs/minecraft_skybot_run.log runlogs/minecraft_skybot_run.log.1
 DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=6 MINERL_HEADLESS=1 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   setsid ./venv_mc/bin/python run_minecraft.py \

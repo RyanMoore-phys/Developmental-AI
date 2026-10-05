@@ -165,6 +165,8 @@ services:
     # gitignored ./.env (compose interpolation), so no LAN IP is committed.
     extra_hosts:
       - "main:${MAIN_HOST:?set MAIN_HOST in docker/monitor/.env}"
+      - "node2:${NODE2_HOST:?set NODE2_HOST in docker/monitor/.env}"
+      - "paper-server:${MC_HOST:?set MC_HOST in docker/monitor/.env}"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus

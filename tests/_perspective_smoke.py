@@ -735,8 +735,9 @@ def test_ego_from_proprio_is_sign_safe():
         v = torch.zeros(1, D)
         v[0, layout["pitch"]] = pitch
         v[0, layout["moved"]] = moved
-        v[0, layout["head_sin"]] = math.sin(yaw_rad)
-        v[0, layout["head_cos"]] = math.cos(yaw_rad)
+        # the env's [0,1] encoding (minerl_env._proprio), not unit sin/cos
+        v[0, layout["head_sin"]] = 0.5 * math.sin(yaw_rad) + 0.5
+        v[0, layout["head_cos"]] = 0.5 * math.cos(yaw_rad) + 0.5
         return v
 
     # A quarter turn, the easy case.

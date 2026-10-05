@@ -64,6 +64,18 @@ RECORD LAYOUT (scope = environment / stream / episode)
              t_complete = the moment the loop held that env's result (an
              upper bound on the true completion: the fleet is collected in
              index order). duration UNKNOWN (ticks are in the payload).
+             payload["source"] (2026-10-04, OPTIONAL — stores written before
+             it simply lack the key; readers must treat it as unrecorded):
+             WHO chose the executed command — "policy" (the shared policy
+             decided this step), "option_slot:<n>" (an option is running in
+             slot n; payload["skill"] = the skill_id of the frame that
+             actually resolved the primitive, payload["option_depth"] its
+             nesting depth, payload["option_root_skill"] the invoked root
+             when nested, payload["scripted"] when a scripted slot), or
+             "option_fallback" (an option closed inside act() and emitted a
+             fallback primitive), "dream_actor" (the dream actor drove the
+             step). Read from the option executor's state AFTER act() and
+             BEFORE env.step — a pure read (see action_sources).
     ending   terminated / truncated / client_recovery, as the store defines
              them; a client rebuild leaves the step's prediction unresolved
              (its outcome is ABSENT, never invented).
@@ -124,14 +136,19 @@ def shadow_config(cfg: Optional[Dict]) -> Dict[str, Any]:
         raise ValueError(f"foundation.shadow: unknown keys {sorted(unknown)} "
                          f"(known: {sorted(DEFAULTS)})")
     out = dict(DEFAULTS)
-    out.update(raw)
+    # PER-KEY reads, not out.update(raw) (2026-10-04): dict.update copies at
+    # C level and bypasses TrackedConfig.__getitem__, so the live config
+    # echo reported every foundation.shadow.* key as "never read" while the
+    # recorder was running on exactly those values.
+    for k in list(raw.keys()):
+        out[k] = raw[k]
     return out
 
 
 class _Stream:
     __slots__ = ("idx", "name", "ep_n", "episode", "seq", "vec", "oracle",
                  "t_wall", "logged_seq", "any_logged", "ctx", "pid",
-                 "adapter", "green")
+                 "adapter", "green", "source")
 
     def __init__(self, idx: int):
         self.idx = idx
@@ -148,6 +165,7 @@ class _Stream:
         self.pid = None            # prediction id made at seq this step
         self.adapter = None
         self.green = None          # the GREEN records logged at logged_seq
+        self.source = None         # who chose action `seq` (action_sources)
 
 
 class ShadowRecorder:
@@ -376,10 +394,12 @@ class ShadowRecorder:
 
     # -------------------------------------------------- the two calls
     def before_step(self, rssm_state, actions, lock=None,
-                    world_model=None) -> None:
+                    world_model=None, executor=None) -> None:
         """Called after action selection, BEFORE env.step. On a sampled step
         logs every stream's observation t and the world model's prediction
-        for the action about to be executed. Never raises."""
+        for the action about to be executed, and notes which actor chose
+        each stream's action (`executor` = the loop's option executor or
+        None; read, never called into). Never raises."""
         if not self.enabled:
             return
         t0 = time.perf_counter()
@@ -390,8 +410,14 @@ class ShadowRecorder:
             for st in self.streams:
                 st.pid = None
                 st.ctx = None
+                st.source = None
             if not self._sampled:
                 return
+            srcs = action_sources(executor, len(actions))
+            for st in self.streams[:len(actions)]:
+                st.source = srcs[st.idx]
+                if srcs[st.idx].get("source") == "unknown":
+                    self.n["source_unknown"] += 1
             ready = []
             for st in self.streams[:len(actions)]:
                 if st.vec is None:
@@ -527,13 +553,17 @@ class ShadowRecorder:
             nvec = None if recovery else self._transport_of(info)
             norc = None if recovery else self._copy_oracle(info)
             if self._sampled and st.ctx is not None and st.logged_seq == st.seq:
+                apay = {"actor": "dream" if dream else "policy",
+                        "action_repeat_ticks": self.action_repeat,
+                        "t_complete_basis": "loop held the env result"}
+                if dream:
+                    apay["source"] = "dream_actor"
+                elif st.source is not None:
+                    apay.update(st.source)
                 act = Action(
                     self.environment, st.name, st.episode, st.seq,
                     self.spec_id, self._command(actions[e]), UNKNOWN,
-                    float(t_dispatch), t_res,
-                    {"actor": "dream" if dream else "policy",
-                     "action_repeat_ticks": self.action_repeat,
-                     "t_complete_basis": "loop held the env result"})
+                    float(t_dispatch), t_res, apay)
                 self.store.log_action(act)
                 self.n["actions"] += 1
                 if recovery:
@@ -602,6 +632,56 @@ class ShadowRecorder:
             logger.info("foundation.shadow summary: %s", self.stats())
         except Exception:
             pass
+
+
+def action_sources(executor, n: int) -> List[Dict[str, Any]]:
+    """Per stream, WHO chose the action just resolved: a payload fragment
+    {"source": ...} (see the module docstring's action entry).
+
+    Called after OptionExecutor.act() and before env.step, when the
+    executor's state describes exactly this step: a stream whose root
+    runtime is active is being driven by that option (act() opens options
+    and resolves through the frozen skill stack; nothing closes them again
+    until the post-step observe), the top nested frame being the skill that
+    emitted the primitive. An inactive runtime with a decision record
+    (`_primary_primitive` for stream 0, `_scout_primitive[e]` for scouts) is
+    the shared policy; inactive WITHOUT one means an option was closed
+    inside act() (unbound slot / rssm skill without a latent) and returned a
+    fallback primitive.
+
+    READ-ONLY: attribute reads and `bank.is_scripted` (a set membership
+    test) — no executor method with side effects, no RNG. Never raises:
+    anything unexpected yields "unknown" for that stream.
+    """
+    if executor is None:
+        return [{"source": "policy"} for _ in range(n)]
+    out: List[Dict[str, Any]] = []
+    for e in range(n):
+        try:
+            rt = executor.runtimes[e]
+            if rt.slot is not None:
+                stack = list(executor.substacks[e]) if hasattr(
+                    executor, "substacks") else []
+                top = stack[-1] if stack else rt
+                d = {"source": f"option_slot:{int(rt.slot)}",
+                     "skill": str(top.skill_id),
+                     "option_depth": 1 + len(stack)}
+                if stack:
+                    d["option_root_skill"] = str(rt.skill_id)
+                bank = getattr(executor, "bank", None)
+                if bank is not None and bank.is_scripted(rt.slot):
+                    d["scripted"] = True
+                out.append(d)
+                continue
+            # getattr: OptionExecutor creates _primary_primitive in act(),
+            # not __init__ (act() always writes it for an idle stream 0)
+            rec = (getattr(executor, "_primary_primitive", None) if e == 0
+                   else executor._scout_primitive[e])
+            out.append({"source": "policy" if rec is not None
+                        else "option_fallback"})
+        except Exception:                       # noqa: BLE001 — observer
+            out.append({"source": "unknown"})
+    return out
 
 
 def rssm_prior_probs(rssm, h, z, actions) -> np.ndarray:

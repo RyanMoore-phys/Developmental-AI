@@ -62,7 +62,7 @@ _ollama_host = None
 
 
 def set_ollama_endpoint(host: Optional[str]) -> None:
-    """Point every Ollama client at `host` (e.g. http://10.0.0.5:11434).
+    """Point every Ollama client at `host` (e.g. http://<ollama-host>:11434).
 
     Must be called before the first client is built; resets the cached client
     so a late call still takes effect rather than silently doing nothing.

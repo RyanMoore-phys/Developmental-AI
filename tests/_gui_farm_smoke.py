@@ -53,6 +53,11 @@ Contracts:
          D3 control: gui_dwell_weight 0 records all zeros, so D1 is
             measuring the dwell term and nothing else in the channel.
        Needs gymnasium (legacy tier); A-C run without it.
+    E. The episodic body re-adopts the cost potentials at episode start.
+    F. THE FARM DAMP REACHES STREAM-0 INTRINSIC (2026-10-04): with the loop
+       detector reporting damp 0.5, the intrinsic handed to the primary mix
+       is exactly 0.5x the undamped run in BOTH real bodies; damp 1.0 is
+       byte-identical; a GUI step still pays exactly 0. See the test.
 
 Run: PYTHONPATH=. python tests/_gui_farm_smoke.py
 """
@@ -210,9 +215,16 @@ def _gui_env(idx):
 GUI_LOG = {}
 
 
-def _drive(lifelong, weight, scaffold):
+INTRINSIC = {}   # the last _drive's stream-0 intrinsic handed to the mix
+
+
+def _drive(lifelong, weight, scaffold, damp=None):
     """Run one real body; return (stream-0 gui flags, stream-0 extrinsic
-    handed to the PRIMARY reward_mixer.mix) step-aligned."""
+    handed to the PRIMARY reward_mixer.mix) step-aligned. The matching
+    INTRINSIC argument of that same call lands in INTRINSIC["rec"].
+    damp: None leaves the infra stack alone; a float makes its loop
+    detector report that damp on every step (the REAL on_step still runs
+    first, so everything else it publishes is unchanged)."""
     import tempfile
     import yaml
     import developmental_ai.core.developmental_loop as dl
@@ -256,12 +268,22 @@ def _drive(lifelong, weight, scaffold):
         if scaffold:
             ai.vision_scaffold = _StubScaffold()
             ai._magnet_step_shaping = lambda *a, **k: 0.0
-        rec = []
+        if damp is not None:
+            assert ai.infra is not None, "fixture needs the infra stack"
+            _on_step = ai.infra.on_step
+
+            def damped_on_step(*a, **k):
+                _on_step(*a, **k)
+                ai.infra.last_loop_damp = float(damp)
+            ai.infra.on_step = damped_on_step
+        rec, irec = [], []
+        INTRINSIC["rec"] = irec
         _mix = ai.reward_mixer.mix
 
         def spy(i, e, update_stats=True):
             if update_stats:              # the PRIMARY call; scouts pass False
                 rec.append(float(e))
+                irec.append(float(i))
             return _mix(i, e, update_stats=update_stats)
         ai.reward_mixer.mix = spy
         if lifelong:
@@ -365,6 +387,54 @@ def test_stream0_dwell_without_scaffold():
 
 
 
+def test_farm_damp_reaches_intrinsic():
+    """F. THE FARM DAMP MUST REACH THE CHANNEL THAT PAYS (2026-10-04).
+    `last_loop_damp` (infra/ledger.py loop_damp) multiplied only `_sr`, the
+    vision magnet's shaping — and the live config runs llm.vision.enabled:
+    false, so `_sr` is always 0 there and a revisit loop's INTRINSIC income
+    (the curiosity a farm actually farms) was never damped: the response to
+    a detected farm was a multiply on a dead channel. Drives BOTH real
+    bodies with the loop detector reporting a damp of 0.5:
+      F1 stream-0 intrinsic handed to the primary mix is EXACTLY 0.5x the
+         undamped run on every open-world step (and nonzero somewhere, so
+         the check is not vacuous) — fails on the pre-fix code, where the
+         two runs are identical;
+      F2 damp 1.0 leaves the whole sequence byte-identical to a run whose
+         detector is untouched (the fix costs nothing when no farm exists);
+      F3 inside a GUI the intrinsic is still EXACTLY 0 (the occlusion
+         zeroing runs after the damp, so the damp cannot resurrect it).
+    The damp is not a latch: it is read fresh every step from loop_damp(),
+    which returns 1.0 again once the agent leaves the cell for more than
+    revisit_horizon steps (contract 3 of _farm_damping_smoke)."""
+    import importlib.util
+    if importlib.util.find_spec("gymnasium") is None:
+        raise ImportError("No module named 'gymnasium'")   # runner: SKIP
+    for lifelong, label in ((True, "_collect_segment"),
+                            (False, "_run_episode_parallel")):
+        flags, _ = _drive(lifelong, 0.0, scaffold=False)
+        base = list(INTRINSIC["rec"])
+        _, _ = _drive(lifelong, 0.0, scaffold=False, damp=1.0)
+        one = list(INTRINSIC["rec"])
+        f2, _ = _drive(lifelong, 0.0, scaffold=False, damp=0.5)
+        half = list(INTRINSIC["rec"])
+        assert f2 == flags and len(base) == len(half) == len(one)
+        assert one == base, (
+            f"{label}: damp 1.0 must leave intrinsic byte-identical")
+        world = [k for k, g in enumerate(flags) if not g]
+        assert any(base[k] != 0.0 for k in world), (
+            f"{label}: undamped intrinsic all zero — F1 would be vacuous")
+        bad = [(k, base[k], half[k]) for k in world
+               if half[k] != 0.5 * base[k]]
+        assert not bad, (
+            f"{label}: loop damp 0.5 did not scale stream-0 INTRINSIC "
+            f"(first mismatches {bad[:3]}) — the damp is on a dead channel")
+        gui = [half[k] for k, g in enumerate(flags) if g]
+        assert gui and all(x == 0.0 for x in gui), (label, gui)
+        print(f"  F. {label}: loop damp 0.5 -> intrinsic exactly 0.5x on "
+              f"{len(world)} open-world steps; damp 1.0 byte-identical; "
+              f"{len(gui)} GUI steps still exactly 0.0")
+
+
 def test_episodic_boundary_readopts_cost_potentials():
     """The episodic body must reset the stream-0 cost potentials at each
     episode start (2026-10-03). Without it, an episode ending inside a menu
@@ -387,5 +457,6 @@ if __name__ == "__main__":
     test_source_contracts()
     test_no_one_way_doors()
     test_stream0_dwell_without_scaffold()
+    test_farm_damp_reaches_intrinsic()
     test_episodic_boundary_readopts_cost_potentials()
     print("[gui-farm] ALL PASS")

@@ -83,6 +83,16 @@ CONTRACT = [
     # node2 brain mirror (scripts/brain_mirror/): pull, verify, retention,
     # latch escapes. Needs only rsync + stdlib.
     "tests/_brain_mirror_smoke.py",
+    # tools/shadow_report.py: reads a live shadow EvidenceStore read-only.
+    "tests/_foundation_shadow_report_smoke.py",
+    # 2026-10-04 live incident: skill copies bypassed the logit-spread cap.
+    "tests/_skill_logit_cap_smoke.py",
+    # 2026-10-04 live incident: LP paid fabricated progress on correlated
+    # (near-identical) visits — micro-turn 45% of actions, 0 blocks in 13 h.
+    "tests/_lp_correlated_gate_smoke.py",
+    # Public repo: no LAN/tailnet IPs or credentials in anything `git add -A`
+    # would commit; local-only files stay ignored.
+    "tests/_no_secrets_smoke.py",
 ]
 
 # These need the full stack (gymnasium / minerl) and so only run on the training host.
@@ -109,6 +119,9 @@ LEGACY = [
     "tests/_learning_rate_wave_smoke.py",
     "tests/_skybot_boot_smoke.py",
     "tests/_metrics_sink_smoke.py",
+    # Loop-detector damp (now applied to stream-0 intrinsic too, 2026-10-04).
+    # Runner-only (not in ci.yml's core list); runs wherever gymnasium does.
+    "tests/_farm_damping_smoke.py",
 ]
 
 

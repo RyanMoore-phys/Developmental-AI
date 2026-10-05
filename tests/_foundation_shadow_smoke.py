@@ -59,6 +59,21 @@ CONTRACTS
        the loop keeps collecting. An unstartable store returns None at
        construction (a shadow cannot stop the learner from booting).
     F. Overhead is measured and printed (ms/step off vs on).
+    G. A held WM lock never blocks the acting thread.
+    H. ACTION SOURCE (2026-10-04). Each sampled Action's payload says WHO
+       chose the command: "policy", "option_slot:<n>" (+ "skill" = the
+       skill_id of the frame that emitted the primitive, "option_depth",
+       "option_root_skill" when nested) or "option_fallback". Driven through
+       the REAL OptionExecutor.act() (stub bank + scripted policy): a
+       primitive pick reads policy, an option pick reads its slot + skill, a
+       nested conv skill reads the CHILD as the acting skill and the root
+       separately, and an option whose slot is unbound mid-flight reads
+       option_fallback. action_sources is a pure read (executor state
+       pickles byte-identical before/after; act() returns the same actions
+       with and without it). Both bodies pass executor=self.option_executor
+       (B); in the real-body run (no executor) every recorded action is
+       "policy" (D). Optional field: stores without it still load
+       (_foundation_shadow_report_smoke B, "unrecorded").
 
 Run: PYTHONPATH=. python tests/_foundation_shadow_smoke.py   (needs gymnasium)
 """
@@ -86,7 +101,9 @@ SHADOW_LOGGER = "developmental_ai.foundation.runtime.shadow"
 
 BEFORE = ("self._shadow.before_step(rssm_state, env_actions,\n"
           "                                         self._wm_param_lock, "
-          "self.world_model)")
+          "self.world_model,\n"
+          "                                         "
+          "executor=self.option_executor)")
 AFTER = ("self._shadow.after_step(\n"
          "                    step_infos, env_actions, rewards, dones, "
          "restarted,\n"
@@ -126,6 +143,16 @@ def test_disabled():
     assert 0 < int(_sh["max_bytes"]) <= 2 * (1 << 30), _sh
     assert int(_sh["every_n_steps"]) >= 8, _sh
     assert 0 < float(_sh["max_ms_per_step"]) <= 10.0, _sh
+    # The config echo must see these keys as READ (live 2026-10-04: all ten
+    # foundation.shadow.* keys were listed "never read" while the recorder
+    # ran on them — dict.update bypassed TrackedConfig.__getitem__).
+    from developmental_ai.infra.config_echo import TrackedConfig
+    from developmental_ai.foundation.runtime.shadow import shadow_config
+    _tc = TrackedConfig(SKY)
+    shadow_config(_tc)
+    _read = _tc.accessed_paths
+    _miss = [k for k in _sh if f"foundation.shadow.{k}" not in _read]
+    assert not _miss, f"config echo would report these as never read: {_miss}"
     assert ShadowRecorder.from_config({}) is None
     assert ShadowRecorder.from_config(
         {"foundation": {"shadow": {"enabled": False}}}) is None
@@ -494,6 +521,7 @@ def test_records():
         assert hits[0][3] == it.evidence.payload["reward_env"]
         assert tr.prediction.candidate_action == (a.command,)
         assert a.t_complete >= a.t_dispatch
+        assert a.payload.get("source") == "policy", a.payload   # H: no executor
         n_checked += 1
     ends = [ev.meta(r)["reason"] for r in ev.refs("episode_end")]
     assert "terminated" in ends, ends
@@ -669,6 +697,7 @@ def main():
         test_disabled()
         test_source()
         test_busy_lock()
+        test_action_source()
         if importlib.util.find_spec("gymnasium") is None:
             print("  C-F. SKIPPED: gymnasium absent here (they drive the real "
                   "loop; CI and the host run them). A-B are the local "
@@ -742,6 +771,126 @@ def test_busy_lock():
     print(f"  G. trainer holding the WM lock: 5/5 predictions skipped, worst "
           f"before_step {worst*1e3:.1f} ms (timeout 2 ms), recording kept; "
           f"lock free -> predictions resume")
+
+
+# --------------------------------------------- H. who chose the action
+P_H = 4
+
+
+class _BankH:
+    """The surface OptionExecutor.act() touches: P primitives + 2 slots;
+    sk_b is a conv skill whose head row 0 invokes sk_a (nesting)."""
+    K = 2
+    scripted = {}
+    disabled_macros = None
+
+    def __init__(self):
+        self.P = P_H
+        self.slots = [{"skill_id": "sk_a", "arch": "mlp"},
+                      {"skill_id": "sk_b", "arch": "conv",
+                       "head_dim": P_H + 2, "p_own": P_H,
+                       "slot_map": {"0": "sk_a"}}]
+        self.skill_bank = _SkillBankH()
+
+    def mask(self, *a, **k):
+        return np.ones(P_H + self.K, bool)
+
+    def note_invoked(self, slot):
+        pass
+
+    def is_scripted(self, slot):
+        return slot in self.scripted
+
+    def slot_of_skill(self, sid):
+        return {"sk_a": 0, "sk_b": 1}.get(sid)
+
+    def skill_action(self, slot, obs, head_mask=None, **k):
+        return 2 if slot == 0 else P_H + 0      # sk_b always invokes sk_a
+
+
+class _SkillBankH:
+    def record_invokes(self, *a):
+        pass
+
+
+class _PolicyH:
+    arch = ""
+
+    def __init__(self, seq):
+        self.seq = list(seq)
+
+    def select_action(self, obs, **k):
+        return self.seq.pop(0), {"log_prob": 0.0, "value": 0.0}
+
+
+def test_action_source():
+    import pickle
+    import torch
+    from developmental_ai.policy.options import OptionExecutor
+    from developmental_ai.foundation.experience import EvidenceStore
+    from developmental_ai.foundation.runtime import ShadowRecorder
+    from developmental_ai.foundation.runtime.shadow import action_sources
+    from developmental_ai.world_model.rssm import WorldModel
+    obs = [np.zeros(3, np.float32)] * 2
+    cases = (
+        ([1, 1], {"source": "policy"}),
+        ([P_H + 0, 1], {"source": "option_slot:0", "skill": "sk_a",
+                        "option_depth": 1}),
+        ([P_H + 1, 1], {"source": "option_slot:1", "skill": "sk_a",
+                        "option_depth": 2, "option_root_skill": "sk_b"}))
+    for seq, want in cases:
+        ex = OptionExecutor(_BankH(), 2, {})
+        a = ex.act(obs, None, _PolicyH(seq), 0)
+        st0 = pickle.dumps(vars(ex))
+        got = action_sources(ex, 2)
+        assert pickle.dumps(vars(ex)) == st0, "action_sources mutated it"
+        assert got == [want, {"source": "policy"}], (seq, got)
+        ex2 = OptionExecutor(_BankH(), 2, {})          # without the read
+        assert ex2.act(obs, None, _PolicyH(seq), 0) == a
+    # an option whose slot is unbound mid-flight closes inside act() and
+    # emits a fallback primitive: neither the policy nor the skill chose it
+    ex = OptionExecutor(_BankH(), 2, {})
+    ex.act(obs, None, _PolicyH([P_H + 0, 1]), 0)
+    ex.bank.slots[0] = None
+    ex.act(obs, None, _PolicyH([1]), 1)
+    assert action_sources(ex, 2)[0] == {"source": "option_fallback"}
+    assert action_sources(None, 2) == [{"source": "policy"}] * 2
+    assert action_sources(object(), 1) == [{"source": "unknown"}]
+    # ... and the recorder files it in the Action payload, per stream
+    root = os.path.join(TMP, "store_source")
+    rec = ShadowRecorder.from_config(
+        {"foundation": {"shadow": _shadow_cfg(root)}}, bus=None,
+        action_dim=P_H, is_discrete=True, num_streams=2, environment="fake")
+    wm = WorldModel(obs_dim=4, action_dim=P_H, stochastic_size=8,
+                    stochastic_classes=8, deterministic_size=32,
+                    hidden_dim=32)
+    s = wm.rssm.initial_state(2, torch.device("cpu"))
+    info = {"proprio": np.ones(3, np.float32)}
+    ex = OptionExecutor(_BankH(), 2, {})
+    for k, seq in enumerate([[1, 1], [1, 1], [P_H + 1, 1], [2]]):
+        acts = ex.act(obs, None, _PolicyH(seq), k)
+        rec.before_step(s, acts, None, wm, executor=ex)
+        t = time.time()
+        rec.after_step([info, info], acts, [0.0, 0.0], [False, False],
+                       [False, False], [(False, False, time.time())] * 2, t)
+    assert rec.enabled, rec.disabled_reason
+    rec.close()
+    ev = EvidenceStore(root, readonly=True).evaluator_view()
+    pays = {}
+    for r in ev.refs("action"):
+        a = ev.get(r)
+        pays[(a.stream, a.seq)] = a.payload
+    assert pays[("stream-0", 1)]["source"] == "policy", pays
+    assert pays[("stream-0", 2)]["source"] == "option_slot:1"
+    assert pays[("stream-0", 2)]["skill"] == "sk_a"
+    assert pays[("stream-0", 3)]["option_root_skill"] == "sk_b"   # continues
+    assert {p["source"] for (st, _), p in pays.items()
+            if st == "stream-1"} == {"policy"}
+    assert all(p["actor"] == "policy" for p in pays.values())
+    print(f"  H. real OptionExecutor.act(): policy / option_slot:<n>+skill / "
+          f"nested child-as-actor / option_fallback read correctly, state "
+          f"pickles identical after the read, act() unchanged; "
+          f"{len(pays)} recorded Action payloads carry the source per stream")
 
 
 if __name__ == "__main__":

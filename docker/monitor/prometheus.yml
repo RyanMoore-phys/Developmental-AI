@@ -12,8 +12,10 @@ scrape_configs:
     static_configs:
       - targets:
           - node-exporter:9100      # node1 (this host, via compose DNS)
-          - 100.64.0.12:9100    # node2
-          - 100.64.0.11:9100      # paper-server
+          # node2 / paper-server resolve via extra_hosts in docker-compose.yml
+          # (NODE2_HOST / MC_HOST in the gitignored docker/monitor/.env).
+          - node2:9100           # node2
+          - paper-server:9100    # paper-server
           # main, THE TRAINING HOST (added 2026-09-24). Nothing watched it
           # until now: the node-exporter container above is pinned to
           # `hostname: node1` with `/:/host:ro`, so it reports NODE1's

@@ -176,6 +176,30 @@ class SkillOptionBank:
         # behaviour (mint once, frozen for the run) is byte-for-byte intact,
         # which is what every config other than skybot still expects.
         self.practice = None
+        # ---- SKILL LOGIT-SPREAD CAP (2026-10-04) --------------------------
+        # The shared policy's `_bound_logits` (policy.logit_range) caps the
+        # best/worst action probability ratio at e^logit_range so it can be
+        # confident but never CERTAIN. skill_action sampled straight from
+        # `actor.action_head` and skipped it, so a frozen skill copy could
+        # be arbitrarily more deterministic than the policy it was copied
+        # from. MEASURED (13 h live shadow, 2026-10-04): action 17 (turn
+        # left micro) was 40% of the first 20 sampled actions BEFORE any
+        # PPO update; the policy itself is not resumed, so the bias entered
+        # through executed skill copies. Holds the shared policy's OWN bound
+        # method (adopted in OptionExecutor.act), never a copy of the value,
+        # so the two cannot drift. None = identity (no policy seen yet, or a
+        # policy/test double without the bound) — never a gate, so no latch.
+        self.logit_bound = None
+
+    def adopt_logit_bound(self, policy) -> None:
+        """Use the SHARED policy's own logit bound for skill sampling.
+
+        Reuses `policy._bound_logits` itself (same function, same live
+        `policy.logit_range`), so a skill copy is bounded exactly as the
+        shared policy is and a config change reaches both at once."""
+        fn = getattr(policy, "_bound_logits", None)
+        self.logit_bound = (fn if callable(fn)
+                            and hasattr(policy, "logit_range") else None)
 
     # ---- slot management ---------------------------------------------------
     def notify_minted(self, skill_id: str) -> None:
@@ -920,6 +944,20 @@ class SkillOptionBank:
                     logits = logits + _d
             except Exception:
                 pass
+        # SAME CAP AS THE SHARED POLICY, SAME ORDER: bound the full head
+        # (delta included, so practice cannot route around it), THEN mask —
+        # exactly as ActorCriticAgent.select_action does on its masked path.
+        # The bound mean-centres every row (softmax-invariant, but not bit-
+        # exact), so a row the rescale did NOT engage on keeps its original
+        # logits: a skill already inside the cap samples byte-identically.
+        if self.logit_bound is not None:
+            _b = self.logit_bound(logits)
+            if _b is not logits:
+                def _spr(t):
+                    return (t.max(dim=-1, keepdim=True).values
+                            - t.min(dim=-1, keepdim=True).values)
+                _hit = _spr(_b) < _spr(logits) * (1.0 - 1e-5)
+                logits = torch.where(_hit, _b.to(logits.dtype), logits)
         if head_mask is not None:
             m = torch.as_tensor(np.asarray(head_mask, dtype=bool),
                                 device=logits.device).reshape(1, -1)
@@ -1136,6 +1174,10 @@ class OptionExecutor:
         those whose initiation conditions currently hold.
         """
         P = self.bank.P
+        # skill copies sample under the shared policy's own logit cap
+        _adopt = getattr(self.bank, "adopt_logit_bound", None)
+        if _adopt is not None:
+            _adopt(policy)
 
         def _pro(e):
             """This env's self-state, or None. The meta-policy decides WHEN

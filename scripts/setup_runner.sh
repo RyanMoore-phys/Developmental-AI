@@ -98,7 +98,7 @@ MAIN_USER=skybot
 MAIN_SSH_KEYFILE=$HOME/.ssh/id_ed25519
 
 # --- required for: host.yml action=connect ---
-MC_SERVER_TS_IP=100.64.0.11
+MC_SERVER_TS_IP=CHANGE_ME   # the Paper server's address. Never commit it.
 
 # --- optional ---
 # Use Tailscale SSH instead of plain ssh. Needs the tailnet ACL rule in

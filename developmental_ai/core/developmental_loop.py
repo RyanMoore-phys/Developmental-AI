@@ -4514,7 +4514,8 @@ class DevelopmentalAI:
             # BEFORE env.step so the store can prove it preceded the outcome.
             if self._shadow is not None:
                 self._shadow.before_step(rssm_state, env_actions,
-                                         self._wm_param_lock, self.world_model)
+                                         self._wm_param_lock, self.world_model,
+                                         executor=self.option_executor)
                 _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
@@ -5096,6 +5097,19 @@ class DevelopmentalAI:
                     float(rewards[0]))
                 if _ei:
                     intrinsic[0] = intrinsic[0] + _ei
+                # ---- FARM DAMP ON THE CHANNEL THAT PAYS (2026-10-04) -----
+                # last_loop_damp used to multiply only the magnet's `_sr`,
+                # which is always 0 on the live config (llm.vision.enabled
+                # false) — so a detected revisit loop kept its full
+                # INTRINSIC income. Read AFTER _infra_step: on_step has just
+                # scored THIS step's cell, and it was fed the UNDAMPED
+                # income, so the damp cannot release itself by its own
+                # effect. BEFORE the gui zeroing at the mix, which still
+                # yields exactly 0 in a menu. Not a latch: see
+                # _loop_damp_factor (leave the cell -> 1.0 again).
+                _ldi = self._loop_damp_factor()
+                if _ldi < 1.0:
+                    intrinsic[0] = intrinsic[0] * _ldi
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -5710,7 +5724,8 @@ class DevelopmentalAI:
             # BEFORE env.step so the store can prove it preceded the outcome.
             if self._shadow is not None:
                 self._shadow.before_step(rssm_state, env_actions,
-                                         self._wm_param_lock, self.world_model)
+                                         self._wm_param_lock, self.world_model,
+                                         executor=self.option_executor)
                 _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
@@ -6716,6 +6731,19 @@ class DevelopmentalAI:
                     float(rewards[0]))
                 if _ei:
                     intrinsic[0] = intrinsic[0] + _ei
+                # ---- FARM DAMP ON THE CHANNEL THAT PAYS (2026-10-04) -----
+                # last_loop_damp used to multiply only the magnet's `_sr`,
+                # which is always 0 on the live config (llm.vision.enabled
+                # false) — so a detected revisit loop kept its full
+                # INTRINSIC income. Read AFTER _infra_step: on_step has just
+                # scored THIS step's cell, and it was fed the UNDAMPED
+                # income, so the damp cannot release itself by its own
+                # effect. BEFORE the gui zeroing at the mix, which still
+                # yields exactly 0 in a menu. Not a latch: see
+                # _loop_damp_factor (leave the cell -> 1.0 again).
+                _ldi = self._loop_damp_factor()
+                if _ldi < 1.0:
+                    intrinsic[0] = intrinsic[0] * _ldi
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -10929,6 +10957,33 @@ class DevelopmentalAI:
         except Exception:
             return None, None
 
+    def _loop_damp_factor(self) -> float:
+        """The farm detector's multiplier for THIS step's stream-0 income,
+        in (0, 1]; 1.0 when infra is off or the value is unusable.
+
+        Applied to stream-0 INTRINSIC by both waking bodies (and, as before,
+        to the magnet's `_sr`). Never to rewards[0]: real environment reward
+        stays honest (_farm_damping_smoke contract 4).
+
+        RE-OPEN CONDITION (CLAUDE.md §4.1). Nothing here stores state: the
+        value is BehaviouralLoopDetector.loop_damp(cell), recomputed every
+        step from the lap count and income EMA, both of which decay once the
+        agent stays out of the cell for more than revisit_horizon steps — so
+        leaving the loop restores full pay, by an action the agent can take.
+
+        SCOUTS ARE NOT DAMPED, deliberately: the detector observes stream 0's
+        cells only (on_step is a primary-only hook), so there is no per-scout
+        loop evidence to damp on. _scout_mixed_reward lists it as omitted."""
+        if self.infra is None:
+            return 1.0
+        try:
+            d = float(getattr(self.infra, "last_loop_damp", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(d) or d <= 0.0:
+            return 1.0
+        return min(1.0, d)
+
     def _infra_step(self, info, action, rssm_state, step_income,
                     raw_extrinsic) -> float:
         """Per-step general-infrastructure hook, shared by both waking loop
@@ -11218,7 +11273,8 @@ class DevelopmentalAI:
           included: env reward, base curiosity (ICM/LP), persistence,
                     GUI-dwell cost, gaze-level cost, GUI intrinsic zeroing
           omitted:  the vision magnet, infra/empowerment shaping,
-                    habituation damping, imagination curiosity, symbol
+                    the farm loop damp (the detector sees stream 0's cells
+                    only — see _loop_damp_factor), habituation damping, imagination curiosity, symbol
                     novelty, symbol centring, view novelty, territory
                     coverage, the reach potential, the gaze-bucket bonus
 

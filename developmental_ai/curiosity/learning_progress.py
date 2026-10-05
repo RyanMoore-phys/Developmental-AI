@@ -18,8 +18,12 @@ is novelty (raw error) vs LP (error reduction). That makes the comparison clean.
 
 LP per transition:
   * bucket the transition by a coarse hash of its observation;
-  * keep a short history of this bucket's recent forward-model errors;
-  * LP = max(0, mean(older half) − mean(recent half))  — the drop in error.
+  * keep a short history of this bucket's recent forward-model errors, ONE
+    entry per VISIT (consecutive same-bucket steps of a stream collapse to
+    their mean; LP is scored once, on entry — see `lp_visit_collapse`);
+  * LP = max(0, mean(older half) − mean(recent half))  — the drop in error,
+    paid only if it clears a significance test that stays valid when the
+    history is autocorrelated (see `lp_sig_z`; the 2026-10 micro-turn farm).
 Crucially, the noisy TV corrupts the observation every step, so each TV
 transition lands in a NEW (singleton) bucket → no history → LP = 0. Learnable
 states recur → their buckets accumulate → error falls → LP > 0. The asymmetry
@@ -47,8 +51,59 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                  lp_max_protos: int = 512, lp_abs_frac: float = 0.0,
                  action_conditional: bool = False, null_action: int = 0,
                  flow_error_weight: float = 1.0,
+                 lp_sig_z: float = 2.33, lp_rho_max: float = 0.9,
+                 lp_visit_collapse: bool = True,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        # ---- A SIGNIFICANCE TEST THAT HOLDS UNDER AUTOCORRELATION ---------
+        # ---- (2026-10, the micro-turn farm) -------------------------------
+        # The gate below used to be `drop > 0.5 * std(history)`. That is a
+        # test for INDEPENDENT samples, and the history is not independent:
+        # the smallest non-noop actions (2-degree micro-turn = action 17,
+        # 120-tick attack hold = action 27) leave the 4x4-pooled frame almost
+        # unchanged, so the agent sits in ONE prototype for many steps and
+        # the 30-entry history fills with back-to-back errors of a model that
+        # has not changed. A correlated series has a large half-mean
+        # difference relative to its own std, so chance passed the gate:
+        #     frozen model, iid errors          ->  9% of transitions paid
+        #     frozen model, AR(1) rho 0.5-0.95  -> 22-39% paid
+        #     LIVE (13 h shadow): action 17 passed 24-28%, action 27 27%,
+        #     everything else ~7%, and action 17's LP pay GREW
+        #     0.03 -> 0.26/step — learning progress fabricated from nothing.
+        # Noop pays exactly 0 (action-attribution gate), so the farm settled
+        # on the smallest action that is not noop.
+        #
+        # TWO CHANGES, both needed (tests/_lp_correlated_gate_smoke.py):
+        #  1. VISIT COLLAPSE (lp_visit_collapse). Consecutive same-bucket
+        #     transitions of one batch row (= one stream) are ONE visit: the
+        #     history gets ONE entry, the visit's mean error, when the visit
+        #     ends; LP is scored ONCE, on the entry transition. A dwell can
+        #     no longer be paid N times for one piece of evidence, and the
+        #     history means what the module docstring always said it meant —
+        #     error over repeated VISITS. Escape path: any bucket change
+        #     closes the visit; the agent controls that by moving.
+        #  2. A VALID TEST (lp_sig_z). Collapse alone cannot help rapid A/B
+        #     oscillation (every step is an entry, entries 2 steps apart).
+        #     So `drop` is compared with the standard error of the difference
+        #     of the two half-means — pooled WITHIN-half variance, so a real
+        #     drop does not inflate its own noise estimate — inflated by
+        #     (1+r)/(1-r) for the history's lag-1 autocorrelation r (the
+        #     effective-sample-size correction n_eff = n(1-r)/(1+r)), against
+        #     a one-sided ~1% quantile at the effective degrees of freedom.
+        #     r is estimated from first differences WITHIN each half
+        #     (von Neumann), which a learning trend barely moves, corrected
+        #     for its small-sample downward bias, and is
+        #     clipped to [0, lp_rho_max] so the threshold stays finite: a
+        #     bucket with an extremely correlated history is HARD to pay,
+        #     never impossible, and the 30-entry window rolls it over.
+        # Revert: lp_sig_z=0 restores the legacy `lp_sig_k * std` gate and
+        # lp_visit_collapse=False the per-step history; the smoke keeps the
+        # legacy pair as a regression witness that must still farm.
+        self.lp_sig_z = float(lp_sig_z)
+        self.lp_rho_max = float(lp_rho_max)
+        self.lp_visit_collapse = bool(lp_visit_collapse)
+        # row index -> [bucket_key, error_sum, n_steps] of the open visit.
+        self._lp_runs: dict = {}
         # Relative weight of the world model's flow residual against the
         # forward-model error when the two are summed for bucketing. 1.0 is
         # "both channels count the same"; 0.0 disables the channel entirely
@@ -220,6 +275,68 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
             return
         self._bucket_err = {k: v for k, v in self._bucket_err.items() if len(v) > 1}
 
+    def _close_visit(self, run) -> None:
+        """Append a finished visit's MEAN error to its bucket's history.
+
+        A bucket whose prototype was LRU-evicted mid-visit has lost its
+        history on purpose (see `_bucket_key`); re-creating it here would
+        leak an orphan history for an id that no longer exists."""
+        key, err_sum, n = run
+        if getattr(self, "pixel_obs", False) and self._protos \
+                and key not in self._protos:
+            return
+        hist = self._bucket_err.get(key)
+        if hist is None:
+            hist = deque(maxlen=self.lp_history)
+            self._bucket_err[key] = hist
+        hist.append(err_sum / max(int(n), 1))
+
+    def _lp_from_history(self, h: np.ndarray) -> float:
+        """The error drop between the halves of `h`, or 0.0 unless it is
+        SIGNIFICANT (relative gate) and MATERIAL (absolute floor)."""
+        half = len(h) // 2
+        a, b = h[:half], h[half:]
+        older = float(a.mean())
+        recent = float(b.mean())
+        drop = older - recent
+        if not drop > 0.0:
+            return 0.0
+        # ABSOLUTE FLOOR: the drop must be a real fraction of the error
+        # still outstanding — what makes a mastered bucket pay exactly 0
+        # instead of an amplified jitter income.
+        if not drop > (float(getattr(self, "lp_abs_frac", 0.0))
+                       * max(recent, 1e-12)):
+            return 0.0
+        z = float(getattr(self, "lp_sig_z", 0.0))
+        if z <= 0.0:
+            # LEGACY relative gate (revert / regression witness only): valid
+            # for independent samples, passes 22-39% of a frozen model's
+            # autocorrelated history. See __init__.
+            sig = drop > float(getattr(self, "lp_sig_k", 0.5)) * float(h.std())
+            return drop if sig else 0.0
+        n = len(h)
+        dof = n - 2
+        ss = float(((a - older) ** 2).sum() + ((b - recent) ** 2).sum())
+        if dof <= 0:
+            return 0.0
+        var = ss / dof
+        if var <= 0.0:
+            return drop            # noiseless and strictly lower: real
+        d = np.concatenate([np.diff(a), np.diff(b)])
+        r = 1.0 - float((d * d).mean()) / (2.0 * var) if len(d) else 0.0
+        # Small-sample bias: an AR(1) estimate from m points reads LOW by
+        # ~(1+3r)/m (Kendall). Uncorrected, 15-point halves under-read
+        # rho 0.9 and A/B oscillation passed 3-5% instead of <=2%.
+        r = r + (1.0 + 3.0 * max(r, 0.0)) / max(len(a), 1)
+        r = min(max(r, 0.0), float(getattr(self, "lp_rho_max", 0.9)))
+        infl = (1.0 + r) / (1.0 - r)
+        se = (var * (1.0 / len(a) + 1.0 / len(b)) * infl) ** 0.5
+        dof_eff = max(1.0, dof / infl)
+        # Student-t quantile from the normal one (Cornish-Fisher, first
+        # term): small or highly correlated histories need a larger t.
+        t = z * (1.0 + (z * z + 1.0) / (4.0 * dof_eff))
+        return drop if drop > t * se else 0.0
+
     def compute_intrinsic_reward(self, obs, action, next_obs,
                                  update_state: bool = True,
                                  extra_error=None):
@@ -300,37 +417,32 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
             lp = np.zeros(len(errs), dtype=np.float32)
             for i in range(len(errs)):
                 key = self._bucket_key(obs_np[i], update_state=update_state)
+                # VISIT COLLAPSE (see __init__): is this transition the ENTRY
+                # into `key` for this row, or a continuation of the open
+                # visit? Read-only calls (imagination) have no visits: every
+                # row is scored against the closed history, as before, and
+                # nothing below them is mutated.
+                entry = True
+                if self.lp_visit_collapse and update_state:
+                    run = self._lp_runs.get(i)
+                    if run is not None and run[0] == key:
+                        entry = False
+                        run[1] += float(errs[i])
+                        run[2] += 1
+                    else:
+                        if run is not None:
+                            self._close_visit(run)
+                        self._lp_runs[i] = [key, float(errs[i]), 1]
                 hist = self._bucket_err.get(key)
                 if hist is None:
                     if not update_state:
                         continue        # read-only: unseen bucket -> LP 0
                     hist = deque(maxlen=self.lp_history)
                     self._bucket_err[key] = hist
-                if len(hist) >= self.lp_min_samples:
-                    h = np.fromiter(hist, dtype=np.float32)
-                    half = len(h) // 2
-                    older = float(h[:half].mean())
-                    recent = float(h[half:].mean())
-                    # SIGNIFICANCE GATE (audit fix): a mastered bucket's flat
-                    # error still jitters, so older-half > recent-half on ~half
-                    # of visits by pure chance — max(0, drop) then had strictly
-                    # positive expectation forever (farmable fake curiosity on
-                    # known scenes). Require the drop to clear a fraction of the
-                    # bucket's OWN error spread; real learning drops dwarf the
-                    # jitter, chance ticks do not. Unit-free (bucket-local).
-                    drop = older - recent
-                    noise = float(h.std())
-                    # BOTH gates must pass: the drop must clear the bucket
-                    # noise (relative significance) AND be a real fraction of
-                    # the error still outstanding (absolute progress). The
-                    # second is what makes a mastered bucket pay exactly 0
-                    # instead of an amplified jitter income.
-                    _sig = drop > float(getattr(self, "lp_sig_k", 0.5)) * noise
-                    _abs = drop > (float(getattr(self, "lp_abs_frac", 0.0))
-                                   * max(recent, 1e-12))
-                    if _sig and _abs:
-                        lp[i] = drop           # error reduction = progress
-                if update_state:
+                if entry and len(hist) >= self.lp_min_samples:
+                    lp[i] = self._lp_from_history(
+                        np.fromiter(hist, dtype=np.float64))
+                if update_state and not self.lp_visit_collapse:
                     hist.append(float(errs[i]))         # counts next time
             if update_state:
                 self._prune_buckets()

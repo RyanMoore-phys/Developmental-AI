@@ -926,6 +926,23 @@ def ego_from_proprio(pp_t: torch.Tensor, pp_t1: torch.Tensor,
     tests/_perspective_smoke.py pins the sign with a known-answer case rather
     than trusting this paragraph.
 
+    THE STORED PAIR IS RESCALED, NOT UNIT (fixed 2026-10-04). The env writes
+    head_sin = 0.5*sin(yaw) + 0.5 and head_cos = 0.5*cos(yaw) + 0.5
+    (minerl_env._proprio: every proprio entry lives in [0, 1]), so the pair
+    is mapped back with 2x - 1 before the rotation formula. Feeding the
+    rescaled values straight in — what this did until now — computed the
+    angle between two vectors offset by (0.5, 0.5): a 90-degree turn read as
+    ~37 degrees, and the error depended on the absolute heading. An unknown
+    heading (0.5, 0.5) decodes to (0, 0) and yields d_yaw = 0. INERT LIVE:
+    only flow_mode "depth" consumes ego, and the live config runs
+    flow_mode: raw — so this fix changes no live number today.
+
+    SIGN, pinned against the world (tests/unit/test_world_model_unit.py, and
+    DeadReckoner's convention in tests/_oracle_isolation_smoke.py F):
+    Minecraft yaw grows CLOCKWISE seen from above (yaw 0 faces +z/south,
+    90 faces -x/west), and d_yaw > 0 exactly when yaw grew — i.e. a turn to
+    the RIGHT (south -> west) is positive.
+
     PITCH is a plain difference: it is clamped to [-90, 90] in the game and
     stored normalized to [0, 1], so it cannot wrap.
 
@@ -938,8 +955,9 @@ def ego_from_proprio(pp_t: torch.Tensor, pp_t1: torch.Tensor,
     hs, hc = layout.get("head_sin"), layout.get("head_cos")
     if None in (ps, pm, hs, hc):
         raise ValueError(f"proprio layout is missing a field: {layout}")
-    sin_t, cos_t = pp_t[:, hs], pp_t[:, hc]
-    sin_1, cos_1 = pp_t1[:, hs], pp_t1[:, hc]
+    # stored as 0.5*v + 0.5 (see above) -> back to [-1, 1]
+    sin_t, cos_t = 2.0 * pp_t[:, hs] - 1.0, 2.0 * pp_t[:, hc] - 1.0
+    sin_1, cos_1 = 2.0 * pp_t1[:, hs] - 1.0, 2.0 * pp_t1[:, hc] - 1.0
     d_yaw = torch.atan2(sin_1 * cos_t - cos_1 * sin_t,
                         cos_1 * cos_t + sin_1 * sin_t)
     # pitch is stored as (90 - pitch_deg)/180 style normalization in [0,1];
