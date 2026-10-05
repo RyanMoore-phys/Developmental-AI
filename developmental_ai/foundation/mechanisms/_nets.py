@@ -12,7 +12,10 @@
     update_static_mask  which continuous outcome dims are STATIC (see below)
     pass_static         predict static dims as identity with floor variance
     train               Adam over minibatches with an explicit numpy RNG; takes
-                        a persistent optimizer so training can RESUME
+                        a persistent optimizer so training can RESUME; optional
+                        validation early stopping (patience DEFAULT_PATIENCE)
+                        that restores the best epoch's weights + optimizer on
+                        EVERY exit path, a raised exception included
     ResumableTraining   per-mechanism persistent Adam + training_state_dict /
                         load_training_state_dict (weights, optimizer, version)
     count_linear_flops  forward-hook FLOP count over Linear and GRUCell layers
@@ -56,6 +59,16 @@ mechanism continues bit-for-bit where the saved one would have.
 `state_dict()` is unchanged: it is the WEIGHTS-only view that
 runtime.SnapshotRegistry publishes for predictions.
 
+EARLY STOPPING / FAILED FITS (2026-10-05 review of the validation-selection
+change). A non-finite training or validation loss used to raise mid-fit,
+leaving weights and the persistent Adam at the last (not the best) epoch
+while BaseMechanism.fit never bumped `version` — so the next fit reused the
+same seed on poisoned moments. Now: train() restores the selected epoch in
+a try/finally; a non-finite validation loss is "no improvement"; and
+TorchMechanism._fit is ATOMIC — any exception puts the module (weights,
+standardisers, static masks) and the optimizer back exactly as before the
+call, so "version not bumped" and "state not changed" always go together.
+
 Seeds: model construction and training run inside torch.random.fork_rng, so
 fitting a shadow model never advances the live learner's torch RNG.
 """
@@ -63,6 +76,7 @@ fitting a shadow model never advances the live learner's torch RNG.
 from __future__ import annotations
 
 import contextlib
+import math
 import copy
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -74,6 +88,7 @@ import torch.nn.functional as F
 VAR_FLOOR = 1e-4          # in standardised units
 STATIC_ATOL = 1e-9        # |change| at or below this on every row = never moved
 TRAIN_STATE_SCHEMA = 1
+DEFAULT_PATIENCE = 5      # early-stopping patience (epochs without validation gain)
 
 
 def mlp(i: int, h: int, o: int, layers: int = 2) -> nn.Sequential:
@@ -189,10 +204,34 @@ def seeded(seed: Optional[int]):
 def train(params, loss_fn: Callable[[np.ndarray], torch.Tensor], n: int, *,
           epochs: int, batch_size: int, lr: float, seed: int,
           weight_decay: float = 0.0,
-          optimizer: Optional[torch.optim.Optimizer] = None) -> List[float]:
+          optimizer: Optional[torch.optim.Optimizer] = None,
+          validation_fn=None, module=None, patience: int = DEFAULT_PATIENCE,
+          min_delta: float = 0.0, validation_history=None,
+          report: Optional[Dict[str, Any]] = None) -> List[float]:
     """loss_fn(index array) -> scalar loss. Returns per-epoch mean losses.
     `optimizer` (over exactly `params`) is reused — its moments carry over —
-    with lr / weight_decay set to this call's values; None = a fresh Adam."""
+    with lr / weight_decay set to this call's values; None = a fresh Adam.
+
+    EARLY STOPPING (validation_fn given): the weights AND optimizer moments
+    of the best validation epoch are restored together — on the normal
+    path, on a patience stop, AND when training is cut short by an
+    exception (try/finally), so the module is never left at a discarded
+    epoch. A non-finite validation loss counts as "no improvement". A
+    non-finite TRAINING loss stops training (stepping on it would poison
+    the weights); if some epoch was already selected, that epoch is
+    restored and the fit completes normally (stop_reason "diverged"),
+    otherwise FloatingPointError is raised. Without validation a
+    non-finite training loss always raises. `report` (optional dict) is
+    filled with selected_epoch (1-based; = len(hist) without validation)
+    stop_reason ("epochs" | "patience" | "diverged") and gradient_steps
+    (optimizer steps actually taken, discarded epochs included)."""
+    if (epochs < 1 or batch_size < 1 or patience < 1
+            or not math.isfinite(float(min_delta)) or min_delta < 0):
+        raise ValueError("invalid training/early-stopping budget")
+    if validation_fn is not None and module is None:
+        raise ValueError("validation requires a restorable module")
+    best, stale, best_state, best_epoch = float("inf"), 0, None, 0
+    stop_reason, diverged, steps = "epochs", None, 0
     rng = np.random.default_rng(seed)
     if optimizer is None:
         opt = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
@@ -201,22 +240,61 @@ def train(params, loss_fn: Callable[[np.ndarray], torch.Tensor], n: int, *,
         for g in opt.param_groups:
             g["lr"], g["weight_decay"] = float(lr), float(weight_decay)
     hist = []
-    with seeded(seed):
-        for ep in range(int(epochs)):
-            perm = rng.permutation(n)
-            tot, cnt = 0.0, 0
-            for s in range(0, n, batch_size):
-                idx = perm[s:s + batch_size]
-                loss = loss_fn(idx)
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(f"non-finite training loss at epoch {ep}")
-                opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(params, 10.0)
-                opt.step()
-                tot += float(loss.detach()) * len(idx)
-                cnt += len(idx)
-            hist.append(tot / max(cnt, 1))
+    try:
+        with seeded(seed):
+            for ep in range(int(epochs)):
+                perm = rng.permutation(n)
+                tot, cnt = 0.0, 0
+                for s in range(0, n, batch_size):
+                    idx = perm[s:s + batch_size]
+                    loss = loss_fn(idx)
+                    if not bool(torch.isfinite(loss)):
+                        diverged = f"non-finite training loss at epoch {ep}"
+                        break
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(params, 10.0)
+                    opt.step()
+                    steps += 1
+                    tot += float(loss.detach()) * len(idx)
+                    cnt += len(idx)
+                if diverged is not None:
+                    stop_reason = "diverged"
+                    break
+                hist.append(tot / max(cnt, 1))
+                if validation_fn is not None:
+                    mode = module.training
+                    module.eval()
+                    try:
+                        with torch.no_grad():
+                            val = float(validation_fn())
+                    finally:
+                        module.train(mode)
+                    if validation_history is not None:
+                        validation_history.append(val)
+                    # NaN/inf is "no improvement", never a new best
+                    if math.isfinite(val) and val < best - min_delta:
+                        best, stale, best_epoch = val, 0, ep + 1
+                        best_state = (copy.deepcopy(module.state_dict()),
+                                      copy.deepcopy(opt.state_dict()))
+                    else:
+                        stale += 1
+                        if stale >= patience:
+                            stop_reason = "patience"
+                            break
+    finally:
+        # weights + optimizer TOGETHER, on every exit path
+        if best_state is not None:
+            module.load_state_dict(best_state[0])
+            opt.load_state_dict(best_state[1])
+    if validation_fn is not None and best_state is None:
+        raise FloatingPointError(diverged or "no finite validation loss in any epoch")
+    if validation_fn is None and diverged is not None:
+        raise FloatingPointError(diverged)
+    if report is not None:
+        report["selected_epoch"] = best_epoch if validation_fn is not None else len(hist)
+        report["stop_reason"] = stop_reason
+        report["gradient_steps"] = steps
     return hist
 
 
@@ -386,7 +464,40 @@ class TorchMechanism(ResumableTraining, BaseMechanism):
         return self._out(mu_n, var_n, logits, state)
 
     def _fit(self, batch: TransitionBatch, epochs: int = 60, batch_size: int = 128,
-             lr: float = 2e-3, seed: Optional[int] = None, weight_decay: float = 0.0):
+             lr: float = 2e-3, seed: Optional[int] = None, weight_decay: float = 0.0,
+             validation=None, patience: int = DEFAULT_PATIENCE, min_delta: float = 0.0):
+        """ATOMIC: if anything raises (a diverged fit, a bad validation
+        batch), the module (weights, standardisers, static masks) and the
+        persistent optimizer are put back exactly as they were before the
+        call. BaseMechanism.fit bumps `version` only after _fit returns, so
+        a failed fit leaves version AND state unchanged together — the next
+        fit reuses the same seed on the same, unpoisoned, moments.
+        Escape path (CLAUDE.md §4.1): a retry with identical data, lr and
+        seed fails identically by construction; a different batch, lr or an
+        explicit seed= is what re-opens it. Nothing is latched in the
+        weights — the failure is raised, never silently kept."""
+        if validation is not None:
+            if not isinstance(validation, TransitionBatch) or len(validation) == 0:
+                raise ContractError(f"{self.mechanism_id}: validation must be a "
+                                    f"non-empty TransitionBatch")
+            self._check(validation.state, validation.action, validation.dt)
+        pre_module = copy.deepcopy(self.module.state_dict())
+        pre_opt = None if self._opt is None else copy.deepcopy(self._opt.state_dict())
+        had_opt = self._opt is not None
+        try:
+            return self._fit_inner(batch, epochs, batch_size, lr, seed, weight_decay,
+                                   validation, patience, min_delta)
+        except BaseException:
+            self.module.load_state_dict(pre_module)
+            if had_opt:
+                self._opt.load_state_dict(pre_opt)
+            else:
+                self._opt = None
+            self.module.eval()
+            raise
+
+    def _fit_inner(self, batch, epochs, batch_size, lr, seed, weight_decay,
+                   validation, patience, min_delta):
         prep = self._prepare(batch.state, batch.action, batch.dt)
         self._fit_stats(prep)
         change = batch.next_state.continuous() - batch.state.continuous()
@@ -406,14 +517,38 @@ class TorchMechanism(ResumableTraining, BaseMechanism):
             mu, var, logits = self._forward(sub)
             return head_loss(mu, var, logits, y[idx], ev[idx], st)
 
+        validation_history = []
+        validation_fn = None
+        if validation is not None:
+            vp = self._prepare(validation.state, validation.action, validation.dt)
+            vy = self.module.out_std(t(validation.next_state.continuous()
+                                      - validation.state.continuous()))
+            ve = torch.as_tensor(validation.events, dtype=torch.long)
+            def validation_fn():
+                mu, var, logits = self._forward(vp)
+                return head_loss(mu, var, logits, vy, ve, st)
+
+        info: Dict[str, Any] = {}
         hist = train(self._trainable_params(), loss_fn, len(batch), epochs=epochs,
                      batch_size=batch_size, lr=lr,
                      seed=self.seed + 1000 * (self.version + 1) if seed is None else seed,
                      weight_decay=weight_decay,
-                     optimizer=self._optimizer(lr, weight_decay))
+                     optimizer=self._optimizer(lr, weight_decay),
+                     validation_fn=validation_fn, module=self.module,
+                     patience=patience, min_delta=min_delta,
+                     validation_history=validation_history, report=info)
         self.module.eval()
+        selected_epoch = int(info["selected_epoch"])
+        # loss_last / loss_hist describe every epoch RUN (including the ones
+        # early stopping discarded); loss_selected is the training loss of
+        # the epoch whose weights the mechanism actually holds.
         return {"loss_first": hist[0], "loss_last": hist[-1], "epochs": len(hist),
-                "loss_hist": [float(h) for h in hist], "static_dims": int(static.sum())}
+                "loss_hist": [float(h) for h in hist], "static_dims": int(static.sum()),
+                "validation_loss": validation_history,
+                "selected_epoch": selected_epoch,
+                "loss_selected": float(hist[selected_epoch - 1]),
+                "stop_reason": info["stop_reason"],
+                "gradient_steps": int(info["gradient_steps"])}
 
     def state_dict(self):
         """Weights (+ standardisers, static masks) only — the snapshot view.

@@ -1,223 +1,196 @@
-"""Compression-progress probe-set smoke (Mac-ok; fake loss_fn, tiny torch).
+"""Paired progress: probe churn, partial failure and drift must not pay.
 
-Contracts:
-  1. Reservoir keeps <= capacity, replaces via reservoir draw (never
-     rotates wholesale), stores detached CPU clones of slice [0:1], and
-     the set is id-stable across evaluate() calls with no adds between.
-  2. First evaluate() -> 0.0 (baseline only); <3 probes -> None; not
-     due -> None.
-  3. Improving loss -> positive rate; CONSTANT loss -> rate decays to
-     ~0 (no payment for staying the same); WORSENING loss -> exactly
-     0.0, never negative.
-  4. Noisy-TV analogue: unlearnable noise around a constant mean pays
-     <15% of a genuinely improving model in the same harness.  Measured
-     while building this: with the spec-exact formulas, PURE Gaussian
-     noise structurally pays ~16-19% of the improving rate at any run
-     length (mean positive excursion ~0.43*sigma vs a running max of
-     ~2.6-3*sigma — scale-free, so no sigma or n_evals changes it).
-     The honest noisy-TV model is heavy-tailed anyway (steady jitter
-     plus occasional dramatic flashes); that pays 7-12% here (seeded,
-     deterministic), and the flashes are exactly what ratchet the
-     running max up and crush the payout of the steady jitter.
-  5. Staleness: no successful evaluate() for 3*eval_every ticks ->
-     rate() == 0 (a dead evaluator must not pay forever); full payment
-     within one window, linear fade after.
-  6. A probe whose loss_fn raises is skipped and counted in
-     eval_errors; the survivors still produce a verdict; ALL probes
-     failing -> evaluate() returns None.
+2026-10 review: the old aggregate EMA compared different exams and paid
+remaining error reductions repeatedly. These tests pin matched identities,
+fixed observable targets, model versions, and shadow-only event delivery.
+
+2026-10-05 second review (contracts E-G):
+  E. RESTORE IS EVIDENCE, NOT CLOCK. load_state_dict used __dict__.update,
+     restoring _last_eval_step from the old run while total_timesteps
+     restarts at 0: `step - _last_eval_step` stayed negative, so no probe
+     was re-evaluated until the new run overtook the old count (a latch,
+     CLAUDE.md 4.1) — and config (_eval_every, _capacity, significance_z)
+     was silently overwritten by the file. Pinned: after a restore at step
+     0 the next evaluate RUNS and pairs against the saved baselines; config
+     comes from the constructor; a smaller capacity drops surplus probes
+     and their baselines.
+  F. A REJECTED STATE TOUCHES NOTHING. Inconsistent tables raise before
+     any field is assigned.
+  G. SIDECAR FILES CANNOT CRASH-LOOP BOOT. A truncated / wrong-schema file
+     -> 'cold' for that component, exactly one warning, the file renamed to
+     .corrupt-<ts> (kept, never deleted). Absent (older checkpoints) ->
+     'absent', silent. Writes are atomic and leave no temp files.
 """
-import random
-
+from dataclasses import replace
+import glob
+import logging
+import os
+import pickle
+import tempfile
 import torch
-
-from developmental_ai.infra.progress_curiosity import ProbeSetProgress
-
-
-def _batch(seed=0):
-    g = torch.Generator().manual_seed(seed)
-    return {"observations": torch.randn(4, 6, 8, generator=g),
-            "actions": torch.randn(4, 6, 3, generator=g)}
+from developmental_ai.infra.progress_curiosity import (
+    ProbeSetProgress, EvidenceCredit, atomic_pickle_dump, load_pickle_sidecar)
 
 
-def _filled(cap=4, eval_every=10, **kw):
-    p = ProbeSetProgress(capacity=cap, eval_every=eval_every, **kw)
-    for i in range(cap):
-        assert p.maybe_add_probe(_batch(seed=i))
+class _Count(logging.Handler):
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _logger():
+    log = logging.getLogger('progress_sidecar_smoke')
+    log.propagate = False
+    for h in list(log.handlers):
+        log.removeHandler(h)
+    h = _Count()
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+    return log, h
+
+
+def filled():
+    p = ProbeSetProgress(capacity=4, eval_every=1)
+    for i in range(4):
+        p.maybe_add_probe({'target': torch.tensor([[float(i)]])}, evidence_ref=f'ev:{i}')
     return p
 
 
-def test_reservoir_capacity_and_stability():
-    p = ProbeSetProgress(capacity=5, eval_every=10)
-    kept_after_full = 0
-    for i in range(50):
-        kept = p.maybe_add_probe(_batch(seed=i))
-        assert len(p._probes) <= 5, len(p._probes)
-        if i >= 5 and kept:
-            kept_after_full += 1
-    assert len(p._probes) == 5
-    # The internal RNG is constant-seeded, so this is deterministic: the
-    # reservoir genuinely replaces (early probes cannot monopolise).
-    assert kept_after_full >= 1, "reservoir never replaced in 45 offers"
-    probe = p._probes[0]
-    assert probe["observations"].shape == (1, 6, 8), \
-        probe["observations"].shape                    # [0:1] slice kept
-    assert not probe["observations"].requires_grad
-    assert probe["observations"].device.type == "cpu"
-    # Clone semantics: mutating the offered batch must not reach the probe.
-    b = _batch(seed=99)
-    p2 = ProbeSetProgress(capacity=3, eval_every=10)
-    assert p2.maybe_add_probe(b)
-    before = p2._probes[0]["observations"].clone()
-    b["observations"].zero_()
-    assert torch.equal(p2._probes[0]["observations"], before)
-    # Stability: two evaluations with no interleaved add -> identical ids.
-    ids1 = [id(x) for x in p._probes]
-    assert p.evaluate(lambda batch: 5.0, step=0) == 0.0
-    assert p.evaluate(lambda batch: 4.0, step=10) is not None
-    ids2 = [id(x) for x in p._probes]
-    assert ids1 == ids2, "probe set churned between evaluations"
-    print(f"  1. reservoir: <=cap always, {kept_after_full} replacements "
-          f"in 45 post-fill offers, clones detached/cpu, id-stable "
-          f"across evals")
+def main():
+    p = filled()
+    assert p.evaluate(lambda b: 2+b['target'].item(), 0, model_version='v0') == 0
+    # Easier replacement cannot create improvement in the surviving probes.
+    for i in range(30):
+        p.maybe_add_probe({'target': torch.tensor([[-1.]])})
+    assert p.evaluate(lambda b: 2+b['target'].item(), 1, model_version='v1') == 0
+    print('  A. reservoir churn does not create progress')
+    p = filled()
+    p.evaluate(lambda b: 2+b['target'].item(), 0, model_version='v0')
+    def partial(b):
+        if b['target'].item() == 3:
+            raise ValueError('unavailable hard probe')
+        return 2+b['target'].item()
+    assert p.evaluate(partial, 1, model_version='v1') == 0
+    assert p.eval_errors == 1
+    print('  B. losing a hard probe does not create progress')
+    p = filled()
+    p.evaluate(lambda b: 1., 0, model_version='v0')
+    assert p.evaluate(lambda b: .25, 1, model_version='v1') > 0
+    e = p.last_event
+    assert e.improvement == .75 and e.probe_ids and e.previous_versions == ('v0',)
+    assert p.rate() == 0
+    assert p.evaluate(lambda b: 0., 2, model_version='v1') is None
+    assert p.evaluate(lambda b: .25, 3, model_version='v2') == 0
+    assert p.evaluate(lambda b: 1., 4, model_version='v3') == 0
+    assert p.last_event.forgetting == .75
+    assert p.evaluate(lambda b: .25, 5, model_version='v4') == 0
+    # A representation/objective change starts a new exam, never a windfall.
+    assert p.evaluate(lambda b: .01, 6, model_version='v5', objective='new-objective') == 0
+    print('  C. same-scene improvement measured; duplicate versions/relearning/target changes pay zero')
+    q = filled(); q.load_state_dict(pickle.loads(pickle.dumps(p.state_dict())))
+    # The version cursor is NOT restored (contract E): only evidence is.
+    assert q._last_version is None and q._last_eval_step is None and q.rate() == 0
+    assert q._previous == p._previous and q._ids == p._ids
+    assert q.evaluate(lambda b: .01, 7, model_version='v6', objective='new-objective') == 0
+    ledger = EvidenceCredit(cap=.1)
+    assert ledger.claim(e, 'ev:0', 1) == 0  # Shadow events cannot be paid.
+    live = replace(e, shadow=False)
+    assert ledger.claim(live, 'unrelated', 1) == 0
+    assert ledger.claim(live, 'ev:0', 1) == .1
+    assert ledger.claim(live, 'ev:0', 2) == 0
+    restored = EvidenceCredit(); restored.load_state_dict(ledger.state_dict())
+    assert restored.claim(live, 'ev:0', 2) == 0
+    assert EvidenceCredit(max_age=1).claim(live, 'ev:0', 10) == 0
+    print('  D. resume, finite evidence credit, expiry and no ambient income')
+    try:
+        p.maybe_add_probe({'target': torch.zeros(1)}, split='heldout')
+        raise AssertionError('held-out leakage')
+    except ValueError:
+        pass
+
+    # ---- E. restore after a step reset re-evaluates; config wins ---------
+    old = ProbeSetProgress(capacity=4, eval_every=512)
+    for i in range(4):
+        old.maybe_add_probe({'target': torch.tensor([[float(i)]])}, evidence_ref=f'ev:{i}')
+    old.evaluate(lambda b: 1., 100000, model_version='adam_step=900')
+    assert old._last_eval_step == 100000
+    state = pickle.loads(pickle.dumps(old.state_dict()))
+    new = ProbeSetProgress(capacity=4, eval_every=512)
+    new.load_state_dict(state)
+    assert new.due(0), 'restored clock latched the cadence'
+    got = new.evaluate(lambda b: .5, 0, model_version='adam_step=901')
+    assert got is not None and got > 0, got           # ran AND paired with saved baselines
+    assert new.last_event.previous_versions == ('adam_step=900',)
+    assert new.rate() == 0
+    # Falsifier: the pre-fix __dict__ restore really did latch here.
+    latched = ProbeSetProgress(capacity=4, eval_every=512)
+    latched.__dict__.update(copy_state(state))
+    assert latched.evaluate(lambda b: .5, 0, model_version='adam_step=901') is None
+    cfg = ProbeSetProgress(capacity=3, eval_every=7, significance_z=1.0)
+    cfg.load_state_dict(state)
+    assert (cfg._eval_every, cfg._capacity, cfg.significance_z) == (7, 3, 1.0)
+    assert len(cfg._probes) == len(cfg._ids) == len(cfg._refs) == 3
+    assert set(cfg._previous) == set(cfg._ids) and set(cfg._best) == set(cfg._ids)
+    print('  E. restore at step 0 re-evaluates against saved baselines; '
+          'config (eval_every/capacity/z) comes from config, never the file')
+
+    # ---- F. a rejected state mutates nothing --------------------------------
+    bad = pickle.loads(pickle.dumps(state))
+    bad['state']['_ids'] = bad['state']['_ids'][:-1]
+    fresh = ProbeSetProgress(capacity=4, eval_every=512)
+    try:
+        fresh.load_state_dict(bad)
+        raise AssertionError('inconsistent probe tables accepted')
+    except ValueError:
+        pass
+    assert fresh._probes == [] and fresh._previous == {} and fresh._objective is None
+    print('  F. inconsistent state rejected before any field is assigned')
+
+    # ---- G. sidecar files: atomic write; corrupt -> cold + warning + kept ---
+    d = tempfile.mkdtemp(prefix='progress_sidecar_')
+    path = os.path.join(d, 'progress_probes.pkl')
+    log, h = _logger()
+    fresh = ProbeSetProgress(capacity=4, eval_every=512)
+    assert load_pickle_sidecar(path, fresh.load_state_dict, 'probes', log=log) == 'absent'
+    assert not h.records, 'an absent (older-checkpoint) sidecar must be silent'
+    atomic_pickle_dump(path, old.state_dict())
+    assert sorted(os.listdir(d)) == ['progress_probes.pkl'], os.listdir(d)  # no temp left
+    ok = ProbeSetProgress(capacity=4, eval_every=512)
+    assert load_pickle_sidecar(path, ok.load_state_dict, 'probes', log=log) == 'loaded'
+    assert ok._ids == old._ids and not h.records
+    with open(path, 'rb') as f:
+        data = f.read()
+    with open(path, 'wb') as f:
+        f.write(data[:len(data)//2])                   # a torn non-atomic write
+    fresh = ProbeSetProgress(capacity=4, eval_every=512)
+    assert load_pickle_sidecar(path, fresh.load_state_dict, 'probes', log=log) == 'cold'
+    warns = [r for r in h.records if r.levelno == logging.WARNING]
+    assert len(warns) == 1 and 'COLD START' in warns[0].getMessage(), h.records
+    assert not os.path.exists(path)
+    kept = glob.glob(path + '.corrupt-*')
+    assert len(kept) == 1 and open(kept[0], 'rb').read() == data[:len(data)//2]
+    assert fresh._probes == [] and fresh.due(0) is False  # cold == as constructed
+    # a VALID pickle the loader rejects (schema) is the same cold start
+    atomic_pickle_dump(path, {'schema': 99})
+    h.records.clear()
+    assert load_pickle_sidecar(path, fresh.load_state_dict, 'probes', log=log) == 'cold'
+    assert len(h.records) == 1 and len(glob.glob(path + '.corrupt-*')) == 2
+    # the component keeps working after a cold start (no latch)
+    for i in range(3):
+        fresh.maybe_add_probe({'target': torch.tensor([[float(i)]])})
+    assert fresh.evaluate(lambda b: 1., 0, model_version='v0') == 0.0
+    print('  G. sidecar: atomic write, absent silent, torn/wrong-schema file '
+          '-> cold start + 1 warning + file kept aside')
+    print('[infra_progress_curiosity_smoke] ALL PASS')
 
 
-def test_first_eval_baseline():
-    p = _filled()
-    out = p.evaluate(lambda batch: 3.0, step=0)
-    assert out == 0.0, out                 # baseline only, no progress
-    assert p.rate() == 0.0
-    assert p.last_mean_loss == 3.0
-    assert p.evaluate(lambda batch: 1.0, step=5) is None   # not due
-    few = ProbeSetProgress(capacity=4, eval_every=10)
-    few.maybe_add_probe(_batch())
-    few.maybe_add_probe(_batch(seed=1))
-    assert few.evaluate(lambda batch: 1.0, step=0) is None  # <3 probes
-    print("  2. first eval -> 0.0 baseline; not-due -> None; "
-          "<3 probes -> None")
+def copy_state(state):
+    import copy
+    return copy.deepcopy(state['state'])
 
 
-def test_improve_constant_worsen():
-    p = _filled()
-    q = {"v": 5.0}
-    lf = lambda batch: q["v"]              # noqa: E731
-    step = 0
-    p.evaluate(lf, step)
-    p.tick(step)
-    rates = []
-    for _ in range(5):                     # improving phase
-        step += 10
-        q["v"] -= 0.2
-        p.evaluate(lf, step)
-        p.tick(step)
-        rates.append(p.rate())
-    assert all(r > 0.0 for r in rates), rates
-    peak = max(rates)
-    const_rates = []
-    for _ in range(40):                    # constant phase: EMA converges
-        step += 10
-        p.evaluate(lf, step)
-        p.tick(step)
-        const_rates.append(p.rate())
-    assert const_rates[-1] <= const_rates[0]
-    assert const_rates[-1] < 0.02 * peak, (const_rates[-1], peak)
-    for _ in range(5):                     # worsening phase
-        step += 10
-        q["v"] += 1.0
-        out = p.evaluate(lf, step)
-        p.tick(step)
-        assert out == 0.0, out             # never negative, exactly zero
-        assert p.rate() == 0.0
-    print(f"  3. improving rate>0 (peak {peak:.4f}); constant decays to "
-          f"{const_rates[-1]:.2e}; worsening pays exactly 0.0")
-
-
-def test_noisy_tv_pays_nothing():
-    def harness(loss_seq_fn, n_evals=300):
-        p = _filled()
-        rates = []
-        for k in range(n_evals):
-            step = k * 10
-            val = loss_seq_fn(k)
-            p.evaluate(lambda batch: val, step)
-            p.tick(step)
-            rates.append(p.rate())
-        return sum(rates) / len(rates)
-
-    improving = harness(lambda k: 5.0 - 0.01 * k)
-    assert improving > 0.0
-    ratios = []
-    for seed in (1234, 7, 42):
-        rng = random.Random(seed)
-
-        def noisy(k, rng=rng):
-            eps = rng.gauss(0.0, 0.05)     # steady unlearnable jitter
-            if rng.random() < 0.03:        # occasional dramatic flash
-                eps += rng.choice((-1.0, 1.0)) * 0.6
-            return 5.0 + eps               # constant mean: nothing learned
-
-        ratio = harness(noisy) / improving
-        assert ratio < 0.15, (seed, ratio)
-        ratios.append(ratio)
-    print(f"  4. noisy-TV pays {['%.3f' % r for r in ratios]} of the "
-          f"improving rate (all < 0.15)")
-
-
-def test_staleness_zeroes_rate():
-    p = _filled()                          # eval_every=10
-    p.evaluate(lambda batch: 5.0, 0)
-    p.tick(0)
-    p.evaluate(lambda batch: 4.0, 10)
-    p.tick(10)
-    full = p.rate()
-    assert full > 0.0
-    p.tick(20)                             # age == eval_every: still full
-    assert p.rate() == full
-    p.tick(25)                             # inside the fade zone
-    faded = p.rate()
-    assert 0.0 < faded < full, (faded, full)
-    p.tick(40)                             # age == 3*eval_every: dead
-    assert p.rate() == 0.0
-    assert p.stats["rate"] == 0.0
-    print(f"  5. staleness: full {full:.4f} through one window, faded "
-          f"{faded:.4f}, zero at 3*eval_every")
-
-
-def test_probe_errors_skipped_and_all_fail():
-    p = ProbeSetProgress(capacity=4, eval_every=10)
-    for i in range(4):                     # distinguishable probes
-        assert p.maybe_add_probe(
-            {"observations": torch.full((2, 3, 4), float(i)),
-             "actions": torch.zeros(2, 3, 2)})
-
-    def lf(batch):
-        if float(batch["observations"].mean()) >= 3.0:
-            raise RuntimeError("synthetic probe failure")
-        return 1.0
-
-    out = p.evaluate(lf, step=0)
-    assert out == 0.0, out                 # survivors -> baseline verdict
-    assert p.eval_errors == 1, p.eval_errors
-    assert p.last_mean_loss == 1.0         # mean over the 3 survivors
-    assert "synthetic probe failure" in (p.last_error or "")
-
-    def dead(batch):
-        raise RuntimeError("dead loss")
-
-    assert p.evaluate(dead, step=10) is None       # all-fail -> None
-    assert p.eval_errors == 5, p.eval_errors       # 1 + all 4
-    assert p.stats["probes"] == 4                  # probes untouched
-    assert p.evaluate(dead, step=15) is None       # window still respected
-    assert p.eval_errors == 5
-    print("  6. raising probe skipped+counted; all-fail -> None; "
-          "retry gated to once per window")
-
-
-if __name__ == "__main__":
-    for fn in (test_reservoir_capacity_and_stability,
-               test_first_eval_baseline,
-               test_improve_constant_worsen,
-               test_noisy_tv_pays_nothing,
-               test_staleness_zeroes_rate,
-               test_probe_errors_skipped_and_all_fail):
-        fn()
-    print("[infra-progress-curiosity] ALL PASS")
+if __name__ == '__main__':
+    main()

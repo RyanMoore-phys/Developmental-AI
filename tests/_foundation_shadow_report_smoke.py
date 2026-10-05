@@ -57,6 +57,34 @@ CONTRACTS
        LIVE store) are tolerated; the quarantined count is reported.
     G. READ-ONLY: every store directory is byte-identical (same files, same
        sha256) before and after the report; the CLI runs.
+    H. RUN FILTER (2026-10-05: a reward fix deployed between two runs of ONE
+       live store needs a clean before/after). A store holding two runs,
+       written by two ShadowRecorders in sequence: the report lists both
+       (sampled steps == each recorder's own counter); --run <A> gives, in
+       EVERY section, exactly run A's records (A/B counters == recorder A's,
+       by-source == A's ground truth, C/E episodes all A's, run B's id
+       appears in no section); --run latest selects B; --run all equals the
+       unfiltered computation section-for-section (the old behaviour) and the
+       two runs' counts sum to it; a run-B ref is invisible through run A's
+       views; the run listing needs no evaluator decode; an unknown run id
+       is an error naming the runs found. The store stays byte-identical.
+    I. VALIDATION SPLIT IS CHRONOLOGICAL (2026-10-05 review). The prereg says
+       "last fifth of episodes"; it used to be the last fifth of a NAME sort,
+       where "r-e10" precedes "r-e9" and, in a multi-run store, the run id
+       dominates. On synthetic rows (shuffled input order) the held-out
+       episodes are the ones that STARTED last (earliest t_wall, then seq):
+       {r-e9, r-e10} of r-e1..r-e10 (a name sort gives {r-e8, r-e9}), and
+       the later run's last two when run "zz" ran BEFORE run "aa". One
+       episode: chronological by seq, with exactly one transition left out
+       between fit and validation (the gap), basis labelled exploratory;
+       too few rows -> ValueError. D's per-run metrics: neural arms report
+       model_updates = optimizer steps (>= epochs run, summed over members),
+       selected_epoch <= epochs run per member, a finite selected-epoch
+       training loss; fixed baselines report 1.
+
+    D's ensemble assertions depend on early stopping (which epoch wins), so
+    torch is pinned to ONE intra-op thread: a multi-threaded reduction order
+    can flip a near-tie in validation NLL between machines.
 
 Run: PYTHONPATH=. python tests/_foundation_shadow_report_smoke.py
 """
@@ -74,7 +102,12 @@ import time
 sys.path.insert(0, ".")
 
 import numpy as np
+import torch
 import yaml
+
+# D's assertions depend on which epoch early stopping selects; pin the
+# reduction order (see the docstring, contract I).
+torch.set_num_threads(1)
 
 TMP = tempfile.mkdtemp(prefix="shadow_report_smoke_")
 SKY = yaml.safe_load(open("configs/minecraft_skybot.yaml"))
@@ -91,10 +124,10 @@ def _tree(root):
     return out
 
 
-def _pick_run_id(n_eps):
+def _pick_run_id(n_eps, prefix="synth"):
     from developmental_ai.foundation.runtime.splits import assign_split
     for i in range(200):
-        rid = f"synth{i}"
+        rid = f"{prefix}{i}"
         ok = True
         for s in ("stream-0", "stream-1"):
             sides = [assign_split(f"synthetic:{s}", f"{rid}-e{k}", 0.2)
@@ -144,7 +177,8 @@ class _StubExecutor:
         return "option_slot:2 [sk_a]"
 
 
-def make_store(root, n_eps, steps, seed=0, executor=False, legacy=False):
+def make_store(root, n_eps, steps, seed=0, executor=False, legacy=False,
+               prefix="synth"):
     """Real ShadowRecorder over the live bus layout; returns ground truth.
     executor: drive action sources through _StubExecutor. legacy: write the
     Action payload exactly as the recorder did before sources existed."""
@@ -166,7 +200,7 @@ def make_store(root, n_eps, steps, seed=0, executor=False, legacy=False):
             "max_ms_per_step": 1e6, "max_ms_single_step": 1e7}}},
         bus=bus, action_dim=N_ACT, is_discrete=True, num_streams=2,
         environment="synthetic", layout_hash=bus.layout_hash())
-    rec.run_id = _pick_run_id(n_eps) if n_eps >= 4 else "tiny"
+    rec.run_id = _pick_run_id(n_eps, prefix) if n_eps >= 4 else "tiny"
     for st in rec.streams:
         st.ep_n = 0
         rec._new_episode(st)
@@ -275,6 +309,10 @@ def main():
     full, tiny = os.path.join(TMP, "full"), os.path.join(TMP, "tiny")
     st_full, truth = make_store(full, n_eps=8, steps=60, executor=True)
     st_tiny, _ = make_store(tiny, n_eps=1, steps=12, seed=1, legacy=True)
+    two = os.path.join(TMP, "two")       # H: ONE store, two runs in sequence
+    st_ra, truth_ra = make_store(two, n_eps=6, steps=30, seed=2, executor=True,
+                                 prefix="runA")
+    st_rb, truth_rb = make_store(two, n_eps=6, steps=30, seed=3, prefix="runB")
     torn = os.path.join(TMP, "torn")
     shutil.copytree(full, torn)
     # F. a LIVE copy: torn trailing journal line + a truncated sealed chunk
@@ -290,7 +328,7 @@ def main():
     q = os.path.join(torn, "dev", sealed[-1])
     b = open(q, "rb").read()
     open(q, "wb").write(b[:len(b) // 2])
-    before = {r: _tree(r) for r in (full, tiny, torn)}
+    before = {r: _tree(r) for r in (full, tiny, torn, two)}
 
     out_full = os.path.join(TMP, "out_full")
     rep = SR.build_report(full, out_full, members=3, epochs=25)
@@ -404,6 +442,56 @@ def main():
           f"no-action ablation {nm:.3f}; tiny store -> insufficient data "
           f"({'; '.join(Dt['reasons'])})")
 
+    for r_ in ab["results"]["runs"]:
+        if r_["status"] != "ok":
+            continue
+        m_ = r_["metrics"]
+        if r_["arm"] in ("persistence", "ridge"):
+            assert r_["model_updates"] == 1, r_["model_updates"]
+            continue
+        er, se = m_["epochs_run_per_member"], m_["selected_epoch_per_member"]
+        assert len(er) == (1 if r_["arm"] == "mlp" else 3), (r_["arm"], er)
+        assert all(1 <= a_ <= b_ for a_, b_ in zip(se, er)), (se, er)
+        # every epoch run takes >= 1 optimizer step, on every member
+        assert r_["model_updates"] >= sum(er) >= len(er), (r_["model_updates"], er)
+        assert all(np.isfinite(x_) for x_ in m_["selected_train_loss_per_member"])
+
+    # I. chronological validation split (pure function, synthetic rows)
+    def _rows(spec):
+        out_ = []
+        for ep_, t0_, n_ in spec:
+            for k_ in range(n_):
+                out_.append({"env": "synthetic", "stream": "stream-0",
+                             "episode": ep_, "seq": k_, "t_wall": t0_ + k_})
+        rng_ = np.random.default_rng(5)
+        return [out_[i_] for i_ in rng_.permutation(len(out_))]
+
+    def _held(rows_):
+        _, val_, basis_ = SR.validation_split(rows_)
+        assert basis_ == "development-episode", basis_
+        return {r_["episode"] for r_ in val_}
+    one_run = _rows([(f"r-e{k}", 1000.0 * k, 4) for k in range(1, 11)])
+    assert sorted({r_["episode"] for r_ in one_run})[-2:] == ["r-e8", "r-e9"]  # the old bug
+    assert _held(one_run) == {"r-e9", "r-e10"}, _held(one_run)
+    two_runs = _rows([(f"zz-e{k}", 1000.0 * k, 4) for k in range(1, 6)]
+                     + [(f"aa-e{k}", 1e6 + 1000.0 * k, 4) for k in range(1, 6)])
+    assert _held(two_runs) == {"aa-e4", "aa-e5"}, _held(two_runs)
+    single = _rows([("solo-e1", 50.0, 20)])
+    fit_, val_, basis_ = SR.validation_split(single)
+    assert basis_ == "development-chronological-gap-exploratory", basis_
+    fs_, vs_ = sorted(r_["seq"] for r_ in fit_), sorted(r_["seq"] for r_ in val_)
+    assert fs_ == list(range(15)) and vs_ == list(range(16, 20)), (fs_, vs_)
+    assert vs_[0] - fs_[-1] == 2          # exactly one transition (seq 15) dropped
+    try:
+        SR.validation_split(_rows([("solo-e1", 0.0, 4)]))
+        raise AssertionError("4 rows accepted for a fit/validation split")
+    except ValueError:
+        pass
+    print("  I. validation split: held out by start time ({r-e9, r-e10}, not the "
+          "name-sort {r-e8, r-e9}; later run 'aa' over earlier 'zz'); single "
+          "episode chronological with a 1-transition gap; neural arms report "
+          "optimizer steps as model_updates")
+
     # E
     E = js["E"]
     assert E["n"] == A["predictions"] and E["versions_unique"] > 1, E
@@ -420,6 +508,71 @@ def main():
           f"quarantined ({I['quarantined_journal_lines']} journal line, "
           f"{I['quarantined_chunk_records']} chunk records), report complete")
 
+    # H. run filter
+    rs = SR.list_runs(SR.open_store(two))[0]
+    ra, rb = [r["run"] for r in rs]
+    assert ra.startswith("runA") and rb.startswith("runB"), rs
+    assert [r["sampled_steps"] for r in rs] == [st_ra["counts"]["actions"],
+                                                st_rb["counts"]["actions"]], rs
+    reps = {w: SR.build_report(two, os.path.join(TMP, f"out_two_{w}"), members=2,
+                               epochs=3, run=w) for w in ("all", "latest", ra)}
+    for w, other, st_, tr_ in ((ra, rb, st_ra, truth_ra), ("latest", ra, st_rb, truth_rb)):
+        R = reps[w]
+        mine = rb if w == "latest" else ra
+        assert R["run_filter"]["selected"] == mine, R["run_filter"]
+        assert [r["run"] for r in R["runs_found"] if r["selected"]] == [mine]
+        c_ = st_["counts"]
+        A_ = R["A"]
+        assert list(A_["runs"]) == [mine], A_["runs"]
+        assert A_["sampled_steps"] == c_["actions"], (w, A_["sampled_steps"], c_)
+        assert A_["predictions"] == c_["predictions"] and A_["outcomes"] == c_["outcomes"]
+        assert A_["evaluator_partition_counts"]["observation"] == c_["evaluator_observations"]
+        assert sum(a["n"] for a in R["B"]["actions"].values()) == c_["actions"]
+        got_ = {s_: {k: v["n"] for k, v in d.items()}
+                for s_, d in R["B"]["actions_by_source"].items()}
+        assert got_ == {s_: dict(x) for s_, x in tr_["src"].items()}, (w, got_)
+        assert R["C"]["available"] and all(
+            k.split("|")[1].startswith(mine + "-e") for k in R["C"]["episodes"])
+        assert list(R["E"]["by_run"]) == [mine], R["E"]["by_run"]
+        for k in "ABCDE":
+            assert other not in json.dumps(R[k]), f"run {other} leaked into {k} ({w})"
+        md_ = open(os.path.join(TMP, f"out_two_{w}", "REPORT.md")).read()
+        assert other in md_[:md_.index("## A.")]          # listed, not reported
+        assert other not in md_[md_.index("## A."):], f"{other} in body ({w})"
+    Ra, Rb, Rall = reps[ra], reps["latest"], reps["all"]
+    for key in ("sampled_steps", "predictions", "outcomes", "episodes_total"):
+        assert Ra["A"][key] + Rb["A"][key] == Rall["A"][key], key
+    assert set(Rall["A"]["runs"]) == {ra, rb} and Rall["run_filter"]["selected"] == "all"
+    # all == the unfiltered computation (the pre-filter code path)
+    raw = SR.open_store(two)
+    g0 = SR.load_green(raw)
+    old = SR._clean({"A": SR.section_a(raw, g0), "B": SR.section_b(g0),
+                     "C": SR.section_c(raw), "E": SR.section_e(g0)})
+    for k in "ABCE":
+        assert Rall[k] == old[k], f"--run all differs from the unfiltered {k}"
+    # the proxy hides, the listing needs no evaluator decode
+    s3 = EvidenceStore(two, readonly=True)
+    s3._parts["evaluator"].decode = boom
+    rs3, attr3 = SR.list_runs(s3)
+    fa = SR.RunFilteredStore(s3, ra, attr3)
+    b_ref = next(r for r, x in attr3.items() if x == rb and r.startswith("dev/"))
+    for fn in (fa.learning_view().get, fa.learning_view().meta, fa.evaluator_view().kind):
+        try:
+            fn(b_ref)
+            raise AssertionError("run B ref visible through run A's view")
+        except KeyError:
+            pass
+    assert b_ref not in fa.learning_view().refs()
+    try:
+        SR.build_report(two, os.path.join(TMP, "out_two_bad"), run="nope")
+        raise AssertionError("unknown run id accepted")
+    except ValueError as e:
+        assert ra in str(e) and rb in str(e), e
+    print(f"  H. two-run store: --run {ra} -> {Ra['A']['sampled_steps']} sampled "
+          f"(== recorder A), latest -> {rb} ({Rb['A']['sampled_steps']}); no "
+          f"cross-run id in any section; all == unfiltered A/B/C/E and == A + B; "
+          f"hidden refs raise KeyError; unknown id rejected")
+
     # G
     r = subprocess.run([sys.executable, "tools/shadow_report.py", tiny, "--out",
                         os.path.join(TMP, "out_cli"), "--members", "2", "--epochs", "3"],
@@ -429,7 +582,7 @@ def main():
     assert os.path.exists(os.path.join(TMP, "out_cli", "REPORT.md"))
     for root, h in before.items():
         assert _tree(root) == h, f"{root} changed: the report wrote to the store"
-    print(f"  G. 3 stores byte-identical before/after ({sum(len(h) for h in before.values())} "
+    print(f"  G. {len(before)} stores byte-identical before/after ({sum(len(h) for h in before.values())} "
           f"files); CLI ok; total {time.time() - t_all:.1f}s")
     shutil.rmtree(TMP, ignore_errors=True)
     print("[foundation_shadow_report_smoke] ALL PASS")

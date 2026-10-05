@@ -399,5 +399,171 @@ def training_state_round_trip_resumes_bit_exact():
     assert all(torch.equal(x, y) for x, y in zip(_weights(r1), _weights(r2)))
 
 
+# ---- early stopping + failed fits (2026-10-05 review) -------------------------
+# docs/foundation/LEARNING_PROCESS_IMPROVEMENTS.md §5: a non-finite loss raised
+# mid-fit and left weights + the persistent Adam at the LAST epoch while
+# `version` was not bumped; a NaN min_delta passed the budget check; the
+# validation batch skipped _check; loss_last described a discarded epoch.
+# The toy cases drive _nets.train with a SCRIPTED validation curve so the
+# epoch that must be selected is known exactly; validation_fn snapshots the
+# weights it is called on, so "restored the best epoch" is checked bit-exact.
+def _toy(vals, nan_at=None, raise_at=None):
+    """-> (module, params, loss_fn, validation_fn, snaps). 4 rows, so
+    batch_size=2 is 2 optimizer steps per epoch. Loss call number `nan_at`
+    (1-based) returns NaN; call `raise_at` raises RuntimeError."""
+    with _nets.seeded(0):
+        mod = torch.nn.Linear(1, 1)
+    x = torch.linspace(0, 1, 4)[:, None]
+    y = 2 * x + 1
+    calls, snaps = [0], []
+
+    def loss_fn(idx):
+        calls[0] += 1
+        if calls[0] == raise_at:
+            raise RuntimeError("boom mid-fit")
+        if calls[0] == nan_at:
+            return torch.tensor(float("nan"))
+        i = torch.as_tensor(idx)
+        return ((mod(x[i]) - y[i]) ** 2).mean()
+
+    def validation_fn():
+        snaps.append([p.detach().clone() for p in mod.parameters()])
+        return vals[len(snaps) - 1]
+    return mod, list(mod.parameters()), loss_fn, validation_fn, snaps
+
+
+def _train_toy(vals, epochs, **kw):
+    nan_at, raise_at = kw.pop("nan_at", None), kw.pop("raise_at", None)
+    mod, ps, lf, vf, snaps = _toy(vals, nan_at, raise_at)
+    opt = torch.optim.Adam(ps, lr=0.05)
+    info = {}
+    hist = _nets.train(ps, lf, 4, epochs=epochs, batch_size=2, lr=0.05, seed=0,
+                       optimizer=opt, validation_fn=vf, module=mod, report=info, **kw)
+    return mod, ps, opt, snaps, hist, info
+
+
+def _is(ps, snap):
+    return all(torch.equal(p.detach(), q) for p, q in zip(ps, snap))
+
+
+@case
+def early_stopping_patience_restores_best_weights_and_moments():
+    mod, ps, opt, snaps, hist, info = _train_toy([3.0, 2.0, 2.5, 2.4, 1.0], 10,
+                                                 patience=2)
+    assert len(hist) == 4 and info["stop_reason"] == "patience", (hist, info)
+    assert info["selected_epoch"] == 2 and info["gradient_steps"] == 8, info
+    assert _is(ps, snaps[1]) and not _is(ps, snaps[3]), "best epoch not restored"
+    assert int(opt.state[ps[0]]["step"]) == 4, "optimizer not restored WITH weights"
+    assert _nets.DEFAULT_PATIENCE == 5
+
+
+@case
+def early_stopping_min_delta():
+    vals = [3.0, 2.95, 2.92, 2.91]
+    _, ps, _, snaps, hist, info = _train_toy(vals, 4, patience=3, min_delta=0.1)
+    assert info == {"selected_epoch": 1, "stop_reason": "patience",
+                    "gradient_steps": 8}, info
+    assert _is(ps, snaps[0])
+    _, ps, _, snaps, hist, info = _train_toy(vals, 4, patience=3, min_delta=0.0)
+    assert info["selected_epoch"] == 4 and info["stop_reason"] == "epochs", info
+    for bad in (float("nan"), float("inf"), -0.1):
+        raises(lambda: _train_toy(vals, 4, min_delta=bad), ValueError,
+               f"min_delta={bad}")
+    raises(lambda: _train_toy(vals, 4, patience=0), ValueError, "patience 0")
+
+
+@case
+def nan_validation_is_no_improvement():
+    nan = float("nan")
+    _, ps, _, snaps, hist, info = _train_toy([3.0, nan, 2.5], 3, patience=5)
+    assert info["selected_epoch"] == 3 and len(hist) == 3, info   # NaN did not stop it
+    _, ps, opt, snaps, hist, info = _train_toy([3.0, nan, nan, 0.1], 10, patience=2)
+    assert info["selected_epoch"] == 1 and info["stop_reason"] == "patience", info
+    assert _is(ps, snaps[0]) and int(opt.state[ps[0]]["step"]) == 2
+    raises(lambda: _train_toy([nan, nan], 2), FloatingPointError, "no finite val")
+
+
+@case
+def nonfinite_training_loss_and_exceptions_restore_best():
+    # call 6 = epoch 3, 2nd batch (one step of epoch 3 already taken)
+    _, ps, opt, snaps, hist, info = _train_toy([2.0, 1.0, 0.5], 5, nan_at=6)
+    assert info["stop_reason"] == "diverged" and info["selected_epoch"] == 2, info
+    assert len(hist) == 2 and _is(ps, snaps[1])
+    assert int(opt.state[ps[0]]["step"]) == 4, "epoch-3 step not undone"
+    raises(lambda: _train_toy([2.0], 5, nan_at=1), FloatingPointError, "nothing selected")
+    mod, ps, lf, vf, snaps = _toy([2.0, 1.0, 0.5], raise_at=6)
+    opt = torch.optim.Adam(ps, lr=0.05)
+    raises(lambda: _nets.train(ps, lf, 4, epochs=5, batch_size=2, lr=0.05, seed=0,
+                               optimizer=opt, validation_fn=vf, module=mod),
+           RuntimeError, "exception propagates")
+    assert _is(ps, snaps[1]) and int(opt.state[ps[0]]["step"]) == 4, \
+        "exception left the module at a discarded epoch"
+    mod, ps, lf, _, _ = _toy([], nan_at=3)                 # no validation -> raise
+    raises(lambda: _nets.train(ps, lf, 4, epochs=5, batch_size=2, lr=0.05, seed=0),
+           FloatingPointError, "no-validation divergence")
+
+
+def _full_state(m):
+    sd = {k: v.clone() for k, v in m.module.state_dict().items()}
+    st = None if m._opt is None else {
+        i: {k: (v.clone() if torch.is_tensor(v) else v) for k, v in s_.items()}
+        for i, s_ in m._opt.state_dict()["state"].items()}
+    return sd, st
+
+
+def _same_state(a, b):
+    (sa, oa), (sb, ob) = a, b
+    if set(sa) != set(sb) or not all(torch.equal(sa[k], sb[k]) for k in sa):
+        return False
+    if (oa is None) != (ob is None):
+        return False
+    return oa is None or all(
+        set(oa[i]) == set(ob[i]) and all(
+            torch.equal(oa[i][k], ob[i][k]) if torch.is_tensor(oa[i][k])
+            else oa[i][k] == ob[i][k] for k in oa[i]) for i in oa)
+
+
+@case
+def failed_fit_is_atomic_and_version_consistent():
+    b = _batch(B=32)
+    m = M.MLPMechanism(*ARGS, hidden=16, seed=0)
+    orig = m._forward
+    m._forward = lambda prep: (lambda o: (o[0] * float("nan"),) + tuple(o[1:]))(orig(prep))
+    raises(lambda: m.fit(b, epochs=2, batch_size=16), FloatingPointError, "first fit")
+    assert m.version == 0 and m._opt is None and not bool(m.module.out_std.fitted), \
+        "a failed FIRST fit left the standardiser frozen / an optimizer behind"
+    del m._forward
+    m.fit(b, epochs=2, batch_size=16)
+    before = _full_state(m)
+    calls = [0]
+
+    def late_nan(prep):                                     # diverge in epoch 2
+        calls[0] += 1
+        o = orig(prep)
+        return (o[0] * float("nan"),) + tuple(o[1:]) if calls[0] == 4 else o
+    m._forward = late_nan
+    raises(lambda: m.fit(b, epochs=3, batch_size=16), FloatingPointError, "second fit")
+    del m._forward
+    assert m.version == 1 and _same_state(_full_state(m), before), \
+        "failed fit changed state without a version bump"
+    rep = m.fit(b, epochs=1, batch_size=16)                 # recovers, same seed
+    assert m.version == 2 and rep["stop_reason"] == "epochs"
+
+
+@case
+def validation_batch_checked_and_selected_loss_reported():
+    b, v = _batch(B=32), _batch(B=8, seed=1)
+    m = M.MLPMechanism(*ARGS, hidden=16, seed=0)
+    raises(lambda: m.fit(b, validation="not a batch"), ContractError, "type")
+    raises(lambda: m.fit(b, validation=_batch(B=8, N=2)), ContractError, "wrong N")
+    assert m.version == 0
+    rep = m.fit(b, epochs=6, batch_size=16, validation=v, patience=2)
+    k = rep["selected_epoch"]
+    assert 1 <= k <= rep["epochs"] == len(rep["loss_hist"]) == len(rep["validation_loss"])
+    assert rep["loss_selected"] == rep["loss_hist"][k - 1]
+    assert rep["loss_last"] == rep["loss_hist"][-1]       # existing key unchanged
+    assert rep["gradient_steps"] >= rep["epochs"] * 2
+
+
 if __name__ == "__main__":
     sys.exit(run_all("foundation-mechanisms-unit"))

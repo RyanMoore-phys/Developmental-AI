@@ -129,33 +129,68 @@ def test_activity_never_outweighs_learning():
 
     Three terms pay for ACTIVITY regardless of meaning — coverage (distance
     travelled), novelty (unseen views) and gaze (where the camera points).
-    Three pay for LEARNING — symbol_weight (naming a new set of things),
-    new_symbol_bonus (acquiring a concept) and progress_weight (the world
-    model measurably improving). Each activity term must sit strictly below
-    every learning term.
+    Two pay for LEARNING — symbol_weight (naming a new set of things) and
+    new_symbol_bonus (acquiring a concept). Each activity term must sit
+    strictly below every learning term.
+
+    progress_weight USED to be the third learning term. Since 2026-10-05
+    (user-accepted) it is MEASUREMENT ONLY and pays nothing: a world-model
+    improvement does not establish credit for the action taken now, and the
+    per-step rate was an ambient wage. Leaving it in the comparison made
+    this test pass trivially on a weight that buys nothing, so the contract
+    for it is now the opposite one: measured, never paid —
+      * no reward path: the loop never calls record_reward("progress"...)
+        and never multiplies _progress_weight into anything (it is read
+        only as the on/off switch for the measurement);
+      * ProbeSetProgress.rate() is 0 even right after a real improvement.
 
     This is a REGRESSION guard, not a style check. Coverage has been retuned
     four times (0.45 -> 0.10 -> 0.30 -> 0.07) and each raise was locally
     justified — "something has to make the body move" — while producing an
     agent paid mostly to wander (measured: coverage 65% of the ledger).
     """
+    import re
     import yaml
-    with open(os.path.join(os.path.dirname(__file__), "..", "configs",
+    import torch
+    from developmental_ai.infra.progress_curiosity import ProbeSetProgress
+    here = os.path.dirname(__file__)
+    with open(os.path.join(here, "..", "configs",
                            "minecraft_skybot.yaml")) as f:
         cur = yaml.safe_load(f)["curiosity"]
     activity = {k: float(cur[k]) for k in
                 ("coverage_weight", "novelty_weight", "gaze_weight")}
     learning = {k: float(cur[k]) for k in
-                ("symbol_weight", "new_symbol_bonus", "progress_weight")}
+                ("symbol_weight", "new_symbol_bonus")}
     worst_learn = min(learning.values())
+    assert worst_learn > 0, learning
     for name, w in sorted(activity.items(), key=lambda kv: -kv[1]):
         assert w < worst_learn, (
             f"{name}={w} >= the weakest learning term ({worst_learn}) — "
             f"activity is being paid like discovery again")
     # and coverage specifically must not dominate the activity block either
     assert activity["coverage_weight"] <= 0.10, activity
+
+    # progress: measured, never paid
+    with open(os.path.join(here, "..", "developmental_ai", "core",
+                           "developmental_loop.py")) as f:
+        src = f.read()
+    assert not re.search(r"record_reward\(\s*[\"']progress[\"']", src), \
+        "a progress payment path is back in the loop"
+    uses = [ln.strip() for ln in src.splitlines() if "_progress_weight" in ln]
+    mult = re.compile(r"\*\s*(self\.)?_progress_weight|_progress_weight\s*\*")
+    for ln in uses:
+        assert not mult.search(ln.split("#")[0]), \
+            f"_progress_weight used as a multiplier: {ln}"
+    assert any("self._progress_weight > 0.0" in ln for ln in uses), uses
+    p = ProbeSetProgress(capacity=3, eval_every=1)
+    for i in range(3):
+        p.maybe_add_probe({"t": torch.tensor([[float(i)]])})
+    p.evaluate(lambda b: 1.0, 0, model_version="v0")
+    assert p.evaluate(lambda b: 0.25, 1, model_version="v1") > 0  # measured
+    assert p.rate() == 0.0 and p.stats["rate"] == 0.0             # unpaid
     print(f"  7. economy shape: activity {activity} all strictly below "
-          f"learning {learning}")
+          f"learning {learning}; progress_weight={cur['progress_weight']} "
+          f"is measurement only (measured > 0, paid 0)")
 
 
 if __name__ == "__main__":

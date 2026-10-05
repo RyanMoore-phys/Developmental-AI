@@ -37,12 +37,20 @@ WHAT IT MUST NEVER DO (tests/_foundation_shadow_smoke.py contract C)
       * never toggles train/eval mode, never takes gradients, and holds
         the loop's `_wm_param_lock` while it reads weights so an async
         optimizer step cannot be observed half-applied;
-      * never raises into the loop. Any exception, and any wall-time budget
-        overrun, disables the recorder for the rest of the run with ONE
-        logged warning.
+      * never raises into the loop. Any exception in the core recorder
+        disables it for the rest of the run with ONE logged warning. A
+        wall-time budget overrun DEGRADES IN STAGES (2026-10-05), one warning
+        per stage, a fresh budget window after each: "full" -> observable
+        forecasts off ("categorical") -> categorical predictions off
+        ("records") -> recorder disabled. stats()["stage"] says which.
+      * isolates the OPTIONAL observable forecast (observable_predict): its
+        exceptions are counted (counts["observable_errors"]) and never reach
+        the recorder-wide disable; `observable_max_failures` consecutive
+        failures at one site (forecast / persistence / score) turn ONLY the
+        observable forecast off, with one warning.
 
     ESCAPE (CLAUDE.md §4.1 — a guard needs a reachable re-opener): the
-    self-disable is per process. Fix the cause (raise max_ms_per_step, lower
+    self-disable and every degrade stage are per process. Fix the cause (raise max_ms_per_step, lower
     every_n_steps, free disk) and relaunch with foundation.shadow.enabled:
     true. Nothing persistent records the disable, so nothing can latch it.
 
@@ -89,8 +97,9 @@ SAMPLING AND BOUNDS
     max_bytes       the EvidenceStore's own retention budget (oldest
                     evidence evicted first; on-disk bytes never exceed it).
     max_ms_per_step amortised shadow wall time per loop step, averaged over
-                    `budget_window` steps; exceeding it disables the
-                    recorder. `max_ms_single_step` catches one pathological
+                    `budget_window` steps; exceeding it degrades the
+                    recorder one stage (observable -> categorical ->
+                    disabled), see "never raises" above. `max_ms_single_step` catches one pathological
                     stall (an fsync on a dying disk) without waiting for
                     the window.
 """
@@ -117,6 +126,10 @@ DEFAULTS = {
     "budget_window": 256,
     "max_ms_single_step": 2000.0,
     "predict": True,
+    "observable_predict": False,
+    # Consecutive failures at ONE observable site (forecast / persistence /
+    # score) before the observable forecast alone is switched off.
+    "observable_max_failures": 3,
     "fsync": False,
     # Max wait for the world model's param lock before SKIPPING one
     # prediction (2026-10-04). The async WM trainer holds that lock while it
@@ -148,7 +161,7 @@ def shadow_config(cfg: Optional[Dict]) -> Dict[str, Any]:
 class _Stream:
     __slots__ = ("idx", "name", "ep_n", "episode", "seq", "vec", "oracle",
                  "t_wall", "logged_seq", "any_logged", "ctx", "pid",
-                 "adapter", "green", "source")
+                 "adapter", "green", "source", "observable")
 
     def __init__(self, idx: int):
         self.idx = idx
@@ -165,6 +178,7 @@ class _Stream:
         self.pid = None            # prediction id made at seq this step
         self.adapter = None
         self.green = None          # the GREEN records logged at logged_seq
+        self.observable = None
         self.source = None         # who chose action `seq` (action_sources)
 
 
@@ -211,6 +225,11 @@ class ShadowRecorder:
         self.max_ms_single = float(sc["max_ms_single_step"])
         self.window = max(1, int(sc["budget_window"]))
         self.do_predict = bool(sc["predict"])
+        self.do_observable = bool(sc["observable_predict"])
+        self.obs_fail_limit = max(1, int(sc["observable_max_failures"]))
+        self._obs_fail_run = collections.Counter()   # site -> consecutive
+        self.observable_off_reason: Optional[str] = None
+        self.degraded: List[Dict[str, str]] = []     # budget stages taken
         self.lock_timeout_s = max(0.0, float(sc["predict_lock_timeout_ms"])) / 1000.0
         self.t = collections.defaultdict(float)   # ms: lock_wait, predict, write
         self.bus = bus
@@ -239,9 +258,11 @@ class ShadowRecorder:
         self.n = collections.Counter()
         self.ms_hist: List[float] = []      # per-step shadow ms (bounded)
         logger.info("foundation.shadow ON: root=%s every_n_steps=%d "
-                    "max_bytes=%d max_ms_per_step=%.2f predict=%s run=%s",
+                    "max_bytes=%d max_ms_per_step=%.2f predict=%s "
+                    "observable_predict=%s run=%s",
                     self.store.root, self.every, self.store.max_bytes,
-                    self.max_ms, self.do_predict, self.run_id)
+                    self.max_ms, self.do_predict, self.do_observable,
+                    self.run_id)
 
     def _ensure_streams(self, n: int) -> None:
         while len(self.streams) < n:
@@ -258,6 +279,7 @@ class ShadowRecorder:
         st.ep_n += 1
         st.seq = 0
         st.vec = st.oracle = st.ctx = st.pid = st.green = None
+        st.observable = None
         st.logged_seq = -1
         st.any_logged = False
 
@@ -292,31 +314,89 @@ class ShadowRecorder:
                        f"{self.max_ms_single:.1f}")
         elif len(self._ms) >= self.window:
             mean = float(np.mean(self._ms))
-            if mean > self.max_ms and self.do_predict:
-                # DEGRADE BEFORE DYING (2026-10-04). The prediction is the
-                # expensive part (lock + GPU forward); observations, actions
-                # and outcomes are cheap and are the evidence itself. Drop
-                # predictions, start a fresh window, and only disable the
-                # whole recorder if it is STILL over budget.
+            if mean <= self.max_ms:
+                return
+            # DEGRADE BEFORE DYING, IN STAGES (2026-10-04, staged 2026-10-05).
+            # Most expensive first: the observable forecast (a full decoder
+            # forward inside the WM lock), then the categorical prediction
+            # (lock + GRU forward). Observations, actions and outcomes are
+            # cheap and are the evidence itself. Each stage starts a fresh
+            # window; only a recorder STILL over budget with both off dies.
+            totals = (f"totals ms: lock_wait {self.t['lock_wait']:.0f}, "
+                      f"predict {self.t['predict']:.0f}, observable "
+                      f"{self.t['observable']:.0f}, write "
+                      f"{self.t['write']:.0f}")
+            if self.do_predict and self.do_observable:
+                self._ms.clear()
+                self.degraded.append({"stage": "categorical",
+                                      "reason": f"mean {mean:.3f} ms/step"})
+                self._observable_off(
+                    f"mean {mean:.3f} ms/step over {self.window} steps > "
+                    f"max_ms_per_step {self.max_ms:.3f}; {totals}")
+            elif self.do_predict:
                 self.do_predict = False
                 self.warnings += 1
                 self._ms.clear()
+                self.degraded.append({"stage": "records",
+                                      "reason": f"mean {mean:.3f} ms/step"})
                 logger.warning(
                     "foundation.shadow: predictions OFF for the rest of this "
                     "run (mean %.3f ms/step over %d steps > max_ms_per_step "
-                    "%.3f; totals ms: lock_wait %.0f, predict %.0f, write "
-                    "%.0f; %d predictions skipped on a busy lock). Still "
+                    "%.3f; %s; %d predictions skipped on a busy lock). Still "
                     "recording observations, actions and outcomes.",
-                    mean, self.window, self.max_ms, self.t["lock_wait"],
-                    self.t["predict"], self.t["write"],
+                    mean, self.window, self.max_ms, totals,
                     self.n["skipped_lock_busy"])
-            elif mean > self.max_ms:
+            else:
                 self._fail(f"mean shadow cost {mean:.3f} ms/step over the "
                            f"last {len(self._ms)} steps > max_ms_per_step "
                            f"{self.max_ms:.3f} (predictions already off; "
-                           f"totals ms: lock_wait {self.t['lock_wait']:.0f}, "
-                           f"predict {self.t['predict']:.0f}, write "
-                           f"{self.t['write']:.0f})")
+                           f"{totals})")
+
+    # ------------------------------------------- observable isolation
+    def _observable_off(self, why: str) -> None:
+        """Observable forecast off for the rest of the run. ONE warning.
+        Per process (relaunch to re-enable), like every other stage."""
+        if not self.do_observable:
+            return
+        self.do_observable = False
+        self.observable_off_reason = why
+        self.warnings += 1
+        logger.warning(
+            "foundation.shadow: observable forecasts OFF for the rest of this "
+            "run (%s). Still recording categorical predictions (if on), "
+            "observations, actions and outcomes.", why)
+
+    def _observable_error(self, site: str, e: BaseException) -> None:
+        self.n["observable_errors"] += 1
+        self.n[f"observable_errors:{site}"] += 1
+        self._obs_fail_run[site] += 1
+        logger.debug("foundation.shadow observable %s failed: %s: %s",
+                     site, type(e).__name__, e)
+        if self._obs_fail_run[site] >= self.obs_fail_limit:
+            self._observable_off(
+                f"{self._obs_fail_run[site]} consecutive {site} failures, "
+                f"last {type(e).__name__}: {e}")
+
+    def _observable_ok(self, site: str) -> None:
+        self._obs_fail_run[site] = 0
+
+    def _rows_of(self, observations, idx: List[int]) -> np.ndarray:
+        """Host float32 copies of rows `idx` of the loop's observations.
+
+        Preferred input: the numpy obs the loop already has (an ndarray or a
+        list of per-stream arrays) — no device traffic at all. A torch tensor
+        is accepted; a NON-CPU one forces a device->host copy (and a sync
+        with queued kernels) and is counted as observable_device_copies."""
+        if hasattr(observations, "detach"):          # torch.Tensor
+            if observations.device.type != "cpu":
+                self.n["observable_device_copies"] += 1
+            sel = observations[list(idx)]
+            return sel.detach().to("cpu").float().numpy().reshape(len(idx), -1)
+        if isinstance(observations, (list, tuple)):
+            return np.stack([np.asarray(observations[i], np.float32).reshape(-1)
+                             for i in idx])
+        x = np.asarray(observations, dtype=np.float32)
+        return x[np.asarray(idx, dtype=np.int64)].reshape(len(idx), -1)
 
     # ------------------------------------------------------- records
     def _green(self, st: _Stream, vec, seq: int, t_wall: float):
@@ -394,7 +474,7 @@ class ShadowRecorder:
 
     # -------------------------------------------------- the two calls
     def before_step(self, rssm_state, actions, lock=None,
-                    world_model=None, executor=None) -> None:
+                    world_model=None, executor=None, observations=None) -> None:
         """Called after action selection, BEFORE env.step. On a sampled step
         logs every stream's observation t and the world model's prediction
         for the action about to be executed, and notes which actor chose
@@ -411,6 +491,7 @@ class ShadowRecorder:
                 st.pid = None
                 st.ctx = None
                 st.source = None
+                st.observable = None
             if not self._sampled:
                 return
             srcs = action_sources(executor, len(actions))
@@ -429,7 +510,7 @@ class ShadowRecorder:
                 st.ctx = {o.channel: o for o in st.green}
                 ready.append(st)
             if ready and self.do_predict and world_model is not None:
-                self._predict(ready, rssm_state, actions, lock, world_model)
+                self._predict(ready, rssm_state, actions, lock, world_model, observations)
         except Exception as e:
             self._fail(f"before_step raised {type(e).__name__}: {e}")
         finally:
@@ -444,7 +525,7 @@ class ShadowRecorder:
         except Exception:
             return "unknown"
 
-    def _predict(self, ready, rssm_state, actions, lock, world_model) -> None:
+    def _predict(self, ready, rssm_state, actions, lock, world_model, observations=None) -> None:
         import torch
         from ..contracts import Prediction
         r = world_model.rssm
@@ -477,32 +558,64 @@ class ShadowRecorder:
         self.t["lock_wait"] += (tp - tw) * 1000.0
         if not got:
             self.n["skipped_lock_busy"] += 1
+            for st in rows:
+                source = (st.source or {}).get("source", "unknown")
+                self.n[f"skipped_lock_busy:{st.name}:{source}"] += 1
             return
+        want_obs = self.do_observable and observations is not None
+        decoded = None
+        obs_ms = 0.0
         try:
             with torch.no_grad():
                 h0 = rssm_state["h"]
                 idx = torch.as_tensor([st.idx for st in rows], device=h0.device,
                                       dtype=torch.long)
-                probs = rssm_prior_probs(r, h0.index_select(0, idx),
+                h1, logits = _prior_step(r, h0.index_select(0, idx),
                                          rssm_state["z"].index_select(0, idx),
                                          a)
+                probs = _probs_np(logits, len(rows), S, C)
+                if want_obs:
+                    # Only WEIGHT READS live inside the lock: the decoder
+                    # forward on the h1/logits just computed (no second GRU
+                    # transition), one host copy. Pooling happens below.
+                    to = time.perf_counter()
+                    try:
+                        from .observable import decode_prior_mode
+                        decoded = (decode_prior_mode(world_model, h1, logits)
+                                   .float().cpu().numpy())
+                        self._observable_ok("forecast")
+                    except Exception as e:          # noqa: BLE001 — isolated
+                        decoded = None
+                        self._observable_error("forecast", e)
+                    obs_ms = (time.perf_counter() - to) * 1000.0
+                    self.t["observable"] += obs_ms
             version = self._model_version(world_model)
         finally:
             if lock is not None:
                 lock.release()
         tw2 = time.perf_counter()
-        self.t["predict"] += (tw2 - tp) * 1000.0
+        # "predict" = the categorical part; the decoder forward is in
+        # "observable" (so the totals in a degrade warning do not overlap)
+        self.t["predict"] += (tw2 - tp) * 1000.0 - obs_ms
+        if decoded is not None:
+            self._forecast(rows, decoded, world_model, observations)
+            tw2 = time.perf_counter()
         snap = f"{self.run_id}:world_model.rssm@{version}"
         t_pred = time.time()
         for i, st in enumerate(rows):
             ctx = next(iter(st.ctx.values()))
             pid = f"{st.name}:{st.episode}:{st.seq}:p"
+            outcome = {"kind": "rssm_prior_categorical",
+                       "probs": probs[i:i + 1].astype(np.float32)}
+            if st.observable is not None:
+                # OPTIONAL key: absent when the feature is off, so stores
+                # without it read as "unrecorded", exactly like old ones.
+                outcome["observable"] = st.observable
             pred = Prediction(
                 pid, f"rssm:{st.name}:{st.episode}:{st.seq}",
                 {"world_model.rssm": version}, snap, self.spec_id,
                 (cmds[i],), 1,
-                {"kind": "rssm_prior_categorical",
-                 "probs": probs[i:i + 1].astype(np.float32)},
+                outcome,
                 t_pred,
                 {"sampling": "none: prior probabilities, no RNG draw",
                  "knowledge": "not conditioned",
@@ -513,9 +626,78 @@ class ShadowRecorder:
             self.n["predictions"] += 1
         self.t["write"] += (time.perf_counter() - tw2) * 1000.0
 
+    def _forecast(self, rows, decoded, world_model, observations) -> None:
+        """Pool forecast + persistence baseline on the HOST, outside the
+        lock. Failures are isolated (see _observable_error)."""
+        from .observable import PROBE_SIDE, pool_observation, probe_meta
+        to = time.perf_counter()
+        try:
+            meta = probe_meta(world_model)
+            predicted = pool_observation(decoded, **meta)
+            persistence = pool_observation(
+                self._rows_of(observations, [st.idx for st in rows]), **meta)
+            if predicted.shape != persistence.shape:
+                raise ValueError(f"forecast {predicted.shape} vs observation "
+                                 f"{persistence.shape}")
+            target = (f"pooled-pov-{PROBE_SIDE}x{PROBE_SIDE}"
+                      if meta["pixel"] else "observation")
+            for j, st in enumerate(rows):
+                st.observable = {
+                    "prediction": predicted[j].copy(),
+                    "persistence": persistence[j].copy(),
+                    "pixel": meta["pixel"], "channels": meta["channels"],
+                    "side": meta["size"], "probe_side": PROBE_SIDE,
+                    "horizon": 1, "units": "observation units",
+                    "decoder": "categorical-mode", "target": target}
+            self._observable_ok("persistence")
+        except Exception as e:                      # noqa: BLE001 — isolated
+            for st in rows:
+                st.observable = None
+            self._observable_error("persistence", e)
+        finally:
+            self.t["observable"] += (time.perf_counter() - to) * 1000.0
+
+    def _score(self, forecast, boundary, observations, e) -> Dict[str, Any]:
+        """Score a filed forecast against obs t+1, pooled in numpy on the
+        host obs (no device traffic when the loop passes numpy)."""
+        scored = {"status": ("invalid-boundary" if boundary
+                             else "missing-outcome"),
+                  "horizon": 1, "target": forecast["target"]}
+        if boundary or observations is None:
+            return scored
+        if not self.do_observable:
+            scored["status"] = "observable-off"
+            return scored
+        from .observable import pool_observation
+        to = time.perf_counter()
+        try:
+            target = pool_observation(
+                self._rows_of(observations, [e]), forecast["pixel"],
+                forecast["channels"], forecast["side"],
+                forecast.get("probe_side", 8))[0]
+            pred, base = forecast["prediction"], forecast["persistence"]
+            if target.shape != pred.shape:
+                raise ValueError(f"outcome {target.shape} vs forecast "
+                                 f"{pred.shape}")
+            if np.isfinite(target).all() and np.isfinite(pred).all():
+                scored.update(
+                    status="scored", target_value=target,
+                    mse=float(np.mean((pred - target) ** 2)),
+                    persistence_mse=float(np.mean((base - target) ** 2)))
+                self.n["observable_scored"] += 1
+            else:
+                scored["status"] = "non-finite"
+            self._observable_ok("score")
+        except Exception as ex:                     # noqa: BLE001 — isolated
+            scored["status"] = "score-error"
+            self._observable_error("score", ex)
+        finally:
+            self.t["observable"] += (time.perf_counter() - to) * 1000.0
+        return scored
+
     def after_step(self, step_infos, actions, rewards, dones, restarted,
                    ends, t_dispatch, prim_extrinsic=None, intrinsic=None,
-                   fleet_reset=False, dream=False) -> None:
+                   fleet_reset=False, dream=False, observations=None) -> None:
         """Called once per step AFTER reward assembly and BEFORE the loop
         advances/resets streams. `ends[e]` = (terminated, truncated,
         t_result) per env. Logs action t, obs t+1 and the evidence on a
@@ -527,7 +709,7 @@ class ShadowRecorder:
         try:
             self._after(step_infos, actions, rewards, dones, restarted, ends,
                         t_dispatch, prim_extrinsic, intrinsic, fleet_reset,
-                        dream)
+                        dream, observations)
         except Exception as e:
             self._fail(f"after_step raised {type(e).__name__}: {e}")
         finally:
@@ -536,7 +718,7 @@ class ShadowRecorder:
                 self._end_step_budget()
 
     def _after(self, step_infos, actions, rewards, dones, restarted, ends,
-               t_dispatch, prim_extrinsic, intrinsic, fleet_reset, dream):
+               t_dispatch, prim_extrinsic, intrinsic, fleet_reset, dream, observations=None):
         from ..contracts import UNKNOWN, Action, Evidence
         n = len(actions)
         self._ensure_streams(n)
@@ -581,6 +763,9 @@ class ShadowRecorder:
                                else rewards[e]),
                            "done": bool(dones[e]), "terminated": bool(term),
                            "truncated": bool(trunc)}
+                    if st.observable is not None:
+                        pay["observable_score"] = self._score(
+                            st.observable, boundary, observations, e)
                     if intrinsic is not None:
                         pay["intrinsic"] = float(intrinsic[e])
                     eid = f"ev:{st.name}:{st.episode}:{st.seq}"
@@ -618,12 +803,24 @@ class ShadowRecorder:
         return {"enabled": self.enabled, "disabled_reason": self.disabled_reason,
                 "warnings": self.warnings, "counts": dict(self.n),
                 "predicting": self.do_predict,
+                "observable_predicting": self.do_observable,
+                "observable_off_reason": self.observable_off_reason,
+                "stage": self.stage(), "degraded": list(self.degraded),
                 "ms_totals": {k: round(v, 1) for k, v in self.t.items()},
                 "ms_per_step_mean": float(ms.mean()) if ms.size else 0.0,
                 "ms_per_step_p95": (float(np.percentile(ms, 95))
                                     if ms.size else 0.0),
                 "store_bytes": self.store.disk_bytes(),
                 "root": self.store.root, "run_id": self.run_id}
+
+    def stage(self) -> str:
+        """full (categorical + observable) / categorical / records /
+        disabled. "categorical" also when observable_predict was never on."""
+        if not self.enabled:
+            return "disabled"
+        if not self.do_predict:
+            return "records"
+        return "full" if self.do_observable else "categorical"
 
     def close(self) -> None:
         try:
@@ -697,16 +894,23 @@ def rssm_prior_probs(rssm, h, z, actions) -> np.ndarray:
     """
     import torch
     with torch.no_grad():
-        dev = h.device
-        at = torch.as_tensor(np.asarray(actions, np.float32), device=dev)
-        if getattr(rssm, "film", None) is not None:
-            base = rssm.film(at, z)
-        else:
-            base = torch.cat([z, at], dim=-1)
-        h1 = rssm.gru_norm(rssm.gru(rssm.gru_input_proj(base), h))
-        S, C = int(rssm.stochastic_size), int(rssm.stochastic_classes)
-        logits = rssm.prior_net(h1).view(h.shape[0], S, C)
-        return torch.softmax(logits.float(), -1).cpu().numpy()
+        _, logits = _prior_step(rssm, h, z, actions)
+        return _probs_np(logits, h.shape[0], int(rssm.stochastic_size),
+                         int(rssm.stochastic_classes))
+
+
+def _prior_step(rssm, h, z, actions):
+    """(h_{t+1}, prior logits) — the one transition both the categorical
+    prediction and the observable forecast read (observable.prior_step)."""
+    import torch
+    from .observable import prior_step
+    at = torch.as_tensor(np.asarray(actions, np.float32), device=h.device)
+    return prior_step(rssm, {"h": h, "z": z}, at)
+
+
+def _probs_np(logits, k: int, S: int, C: int) -> np.ndarray:
+    import torch
+    return torch.softmax(logits.view(k, S, C).float(), -1).cpu().numpy()
 
 
 def _scope(environment: str, st: _Stream):

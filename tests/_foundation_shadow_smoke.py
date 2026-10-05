@@ -34,7 +34,11 @@ CONTRACTS
        _collect_segment — and zero times in _run_episode. In each body the
        order is before_step < env dispatch < replay add < PPO store <
        after_step < the advance/reset, i.e. the prediction precedes the
-       outcome and the record sees FINAL reward values.
+       outcome and the record sees FINAL reward values. The observable
+       path is handed the HOST observation lists (obs_list /
+       next_obs_list), never the device tensors obs_t / next_obs_t: a
+       device tensor forces a GPU->host copy on the acting thread
+       (counted as observable_device_copies; 2026-10-05).
     C. NON-INTERFERENCE A/B on the real bodies (fake sensed CartPole, 2
        streams; lifelong _collect_segment with WM training + a PPO update,
        and episodic _run_episode_parallel): shadow OFF vs ON (every step
@@ -54,9 +58,12 @@ CONTRACTS
        and returned at that step; episodes end as terminated (CartPole) and
        as client_recovery (driven directly) with the prediction left
        unresolved; the shadow prior equals RSSMPredictor's horizon-1 probs.
-    E. Self-disable: a wall-time budget overrun and an exception inside the
-       recorder each produce exactly ONE warning, disable the recorder, and
-       the loop keeps collecting. An unstartable store returns None at
+    E. Self-disable: a wall-time budget overrun DEGRADES IN STAGES — one
+       warning per stage, a fresh window each: observable forecasts off,
+       then categorical predictions off, then the recorder disabled
+       (2026-10-05; three windows) — and an exception inside the core
+       recorder produces exactly ONE warning and disables it; the loop
+       keeps collecting either way. An unstartable store returns None at
        construction (a shadow cannot stop the learner from booting).
     F. Overhead is measured and printed (ms/step off vs on).
     G. A held WM lock never blocks the acting thread.
@@ -74,6 +81,29 @@ CONTRACTS
        (B); in the real-body run (no executor) every recorded action is
        "policy" (D). Optional field: stores without it still load
        (_foundation_shadow_report_smoke B, "unrecorded").
+    I. PIXEL OBSERVABLE FORECAST (2026-10-05). Contract C only ever drove a
+       vector (CartPole) model, so the pixel path — decoder forward, 8x8
+       pooling, scoring — had never run. A tiny pixel world model (3x16x16,
+       learner = posterior observe_step [draws torch RNG] + a real optimizer
+       step under the WM lock, numpy obs exactly as the loop holds them),
+       shadow OFF vs ON (observable on, every step): byte-identical weights,
+       optimizer state, losses, latent state, obs and torch/numpy RNG. The
+       ON run files a forecast for every prediction and scores every
+       outcome; the forecast equals an INDEPENDENT second transition +
+       decode (so reusing the categorical prediction's h1/logits changed
+       nothing), the numpy pooling equals torch's adaptive_avg_pool2d, and
+       the scored target / persistence MSE recompute from the raw frames.
+       No device copies (numpy obs). Falsifier: a recorder drawing one torch
+       random per step moves the fingerprints.
+    J. OBSERVABLE ISOLATION + STAGES (2026-10-05). A decoder that raises
+       never reaches the recorder-wide disable: categorical predictions keep
+       being filed, `observable_max_failures` consecutive failures turn ONLY
+       the observable forecast off (one warning), records then carry no
+       "observable" key. A malformed outcome observation fails at the score
+       site the same way. Driven directly over budget, the stages fire in
+       order full -> categorical -> records -> disabled with exactly three
+       warnings. observable_predict off: no "observable" key in prediction
+       outcomes, no observable_score in evidence (old-store shape).
 
 Run: PYTHONPATH=. python tests/_foundation_shadow_smoke.py   (needs gymnasium)
 """
@@ -103,12 +133,12 @@ BEFORE = ("self._shadow.before_step(rssm_state, env_actions,\n"
           "                                         self._wm_param_lock, "
           "self.world_model,\n"
           "                                         "
-          "executor=self.option_executor)")
+          "executor=self.option_executor, observations=obs_list)")
 AFTER = ("self._shadow.after_step(\n"
          "                    step_infos, env_actions, rewards, dones, "
          "restarted,\n"
          "                    _sh_ends, _t_env0, prim_extrinsic, intrinsic,\n"
-         "                    _sh_fleet_reset, use_dream_actor)")
+         "                    _sh_fleet_reset, use_dream_actor, observations=next_obs_list)")
 
 
 class _Warnings(logging.Handler):
@@ -181,6 +211,9 @@ def test_source():
     src = open(LOOP).read()
     assert src.count(BEFORE) == 2, src.count(BEFORE)
     assert src.count(AFTER) == 2, src.count(AFTER)
+    # Falsifier: the device-tensor form must be gone from BOTH bodies.
+    assert "observations=obs_t)" not in src, "device obs to shadow"
+    assert "observations=next_obs_t)" not in src, "device next obs to shadow"
     tt = "_sh_ends.append((bool(term), bool(trunc), time.time()))"
     assert src.count(tt) == 2
     legacy = _body(src, "_run_episode")
@@ -199,7 +232,7 @@ def test_source():
         assert order == sorted(order), (name, order)
     print("  B. before_step x2 / after_step x2 (identical text), 0 in "
           "_run_episode; per body: predict < dispatch < replay < PPO store "
-          "< record < advance")
+          "< record < advance; host obs lists, not device tensors")
 
 
 # ------------------------------------------------------ the fake sensed env
@@ -296,7 +329,7 @@ def _cfg(lifelong, shadow=None):
 
 def _shadow_cfg(root, **kw):
     d = {"enabled": True, "root": root, "max_bytes": 1 << 26,
-         "chunk_bytes": 1 << 16, "every_n_steps": 1,
+         "chunk_bytes": 1 << 16, "every_n_steps": 1, "observable_predict": True,
          "max_ms_per_step": 1e6, "max_ms_single_step": 1e7}
     d.update(kw)
     return d
@@ -580,15 +613,23 @@ def test_self_disable():
             budget_window=3), segments=2)
     finally:
         _release(h)
-    # DEGRADE, THEN DIE (2026-10-04): window 1 over budget -> predictions
-    # off (warning 1); window 2 still over -> recorder off (warning 2).
+    # DEGRADE IN STAGES, THEN DIE (2026-10-05): window 1 over budget ->
+    # observable forecasts off (warning 1); window 2 -> categorical
+    # predictions off (warning 2); window 3 still over -> recorder off (3).
     assert not sh.enabled and "max_ms_per_step" in sh.disabled_reason
     assert "predictions already off" in sh.disabled_reason
-    assert len(h.msgs) == 2 and "predictions OFF" in h.msgs[0], h.msgs
-    assert sh.n["steps"] == 6, sh.n          # two windows of 3
+    assert len(h.msgs) == 3, h.msgs
+    assert "observable forecasts OFF" in h.msgs[0], h.msgs
+    assert "predictions OFF" in h.msgs[1], h.msgs
+    assert "DISABLED" in h.msgs[2], h.msgs
+    assert [d["stage"] for d in sh.degraded] == ["categorical", "records"]
+    assert sh.stage() == "disabled"
+    assert sh.n["steps"] == 9, sh.n          # three windows of 3
+    assert sh.n.get("observable_errors", 0) == 0, sh.n
     assert ai.total_timesteps == 2 * 40 * 2  # the loop kept collecting
-    print(f"  E. budget overrun -> predictions off after 3 steps, recorder "
-          f"off after {sh.n['steps']} (2 warnings); loop finished all "
+    print(f"  E. budget overrun -> observable off after 3 steps, "
+          f"predictions off after 6, recorder off after {sh.n['steps']} "
+          f"(3 warnings, one per stage); loop finished all "
           f"{ai.total_timesteps} transitions")
 
     # an exception inside the recorder
@@ -698,6 +739,8 @@ def main():
         test_source()
         test_busy_lock()
         test_action_source()
+        test_pixel_observable()
+        test_observable_isolation()
         if importlib.util.find_spec("gymnasium") is None:
             print("  C-F. SKIPPED: gymnasium absent here (they drive the real "
                   "loop; CI and the host run them). A-B are the local "
@@ -891,6 +934,311 @@ def test_action_source():
           f"nested child-as-actor / option_fallback read correctly, state "
           f"pickles identical after the read, act() unchanged; "
           f"{len(pays)} recorded Action payloads carry the source per stream")
+
+
+# ------------------------------------------- I. pixel observable forecast
+PIX = {"C": 3, "S": 16, "A": 3, "n": 2, "steps": 12}
+
+
+def _pixel_wm():
+    import torch
+    from developmental_ai.world_model.rssm import WorldModel
+    torch.manual_seed(0)
+    return WorldModel(obs_dim=PIX["C"] * PIX["S"] ** 2, action_dim=PIX["A"],
+                      stochastic_size=4, stochastic_classes=4,
+                      deterministic_size=16, hidden_dim=16, pixel_obs=True,
+                      image_channels=PIX["C"], image_size=PIX["S"])
+
+
+def _tpool(x, size=None):
+    """The torch reference for the 8x8 observable target."""
+    import torch
+    import torch.nn.functional as F
+    size = size or PIX["S"]
+    t = torch.as_tensor(np.asarray(x, np.float32)).reshape(
+        -1, PIX["C"], size, size)
+    return F.adaptive_avg_pool2d(t, (8, 8)).flatten(1).numpy()
+
+
+def _pixel_run(shadow):
+    """A tiny pixel learner shaped like the live one: numpy frames (what the
+    loop holds in obs_list), a posterior observe_step that SAMPLES (train
+    mode: Gumbel, torch RNG) and a real world-model optimizer step under the
+    WM lock. Single-threaded so the A/B is deterministic. `shadow` is a
+    foundation.shadow block, or None for the OFF arm. Both arms also compute
+    the independent reference forecast (pure: no RNG, no grads, no writes),
+    so that computation is not a difference between them."""
+    import threading
+    import torch
+    import torch.nn.functional as F
+    from developmental_ai.foundation.runtime import (ShadowRecorder,
+                                                     rssm_prior_probs)
+    from developmental_ai.foundation.runtime.observable import (
+        predict_observation)
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+    wm = _pixel_wm()
+    lock = threading.RLock()
+    n, A, D = PIX["n"], PIX["A"], PIX["C"] * PIX["S"] ** 2
+    rec = None if shadow is None else ShadowRecorder.from_config(
+        {"foundation": {"shadow": shadow}}, bus=None, action_dim=A,
+        is_discrete=True, num_streams=n, environment="pixel")
+    rng = np.random.default_rng(7)            # the world: local generator
+    frames = [rng.random((n, D), dtype=np.float32)]
+    state = wm.rssm.initial_state(n, torch.device("cpu"))
+    infos = [{"proprio": np.ones(3, np.float32)} for _ in range(n)]
+    losses, expected, expected_probs = [], [], []
+    for _k in range(PIX["steps"]):
+        obs = frames[-1]
+        acts = [int(x) for x in rng.integers(0, A, n)]
+        a1h = torch.eye(A)[acts]
+        expected.append(predict_observation(wm, state, a1h).numpy().copy())
+        expected_probs.append(rssm_prior_probs(wm.rssm, state["h"],
+                                               state["z"], a1h.numpy()))
+        if rec is not None:
+            rec.before_step(state, acts, lock, wm, observations=obs)
+        nxt = np.clip(0.8 * obs + 0.2 * rng.random((n, D), dtype=np.float32),
+                      0.0, 1.0).astype(np.float32)
+        if rec is not None:
+            t = time.time()
+            rec.after_step(infos, acts, [0.0] * n, [False] * n, [False] * n,
+                           [(False, False, time.time())] * n, t,
+                           observations=nxt)
+        with lock:                                # the trainer's update
+            post, _ = wm.rssm.observe_step(state, a1h,
+                                           wm.embed(torch.from_numpy(nxt)))
+            loss = F.mse_loss(wm.decoder(wm.rssm.get_latent(post)),
+                              torch.from_numpy(nxt))
+            wm.optimizer.zero_grad()
+            loss.backward()
+            wm.optimizer.step()
+        state = {kk: v.detach() for kk, v in post.items()}
+        losses.append(float(loss))
+        frames.append(nxt)
+    fp = {"wm": _h(*[v.detach().numpy() for v in wm.state_dict().values()]),
+          "optimizer": _h(*_arrays_of(wm.optimizer.state_dict())),
+          "losses": repr(losses),
+          "latent_state": _h(state["h"].numpy(), state["z"].numpy()),
+          "frames": _h(*frames),
+          "torch_rng": _h(torch.get_rng_state().numpy()),
+          "numpy_rng": repr(np.random.get_state()[1][:8].tolist()),
+          "python_rng": repr(random.getstate()[1][:8])}
+    if rec is not None:
+        rec.close()
+    return fp, rec, frames, expected, expected_probs
+
+
+def test_pixel_observable():
+    import torch
+    from developmental_ai.foundation.experience import EvidenceStore
+    from developmental_ai.foundation.runtime import ShadowRecorder
+    from developmental_ai.foundation.runtime.observable import (
+        pool_observation)
+    C, S, n = PIX["C"], PIX["S"], PIX["n"]
+    # the numpy pooling IS torch's adaptive_avg_pool2d: block case (16 -> 8)
+    # and the uneven-bin case (12 -> 8), so a future size cannot drift
+    g = np.random.default_rng(3)
+    x = g.random((2, C * S * S), dtype=np.float32)
+    assert np.allclose(pool_observation(x, True, C, S), _tpool(x), atol=1e-6)
+    y = g.random((2, C * 12 * 12), dtype=np.float32)
+    assert np.allclose(pool_observation(y, True, C, 12), _tpool(y, 12),
+                       atol=1e-6)
+    x0 = x.copy()
+    pool_observation(x, True, C, S)
+    assert np.array_equal(x, x0), "pooling modified its input"
+
+    root = os.path.join(TMP, "store_pixel")
+    off, _, _, _, _ = _pixel_run(None)
+    on, rec, frames, expected, eprobs = _pixel_run(_shadow_cfg(root))
+    diff = [k for k in off if off[k] != on[k]]
+    assert not diff, f"pixel: shadow ON changed the learner: {diff}"
+    st = rec.stats()
+    cn = st["counts"]
+    want = n * (PIX["steps"] - 1)           # step 0 has no context yet
+    assert rec.enabled and rec.stage() == "full", st
+    assert cn.get("predictions") == want, cn
+    assert cn.get("observable_scored") == want, cn
+    assert cn.get("observable_errors", 0) == 0, cn
+    assert cn.get("observable_device_copies", 0) == 0, cn   # numpy obs
+
+    ev = EvidenceStore(root, readonly=True).evaluator_view()
+    preds = {}
+    for r in ev.refs("prediction"):
+        p = ev.get(r)
+        name, _ep, seq, _p = p.prediction_id.split(":")
+        preds[(name, int(seq))] = p
+    assert len(preds) == want, len(preds)
+    for (name, seq), p in preds.items():
+        e = int(name.split("-")[1])
+        ob = p.outcome["observable"]
+        assert ob["target"] == "pooled-pov-8x8" and bool(ob["pixel"]), ob
+        pr = np.asarray(ob["prediction"], np.float32)
+        assert pr.shape == (C * 64,), pr.shape
+        # h1/logits reuse == an independent second transition + decode
+        ref = _tpool(expected[seq][e:e + 1])[0]
+        assert np.allclose(pr, ref, atol=1e-5), np.abs(pr - ref).max()
+        assert np.allclose(np.asarray(ob["persistence"]),
+                           _tpool(frames[seq][e:e + 1])[0], atol=1e-6)
+        assert np.allclose(np.asarray(p.outcome["probs"])[0],
+                           eprobs[seq][e], atol=1e-6)
+    scored = 0
+    for r in ev.refs("evidence"):
+        evd = ev.get(r)
+        if evd.provenance != "sensor":
+            continue
+        a = evd.actions[0]
+        e = int(a.stream.split("-")[1])
+        sc = evd.payload["observable_score"]
+        assert sc["status"] == "scored", sc
+        tgt = _tpool(frames[a.seq + 1][e:e + 1])[0]
+        base = _tpool(frames[a.seq][e:e + 1])[0]
+        pr = np.asarray(preds[(a.stream, a.seq)].outcome["observable"]
+                        ["prediction"], np.float32)
+        assert np.allclose(np.asarray(sc["target_value"]), tgt, atol=1e-6)
+        assert abs(sc["mse"] - float(np.mean((pr - tgt) ** 2))) < 1e-6
+        assert abs(sc["persistence_mse"]
+                   - float(np.mean((base - tgt) ** 2))) < 1e-6
+        scored += 1
+    assert scored == want, scored
+    print(f"  I. PIXEL 3x{S}x{S}: {len(off)} learner fingerprints identical "
+          f"OFF vs ON (observable on, every step); {want} forecasts == an "
+          f"independent transition+decode, {scored} outcomes scored against "
+          f"the raw frames; numpy pool == adaptive_avg_pool2d (16->8, 12->8); "
+          f"0 device copies")
+
+    # falsifier: the pixel A/B is sensitive (one torch draw per step moves it)
+    orig = ShadowRecorder.before_step
+
+    def leaky(self, *a, **k):
+        orig(self, *a, **k)
+        torch.rand(1)
+    ShadowRecorder.before_step = leaky
+    try:
+        bad = _pixel_run(_shadow_cfg(os.path.join(TMP, "store_pixel_leaky")))[0]
+    finally:
+        ShadowRecorder.before_step = orig
+    moved = [k for k in bad if bad[k] != off[k]]
+    assert "torch_rng" in moved and len(moved) >= 2, moved
+    print(f"     falsifier: one torch draw/step in the recorder moves {moved}")
+
+
+# ------------------------------- J. observable isolation + staged degrade
+def test_observable_isolation():
+    import torch
+    from developmental_ai.foundation.experience import EvidenceStore
+    from developmental_ai.foundation.runtime import ShadowRecorder
+    C, S, A, n = PIX["C"], PIX["S"], PIX["A"], PIX["n"]
+    D = C * S * S
+    infos = [{"proprio": np.ones(3, np.float32)} for _ in range(n)]
+    g = np.random.default_rng(11)
+
+    def make(root, **kw):
+        return ShadowRecorder.from_config(
+            {"foundation": {"shadow": _shadow_cfg(root, **kw)}}, bus=None,
+            action_dim=A, is_discrete=True, num_streams=n,
+            environment="pixel")
+
+    def drive(rec, wm, steps, next_width=D):
+        s = wm.rssm.initial_state(n, torch.device("cpu"))
+        for k in range(steps):
+            acts = [k % A] * n
+            rec.before_step(s, acts, None, wm, observations=g.random(
+                (n, D), dtype=np.float32))
+            rec.after_step(infos, acts, [0.0] * n, [False] * n, [False] * n,
+                           [(False, False, time.time())] * n, time.time(),
+                           observations=g.random((n, next_width),
+                                                 dtype=np.float32))
+
+    def records(root):
+        ev = EvidenceStore(root, readonly=True).evaluator_view()
+        return ([ev.get(r) for r in ev.refs("prediction")],
+                [ev.get(r) for r in ev.refs("evidence")
+                 if ev.get(r).provenance == "sensor"])
+
+    # 1. a decoder that raises: categorical keeps going, observable turns off
+    wm = _pixel_wm()
+
+    def boom(*a, **k):
+        raise RuntimeError("decoder exploded (injected)")
+    wm.decoder.forward = boom
+    root = os.path.join(TMP, "store_obs_fail")
+    h = _capture()
+    try:
+        rec = make(root, observable_max_failures=2)
+        drive(rec, wm, 6)
+    finally:
+        _release(h)
+    cn = rec.stats()["counts"]
+    assert rec.enabled, rec.disabled_reason
+    assert rec.stage() == "categorical" and not rec.do_observable
+    assert "forecast" in rec.observable_off_reason, rec.observable_off_reason
+    assert cn["observable_errors"] == 2 == cn["observable_errors:forecast"], cn
+    assert cn["predictions"] == n * 5, cn
+    assert len(h.msgs) == 1 and "observable forecasts OFF" in h.msgs[0], h.msgs
+    rec.close()
+    preds, outs = records(root)
+    assert len(preds) == n * 5 and len(outs) == n * 5
+    assert not [p for p in preds if "observable" in p.outcome]
+    assert not [o for o in outs if "observable_score" in o.payload]
+    print("  J. raising decoder: 2 consecutive failures -> observable OFF "
+          "(1 warning), recorder still enabled, all categorical predictions "
+          "filed, no 'observable' key written")
+
+    # 2. a malformed outcome observation fails at the SCORE site the same way
+    wm = _pixel_wm()
+    root = os.path.join(TMP, "store_score_fail")
+    h = _capture()
+    try:
+        rec = make(root, observable_max_failures=2)
+        drive(rec, wm, 4, next_width=D + 1)
+    finally:
+        _release(h)
+    cn = rec.stats()["counts"]
+    assert rec.enabled and rec.stage() == "categorical", rec.stats()
+    assert cn["observable_errors"] == 2 == cn["observable_errors:score"], cn
+    assert len(h.msgs) == 1 and "score" in h.msgs[0], h.msgs
+    rec.close()
+    preds, outs = records(root)
+    st = collections.Counter(o.payload["observable_score"]["status"]
+                             for o in outs if "observable_score" in o.payload)
+    assert st == {"score-error": 2}, st
+    assert len(preds) == n * 3, len(preds)
+    print("  J. malformed outcome frame: 2 score errors -> observable OFF "
+          "(1 warning), labelled score-error, never scored as success")
+
+    # 3. budget stages, in order, one warning each
+    wm = _pixel_wm()
+    h = _capture()
+    try:
+        rec = make(os.path.join(TMP, "store_stages"), max_ms_per_step=1e-9,
+                   budget_window=2)
+        stages = []
+        for _ in range(3):
+            drive(rec, wm, 2)
+            stages.append(rec.stage())
+    finally:
+        _release(h)
+    assert stages == ["categorical", "records", "disabled"], stages
+    assert len(h.msgs) == 3, h.msgs
+    assert "observable forecasts OFF" in h.msgs[0], h.msgs
+    assert "predictions OFF" in h.msgs[1] and "DISABLED" in h.msgs[2], h.msgs
+    assert [d["stage"] for d in rec.degraded] == ["categorical", "records"]
+    print(f"  J. over budget: stages {stages} after each window of 2, "
+          f"exactly 3 warnings")
+
+    # 4. feature off: old-store shape (no observable key, no score)
+    root = os.path.join(TMP, "store_obs_off")
+    rec = make(root, observable_predict=False)
+    drive(rec, _pixel_wm(), 3)
+    assert rec.enabled and rec.stage() == "categorical"
+    rec.close()
+    preds, outs = records(root)
+    assert len(preds) == n * 2 and len(outs) == n * 2
+    assert not [p for p in preds if "observable" in p.outcome]
+    assert not [o for o in outs if "observable_score" in o.payload]
+    print("  J. observable_predict off: predictions carry no 'observable' "
+          "key and evidence no observable_score (reads as unrecorded)")
 
 
 if __name__ == "__main__":

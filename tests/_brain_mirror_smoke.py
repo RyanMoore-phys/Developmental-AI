@@ -34,7 +34,7 @@ Contracts:
     D. A save landing mid-copy triggers a re-pull and the snapshot holds the
        NEW bytes; a brain that never stops changing is kept as mixed: true
        after exactly MAX_REPULLS re-pulls.
-    E. A truncated .pt fails verification: .failed, `latest` unchanged,
+    E. A truncated .pt (or .pkl sidecar: framing check) fails verification: .failed, `latest` unchanged,
        nothing pruned. LATCH ESCAPE (CLAUDE.md 4.1): the same bytes failing
        DEGRADED_AFTER runs in a row are promoted as degraded:true (exit 15)
        instead of freezing the mirror forever. Real torch.save output passes
@@ -63,6 +63,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pickle
 import re
 import shutil
 import subprocess
@@ -123,6 +124,9 @@ BRAIN_SET = {
     "logs/checkpoints/magnet.pt", "logs/checkpoints/knowledge_graph.json",
     "logs/checkpoints/options_state.json", "runlogs/breaks_by_type.json",
     "runlogs/consequence_state.json",
+    # 2026-10-05 sidecar. Its sibling curiosity_visits.pkl is deliberately
+    # ABSENT here (an older checkpoint): B asserts that is skipped, not fatal.
+    "logs/checkpoints/progress_probes.pkl",
     "skill_bank_mc_rssm/registry.json",
     "skill_bank_mc_rssm/skills/s1/policy.pt",
     "skill_bank_mc_rssm/skills/s1/deep/nested/notes.json",
@@ -134,6 +138,11 @@ def make_source(root):
     for rel in BRAIN_SET:
         if rel.endswith(".pt"):
             make_pt(os.path.join(root, rel), b"weights:" + rel.encode())
+        elif rel.endswith(".pkl"):
+            p = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                pickle.dump({"rel": rel, "n": 1}, f, protocol=4)
         else:
             put(root, rel, json.dumps({"rel": rel, "n": 1}))
     # NOT brain: must never be copied
@@ -142,6 +151,10 @@ def make_source(root):
     put(root, "runlogs/heartbeat.jsonl", '{"h": 1}\n')
     put(root, "skill_bank_mc_rssm/registry.json.tmp", "{half-writ")
     put(root, "logs/checkpoints/world_model.pt.tmp", "partial")
+    # the sidecar writer's in-flight temp and its corrupt-aside rename
+    put(root, "logs/checkpoints/progress_probes.pkl.ab12cd.tmp", "partial")
+    put(root, "logs/checkpoints/curiosity_visits.pkl.corrupt-20261005T000000",
+        "bad")
     put(root, "configs/minecraft_skybot.yaml", "loop: {}\n")
     put(root, "runlogs/foundation_shadow/shadow.jsonl", '{"s": 1}\n')
 
@@ -348,6 +361,10 @@ def _main(tmp):
           "clean snapshot: mixed false, verified, 1 pull")
     check("logs/checkpoints/curiosity.pt" in m1["brain_paths_missing"],
           "absent brain paths are recorded, not fatal")
+    check("logs/checkpoints/curiosity_visits.pkl" in m1["brain_paths_missing"]
+          and "logs/checkpoints/curiosity_visits.pkl" in bm.DEFAULT_BRAIN_PATHS
+          and "logs/checkpoints/progress_probes.pkl" in bm.DEFAULT_BRAIN_PATHS,
+          "both 2026-10-05 sidecars are listed; a missing one is skipped")
     # ---------------------------------------------------------------- L
     print("L. shadow mirror")
     check(os.path.isfile(os.path.join(dest_a, "shadow_mirror",
@@ -419,6 +436,20 @@ def _main(tmp):
               "a half-written torch.save file FAILS it")
     except ImportError:
         print("      (torch not importable here: real-format check skipped)")
+    kp = os.path.join(tmp, "sidecar.pkl")
+    with open(kp, "wb") as f:
+        pickle.dump({"probes": list(range(5000))}, f)
+    check(bm.check_file(kp, "x.pkl")[0] == "ok",
+          "a whole default-protocol pickle passes the framing check")
+    with open(kp, "rb") as f:
+        data = f.read()
+    with open(kp, "wb") as f:
+        f.write(data[: len(data) // 2])
+    check(bm.check_file(kp, "x.pkl")[0] == "bad",
+          "a half-written sidecar pickle FAILS it")
+    with open(kp, "wb") as f:
+        pass
+    check(bm.check_file(kp, "x.pkl")[0] == "bad", "an empty sidecar FAILS it")
     src_e = os.path.join(tmp, "srcE")
     make_source(src_e)
     dest_e = os.path.join(tmp, "destE")

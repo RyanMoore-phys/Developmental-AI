@@ -850,6 +850,32 @@ class DevelopmentalAI:
         self._gui_dwell_steps = float(_cur_cfg.get("gui_dwell_steps", 200.0))
         self._gui_dwell_phi = None
         self._gui_run = 0
+        # Validated HERE, not first inside the step loop (gui_costs raises
+        # there too): a negative weight would flip the entry charge into an
+        # entry wage, and a bad value should fail at boot, not mid-run.
+        if (not math.isfinite(self._gui_dwell_weight)
+                or self._gui_dwell_weight < 0.0
+                or not math.isfinite(self._gui_dwell_steps)):
+            raise ValueError(
+                "curiosity.gui_dwell_weight must be finite and >= 0 and "
+                "gui_dwell_steps finite: "
+                f"{self._gui_dwell_weight}, {self._gui_dwell_steps}")
+        # GUI-DWELL STEP COST (2026-10-05; see its use site). A genuine
+        # per-step charge after a grace period, because the potential above
+        # pays exactly 0 while pinned and so cannot discourage dwelling.
+        # Negative values would be a WAGE for sitting in a menu — refused.
+        self._gui_dwell_step_cost = float(_cur_cfg.get("gui_dwell_step_cost",
+                                                       0.0))
+        self._gui_dwell_grace_steps = int(_cur_cfg.get("gui_dwell_grace_steps",
+                                                       40))
+        if (not math.isfinite(self._gui_dwell_step_cost)
+                or self._gui_dwell_step_cost < 0.0
+                or self._gui_dwell_grace_steps < 0):
+            raise ValueError(
+                "curiosity.gui_dwell_step_cost and gui_dwell_grace_steps "
+                "must be >= 0 (a negative cost pays the agent to sit in a "
+                f"menu): {self._gui_dwell_step_cost}, "
+                f"{self._gui_dwell_grace_steps}")
         # ---- PERCEPTUAL NOVELTY (see _perceptual_cell) --------------------
         # Count-based novelty over WHAT IS SEEN rather than WHERE THE BODY IS.
         self._novelty_weight = float(_cur_cfg.get("novelty_weight", 0.0))
@@ -1023,6 +1049,9 @@ class DevelopmentalAI:
         if self.curiosity_mode == "learning_progress":
             self.curiosity = LearningProgressCuriosity(
                 **_cur_kwargs,
+                lp_sig_z=cur_cfg.get("lp_sig_z", 2.33),
+                lp_rho_max=cur_cfg.get("lp_rho_max", 0.9),
+                lp_visit_collapse=cur_cfg.get("lp_visit_collapse", True),
                 lp_history=cur_cfg.get("lp_history", 30),
                 lp_min_samples=cur_cfg.get("lp_min_samples", 4),
                 lp_bucket_round=cur_cfg.get("lp_bucket_round", 1),
@@ -1047,6 +1076,9 @@ class DevelopmentalAI:
                 flow_error_weight=float(
                     cur_cfg.get("flow_error_weight", 1.0)),
             ).to(self.device)
+            logger.info("LP gate: z=%s rho_max=%s visit_collapse=%s",
+                        self.curiosity.lp_sig_z, self.curiosity.lp_rho_max,
+                        self.curiosity.lp_visit_collapse)
             if cur_cfg.get("action_conditional", False):
                 logger.info(
                     "ACTION-CONDITIONAL CURIOSITY ACTIVE: intrinsic is scaled "
@@ -2384,10 +2416,12 @@ class DevelopmentalAI:
         # ---- COMPRESSION-PROGRESS CURIOSITY (infra #13, 2026-08-09) ------
         # The base intrinsic is ICM prediction ERROR — maximized by anything
         # visually dramatic, which funded five distinct reward farms. This
-        # term pays for the world model measurably IMPROVING on a FIXED
-        # probe set: being drawn to what you are LEARNING, not to what
-        # flickers. The base term is simultaneously scaled down
-        # (icm_base_scale) so learning, not surprise, leads the drive.
+        # block MEASURES the world model improving on matched probes (same
+        # probe, same objective, across model versions). Since 2026-10-05 it
+        # PAYS NOTHING: model improvement does not establish credit for the
+        # action being taken now, and the old per-step rate was an ambient
+        # wage. progress_weight > 0 only switches the measurement on;
+        # icm_base_scale still damps the raw-error term independently.
         self._progress = None
         self._progress_weight = float(_cur_cfg.get("progress_weight", 0.0))
         self._icm_base_scale = float(_cur_cfg.get("icm_base_scale", 1.0))
@@ -2410,7 +2444,7 @@ class DevelopmentalAI:
                 self._progress = ProbeSetProgress(
                     eval_every=self._progress_every)
                 logger.info(
-                    "compression-progress curiosity ACTIVE: weight=%.3f "
+                    "paired progress SHADOW ONLY (no reward): legacy weight=%.3f "
                     "eval_every=%d icm_base_scale=%.2f",
                     self._progress_weight, self._progress_every,
                     self._icm_base_scale)
@@ -3715,6 +3749,7 @@ class DevelopmentalAI:
              f. Policy stores experience for training
           3. After episode: update policy, extract action rules
         """
+        self._curiosity_boundary()
         obs, info = self._seeded_reset()
         # Rung 6 broadcast: clear the broadcaster and fold in the starting view so
         # the first action is conditioned on what is visible at reset.
@@ -3823,12 +3858,14 @@ class DevelopmentalAI:
                     np.asarray(action, dtype=np.float32)
                 ).unsqueeze(0).to(self.device)
 
-            intrinsic_reward = self.curiosity.compute_intrinsic_reward(
-                obs_tensor, action_tensor, next_obs_tensor
-            ).item()
-            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
-            # compression progress does; the raw-error term is damped by
-            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic_reward = self._curiosity_reward(
+                obs_tensor, action_tensor, next_obs_tensor,
+                ended=[terminated or truncated]).item()
+            # ICM BASE SCALE (infra #13): the raw-error term is damped by
+            # config so it seasons rather than dominates. Since 2026-10-05
+            # paired progress is MEASUREMENT ONLY and pays nothing, so this
+            # damped term (plus the itemised novelty terms) IS the base drive
+            # — nothing "leads" it any more. 1.0 = old behaviour.
             intrinsic_reward *= float(getattr(self, "_icm_base_scale", 1.0))
 
             # ---- 3b. CURIOSITY-RANKED MAGNET (waking only) ----
@@ -4327,6 +4364,7 @@ class DevelopmentalAI:
         # subprocess for 70ms-90s with the GIL released, so serial resets
         # would cost N x 90s at every episode boundary. Fast envs are
         # unaffected (thread overhead is microseconds).
+        self._curiosity_boundary()
         obs_list = self._parallel_reset(envs)
         self.symbolic_decoder.update_discretizer(obs_list[0])
 
@@ -4515,7 +4553,7 @@ class DevelopmentalAI:
             if self._shadow is not None:
                 self._shadow.before_step(rssm_state, env_actions,
                                          self._wm_param_lock, self.world_model,
-                                         executor=self.option_executor)
+                                         executor=self.option_executor, observations=obs_list)
                 _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
@@ -4774,12 +4812,15 @@ class DevelopmentalAI:
             if _fr is not None:
                 self.training_metrics["flow_residual"].append(
                     self._flow_resid_now)
-            intrinsic = self.curiosity.compute_intrinsic_reward(
-                obs_t, action_tensor, next_obs_t, extra_error=_fr
-            )
-            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
-            # compression progress does; the raw-error term is damped by
-            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic = self._curiosity_reward(
+                obs_t, action_tensor, next_obs_t, extra_error=_fr,
+                ended=dones, invalid=[bool(restarted[i]) or bool(
+                    (step_infos[i] or {}).get("env_restarted")) for i in range(n)])
+            # ICM BASE SCALE (infra #13): the raw-error term is damped by
+            # config so it seasons rather than dominates. Since 2026-10-05
+            # paired progress is MEASUREMENT ONLY and pays nothing, so this
+            # damped term (plus the itemised novelty terms) IS the base drive
+            # — nothing "leads" it any more. 1.0 = old behaviour.
             intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
             icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
@@ -5070,25 +5111,7 @@ class DevelopmentalAI:
             # source as the scout path and the intrinsic-zeroing guard — so
             # this runs exactly once per waking step, scaffold or not.
             if not use_dream_actor:
-                _gui_dw = bool((step_infos[0] or {}).get("gui_open"))
-                _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
-                if _gdw > 0.0:
-                    self._gui_run = (self._gui_run + 1) if _gui_dw else 0
-                    _gphi = -min(1.0, self._gui_run
-                                 / max(1.0, self._gui_dwell_steps))
-                    _gprev = getattr(self, "_gui_dwell_phi", None)
-                    if _gprev is not None:
-                        # PLAIN DIFFERENCE, NOT gamma*Phi' - Phi. Caught by
-                        # its own test: with gamma<1 a potential PINNED at a
-                        # constant floor pays w*(1-gamma) EVERY step, so a
-                        # "cost of sitting here" silently becomes a wage for
-                        # sitting here (+0.0005/step at this weight — the
-                        # exact farm this term exists to kill). Phi' - Phi
-                        # is 0 while the state is unchanged, negative on
-                        # entry, positive on exit, and nets 0 over a cycle.
-                        prim_extrinsic = prim_extrinsic + _gdw * (
-                            _gphi - float(_gprev))
-                    self._gui_dwell_phi = _gphi
+                prim_extrinsic += self._gui_reward(0, step_infos[0])
             # general infra: event monitors + empowerment (shared helper)
             if not use_dream_actor:
                 _ei = self._infra_step(
@@ -5421,7 +5444,7 @@ class DevelopmentalAI:
                 self._shadow.after_step(
                     step_infos, env_actions, rewards, dones, restarted,
                     _sh_ends, _t_env0, prim_extrinsic, intrinsic,
-                    _sh_fleet_reset, use_dream_actor)
+                    _sh_fleet_reset, use_dream_actor, observations=next_obs_list)
                 _pt = self._phase_mark("shadow", _pt)
 
             # ---- 6. ADVANCE / AUTORESET ----
@@ -5522,6 +5545,7 @@ class DevelopmentalAI:
         # subprocess for 70ms-90s with the GIL released, so serial resets
         # would cost N x 90s at every episode boundary. Fast envs are
         # unaffected (thread overhead is microseconds).
+        self._curiosity_boundary()
         obs_list = self._parallel_reset(envs)
         self.symbolic_decoder.update_discretizer(obs_list[0])
 
@@ -5725,7 +5749,7 @@ class DevelopmentalAI:
             if self._shadow is not None:
                 self._shadow.before_step(rssm_state, env_actions,
                                          self._wm_param_lock, self.world_model,
-                                         executor=self.option_executor)
+                                         executor=self.option_executor, observations=obs_list)
                 _pt = self._phase_mark("shadow", _pt)
 
             # ---- 2. STEP ALL ENVS (concurrently — see reset note) ----
@@ -5982,12 +6006,15 @@ class DevelopmentalAI:
             if _fr is not None:
                 self.training_metrics["flow_residual"].append(
                     self._flow_resid_now)
-            intrinsic = self.curiosity.compute_intrinsic_reward(
-                obs_t, action_tensor, next_obs_t, extra_error=_fr
-            )
-            # ICM BASE SCALE (infra #13): surprise no longer leads the drive —
-            # compression progress does; the raw-error term is damped by
-            # config so it seasons rather than dominates. 1.0 = old behaviour.
+            intrinsic = self._curiosity_reward(
+                obs_t, action_tensor, next_obs_t, extra_error=_fr,
+                ended=dones, invalid=[bool(restarted[i]) or bool(
+                    (step_infos[i] or {}).get("env_restarted")) for i in range(n)])
+            # ICM BASE SCALE (infra #13): the raw-error term is damped by
+            # config so it seasons rather than dominates. Since 2026-10-05
+            # paired progress is MEASUREMENT ONLY and pays nothing, so this
+            # damped term (plus the itemised novelty terms) IS the base drive
+            # — nothing "leads" it any more. 1.0 = old behaviour.
             intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
             # BORING-VIEW BASE DISCOUNT (2026-08-16). The sky discount only
             # ever covered the itemised novelty term; the BASE was left at
@@ -6703,25 +6730,7 @@ class DevelopmentalAI:
             # source as the scout path and the intrinsic-zeroing guard — so
             # this runs exactly once per waking step, scaffold or not.
             if not use_dream_actor:
-                _gui_dw = bool((step_infos[0] or {}).get("gui_open"))
-                _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
-                if _gdw > 0.0:
-                    self._gui_run = (self._gui_run + 1) if _gui_dw else 0
-                    _gphi = -min(1.0, self._gui_run
-                                 / max(1.0, self._gui_dwell_steps))
-                    _gprev = getattr(self, "_gui_dwell_phi", None)
-                    if _gprev is not None:
-                        # PLAIN DIFFERENCE, NOT gamma*Phi' - Phi. Caught by
-                        # its own test: with gamma<1 a potential PINNED at a
-                        # constant floor pays w*(1-gamma) EVERY step, so a
-                        # "cost of sitting here" silently becomes a wage for
-                        # sitting here (+0.0005/step at this weight — the
-                        # exact farm this term exists to kill). Phi' - Phi
-                        # is 0 while the state is unchanged, negative on
-                        # entry, positive on exit, and nets 0 over a cycle.
-                        prim_extrinsic = prim_extrinsic + _gdw * (
-                            _gphi - float(_gprev))
-                    self._gui_dwell_phi = _gphi
+                prim_extrinsic += self._gui_reward(0, step_infos[0])
             # general infra: event monitors + empowerment shaping (shared
             # helper — see _infra_step)
             if not use_dream_actor:
@@ -7208,7 +7217,7 @@ class DevelopmentalAI:
                 self._shadow.after_step(
                     step_infos, env_actions, rewards, dones, restarted,
                     _sh_ends, _t_env0, prim_extrinsic, intrinsic,
-                    _sh_fleet_reset, use_dream_actor)
+                    _sh_fleet_reset, use_dream_actor, observations=next_obs_list)
                 _pt = self._phase_mark("shadow", _pt)
             _reset_to = float(self.config.get("parallel_envs", {}).get(
                 "reset_timeout_s", 300))
@@ -8979,6 +8988,27 @@ class DevelopmentalAI:
             os.path.join(checkpoint_dir, "curiosity.pt"),
         )
 
+        # SIDECARS (2026-10-05): atomic (tmp + fsync + os.replace) so a
+        # crash mid-write cannot leave a torn file for the next boot, and
+        # guarded so a failed sidecar never costs the policy save below.
+        # Brain-mirrored: scripts/brain_mirror/brain_mirror.py lists both.
+        from developmental_ai.infra.progress_curiosity import (
+            atomic_pickle_dump)
+        if isinstance(self.curiosity, LearningProgressCuriosity):
+            try:
+                atomic_pickle_dump(
+                    os.path.join(checkpoint_dir, "curiosity_visits.pkl"),
+                    self.curiosity.visit_state_dict())
+            except Exception as _e:
+                logger.warning("curiosity_visits.pkl save failed: %s", _e)
+        if getattr(self, "_progress", None) is not None:
+            try:
+                atomic_pickle_dump(
+                    os.path.join(checkpoint_dir, "progress_probes.pkl"),
+                    self._progress.state_dict())
+            except Exception as _e:
+                logger.warning("progress_probes.pkl save failed: %s", _e)
+
         # Save policy
         torch.save(
             self.policy.get_state_dict(),
@@ -9116,6 +9146,25 @@ class DevelopmentalAI:
             self.curiosity.load_state_dict(
                 torch.load(cur_path, map_location=self.device)
             )
+
+        # SIDECARS: absent (pre-2026-10 checkpoints) is silent; unreadable
+        # or rejected (truncated write, prototype size changed by config)
+        # is a COLD START FOR THAT COMPONENT ONLY, one warning, the file
+        # renamed aside — never a boot crash, which the supervisor would
+        # relaunch into forever (CLAUDE.md 4.1). Both load methods validate
+        # before mutating, so "cold" really is the fresh module.
+        from developmental_ai.infra.progress_curiosity import (
+            load_pickle_sidecar)
+        if isinstance(self.curiosity, LearningProgressCuriosity):
+            load_pickle_sidecar(
+                os.path.join(checkpoint_dir, "curiosity_visits.pkl"),
+                self.curiosity.load_visit_state_dict, "curiosity visits",
+                log=logger)
+        if getattr(self, "_progress", None) is not None:
+            load_pickle_sidecar(
+                os.path.join(checkpoint_dir, "progress_probes.pkl"),
+                self._progress.load_state_dict, "paired progress probes",
+                log=logger)
 
         # Load policy
         pol_path = os.path.join(checkpoint_dir, "policy.pt")
@@ -9898,6 +9947,39 @@ class DevelopmentalAI:
         _acc[name] = _acc.get(name, 0.0) + (_now - t0)
         return _now
 
+    def _world_model_version(self):
+        steps = [int(v.get("step", 0)) for v in self.world_model.optimizer.state.values()]
+        return "adam_step=" + str(max(steps, default=0))
+
+    def _curiosity_boundary(self, streams=None, valid=True):
+        if isinstance(self.curiosity, LearningProgressCuriosity):
+            self.curiosity.end_visits(streams, valid=valid)
+
+    def _curiosity_reward(self, obs, actions, next_obs, extra_error=None,
+                          ended=None, invalid=None):
+        """One stream/boundary contract for all collection paths."""
+        n = len(obs)
+        bad = np.zeros(n, dtype=bool) if invalid is None else np.asarray(invalid, bool)
+        self._curiosity_valid_rows = ~bad
+        ids = [i for i in range(n) if not bad[i]]
+        result = torch.zeros(n, device=obs.device)
+        if ids:
+            kw = {}
+            if extra_error is not None:
+                kw["extra_error"] = torch.as_tensor(extra_error, device=obs.device)[ids]
+            if isinstance(self.curiosity, LearningProgressCuriosity):
+                kw["stream_ids"] = ids
+            result[ids] = self.curiosity.compute_intrinsic_reward(
+                obs[ids], actions[ids], next_obs[ids], **kw)
+        # A restart row is EXCLUDED above (its transition splices two
+        # worlds), but the visit open before it was real experience in the
+        # old world: close it as valid. Discarding it threw away the very
+        # pre-crash evidence the splice exclusion exists to protect.
+        for i in range(n):
+            if bad[i] or (ended is not None and ended[i]):
+                self._curiosity_boundary([i])
+        return result
+
     def _curiosity_train(self, obs_t, action_t, next_obs_t) -> Dict[str, float]:
         """One curiosity gradient step, optionally BATCHED across env steps.
 
@@ -9913,6 +9995,12 @@ class DevelopmentalAI:
         kernel launches. Returns the most recent metrics on the steps that
         do not train (they feed the `curiosity_loss` log line only).
         """
+        valid = getattr(self, "_curiosity_valid_rows", None)
+        if valid is not None and len(valid) == len(obs_t):
+            mask = torch.as_tensor(valid, device=obs_t.device)
+            obs_t, action_t, next_obs_t = obs_t[mask], action_t[mask], next_obs_t[mask]
+        if len(obs_t) == 0:
+            return self._last_icm_metrics
         _k = self._curiosity_train_every
         if _k <= 1:
             self._last_icm_metrics = self.curiosity.train_step(
@@ -11105,32 +11193,33 @@ class DevelopmentalAI:
                         pass
 
                 def _wm_loss(pb):
-                    out = self.world_model.compute_loss(
-                        pb["observations"], pb["actions"],
-                        pb["rewards"], pb["continues"])
-                    if isinstance(out, dict):
-                        return float(out.get("total", 0.0))
-                    return float(out[0]["total"]) if isinstance(
-                        out, tuple) else float(out)
+                    from developmental_ai.foundation.runtime.observable import sequence_loss
+                    return sequence_loss(self.world_model, pb)
                 _lk = getattr(self, "_wm_param_lock", None)
-                if _lk is None or _lk.acquire(blocking=False):
+                # Cadence FIRST: the lock and the optimizer-state scan in
+                # _world_model_version() are only paid on a due step.
+                if self._progress.due(self.total_timesteps) and (
+                        _lk is None or _lk.acquire(blocking=False)):
                     try:
                         self._progress.evaluate(_wm_loss,
                                                 self.total_timesteps,
-                                                device=self.device)
+                                                device=self.device,
+                                                model_version=self._world_model_version(),
+                                                objective="deterministic-observation-mse-v1")
                     finally:
                         if _lk is not None:
                             _lk.release()
-                # FLEET FACTOR (review finding): rate() amortises over
-                # eval_every TOTAL timesteps, but payment happens once per
-                # PRIMARY step and total_timesteps advances num_envs per
-                # step — without the multiplier only 1/num_envs of each
-                # window's earned progress is ever paid.
-                _pr = (self._progress_weight * float(self._progress.rate())
-                       * max(1, int(getattr(self, "_num_envs", 1) or 1)))
-                if _pr:
-                    self.infra.record_reward("progress", _pr)
-                    _extra += _pr
+                    self.infra.progress_measurement = self._progress.stats
+                # Measurement only: model improvement does not establish
+                # credit for the action being taken now. No ambient payment
+                # — there is deliberately no record_reward for it.
+                event = self._progress.last_event
+                if event is not None and event.event_id != getattr(self, "_last_progress_event", None):
+                    self._last_progress_event = event.event_id
+                    logger.info("paired-progress shadow event=%s model=%s improvement=%.6g "
+                                "forgetting=%.6g se=%.6g probes=%d reward=0",
+                                event.event_id, event.model_version, event.improvement,
+                                event.forgetting, event.standard_error, len(event.probe_ids))
             # ---- MEMORY-PULL POTENTIAL (2026-08-10, point 3) -------------
             # gamma-potential on remembered-goal-site closeness; a CHANGED
             # memory record re-adopts the baseline unpaid (else every fresh
@@ -11253,6 +11342,27 @@ class DevelopmentalAI:
         except Exception:
             return 0.0
 
+    def _gui_reward(self, stream, info):
+        """Extrinsic-only state costs; closing the GUI resets dwell immediately.
+
+        Both primary collection paths and scouts use the same pure calculation.
+        Existing boundary code resets these state holders without a refund.
+        """
+        from developmental_ai.core.reward_components import gui_costs
+        state = {} if stream == 0 else self._sc_phi.setdefault(stream, {})
+        run = getattr(self, "_gui_run", 0) if stream == 0 else state.get("gui_run", 0)
+        prev = getattr(self, "_gui_dwell_phi", None) if stream == 0 else state.get("gui")
+        costs = gui_costs(bool((info or {}).get("gui_open")), run, prev,
+            weight=float(getattr(self, "_gui_dwell_weight", 0.0)),
+            dwell_steps=float(getattr(self, "_gui_dwell_steps", 200.0)),
+            step_cost=float(getattr(self, "_gui_dwell_step_cost", 0.0)),
+            grace_steps=int(getattr(self, "_gui_dwell_grace_steps", 40)))
+        if stream == 0:
+            self._gui_run, self._gui_dwell_phi = costs.run, costs.potential
+        else:
+            state["gui_run"], state["gui"] = costs.run, costs.potential
+        return costs.total
+
     def _scout_mixed_reward(self, e_i: int, info, raw_ext: float,
                             intrinsic_e: float) -> float:
         """The reward a SCOUT stream's PPO row carries (2026-09-01).
@@ -11334,17 +11444,7 @@ class DevelopmentalAI:
         if _gui:
             _int = 0.0
 
-        # GUI DWELL: paid into EXTRINSIC on purpose. The intrinsic channel is
-        # zeroed above, so a cost placed there would be erased by the very
-        # guard it complements (reward-channel confusion, §4.4).
-        _gdw = float(getattr(self, "_gui_dwell_weight", 0.0))
-        if _gdw > 0.0:
-            _run = (int(_st.get("gui_run", 0)) + 1) if _gui else 0
-            _st["gui_run"] = _run
-            _gphi = -min(1.0, _run / max(1.0, self._gui_dwell_steps))
-            if "gui" in _st:
-                _ext += _gdw * (_gphi - float(_st["gui"]))
-            _st["gui"] = _gphi
+        _ext += self._gui_reward(e_i, info)
 
         # update_stats=False: the return EMAs are a per-STEP clock tuned on
         # ONE stream; letting N bodies tick it would scale the anneal by N.

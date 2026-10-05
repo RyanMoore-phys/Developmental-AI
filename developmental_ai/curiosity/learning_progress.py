@@ -33,6 +33,7 @@ states recur → their buckets accumulate → error falls → LP > 0. The asymme
 from __future__ import annotations
 
 from collections import deque
+import math
 
 import numpy as np
 import torch
@@ -99,6 +100,12 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         # Revert: lp_sig_z=0 restores the legacy `lp_sig_k * std` gate and
         # lp_visit_collapse=False the per-step history; the smoke keeps the
         # legacy pair as a regression witness that must still farm.
+        if not math.isfinite(float(lp_sig_z)) or float(lp_sig_z) < 0:
+            raise ValueError("lp_sig_z must be finite and >= 0")
+        if not math.isfinite(float(lp_rho_max)) or not 0 <= float(lp_rho_max) < 1:
+            raise ValueError("lp_rho_max must be finite and in [0, 1)")
+        if int(lp_history) < 2 or not 2 <= int(lp_min_samples) <= int(lp_history):
+            raise ValueError("require 2 <= lp_min_samples <= lp_history")
         self.lp_sig_z = float(lp_sig_z)
         self.lp_rho_max = float(lp_rho_max)
         self.lp_visit_collapse = bool(lp_visit_collapse)
@@ -275,6 +282,86 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
             return
         self._bucket_err = {k: v for k, v in self._bucket_err.items() if len(v) > 1}
 
+    def end_visits(self, stream_ids=None, *, valid=True):
+        """Close the open visits of `stream_ids` (all streams when None).
+
+        valid=True folds each visit's mean error into its bucket history.
+        On an environment restart the CALLER excludes the splice row (it
+        spans two worlds) and closes the pre-crash visit as valid — those
+        transitions were real. valid=False discards the open visit, for
+        callers whose visit is not training evidence (evaluation). A new
+        process starts with no open visits: the world is not checkpointed.
+        """
+        ids = list(self._lp_runs) if stream_ids is None else list(stream_ids)
+        for stream in ids:
+            run = self._lp_runs.pop(stream, None)
+            if run is not None and valid:
+                self._close_visit(run)
+
+    def visit_state_dict(self):
+        """Separate from neural weights, so old curiosity.pt remains loadable."""
+        return {"schema": 1, "histories": dict(self._bucket_err),
+                "protos": self._protos, "proto_used": self._proto_used,
+                "proto_next": self._proto_next_id, "proto_tick": self._proto_tick,
+                "reward_history": list(self.reward_history),
+                "normalization": (self._running_mean, self._running_median,
+                                  self._running_std)}
+
+    def load_visit_state_dict(self, state):
+        """Validate EVERYTHING, then apply. A rejected state raises before
+        any field is touched, so the caller's cold start really is the
+        freshly-constructed module (see load_pickle_sidecar). The prototype
+        size check matters most: a changed lp_pixel_pool / image_channels
+        would otherwise load vectors `_bucket_key` cannot compare with, and
+        the first np.abs(arr - v) after boot would crash the loop."""
+        if not isinstance(state, dict) or state.get("schema") != 1:
+            raise ValueError("unsupported curiosity visit state")
+        pixel = bool(getattr(self, "pixel_obs", False))
+        expected = int(getattr(self, "image_channels", 3)) * self.lp_pixel_pool ** 2
+        protos = {}
+        for pid, vec in dict(state["protos"]).items():
+            v = np.asarray(vec, dtype=np.float32)
+            if v.ndim != 1 or (pixel and v.shape[0] != expected):
+                raise ValueError(
+                    "prototype %r has shape %s, config expects (%d,)"
+                    % (pid, tuple(v.shape), expected))
+            if not np.all(np.isfinite(v)):
+                raise ValueError("prototype %r is not finite" % (pid,))
+            protos[int(pid)] = v
+        if protos and not pixel:
+            raise ValueError("prototypes saved but this module is not pixel_obs")
+        used = {int(k): int(t) for k, t in dict(state["proto_used"]).items()}
+        if set(used) != set(protos):
+            raise ValueError("prototype LRU table does not match prototypes")
+        proto_next = int(state["proto_next"])
+        if protos and proto_next <= max(protos):
+            raise ValueError("prototype id counter would reissue a live id")
+        proto_tick = int(state["proto_tick"])
+        histories = {}
+        for k, h in dict(state["histories"]).items():
+            vals = [float(x) for x in h]
+            if not all(math.isfinite(x) for x in vals):
+                raise ValueError("bucket history %r is not finite" % (k,))
+            histories[k] = deque(vals, maxlen=self.lp_history)
+        rewards = [float(x) for x in state["reward_history"]]
+        norm = tuple(float(x) for x in state["normalization"])
+        if len(norm) != 3 or not all(math.isfinite(x) for x in norm + tuple(rewards)):
+            raise ValueError("curiosity normalisation state is not finite")
+        # Config wins on capacity: evict least-recently-used beyond the cap,
+        # history dropped with it (the same rule as live eviction).
+        while len(protos) > self.lp_max_protos:
+            old = min(used, key=used.get)
+            protos.pop(old); used.pop(old); histories.pop(old, None)
+        # --- validated; apply ---
+        self._bucket_err = histories
+        self._protos, self._proto_used = protos, used
+        self._proto_next_id, self._proto_tick = proto_next, proto_tick
+        self.reward_history.clear()
+        self.reward_history.extend(rewards)
+        self._running_mean, self._running_median, self._running_std = norm
+        self._lp_runs.clear()  # Environment state is not checkpointed.
+        self._proto_arr = self._proto_ids = None
+
     def _close_visit(self, run) -> None:
         """Append a finished visit's MEAN error to its bucket's history.
 
@@ -339,7 +426,7 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
 
     def compute_intrinsic_reward(self, obs, action, next_obs,
                                  update_state: bool = True,
-                                 extra_error=None):
+                                 extra_error=None, stream_ids=None):
         """Learning progress over the agent's total prediction error.
 
         ---- THE FLOW RESIDUAL CHANNEL (2026-09-18) ----------------------
@@ -414,6 +501,9 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                     self.last_flow_error = float(_xe.mean().item())
             errs = lp_error.detach().cpu().numpy()
             obs_np = obs.detach().cpu().numpy()
+            streams = list(range(len(errs))) if stream_ids is None else list(stream_ids)
+            if len(streams) != len(errs) or len(set(streams)) != len(streams):
+                raise ValueError("stream_ids must be unique and match batch rows")
             lp = np.zeros(len(errs), dtype=np.float32)
             for i in range(len(errs)):
                 key = self._bucket_key(obs_np[i], update_state=update_state)
@@ -424,7 +514,7 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                 # nothing below them is mutated.
                 entry = True
                 if self.lp_visit_collapse and update_state:
-                    run = self._lp_runs.get(i)
+                    run = self._lp_runs.get(streams[i])
                     if run is not None and run[0] == key:
                         entry = False
                         run[1] += float(errs[i])
@@ -432,7 +522,7 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                     else:
                         if run is not None:
                             self._close_visit(run)
-                        self._lp_runs[i] = [key, float(errs[i]), 1]
+                        self._lp_runs[streams[i]] = [key, float(errs[i]), 1]
                 hist = self._bucket_err.get(key)
                 if hist is None:
                     if not update_state:

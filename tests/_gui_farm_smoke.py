@@ -58,10 +58,15 @@ Contracts:
        detector reporting damp 0.5, the intrinsic handed to the primary mix
        is exactly 0.5x the undamped run in BOTH real bodies; damp 1.0 is
        byte-identical; a GUI step still pays exactly 0. See the test.
+    G. A GENUINE PER-STEP DWELL COST after a grace period (2026-10-05): the
+       potential pays 0 while pinned, so it cannot discourage dwelling, and
+       the menu became a refuge (GUI 19% -> 70%). G drives both real bodies
+       and the scout path; see the test for G1-G6.
 
 Run: PYTHONPATH=. python tests/_gui_farm_smoke.py
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, ".")
@@ -116,12 +121,12 @@ def test_source_contracts():
     # both duplicated bodies must carry it (this codebase's recurring bug)
     assert src.count("_gui_now2 = bool(") == 2, (
         "the gui gate must exist in BOTH stepping bodies")
-    assert src.count("self._gui_dwell_phi = _gphi") == 2
+    assert src.count("prim_extrinsic += self._gui_reward(0, step_infos[0])") == 2
     print("  B1. magnet shaping gui-gated in BOTH bodies; seek re-adopts")
 
     # the dwell cost must use the plain difference, in BOTH bodies
-    assert "_gdw * (\n                            _gphi - float(_gprev))" in src \
-        or "_gphi - float(_gprev)" in src
+    from developmental_ai.core.reward_components import gui_costs
+    assert gui_costs(True, 200, -1.0, weight=0.05).total == 0.0
     assert "_gg * _gphi" not in src, (
         "gui dwell reverted to the gamma form — it would pay to dwell")
     assert "_gp * _php" not in src, (
@@ -130,7 +135,7 @@ def test_source_contracts():
     print("  B2. both state-cost potentials use the plain difference")
 
     # the cost must go to the EXTRINSIC channel
-    i_cost = src.index("prim_extrinsic = prim_extrinsic + _gdw")
+    i_cost = src.index("prim_extrinsic += self._gui_reward(0, step_infos[0])")
     i_zero = src.index("intrinsic[0] = intrinsic[0] * 0.0")
     assert i_cost < i_zero, "cost must not be placed after/into the zeroing"
     assert "intrinsic[0] = intrinsic[0] + _gdw" not in src, (
@@ -200,8 +205,8 @@ def _gui_env(idx):
             return self._obs(), {"gui_open": False}
 
         def step(self, a):
-            g = (self.idx == 0
-                 and GUI_OPEN_AT <= self.t < GUI_OPEN_AT + GUI_LEN)
+            g = (self.idx in GUI_STREAMS
+                 and any(a <= self.t < b for a, b in GUI_WINDOWS))
             self.t += 1
             GUI_LOG[self.idx].append(bool(g))
             # truncates at 70 so the EPISODIC body ends; the lifelong
@@ -213,12 +218,18 @@ def _gui_env(idx):
 
 
 GUI_LOG = {}
+# Which streams open a GUI, and over which step windows. The defaults are the
+# D/F fixture (stream 0 only, one 30-step stay); contract G widens them.
+GUI_STREAMS = {0}
+GUI_WINDOWS = [(GUI_OPEN_AT, GUI_OPEN_AT + GUI_LEN)]
 
 
 INTRINSIC = {}   # the last _drive's stream-0 intrinsic handed to the mix
+SCOUT = {}       # the last _drive's scout (stream 1) extrinsic handed to mix
 
 
-def _drive(lifelong, weight, scaffold, damp=None):
+def _drive(lifelong, weight, scaffold, damp=None, step_cost=None,
+           grace=None):
     """Run one real body; return (stream-0 gui flags, stream-0 extrinsic
     handed to the PRIMARY reward_mixer.mix) step-aligned. The matching
     INTRINSIC argument of that same call lands in INTRINSIC["rec"].
@@ -265,6 +276,10 @@ def _drive(lifelong, weight, scaffold, damp=None):
         assert ai.vision_scaffold is None, "fixture must start scaffold-less"
         ai._gui_dwell_weight = float(weight)
         ai._gui_dwell_steps = DWELL_N
+        if step_cost is not None:      # None: leave the loop's own default
+            ai._gui_dwell_step_cost = float(step_cost)
+        if grace is not None:
+            ai._gui_dwell_grace_steps = int(grace)
         if scaffold:
             ai.vision_scaffold = _StubScaffold()
             ai._magnet_step_shaping = lambda *a, **k: 0.0
@@ -276,14 +291,17 @@ def _drive(lifelong, weight, scaffold, damp=None):
                 _on_step(*a, **k)
                 ai.infra.last_loop_damp = float(damp)
             ai.infra.on_step = damped_on_step
-        rec, irec = [], []
+        rec, irec, srec = [], [], []
         INTRINSIC["rec"] = irec
+        SCOUT["rec"] = srec
         _mix = ai.reward_mixer.mix
 
         def spy(i, e, update_stats=True):
             if update_stats:              # the PRIMARY call; scouts pass False
                 rec.append(float(e))
                 irec.append(float(i))
+            else:
+                srec.append(float(e))
             return _mix(i, e, update_stats=update_stats)
         ai.reward_mixer.mix = spy
         if lifelong:
@@ -435,6 +453,212 @@ def test_farm_damp_reaches_intrinsic():
               f"{len(gui)} GUI steps still exactly 0.0")
 
 
+STEP_COST, GRACE = 0.002, 10      # 30-step stay -> 20 charged steps
+
+
+def _expected_step_cost(flags, cost, grace):
+    """The rule, independently: run = consecutive GUI steps so far; a GUI
+    step whose run exceeds `grace` costs `cost`; anything else costs 0."""
+    out, run = [], 0
+    for g in flags:
+        run = run + 1 if g else 0
+        out.append(-cost if (g and run > grace) else 0.0)
+    return out
+
+
+def test_gui_dwell_step_cost():
+    """G. A GENUINE PER-STEP GUI DWELL COST AFTER A GRACE PERIOD (2026-10-05).
+
+    THE LIVE INCIDENT. 11.4 h of shadow data after the LP fix: GUI-open
+    share rose 19% -> 70% on stream 0 and 50% on stream 1, the longest stay
+    ~1040 steps, and action 10 (toggle inventory) became the TOP action,
+    chosen mostly by the shared policy. Pay per sampled step: moving outside
+    -0.0057 intrinsic, standing still outside +0.0004, inside a GUI ~0. The
+    menu became a REFUGE from a world that, on average, cost money.
+
+    WHY THE EXISTING TERM COULD NOT STOP IT. `gui_dwell_weight` is a
+    plain-difference potential (correctly — CLAUDE.md 4.3): it charges once
+    on entry and refunds on exit, so it pays EXACTLY 0 per step while
+    pinned. A telescoping potential structurally cannot discourage
+    dwelling; only a genuine per-step cost can. Hence `gui_dwell_step_cost`
+    charged on every GUI step past `gui_dwell_grace_steps` — into
+    prim_EXTRINSIC (the intrinsic channel is zeroed in a GUI, 4.4), with no
+    refund and no potential, so nothing about it can be farmed. Closing the
+    GUI (action 10, always offered — contract C) ends it on the next step.
+
+    Drives the REAL bodies (vision scaffold None, the live config) exactly
+    as contract D does, isolating the new term as the difference between a
+    run with the cost and the identical run without it:
+      G1 a stay of grace+N steps costs exactly N*cost beyond the potential,
+         on precisely the GUI steps whose run exceeds the grace, in BOTH
+         bodies, the same per-step numbers in each; and with the potential
+         OFF (weight 0) the cost still runs (it must not depend on the
+         potential's run counter being ticked).
+      G2 a stay <= grace (grace = stay length, and grace > stay) costs
+         nothing extra.
+      G3 closing stops the cost on the very next step, and the run counter
+         RESETS: a second, shorter stay restarts the grace (a counter that
+         did not reset would charge its whole length).
+      G4 cost 0 is byte-identical to a run with the loop's defaults and to
+         the plain-difference reference — contract D's numbers unchanged.
+      G5 scouts (_scout_mixed_reward, per-stream gui_run) follow the same
+         rule on their own stay.
+      G6 source: since the refactor into reward_components.gui_costs /
+         `_gui_reward` (2026-10-05) the cost is computed in ONE place and
+         called from exactly THREE sites — once in each live body (each
+         before the intrinsic-zeroing line) and once in the scout reward.
+         Inside `_gui_reward`, gui_costs is called once and the potential
+         is assigned once per holder (stream 0 / scout state); everywhere
+         else in the loop the stream-0 potential is only ever RESET to None
+         (boundary re-adoption), never computed — a second computing site
+         is exactly the duplicated-body drift (CLAUDE.md 4.2) this guards.
+    Fails on the pre-change code: the attributes are ignored, so the
+    with-cost and without-cost runs are identical and G1 sees 0, not N*cost.
+    """
+    import importlib.util
+    global GUI_STREAMS, GUI_WINDOWS
+    if importlib.util.find_spec("gymnasium") is None:
+        raise ImportError("No module named 'gymnasium'")   # runner: SKIP
+    w0 = (GUI_STREAMS, GUI_WINDOWS)
+    try:
+        per_body = {}
+        for lifelong, label in ((True, "_collect_segment"),
+                                (False, "_run_episode_parallel")):
+            flags, base = _drive(lifelong, DWELL_W, False,
+                                 step_cost=0.0, grace=GRACE)
+            f1, paid = _drive(lifelong, DWELL_W, False,
+                              step_cost=STEP_COST, grace=GRACE)
+            assert f1 == flags
+            diff = [b - a for a, b in zip(base, paid)]
+            want = _expected_step_cost(flags, STEP_COST, GRACE)
+            n_charged = GUI_LEN - GRACE
+            assert max(abs(d - x) for d, x in zip(diff, want)) < 1e-12, (
+                f"{label}: per-step dwell cost does not follow the rule "
+                f"(got {sum(diff):+.6f}, want {sum(want):+.6f}) — the term "
+                f"is missing from this body or charges the wrong steps")
+            assert abs(sum(diff) + n_charged * STEP_COST) < 1e-12, (
+                label, sum(diff))
+            o = flags.index(True)
+            per_body[label] = diff[o:o + GUI_LEN + 3]
+            print(f"  G1. {label}: {GUI_LEN}-step stay, grace {GRACE} -> "
+                  f"{sum(diff):+.4f} beyond the potential "
+                  f"({n_charged} x {-STEP_COST:+.4f})")
+
+            fz, pz = _drive(lifelong, 0.0, False, step_cost=0.0,
+                            grace=GRACE)
+            fc, pc = _drive(lifelong, 0.0, False, step_cost=STEP_COST,
+                            grace=GRACE)
+            assert all(x == 0.0 for x in pz), (label, pz)
+            assert max(abs(a - b) for a, b in zip(pc, want)) < 1e-12, (
+                f"{label}: with the potential OFF the step cost must still "
+                f"run (it may not borrow a counter nobody ticks): "
+                f"{sum(pc):+.6f}")
+            print(f"  G1. {label}: potential off (weight 0) -> step cost "
+                  f"alone {sum(pc):+.4f}, same rule")
+
+            for g in (GUI_LEN, GUI_LEN + 10):
+                _, pg = _drive(lifelong, DWELL_W, False,
+                               step_cost=STEP_COST, grace=g)
+                assert pg == base, (
+                    f"{label}: stay {GUI_LEN} <= grace {g} must cost nothing "
+                    f"extra: {sum(pg) - sum(base):+.6f}")
+            print(f"  G2. {label}: stay {GUI_LEN} with grace {GUI_LEN} and "
+                  f"{GUI_LEN + 10} -> exactly the potential, nothing extra")
+
+            # G3: two stays; the second (15 steps) must restart the grace
+            GUI_WINDOWS = [(5, 35), (37, 52)]
+            f3, b3 = _drive(lifelong, DWELL_W, False, step_cost=0.0,
+                            grace=GRACE)
+            _, p3 = _drive(lifelong, DWELL_W, False, step_cost=STEP_COST,
+                           grace=GRACE)
+            d3 = [b - a for a, b in zip(b3, p3)]
+            w3 = _expected_step_cost(f3, STEP_COST, GRACE)
+            assert max(abs(a - b) for a, b in zip(d3, w3)) < 1e-12, (
+                f"{label}: two stays mis-charged ({sum(d3):+.6f} vs "
+                f"{sum(w3):+.6f}) — the run counter did not reset on close")
+            closes = [k for k in range(1, len(f3)) if f3[k - 1] and not f3[k]]
+            assert len(closes) == 2 and all(d3[k] == 0.0 for k in closes)
+            assert all(d3[k] == 0.0 for k, g in enumerate(f3) if not g)
+            second = sum(d3[37:])
+            assert abs(second + 5 * STEP_COST) < 1e-12, (label, second)
+            GUI_WINDOWS = w0[1]
+            print(f"  G3. {label}: close step and every open-world step pay "
+                  f"0 extra; second 15-step stay {second:+.4f} (5 charged — "
+                  f"the counter reset, grace restarted)")
+
+            # G4: cost 0 == the loop's defaults == contract D reference
+            fd, pd = _drive(lifelong, DWELL_W, False)
+            assert fd == flags and pd == base, (
+                f"{label}: cost 0 is not byte-identical to the default run")
+            ref = _reference(flags, DWELL_W, DWELL_N)
+            assert max(abs(a - b) for a, b in zip(base, ref)) < 1e-9
+            print(f"  G4. {label}: cost 0 byte-identical to the default run "
+                  f"and to contract D's plain-difference reference")
+        a, b = per_body.values()
+        assert a == b, "the two bodies charge different numbers"
+        print("  G1. both bodies: identical per-step cost sequence")
+
+        # G5: scouts. Only the lifelong body trains PPO on scouts.
+        GUI_STREAMS = {0, 1}
+        _drive(True, DWELL_W, False, step_cost=0.0, grace=GRACE)
+        s0 = list(SCOUT["rec"])
+        _drive(True, DWELL_W, False, step_cost=STEP_COST, grace=GRACE)
+        s1 = list(SCOUT["rec"])
+        sflags = list(GUI_LOG[1])
+        assert len(s0) == len(s1) == len(sflags) and any(sflags)
+        sd = [b - a for a, b in zip(s0, s1)]
+        sw = _expected_step_cost(sflags, STEP_COST, GRACE)
+        assert max(abs(x - y) for x, y in zip(sd, sw)) < 1e-12, (
+            f"scout dwell step cost wrong: {sum(sd):+.6f} vs {sum(sw):+.6f}")
+        assert abs(sum(sd) + (GUI_LEN - GRACE) * STEP_COST) < 1e-12
+        print(f"  G5. scout (_scout_mixed_reward): same rule, "
+              f"{sum(sd):+.4f} over its {GUI_LEN}-step stay")
+    finally:
+        GUI_STREAMS, GUI_WINDOWS = w0
+
+    src = open(SRC).read()
+
+    def _method(name):
+        i0 = src.index(f"    def {name}(")
+        return src[i0:src.index("\n    def ", i0 + 10)]
+
+    key = "prim_extrinsic += self._gui_reward(0, step_infos[0])"
+    assert src.count(key) == 2, (
+        f"stream-0 step cost must exist in BOTH bodies: {src.count(key)}")
+    assert src.count("    def _gui_reward(") == 1
+    # exactly three call sites: two live bodies + the scout reward
+    assert src.count("self._gui_reward(") == 3, src.count("self._gui_reward(")
+    for name in ("_run_episode_parallel", "_collect_segment"):
+        body = _method(name)
+        assert body.count("self._gui_reward(") == 1, name
+        assert body.index(key) < body.index(
+            "intrinsic[0] = intrinsic[0] * 0.0"), name
+    assert "_gui_reward(" not in _method("_run_episode"), (
+        "the unwired legacy body must not grow a third copy")
+    scout = _method("_scout_mixed_reward")
+    assert scout.count("self._gui_reward(") == 1
+    assert "_ext += self._gui_reward(e_i, info)" in scout
+    # one computation, one assignment per holder, all inside _gui_reward
+    gr = _method("_gui_reward")
+    assert src.count("gui_costs(") == 1 and gr.count("gui_costs(") == 1, (
+        "gui_costs must be called from _gui_reward only")
+    s0 = "self._gui_run, self._gui_dwell_phi = costs.run, costs.potential"
+    sc = 'state["gui_run"], state["gui"] = costs.run, costs.potential'
+    assert gr.count(s0) == 1 and gr.count(sc) == 1, (
+        "potential must be assigned exactly once per holder in _gui_reward")
+    assert src.count(s0) == 1 and src.count(sc) == 1
+    rhs = re.findall(r"self\._gui_dwell_phi\s*=(?!=)\s*([^\n]*)", src)
+    computed = [r for r in rhs if r.split("#")[0].strip() != "None"]
+    assert computed == ["costs.run, costs.potential"], (
+        f"stream-0 potential written with a non-reset value outside "
+        f"_gui_reward: {computed}")
+    print(f"  G6. _gui_reward called at exactly 3 sites (one per live body, "
+          f"each before the intrinsic zeroing; one scout on _ext; none in "
+          f"_run_episode); gui_costs called once; potential assigned once per "
+          f"holder inside _gui_reward, elsewhere only reset to None "
+          f"({len(rhs) - 1} resets)")
+
+
 def test_episodic_boundary_readopts_cost_potentials():
     """The episodic body must reset the stream-0 cost potentials at each
     episode start (2026-10-03). Without it, an episode ending inside a menu
@@ -459,4 +683,5 @@ if __name__ == "__main__":
     test_stream0_dwell_without_scaffold()
     test_farm_damp_reaches_intrinsic()
     test_episodic_boundary_readopts_cost_potentials()
+    test_gui_dwell_step_cost()
     print("[gui-farm] ALL PASS")

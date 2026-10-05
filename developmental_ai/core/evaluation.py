@@ -39,6 +39,30 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# EVAL'S OWN STREAM NAMESPACE (2026-10-05 review). LearningProgressCuriosity
+# keys open visits by stream id and defaults a 1-row batch to stream 0 —
+# which IS the live primary stream. An eval call would therefore continue
+# (or close) the live agent's open visit with eval transitions. A tuple can
+# never equal the loop's int ids. The eval visit still open at episode end is
+# discarded, so it cannot dangle into the next eval episode. (Mid-episode
+# bucket changes still close eval visits into the shared histories, as they
+# always did — only the live-stream collision is fixed here.)
+EVAL_STREAM_ID = ("eval", 0)
+
+
+def _eval_intrinsic(curiosity, obs_t, act_t, next_obs_t):
+    from developmental_ai.curiosity.learning_progress import (
+        LearningProgressCuriosity)
+    if isinstance(curiosity, LearningProgressCuriosity):
+        return curiosity.compute_intrinsic_reward(
+            obs_t, act_t, next_obs_t, stream_ids=[EVAL_STREAM_ID])
+    return curiosity.compute_intrinsic_reward(obs_t, act_t, next_obs_t)
+
+
+def _end_eval_visit(curiosity):
+    if hasattr(curiosity, "end_visits"):
+        curiosity.end_visits([EVAL_STREAM_ID], valid=False)
+
 
 class EvalEpisodeRunner:
     """Runs episodes in eval mode: no training, deterministic actions."""
@@ -119,9 +143,8 @@ class EvalEpisodeRunner:
                 ).unsqueeze(0).to(self.agent.device)
 
             with torch.no_grad():
-                intrinsic = self.agent.curiosity.compute_intrinsic_reward(
-                    obs_t, act_t, next_obs_t
-                ).item()
+                intrinsic = _eval_intrinsic(
+                    self.agent.curiosity, obs_t, act_t, next_obs_t).item()
 
                 encoded = self.agent.world_model.embed(next_obs_t)
                 rssm_state, _ = self.agent.world_model.rssm.observe_step(
@@ -138,6 +161,7 @@ class EvalEpisodeRunner:
             episode_length += 1
             obs = next_obs
 
+        _end_eval_visit(self.agent.curiosity)
         return {
             "episode_reward": episode_reward,
             "episode_length": episode_length,

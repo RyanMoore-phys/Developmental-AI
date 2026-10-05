@@ -379,6 +379,15 @@ and pay for measured improvement attributable to recent experience
 (compression progress / information gain). Keep raw error only as a
 short-horizon supplement, capped by the ledger's concentration alarm.
 
+> **Superseded 2026-10-05: progress is measured, never paid.** The paired
+> probe measurement (`infra/progress_curiosity.py`) still runs when
+> `progress_weight > 0`, but it records no reward: an improvement in the
+> world model does not establish credit for the action being taken now, and
+> the per-step rate was an ambient wage. The drive is the damped raw-error
+> term (`icm_base_scale`) plus the itemised novelty terms. Paying for progress
+> again needs causal attribution (`EvidenceCredit`, deliberately unwired) and
+> a validated live integration. See `docs/foundation/LEARNING_PROCESS_IMPROVEMENTS.md`.
+
 **Why this solution.** Error is maximised by noise — the noisy-TV problem, of
 which drifting clouds are a textbook instance — while progress is maximised by
 *learnable* structure, which is what a developmental agent should be
@@ -1458,6 +1467,9 @@ integration pending)  #50 ✅  #2 ✅ (tool; startup integration pending)
   lock, improvement (never surprise) paid as a slowly-varying rate;
   noisy-TV analogue pays ~0 by test. The raw ICM base term is damped
   (`icm_base_scale: 0.5` on SkyBot) so learning leads the drive.
+  **Superseded 2026-10-05:** the payment is removed (measurement only,
+  `reward=0` in the log); `icm_base_scale` still damps the base term, which
+  together with novelty is now the whole base drive — progress leads nothing.
 * **Metabolic effort cost (new, #15-flavoured).** Observed live: sustained
   attack swings at CLOUDS — futile effort was exactly free under the
   whitelisted economy. attack/use/jump steps now cost a small constant via

@@ -1098,6 +1098,12 @@ prioritized_replay:
 async_replay:
   enabled: true
 curiosity:
+  # Explicit rollback: lp_sig_z: 0 and lp_visit_collapse: false restore
+  # legacy per-step LP. New paired observable progress is shadow-only.
+  lp_sig_z: 2.33
+  lp_rho_max: 0.9
+  lp_visit_collapse: true
+
   # ---- PERSPECTIVE FROM MOTION joins the DRIVE (2026-09-18) ------------
   # Weight of the world model's flow residual — how much of the change
   # between the last two frames the action-conditioned warp could NOT
@@ -1211,6 +1217,31 @@ curiosity:
   # ran 10,149 consecutive steps inside a wandering villager's trade screen.
   # 100 restores the original ~400-tick meaning.
   gui_dwell_steps: 100
+  # GUI DWELL STEP COST (2026-10-05). 11.4 h of shadow data after the LP
+  # fix: GUI open 19% -> 70% (stream 0) / 50% (stream 1), longest stay
+  # ~1040 steps, toggle-inventory (10) the top action, mostly the shared
+  # policy's choice. Moving outside paid -0.0057/step, still outside
+  # +0.0004, inside ~0 — the menu was a refuge. gui_dwell_weight cannot fix
+  # that: a plain-difference potential pays EXACTLY 0 while pinned, and a
+  # telescoping potential structurally cannot discourage dwelling
+  # (CLAUDE.md 4.3). This is a genuine per-step cost.
+  #   channel: prim_extrinsic (scouts: _ext), BEFORE the intrinsic-zeroing
+  #     line — survives occlusion. Stream 0 and every scout alike.
+  #   idle: 0 outside a GUI; 0 for the first gui_dwell_grace_steps of a
+  #     stay; -cost on every GUI step after that.
+  #   recovery: closing the GUI — action 10 is always available
+  #     (test_no_one_way_doors keeps it so) — stops it on the very next
+  #     step. It carries no state beyond the current run counter, which
+  #     closing resets, so it is not a latch.
+  #   farming: pure cost, no refund, no potential — there is no sequence of
+  #     actions on which it pays anything.
+  # 0.002 is ~1/3 of what moving outside costs per step: enough to make a
+  # long stay strictly worse than the world, not enough to outweigh a craft.
+  gui_dwell_step_cost: 0.002
+  # Steps (not ticks) a stay may last before the step cost starts. 40 x 4
+  # ticks = 8 s of game time: room to open the inventory and craft, while a
+  # ~1040-step refuge pays ~ -2.0.
+  gui_dwell_grace_steps: 40
   # BORING-VIEW BASE DISCOUNT (2026-08-16). Run of 2026-08-16, -90 clamp:
   # ICM/LP base +0.0147/step = 96% of the drive, paid for watching clouds
   # drift — the sky discount only ever covered the itemised novelty term,
@@ -1329,14 +1360,18 @@ curiosity:
   # (a fresh dirt hole is a genuinely new view — digging manufactures
   # novelty — so mastered-material views pay less). 0 = off.
   break_habituation_scale: 50
-  # COMPRESSION-PROGRESS CURIOSITY (infra #13, 2026-08-09): pay for the world
-  # model measurably IMPROVING on a fixed probe set — being drawn to what you
-  # are LEARNING — while the raw ICM error term is damped to a seasoning
-  # (it funded five farms: anything visually dramatic paid). progress_weight
-  # is the per-step rate multiplier; eval every 512 steps under a
-  # non-blocking WM lock.
+  # Paired observable progress diagnostics. progress_weight is MEASUREMENT
+  # ONLY since 2026-10-05; it PAYS NOTHING. Any value > 0 just switches the
+  # measurement on (the 0.4 magnitude is now meaningless); 0 turns it off.
+  # Matched probes are re-scored across model versions every 512 steps
+  # under the WM lock and logged as "paired-progress shadow event ...
+  # reward=0". Causal reward credit would need a separate validated
+  # integration (EvidenceCredit exists, deliberately unwired).
   progress_weight: 0.4
   progress_eval_every: 512
+  # Damps the raw ICM/LP error term. With progress paying nothing, this
+  # damped term plus the itemised novelty terms IS the base drive; progress
+  # no longer "leads" it. 1.0 = undamped.
   icm_base_scale: 0.5
   # ---- BATCHED CURIOSITY TRAINING (2026-08-23) -------------------------
   # MEASURED on the live module (LearningProgressCuriosity, CNN encoder,
@@ -3069,6 +3104,11 @@ prospection:
 #   max_ms_single_step one pathological stall (fsync on a failing disk).
 foundation:
   shadow:
+    # Bounded one-step POV forecast scores (no action/reward effect). OFF
+    # until its lock / GPU-sync fixes are measured in a live window: the
+    # live budget margin is ~0 — predictions degraded at 5.009 ms/step
+    # against max_ms_per_step 5.0 on 2026-10-05.
+    observable_predict: false
     enabled: true
     root: runlogs/foundation_shadow
     max_bytes: 1073741824

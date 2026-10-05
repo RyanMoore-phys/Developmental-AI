@@ -1,260 +1,336 @@
-"""Compression progress: pay for LEARNING, not for surprise.
+"""Paired development-probe progress, independent of action rewards.
 
-WHY THIS EXISTS.  The base intrinsic reward was ICM prediction ERROR —
-the agent is paid wherever its forward model is currently wrong.  On
-the long runs that signal was maximised by anything visually dramatic,
-and it funded five distinct reward farms: scenes the model could NEVER
-compress (high-motion backdrops, destruction spectacle, flicker) kept
-paying forever precisely because they are unlearnable.  This is the
-classic noisy-TV pathology: a strobe light is maximally surprising and
-zero per cent learnable, so an error-seeker parks in front of it.
-
-The principled replacement is COMPRESSION PROGRESS (Schmidhuber): pay
-for the world model measurably IMPROVING — the derivative of competence
-— rather than the level of incompetence.  Irreducible noise then pays
-nothing (the model never gets better at it), a mastered scene pays
-nothing (no room left to improve), and a scene the model is actively
-learning pays — exactly the gradient attention should follow.
-
-MEASUREMENT DISCIPLINE.  Improvement is scored on a FIXED probe set,
-never on the current stream.  Scoring on whatever the agent happens to
-be looking at would re-open the farm (drift toward easy frames and call
-the falling loss "progress").  Probes are reservoir-sampled from replay
-batches the caller offers, so the set stays representative of lifetime
-experience without early experience monopolising it — but it is STABLE
-between evaluations: the same exam is re-sat every interval, and only a
-reservoir draw ever swaps a single question, never a wholesale rotate
-(a rotating exam would let probe-set churn masquerade as learning, in
-either direction).
-
-DEFENSIVE CONTRACT.  This is reward machinery riding on a live world
-model whose shapes, devices and failure modes change across arch
-versions; it must never be able to kill a run.  A probe whose loss call
-raises is skipped and counted in ``eval_errors`` (last repr parked on
-``last_error`` for telemetry); an evaluation where every probe fails
-returns None and pays nothing new; and a dead evaluator's payout decays
-to zero within three missed evaluation windows instead of paying a
-stale rate forever.  This codebase has hit the guard-becomes-latch
-anti-pattern four times; a REWARD that latches is the same disease with
-the sign flipped, so staleness decay is built in rather than left to
-the caller.
+Only identical probe identities with the same observable objective can be
+compared. New/replaced probes establish baselines. Failed probes cannot make
+an aggregate easier. Versions must advance; repeated readings are not learning.
+New signals are shadow-only. Explicit evidence credit is a separate API and
+is not connected to the live reward mixer.
 """
-
-from __future__ import annotations
-
+from collections import deque
+from dataclasses import asdict, dataclass
+import copy
+import logging
 import math
+import os
+import pickle
 import random
-from typing import Any, Callable, Dict, List, Optional
-
+import tempfile
+import time
+import uuid
+from typing import Any, Callable, Dict
+import numpy as np
 import torch
 
-__all__ = ["ProbeSetProgress"]
+logger = logging.getLogger(__name__)
+
+
+# ---- CHECKPOINT SIDECARS (2026-10-05 review) -------------------------------
+# curiosity_visits.pkl and progress_probes.pkl sit beside the torch
+# checkpoints. Two ways they could kill a run, both fixed here:
+#  * a NON-ATOMIC write interrupted by a crash/OOM leaves a truncated file;
+#  * an UNGUARDED load of that file (or of a valid file whose prototype size
+#    no longer matches the config) raised inside load_checkpoint, so boot
+#    died, the supervisor relaunched, boot died again — forever. A guard
+#    with no reachable escape is a latch (CLAUDE.md 4.1).
+# Escape path: an unreadable sidecar costs ONLY its own component a cold
+# start, with one warning, and the file is renamed aside (never deleted) so
+# a human can inspect it; the next checkpoint writes a fresh one.
+def atomic_pickle_dump(path, obj):
+    """tmp file in the same directory + fsync + os.replace: readers see the
+    old file or the new one, never a torn one."""
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.',
+                               suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            pickle.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:  # make the rename itself durable (best effort; not on every FS)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def load_pickle_sidecar(path, apply: Callable[[Any], None], label,
+                        log=None):
+    """Load `path` and hand it to `apply`. Returns 'absent', 'loaded' or
+    'cold'. 'absent' (older checkpoints never had the file) is silent.
+    'cold': unreadable or rejected by `apply` -> one warning, the file is
+    moved to `<path>.corrupt-<timestamp>` and the component keeps its fresh
+    state. `apply` MUST validate before it mutates, so a rejection leaves
+    the component exactly as constructed."""
+    log = log or logger
+    path = os.fspath(path)
+    if not os.path.exists(path):
+        return 'absent'
+    try:
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+        apply(state)
+        return 'loaded'
+    except Exception as exc:
+        aside = '%s.corrupt-%s' % (path, time.strftime('%Y%m%dT%H%M%S'))
+        n = 1
+        while os.path.exists(aside):
+            aside = '%s.corrupt-%s-%d' % (path, time.strftime('%Y%m%dT%H%M%S'), n)
+            n += 1
+        try:
+            os.replace(path, aside)
+        except OSError as mv_exc:
+            aside = '%s (could not move aside: %s)' % (path, mv_exc)
+        log.warning('%s sidecar unusable (%s: %s) -> COLD START for this '
+                    'component only; file kept at %s', label,
+                    type(exc).__name__, exc, aside)
+        return 'cold'
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    event_id: str
+    previous_versions: tuple
+    model_version: str
+    objective: str
+    probe_ids: tuple
+    evidence_refs: tuple
+    improvement: float
+    forgetting: float
+    standard_error: float
+    step: int
+    shadow: bool = True
+
+
+class EvidenceCredit:
+    """Bounded single-use credit for explicitly attributed experience.
+
+    Not wired into PPO. No credit for shadow events, expired events, unrelated
+    evidence, or repeated claims. The consumed set never evicts: on capacity
+    exhaustion this ledger closes until an explicit new run/ledger is started.
+    """
+    def __init__(self, cap=0.1, max_age=512, capacity=10000):
+        if not math.isfinite(cap) or cap < 0 or max_age < 0 or capacity < 1:
+            raise ValueError('invalid evidence credit budget')
+        self.cap, self.max_age, self.capacity = cap, max_age, capacity
+        self.consumed = set()
+
+    def claim(self, event, evidence_ref, step):
+        if (event.shadow or event.event_id in self.consumed
+                or len(self.consumed) >= self.capacity
+                or not 0 <= step - event.step <= self.max_age
+                or evidence_ref not in event.evidence_refs):
+            return 0.0
+        self.consumed.add(event.event_id)
+        return min(self.cap, max(0.0, event.improvement))
+
+    def state_dict(self):
+        return {'consumed': sorted(self.consumed)}
+
+    def load_state_dict(self, state):
+        self.consumed = set(state['consumed'])
 
 
 class ProbeSetProgress:
-    """Reward = normalised improvement of world-model loss on fixed probes.
-
-    Lifecycle: the caller offers replay batches to :meth:`maybe_add_probe`
-    whenever convenient, calls :meth:`tick` once per environment step, and
-    calls :meth:`evaluate` with a loss closure on the same step clock; the
-    per-step intrinsic payout is read from :meth:`rate`.  All state is
-    plain Python floats plus small detached CPU tensors, so the object is
-    checkpoint-friendly and holds no autograd graphs.
-    """
-
-    def __init__(self, capacity: int = 12, eval_every: int = 512,
-                 ema_beta: float = 0.3, norm_decay: float = 0.999) -> None:
-        self._capacity = max(1, int(capacity))
-        self._eval_every = max(1, int(eval_every))
-        self._ema_beta = float(ema_beta)
-        self._norm_decay = float(norm_decay)
-        # Private, constant-seeded RNG: the reservoir must not consume
-        # from (or be perturbed by) the global RNG stream the trainer
-        # seeds, and identical runs should build identical probe sets so
-        # progress curves are comparable across reruns.
+    def __init__(self, capacity=12, eval_every=512, ema_beta=0.3,
+                 norm_decay=0.999, shadow=True, significance_z=2.33):
+        if capacity < 3 or eval_every < 1 or not math.isfinite(significance_z) or significance_z < 0:
+            raise ValueError('invalid paired-probe configuration')
+        self._capacity, self._eval_every = int(capacity), int(eval_every)
+        # Kept as accepted arguments for old configs; EMA comparisons are gone.
+        self.shadow = bool(shadow)
+        self.significance_z = float(significance_z)
         self._rng = random.Random(0x5EED)
-        self._probes: List[Dict[str, torch.Tensor]] = []
+        self._probes, self._ids, self._refs = [], [], []
         self._offers = 0
-        # EMA of probe-set mean loss.  None until the first evaluation:
-        # you cannot have improved before you have a baseline, so the
-        # first evaluation only SETS this and pays 0.0.
-        self._ema: Optional[float] = None
-        # Running-max normaliser, exactly like EmpowermentPotential's:
-        # raw progress is in loss units, which shrink by orders of
-        # magnitude as the model converges; a fixed scale would make the
-        # payout vanish mid-run.  The decay before absorption is the
-        # standing latch antidote — one early giant improvement must not
-        # pin the denominator and flatten every later payout to ~0.
-        self._running_max = 0.0
-        self._last_eval_step: Optional[int] = None     # gates due-ness
-        self._last_success_step: Optional[int] = None  # gates staleness
-        self._step = 0                                 # advanced by tick()
+        self._previous, self._best = {}, {}
+        self._objective = None
+        self._last_eval_step = self._last_success_step = None
+        self._last_version = None
+        self._step = 0
         self._rate = 0.0
-        self.last_mean_loss: Optional[float] = None
+        self._running_max = 0.0
+        self._norm_decay = norm_decay
+        self.last_mean_loss = None
         self.last_progress = 0.0
+        self.last_forgetting = 0.0
+        self.last_error = None
         self.eval_errors = 0
-        self.last_error: Optional[str] = None
+        self.last_event = None
+        self.events = deque(maxlen=128)
+        self._run_id = uuid.uuid4().hex
+        self._serial = 0
 
-    # ------------------------------------------------------------------ #
-    # probe management                                                   #
-    # ------------------------------------------------------------------ #
-    def maybe_add_probe(self, batch: Dict[str, Any]) -> bool:
-        """Offer a replay batch; reservoir-keep at most ``capacity`` probes.
-
-        Algorithm R over the number of offers seen: the first ``capacity``
-        offers are kept outright, offer *i* thereafter replaces a random
-        held probe with probability capacity/i.  Every batch ever offered
-        therefore has EQUAL probability of being in the set — early
-        experience cannot monopolise the exam — yet between two
-        evaluations with no interleaved keep the set is byte-identical.
-
-        Only the first sequence of the batch (slice ``[0:1]``) is stored,
-        as a detached CPU clone per tensor: a probe must not pin a full
-        replay batch, a GPU allocation, or an autograd graph for the
-        lifetime of the run.  Malformed offers (no tensors, unsliceable
-        values) are declined with the error parked on ``last_error`` —
-        a reward monitor never crashes the run over a bad batch.
-        """
+    def maybe_add_probe(self, batch: Dict[str, Any], *, evidence_ref=None, split='dev'):
+        if split != 'dev':
+            raise ValueError('progress probes must be development evidence')
         try:
             probe = {k: v[0:1].detach().cpu().clone()
                      for k, v in batch.items() if torch.is_tensor(v)}
             if not probe:
                 return False
             self._offers += 1
-            if len(self._probes) < self._capacity:
-                self._probes.append(probe)
-                return True
-            j = self._rng.randrange(self._offers)
-            if j < self._capacity:
-                self._probes[j] = probe
-                return True
-            return False
-        except Exception as exc:                       # noqa: BLE001
+            j = len(self._probes) if len(self._probes) < self._capacity else self._rng.randrange(self._offers)
+            if j >= self._capacity:
+                return False
+            pid = f'{self._run_id}:probe:{self._offers}'
+            if j == len(self._probes):
+                self._probes.append(probe); self._ids.append(pid); self._refs.append(evidence_ref)
+            else:
+                old = self._ids[j]
+                self._previous.pop(old, None); self._best.pop(old, None)
+                self._probes[j], self._ids[j], self._refs[j] = probe, pid, evidence_ref
+            return True
+        except Exception as exc:
             self.last_error = repr(exc)
             return False
 
-    # ------------------------------------------------------------------ #
-    # evaluation                                                         #
-    # ------------------------------------------------------------------ #
-    def evaluate(self, loss_fn: Callable[[Dict[str, torch.Tensor]], Any],
-                 step: int, device: Any = None) -> Optional[float]:
-        """Re-sit the fixed exam; return normalised improvement (or None).
-
-        None means "no verdict": not due yet, fewer than 3 probes held
-        (a 1-probe exam is pure variance), or every probe's loss call
-        failed.  Otherwise the return is progress in [0, 1]-ish units:
-        ``max(0, ema_prev - mean_loss)`` run through running-max
-        normalisation.  Improvement only — a WORSENING model pays 0.0,
-        never negative: intrinsic reward steers attention, and punishing
-        the agent for its trainer's bad gradient step would teach it to
-        avoid being present when learning happens.
-
-        Per-probe failures are skipped and counted in ``eval_errors``;
-        the surviving probes still produce a verdict, because one probe
-        with a stale shape must not blind the whole signal.  On an
-        all-fail evaluation ``_last_eval_step`` still advances so a
-        broken loss_fn is retried once per window, not hammered every
-        step — but ``_last_success_step`` does not, so :meth:`rate`
-        decays the payout of a dead evaluator to zero.
-        """
-        try:
-            step = int(step)
-            if (self._last_eval_step is not None
-                    and step - self._last_eval_step < self._eval_every):
-                return None
-            if len(self._probes) < 3:
-                return None
-
-            losses: List[float] = []
-            with torch.no_grad():
-                for probe in self._probes:
-                    try:
-                        batch = (probe if device is None else
-                                 {k: v.to(device) for k, v in probe.items()})
-                        val = float(loss_fn(batch))
-                        if not math.isfinite(val):
-                            raise ValueError(
-                                f"non-finite probe loss {val!r}")
-                        losses.append(val)
-                    except Exception as exc:           # noqa: BLE001
-                        self.eval_errors += 1
-                        self.last_error = repr(exc)
-
-            if not losses:
-                self._last_eval_step = step
-                return None
-
-            mean_loss = sum(losses) / len(losses)
-            self._last_eval_step = step
-            self._last_success_step = step
-            self.last_mean_loss = mean_loss
-
-            if self._ema is None:
-                # Baseline-setting evaluation: no prior, no progress.
-                self._ema = mean_loss
-                self.last_progress = 0.0
-                self._rate = 0.0
-                return 0.0
-
-            progress_raw = max(0.0, self._ema - mean_loss)
-            self._ema = ((1.0 - self._ema_beta) * self._ema
-                         + self._ema_beta * mean_loss)
-            self._running_max = max(self._running_max * self._norm_decay,
-                                    progress_raw)
-            out = (progress_raw / self._running_max
-                   if self._running_max > 0.0 else 0.0)
-            self.last_progress = out
-            # Amortise: the improvement was earned over eval_every steps
-            # of experience, so it is paid back at out/eval_every per
-            # step rather than as a lump the policy could time-farm.
-            self._rate = out / self._eval_every
-            return out
-        except Exception as exc:                       # noqa: BLE001
-            self.last_error = repr(exc)
+    def evaluate(self, loss_fn, step, device=None, *, model_version=None,
+                 objective='observable-mse-v1'):
+        step = int(step)
+        version = str(step if model_version is None else model_version)
+        if not self.due(step) or version == self._last_version:
             return None
-
-    # ------------------------------------------------------------------ #
-    # per-step payout                                                    #
-    # ------------------------------------------------------------------ #
-    def tick(self, step: int) -> None:
-        """Advance the internal step clock (O(1); call once per env step).
-
-        rate() judges staleness against this clock rather than taking a
-        step argument, so a caller that stops evaluating (crashed trainer
-        thread, wedged model) still sees the payout die: reward paths
-        must degrade to silence, not to a frozen last-known-good value.
-        """
-        try:
-            self._step = int(step)
-        except (TypeError, ValueError):
-            pass  # a garbage step must not kill the run; clock just holds
-
-    def rate(self) -> float:
-        """Current per-step payout; full for one window, then fades to 0.
-
-        Within ``eval_every`` steps of the last successful evaluation the
-        amortised rate is paid in full (that IS the interval it was
-        earned over).  Beyond that it fades linearly, hitting exactly 0
-        at ``3 * eval_every``: an evaluator that has missed three windows
-        is dead, and a dead evaluator must not pay forever — the reward
-        mirror of the guard-becomes-latch bug this repo has hit four
-        times.
-        """
-        if self._rate <= 0.0 or self._last_success_step is None:
+        self._last_eval_step = step
+        if objective != self._objective:
+            self._previous.clear(); self._best.clear()
+            self._objective = objective
+        losses, paired = [], []
+        with torch.no_grad():
+            for pid, ref, probe in zip(self._ids, self._refs, self._probes):
+                try:
+                    batch = probe if device is None else {k: v.to(device) for k, v in probe.items()}
+                    val = float(loss_fn(batch))
+                    if not math.isfinite(val) or val < 0:
+                        raise ValueError('probe loss must be finite and nonnegative')
+                    losses.append(val)
+                    if pid in self._previous:
+                        old_version, old_loss = self._previous[pid]
+                        paired.append((pid, ref, old_version, old_loss-val,
+                                       self._best[pid]-val))
+                    self._previous[pid] = (version, val)
+                    self._best[pid] = min(self._best.get(pid, val), val)
+                except Exception as exc:
+                    self.eval_errors += 1; self.last_error = repr(exc)
+        self.last_event = None
+        self._rate = self.last_progress = 0.0
+        if not losses:
+            return None
+        self.last_mean_loss = sum(losses)/len(losses)
+        self._last_success_step, self._last_version = step, version
+        if len(paired) < 3:
             return 0.0
-        age = self._step - self._last_success_step
-        if age >= 3 * self._eval_every:
-            return 0.0
-        if age <= self._eval_every:
-            return self._rate
-        fade = 1.0 - (age - self._eval_every) / float(2 * self._eval_every)
-        return self._rate * fade
+        drops = np.array([x[4] for x in paired])  # Improvement over best-ever score.
+        se = float(drops.std(ddof=1)/math.sqrt(len(drops)))
+        raw = max(0.0, float(drops.mean()) - self.significance_z*se)
+        self.last_forgetting = max(0.0, -float(np.mean([x[3] for x in paired])))
+        self._running_max = max(self._running_max*self._norm_decay, raw)
+        self.last_progress = raw/self._running_max if self._running_max else 0.0
+        self._serial += 1
+        event = ProgressEvent(f'{self._run_id}:event:{self._serial}',
+            tuple(sorted(set(x[2] for x in paired))), version, objective,
+            tuple(x[0] for x in paired), tuple(x[1] for x in paired if x[1] is not None),
+            raw, self.last_forgetting, se, step, self.shadow)
+        self.last_event = event; self.events.append(event)
+        return self.last_progress
+
+    def due(self, step):
+        """Cadence check, cheap enough for every step: callers test this
+        BEFORE taking the WM lock or computing a model version."""
+        step = int(step)
+        if len(self._probes) < 3:
+            return False
+        return (self._last_eval_step is None
+                or step - self._last_eval_step >= self._eval_every)
+
+    def tick(self, step):
+        self._step = int(step)
+
+    def rate(self):
+        # Measurement is never an ambient wage. Use EvidenceCredit explicitly.
+        return 0.0
+
+    def state_dict(self):
+        return {'schema': 2, 'state': copy.deepcopy(self.__dict__)}
+
+    # EVIDENCE ONLY (2026-10-05 review). The old load did
+    # __dict__.update(saved), which also restored the CLOCK: _last_eval_step
+    # from the previous run while total_timesteps restarts at 0, so
+    # `step - _last_eval_step` stayed negative and no probe was re-evaluated
+    # until the new run overtook the old count — a latch (CLAUDE.md 4.1). It
+    # also overwrote config (_eval_every, _capacity, significance_z). Now:
+    # evidence comes from the file, config from the constructor, and the
+    # clock/version cursor start fresh, so the first due evaluation of the
+    # new process re-scores every probe against its saved baseline.
+    _EVIDENCE = ('_probes', '_ids', '_refs', '_offers', '_previous', '_best',
+                 '_objective', '_running_max', 'eval_errors',
+                 'last_mean_loss', 'last_forgetting', '_run_id', '_serial')
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict) or state.get('schema') != 2:
+            raise ValueError('unsupported paired-progress state')
+        saved = state.get('state')
+        if not isinstance(saved, dict):
+            raise ValueError('paired-progress state has no body')
+        missing = [k for k in self._EVIDENCE if k not in saved]
+        if missing:
+            raise ValueError('paired-progress state lacks %s' % missing)
+        ev = copy.deepcopy({k: saved[k] for k in self._EVIDENCE})
+        probes, ids, refs = list(ev['_probes']), list(ev['_ids']), list(ev['_refs'])
+        if not len(probes) == len(ids) == len(refs) or len(set(ids)) != len(ids):
+            raise ValueError('paired-progress probe tables are inconsistent')
+        if not all(isinstance(p, dict) and p and all(torch.is_tensor(v) for v in p.values())
+                   for p in probes):
+            raise ValueError('paired-progress probes must be tensor dicts')
+        running_max = float(ev['_running_max'])
+        if not math.isfinite(running_max) or running_max < 0:
+            raise ValueError('paired-progress normaliser is invalid')
+        offers, eval_errors = int(ev['_offers']), int(ev['eval_errors'])
+        forgetting, serial = float(ev['last_forgetting']), int(ev['_serial'])
+        run_id = str(ev['_run_id'])
+        saved_rng = saved.get('_rng')
+        rng_state = saved_rng.getstate() if isinstance(saved_rng, random.Random) else None
+        events = list(saved.get('events', ()))
+        previous, best = dict(ev['_previous']), dict(ev['_best'])
+        # Config wins: a smaller capacity drops the surplus probes (and their
+        # baselines), never the reverse.
+        for pid in ids[self._capacity:]:
+            previous.pop(pid, None); best.pop(pid, None)
+        probes, ids, refs = probes[:self._capacity], ids[:self._capacity], refs[:self._capacity]
+        # --- validated; apply ---
+        self._probes, self._ids, self._refs = probes, ids, refs
+        self._offers = max(offers, len(probes))
+        self._previous, self._best = previous, best
+        self._objective = ev['_objective']
+        self._running_max = running_max
+        self.eval_errors = eval_errors
+        self.last_mean_loss = ev['last_mean_loss']
+        self.last_forgetting = forgetting
+        self._run_id, self._serial = run_id, serial
+        if rng_state is not None:
+            self._rng.setstate(rng_state)
+        self.events = deque(events, maxlen=self.events.maxlen)
+        # Fresh clock and cursor (see block comment).
+        self._last_eval_step = self._last_success_step = None
+        self._last_version = None
+        self._step = 0
+        self.last_event = None
+        self.last_error = None
+        self._rate = self.last_progress = 0.0
 
     @property
-    def stats(self) -> Dict[str, Any]:
-        """Telemetry snapshot; safe to call at any time, never raises."""
-        return {"probes": len(self._probes),
-                "last_mean_loss": self.last_mean_loss,
-                "last_progress": self.last_progress,
-                "eval_errors": self.eval_errors,
-                "rate": self.rate()}
+    def stats(self):
+        return {'probes': len(self._probes), 'last_mean_loss': self.last_mean_loss,
+                'last_progress': self.last_progress, 'forgetting': self.last_forgetting,
+                'eval_errors': self.eval_errors, 'rate': 0.0, 'shadow': self.shadow,
+                'event': None if self.last_event is None else asdict(self.last_event)}

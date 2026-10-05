@@ -20,6 +20,10 @@ launch cwd -- scripts/launch_skybot.sh does `cd /workspace/devai`)
         ./logs. NOT ATOMIC: torch.save / open("w") straight onto the final
         name, one file after another -- so a copy can catch a half-written
         file (truncated zip) or two generations side by side.
+    logs/checkpoints/curiosity_visits.pkl + progress_probes.pkl
+        same writer, but tmp + fsync + os.replace (atomic). Missing on
+        checkpoints older than 2026-10-05: recorded as brain_paths_missing,
+        never fatal. Verified by pickle framing only (never unpickled here).
     runlogs/breaks_by_type.json      env.break_memory_path   (tmp+os.replace)
     runlogs/consequence_state.json   infra.log_dir           (tmp+os.replace)
     runlogs/anticipation_state.json  infra.log_dir           (tmp+os.replace)
@@ -108,7 +112,10 @@ CHECKPOINT_FILES = (
     "world_model.pt", "curiosity.pt", "policy.pt", "dream_actor.pt",
     "symbolic_decoder.pt", "glue_layer.pt", "symbolizer.pt",
     "familiarity.pt", "magnet.pt", "knowledge_graph.json",
-    "options_state.json")
+    "options_state.json",
+    # 2026-10-05 sidecars (LP visit histories/prototypes; paired-progress
+    # probes). Absent on older checkpoints -> skipped like any missing path.
+    "curiosity_visits.pkl", "progress_probes.pkl")
 DEFAULT_BRAIN_PATHS = tuple(
     ["logs/checkpoints/" + f for f in CHECKPOINT_FILES]
     + ["runlogs/breaks_by_type.json",
@@ -626,6 +633,22 @@ def check_file(path, rel):
                 json.loads(f.read().decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             return "bad", "json does not parse: %s" % e
+    if rel.endswith(".pkl"):
+        # FRAMING ONLY -- a mirror must never unpickle (arbitrary code, and
+        # it would need torch + the repo). Protocol >= 2 opens with PROTO
+        # (0x80) and every pickle ends with STOP ("."): a truncated write
+        # loses the STOP byte.
+        size = os.path.getsize(path)
+        if size < 3:
+            return "bad", "empty / truncated .pkl"
+        with open(path, "rb") as f:
+            head = f.read(1)
+            f.seek(size - 1)
+            tail = f.read(1)
+        if head != b"\x80":
+            return "legacy", "not a protocol>=2 pickle"
+        if tail != b".":
+            return "bad", "pickle has no STOP opcode (truncated)"
     return "ok", ""
 
 

@@ -1,8 +1,19 @@
 """Read-only report over a ShadowRecorder EvidenceStore (runtime/shadow.py).
 
     PYTHONPATH=. python tools/shadow_report.py <store_dir> [--out DIR]
+            [--run <run_id|latest|all>]
         (default --out runlogs/shadow_report/) -> DIR/REPORT.md, DIR/report.json,
         DIR/ab/ (the A/B harness's own JSON + markdown, when section D runs)
+
+RUNS (--run, 2026-10-05)
+    The live store accumulates every launch; each ShadowRecorder has a run id
+    and names episodes "<run_id>-e<N>". REPORT.md / report.json open with the
+    runs found (id, first/last time, sampled steps). --run all (default) reads
+    everything exactly as before; --run latest / <id> wraps the store ONCE in
+    RunFilteredStore, a read-only proxy whose dev/held-out/evaluator views hide
+    every record of another run (interpretations, which carry no episode, go
+    with the record they target), so A-E all see the same run. BEFORE/AFTER a
+    change: run the tool twice with different --out dirs, one per run id.
 
 WHAT IT READS, AND HOW
     The store is opened `readonly=True`: no recovery write, no quarantine
@@ -80,6 +91,8 @@ MIN_EPISODES = 6
 MIN_HELDOUT_PAIRS = 30
 SEEDS = (0, 1, 2)
 GROUP_BOOTSTRAP_MIN = 8
+PATIENCE = 5               # D early stopping: epochs without validation gain (preregistered)
+BATCH_SIZE = 128           # D neural arms' minibatch size
 EVENT_CLASSES = ("none", "event")
 GUI_INDEX = PROPRIO_FIELDS.index("gui_open")
 UNRECORDED = "unrecorded"  # action source of a store written before 2026-10-04
@@ -176,6 +189,155 @@ def integrity(store: EvidenceStore) -> Dict[str, Any]:
             "disk_bytes": st["disk_bytes"], "max_bytes": st["max_bytes"],
             "evicted": st["evicted"], "store_id": store.ident.get("store_id"),
             "split": store.ident.get("split")}
+
+
+# ------------------------------------------------------------- run filter
+def _ref_run(ev_view, ref: str, meta: Dict[str, Any]) -> Optional[str]:
+    """The run a record belongs to. observation / action / prediction /
+    evidence / episode_end carry `episode` in their index meta; an
+    interpretation carries only `target`, so it belongs to its target's run
+    (None when the target is gone - evicted - so it cannot be attributed)."""
+    if "episode" in meta:
+        return _run_of(str(meta["episode"]))
+    tgt = meta.get("target")
+    if isinstance(tgt, str):
+        try:
+            return _ref_run(ev_view, tgt, ev_view.meta(tgt))
+        except Exception:
+            return None
+    return None
+
+
+def list_runs(store) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    """Every run in the store (index meta only, no decode) and each ref's run.
+    t_first / t_last span every timestamp in the run's metas; sampled_steps
+    is its action-record count."""
+    ev = store.evaluator_view()
+    attr: Dict[str, Optional[str]] = {}
+    runs = collections.defaultdict(lambda: {"t_first": math.inf, "t_last": -math.inf,
+                                            "sampled_steps": 0, "records": 0,
+                                            "episodes": set(), "streams": set()})
+    for ref in ev.refs():
+        m = ev.meta(ref)
+        rid = attr[ref] = _ref_run(ev, ref, m)
+        if rid is None:
+            continue
+        R = runs[rid]
+        R["records"] += 1
+        if "stream" in m:
+            R["streams"].add(m["stream"])
+            R["episodes"].add((m["stream"], m.get("episode")))
+        for key in ("t_wall", "t_dispatch", "t_complete"):
+            if isinstance(m.get(key), (int, float)) and math.isfinite(m[key]):
+                R["t_first"] = min(R["t_first"], float(m[key]))
+                R["t_last"] = max(R["t_last"], float(m[key]))
+        if ev.kind(ref) == "action":
+            R["sampled_steps"] += 1
+    out = []
+    for rid, R in runs.items():
+        ok = math.isfinite(R["t_first"])
+        out.append({"run": rid, "t_first": R["t_first"] if ok else None,
+                    "t_last": R["t_last"] if ok else None,
+                    "first": _ts(R["t_first"]) if ok else None,
+                    "last": _ts(R["t_last"]) if ok else None,
+                    "sampled_steps": R["sampled_steps"], "records": R["records"],
+                    "episodes": len(R["episodes"]), "streams": sorted(R["streams"])})
+    out.sort(key=lambda r: (r["t_first"] is None, r["t_first"] or 0.0, r["run"]))
+    return out, attr
+
+
+def resolve_run(runs: List[Dict[str, Any]], want: str) -> Optional[str]:
+    """`all` -> None (no filter); `latest` -> the run that STARTED last;
+    otherwise an exact run id present in the store."""
+    if want in (None, "", "all"):
+        return None
+    if not runs:
+        raise ValueError("the store has no attributable runs")
+    if want == "latest":
+        timed = [r for r in runs if r["t_first"] is not None]
+        return max(timed or runs, key=lambda r: (r["t_first"] or 0.0, r["run"]))["run"]
+    ids = [r["run"] for r in runs]
+    if want not in ids:
+        raise ValueError(f"run {want!r} not in the store; runs found: {ids}")
+    return want
+
+
+class _RunView:
+    """Read-only proxy over one store view that HIDES every record not
+    attributed to the selected run. Exposes only what the report reads
+    (refs / kind / meta / get); a hidden ref raises KeyError exactly like a
+    ref outside the view's partitions."""
+
+    def __init__(self, view, visible: frozenset, run_id: str):
+        self._v, self._vis, self._run = view, visible, run_id
+
+    @property
+    def partitions(self):
+        return self._v.partitions
+
+    def _check(self, ref: str):
+        if ref not in self._vis:
+            raise KeyError(f"{ref} is not in run {self._run!r} (run-filtered view)")
+
+    def refs(self, kind: Optional[str] = None) -> List[str]:
+        return [r for r in self._v.refs(kind) if r in self._vis]
+
+    def kind(self, ref: str) -> str:
+        self._check(ref)
+        return self._v.kind(ref)
+
+    def meta(self, ref: str) -> Dict[str, Any]:
+        self._check(ref)
+        return self._v.meta(ref)
+
+    def get(self, ref: str):
+        self._check(ref)
+        return self._v.get(ref)
+
+    def __len__(self) -> int:
+        return len(self.refs())
+
+    def __getattr__(self, name):
+        raise AttributeError(f"{name!r} is not supported by the run-filtered view "
+                             f"(add it to _RunView so it filters too)")
+
+
+class RunFilteredStore:
+    """The ONE place the --run filter lives: every section reads the store
+    through this, so A-E see the same records. Views are _RunView proxies;
+    stats() reports the selected run's per-partition counts (index only, no
+    decode); split parameters pass through. Never writes."""
+
+    def __init__(self, store, run_id: str, attr: Dict[str, Optional[str]]):
+        self._s, self.run_id = store, run_id
+        self._vis = frozenset(r for r, rid in attr.items() if rid == run_id)
+        self.heldout_fraction = store.heldout_fraction
+        self.split_salt = store.split_salt
+        self.ident = store.ident
+        self.recovery = store.recovery
+
+    def learning_view(self):
+        return _RunView(self._s.learning_view(), self._vis, self.run_id)
+
+    def heldout_view(self):
+        return _RunView(self._s.heldout_view(), self._vis, self.run_id)
+
+    def evaluator_view(self):
+        return _RunView(self._s.evaluator_view(), self._vis, self.run_id)
+
+    def stats(self) -> Dict[str, Any]:
+        st = dict(self._s.stats())
+        ev = self._s.evaluator_view()
+        per: Dict[str, Dict[str, Any]] = {}
+        for ref in sorted(self._vis):
+            part = ref.split("/", 1)[0]
+            d = per.setdefault(part, {"records": 0, "by_kind": collections.Counter()})
+            d["records"] += 1
+            d["by_kind"][ev.kind(ref)] += 1
+        st["partitions"] = {p: {"records": d["records"], "by_kind": dict(d["by_kind"])}
+                            for p, d in per.items()}
+        st["run_filter"] = self.run_id
+        return st
 
 
 def _green_views(store):
@@ -614,11 +776,11 @@ def section_c(store) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------- D
-def preregistration():
+def preregistration(members=5, epochs=40):
     """Created and FROZEN before any data is read for section D."""
     from developmental_ai.foundation.experiments.ab import Preregistration
     return Preregistration(
-        name="shadow-green-next-step-vs-persistence",
+        name="shadow-green-next-step-v2-validation",
         hypothesis=("a learned one-step predictor of the small-width GREEN "
                     "channels, conditioned on (x_t, a_t) (bootstrap ensemble "
                     "of MLPs), has lower held-out RMSE than persistence "
@@ -637,7 +799,13 @@ def preregistration():
                f"obs t -> obs t+1, same stream and episode, transition_valid on "
                f"every channel; split: one per stream, the store's own episode "
                f"split (runtime.splits with the store's salt and fraction); fit "
-               f"on the learning view (dev), score on the held-out view; metric: "
+               f"on the learning view (dev), reserving its chronologically last fifth "
+               f"of episodes (ordered by each episode's earliest t_wall, then seq) "
+               f"for validation (single episode: chronological split with a gap); "
+               f"all arms use the same fit rows; neural arms select validation NLL "
+               f"with patience {PATIENCE}, maximum {epochs} epochs per member and "
+               f"{members} ensemble members; restore weights and optimizer together; "
+               f"score once on the held-out view; metric: "
                f"mean over channels with nonzero held-out persistence error of "
                f"RMSE(arm)/RMSE(persistence); seeds {list(SEEDS)}; "
                f"insufficient below {MIN_PAIRS} pairs or {MIN_EPISODES} episodes")
@@ -689,6 +857,39 @@ def _slices(chans):
     return out
 
 
+def validation_split(rows):
+    """Development-only split, stable episode IDs. Never examines test rows.
+
+    Multi-episode: the CHRONOLOGICALLY last fifth of episodes is held out,
+    each episode ordered by its earliest (t_wall, seq). Not a sort of the
+    ids: lexicographically "-e10" precedes "-e9", and in a multi-run store
+    the run id would dominate, so a name sort holds out an arbitrary fifth.
+    One-episode screening uses a chronological split with a transition gap;
+    it remains exploratory and does not establish episode generalization.
+    """
+    start: Dict[Tuple[Any, Any, Any], Tuple[float, int]] = {}
+    for r in rows:
+        k = (r["env"], r["stream"], r["episode"])
+        when = (float(r["t_wall"]), int(r["seq"]))
+        if k not in start or when < start[k]:
+            start[k] = when
+    # ties on (t_wall, seq) fall back to the key (repr: env may be None)
+    keys = sorted(start, key=lambda k: (start[k], repr(k)))
+    if len(keys) >= 2:
+        held = set(keys[-max(1, len(keys)//5):])
+        fit = [r for r in rows if (r["env"], r["stream"], r["episode"]) not in held]
+        val = [r for r in rows if (r["env"], r["stream"], r["episode"]) in held]
+        basis = "development-episode"
+    else:
+        ordered = sorted(rows, key=lambda r: (int(r["seq"]), float(r["t_wall"])))
+        cut = int(len(ordered)*0.8)
+        fit, val = ordered[:max(0, cut-1)], ordered[cut:]
+        basis = "development-chronological-gap-exploratory"
+    if len(fit) < 3 or len(val) < 2:
+        raise ValueError("insufficient development data for validation")
+    return fit, val, basis
+
+
 def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
              members: int = 5, epochs: int = 40) -> Dict[str, Any]:
     """Fit `arm` on train rows, score on test rows. All metrics on the
@@ -696,7 +897,10 @@ def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
     from developmental_ai.foundation.mechanisms import (EntityBatch, MixedOutcome,
                                                         OutcomeLayout, TransitionBatch,
                                                         score)
+    supplied_train = len(train)
+    train, validation, validation_basis = validation_split(train)
     X, A, Y, G = _mats(train, chans, ad, discrete)
+    Xv, Av, Yv, _ = _mats(validation, chans, ad, discrete)
     Xt, At, Yt, _ = _mats(test, chans, ad, discrete)
     D = X.shape[1]
     sl = _slices(chans)
@@ -708,6 +912,7 @@ def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
     t0 = time.perf_counter()
     lay = OutcomeLayout(tuple(f"d{i}" for i in range(D)))
     ens = None
+    fit_reports = []
     if arm == "persistence":
         var = np.maximum((dlt ** 2).mean(0), 1e-12)
         dist = MixedOutcome.gaussian_categorical(lay, Xt, np.tile(var, (len(Xt), 1)))
@@ -740,9 +945,12 @@ def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
         def make(i):
             return MLPMechanism(1, D, 0, ad, EVENT_CLASSES, hidden=64, layers=2,
                                 seed=1000 * seed + i, mechanism_id=f"{arm}.m{i}")
+        val_batch = TransitionBatch(eb(Xv), (Av if use_a else np.zeros_like(Av))[:, None, :],
+                                    np.ones(len(Xv)), eb(Yv))
         if arm == "mlp":
             model = make(0)
-            model.fit(batch, epochs=epochs, batch_size=128, lr=2e-3)
+            fit_reports = [model.fit(batch, epochs=epochs, batch_size=BATCH_SIZE,
+                                     lr=2e-3, validation=val_batch, patience=PATIENCE)]
         else:
             n_groups = len(set(G.tolist()))
             model = ens = BootstrapEnsemble(make, k=members, seed=seed)
@@ -751,8 +959,10 @@ def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
             # member drawn on the two short ones extrapolates wildly and the
             # mixture mean is ruined (measured RMSE ratio 6.5 vs 0.96 for
             # one MLP). Below GROUP_BOOTSTRAP_MIN episodes: i.i.d. rows.
-            model.fit(batch, groups=G if n_groups >= GROUP_BOOTSTRAP_MIN else None,
-                      epochs=epochs, batch_size=128, lr=2e-3)
+            fit_reports = model.fit(
+                batch, groups=G if n_groups >= GROUP_BOOTSTRAP_MIN else None,
+                epochs=epochs, batch_size=BATCH_SIZE, lr=2e-3,
+                validation=val_batch, patience=PATIENCE)["members"]
         dist = model.predict(eb(Xt), Ate[:, None, :], np.ones(len(Xt)))
     secs = time.perf_counter() - t0
     tgt = {"continuous": (Yt if dist.layout.Dc == D else
@@ -776,7 +986,20 @@ def fit_eval(arm: str, seed: int, train, test, chans, ad, discrete,
            "cov90": sc.get("cov90"), "cov50": sc.get("cov50"),
            "rmse_dyn_dims": sc.get("rmse"), "n_train": len(train), "n_test": len(test),
            "dyn_dims": int(dyn.size), "fit_seconds": secs,
-           "interactions": len(train), "model_updates": 1}
+           "interactions": supplied_train,
+           # neural arms: optimizer steps actually taken, summed over members
+           # (epochs early stopping discarded included); a fixed baseline is
+           # one closed-form fit
+           "model_updates": (int(sum(r["gradient_steps"] for r in fit_reports))
+                             if fit_reports else 1),
+           "validation_pairs": len(validation), "validation_basis": validation_basis,
+           "epoch_budget_per_member": epochs,
+           "epochs_run_per_member": [r["epochs"] for r in fit_reports],
+           "selected_epoch_per_member": [r["selected_epoch"] for r in fit_reports],
+           "selected_train_loss_per_member": [r["loss_selected"] for r in fit_reports],
+           "selection": (f"validation NLL; patience {PATIENCE}; best weights and "
+                         f"optimizer restored"
+                         if fit_reports else "fixed baseline; no validation selection")}
     if ens is not None:
         dec = ens.decompose(eb(Xt), Ate[:, None, :], np.ones(len(Xt)))
         epi = dec["epistemic"][:, :D][:, dyn] / np.maximum(dsd[dyn] ** 2, 1e-12)
@@ -793,7 +1016,7 @@ ARMS = ("persistence", "ridge", "mlp", "ensemble_mlp", "ensemble_mlp_no_action")
 
 def section_d(store, g, out_dir: str, members: int = 5, epochs: int = 40) -> Dict[str, Any]:
     from developmental_ai.foundation.experiments.ab import make_split, run_ab
-    prereg = preregistration()          # FROZEN before any D data is touched
+    prereg = preregistration(members, epochs)  # FROZEN before any D data is touched
     res: Dict[str, Any] = {"prereg": prereg.to_dict(), "prereg_frozen_at_ns":
                            prereg.frozen_at_ns}
     rows = [r for r in g["rows"] if r["valid"]]
@@ -950,10 +1173,27 @@ def exploratory_d(rows, chans, ad, discrete, members, epochs) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------- E
+def observable_scores(g):
+    """Outcome scoring is separate from categorical entropy and record counts."""
+    statuses = collections.Counter()
+    groups = collections.defaultdict(list)
+    for row in g["rows"]:
+        score = row["pay"].get("observable_score", {})
+        statuses[score.get("status", "unrecorded")] += 1
+        if score.get("status") == "scored":
+            groups[(row["part"], row["stream"], score["target"])].append(score)
+    return {"statuses": dict(statuses), "groups": [
+        {"partition": k[0], "stream": k[1], "target": k[2], "horizon": 1,
+         "n": len(v), "mse": float(np.mean([x["mse"] for x in v])),
+         "persistence_mse": float(np.mean([x["persistence_mse"] for x in v]))}
+        for k, v in sorted(groups.items())]}
+
+
 def section_e(g) -> Dict[str, Any]:
+    observed = observable_scores(g)
     ps = [p for p in g["preds"] if p["probs"] is not None]
     if not ps:
-        return {"available": False, "reason": "no prediction carries prior probs"}
+        return {"available": False, "reason": "no prediction carries prior probs", "observable": observed}
     for p in ps:
         pr = np.clip(p["probs"].reshape(-1, p["probs"].shape[-1]), 1e-12, 1.0)
         h = -(pr * np.log(pr)).sum(-1)
@@ -962,7 +1202,7 @@ def section_e(g) -> Dict[str, Any]:
         p["pmax"] = float(pr.max(-1).mean())
         p["S"], p["C"] = pr.shape
     H = np.array([p["H"] for p in ps])
-    out = {"n": len(ps), "latent": f"{ps[0]['S']}x{ps[0]['C']}",
+    out = {"observable": observed, "n": len(ps), "latent": f"{ps[0]['S']}x{ps[0]['C']}",
            "definition": "per-categorical entropy (nats) averaged over the S "
                          "latent groups; normalised = / ln C (1.0 = uniform)",
            "entropy": _stats(H),
@@ -1029,6 +1269,17 @@ def render(rep: Dict[str, Any]) -> str:
          f"{I['manifest_records_missing_on_disk']} listed but missing); "
          f"{len(I['recovery_notes'])} recovery note(s)"]
     L += [f"  - {n}" for n in I["recovery_notes"][:10]]
+    RF = rep.get("run_filter", {"requested": "all", "selected": "all"})
+    L += ["", f"### Runs in the store (--run {RF['requested']} -> sections A-E "
+          f"cover: **{RF['selected']}**)", ""]
+    L += _table(["run", "first", "last", "sampled steps", "episodes", "streams",
+                 "selected"],
+                [[r["run"], r["first"], r["last"], r["sampled_steps"], r["episodes"],
+                  ",".join(r["streams"]), "yes" if r["selected"] else ""]
+                 for r in rep.get("runs_found", [])])
+    if RF.get("unattributed_records"):
+        L.append(f"- {RF['unattributed_records']} record(s) attributable to no run "
+                 f"(shown only under --run all)")
     L += ["", "## A. Inventory", ""]
     L += _table(["run", "start", "end", "hours", "streams", "episodes",
                  "agent steps", "steps/s/stream"],
@@ -1163,6 +1414,13 @@ def render(rep: Dict[str, Any]) -> str:
     else:
         L.append(f"- not available: {E['reason']}")
     L.append("")
+    L += ["", "## Observable forecast accuracy", "",
+          "Latent entropy is not prediction accuracy. Boundary outcomes are excluded.", "",
+          f"- scoring coverage: {E.get('observable', {}).get('statuses', {})}"]
+    for group in E.get("observable", {}).get("groups", []):
+        L.append(f"- {group['partition']} / {group['stream']} / {group['target']}: "
+                 f"n={group['n']}, MSE={group['mse']:.6g}, "
+                 f"persistence MSE={group['persistence_mse']:.6g}, horizon=1")
     return "\n".join(L)
 
 
@@ -1186,11 +1444,24 @@ def _fmtd(d) -> str:
 
 # ----------------------------------------------------------------- main
 def build_report(store_dir: str, out_dir: str, members: int = 5,
-                 epochs: int = 40) -> Dict[str, Any]:
+                 epochs: int = 40, run: str = "all") -> Dict[str, Any]:
+    """run: "all" (every run, the pre-2026-10-05 behaviour), "latest" (the
+    run that started last) or an exact run id. The filter is applied ONCE,
+    by wrapping the store in RunFilteredStore; integrity stays whole-store
+    (it describes the files, not a run)."""
     t0 = time.time()
-    store = open_store(store_dir)
+    raw = open_store(store_dir)
+    runs, attr = list_runs(raw)
+    sel = resolve_run(runs, run)
+    for r in runs:
+        r["selected"] = sel is None or r["run"] == sel
     rep = {"store": os.path.abspath(store_dir),
-           "generated": _ts(time.time()), "integrity": integrity(store)}
+           "generated": _ts(time.time()), "integrity": integrity(raw),
+           "runs_found": runs,
+           "run_filter": {"requested": run, "selected": sel if sel else "all",
+                          "unattributed_records": sum(1 for v in attr.values()
+                                                      if v is None)}}
+    store = raw if sel is None else RunFilteredStore(raw, sel, attr)
     g = load_green(store)
     rep["A"] = section_a(store, g)
     rep["B"] = section_b(g)
@@ -1213,12 +1484,21 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="runlogs/shadow_report")
     ap.add_argument("--members", type=int, default=5)
     ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--run", default="all",
+                    help="run id, 'latest' (started last) or 'all' (default). "
+                         "Before/after: run twice with different --out, e.g. "
+                         "--run <old_id> --out runlogs/rep_before and --run "
+                         "latest --out runlogs/rep_after")
     a = ap.parse_args(argv)
     out = os.path.abspath(a.out)
     st = os.path.abspath(a.store)
     if out == st or out.startswith(st + os.sep):
         ap.error("--out must not be inside the store (the store is read-only)")
-    rep = build_report(a.store, a.out, a.members, a.epochs)
+    rep = build_report(a.store, a.out, a.members, a.epochs, run=a.run)
+    print(f"runs: " + ", ".join(f"{r['run']} ({r['first']} .. {r['last']}, "
+                                f"{r['sampled_steps']} sampled)"
+                                for r in rep["runs_found"])
+          + f"; selected {rep['run_filter']['selected']}")
     print(f"wrote {os.path.join(a.out, 'REPORT.md')} and report.json "
           f"({rep['seconds']:.1f}s; quarantined {rep['integrity']['quarantined_total']}; "
           f"D: {rep['D']['status']})")

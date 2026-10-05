@@ -46,6 +46,8 @@ UNIT = [
 ]
 
 CONTRACT = [
+    "tests/_learning_processes_smoke.py",
+    "tests/_infra_progress_curiosity_smoke.py",
     "tests/_perspective_smoke.py",
     "tests/_sensor_bus_smoke.py",
     "tests/_oracle_isolation_smoke.py",
