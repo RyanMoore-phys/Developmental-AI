@@ -442,6 +442,7 @@ class ReplayBuffer:
         # a handful of rows. So it is computed once and reused until enough
         # new experience has arrived to matter.
         self._writes = 0                    # monotonic; bumped by add()
+        self._n_added = 0                   # monotonic; ONLY add() bumps it
         self._starts_cache: Dict[Tuple, Tuple] = {}
         # How many new rows may arrive before a rescan. The newest rows are
         # simply not sampleable until then — a mild recency bias, traded for
@@ -464,6 +465,75 @@ class ReplayBuffer:
 
         # A lock guarding writes so a background sampler can read safely.
         self._lock = threading.Lock()
+        self._reset_sample_stats()
+
+    # ---- SAMPLER TELEMETRY (2026-10-07, measurement only) ------------------
+    # Counted inside sample_sequences under the existing lock, AFTER every
+    # random draw, from arrays the sampler already built: no extra RNG use,
+    # no change to what is sampled. pop_sample_stats() reads and resets.
+    def _reset_sample_stats(self) -> None:
+        self._ss_calls = 0
+        self._ss_sequences = 0
+        self._ss_rejected = 0
+        self._ss_candidates = 0
+        self._ss_pri_sum = 0.0
+        self._ss_pri_n = 0
+
+    def _count_sample(self, indices, seq_len: int, n_valid: int,
+                      n_terminal_pool: int) -> None:
+        try:
+            if not hasattr(self, "_ss_calls"):
+                self._reset_sample_stats()
+            cand = max(0, int(self.size) - int(seq_len))
+            self._ss_calls += 1
+            self._ss_sequences += int(len(indices))
+            self._ss_candidates += cand
+            # Starts the scan excluded: the window crosses a done (other than
+            # at its last step), a restart, or the ring's write seam.
+            self._ss_rejected += max(0, cand - int(n_valid)
+                                     - int(n_terminal_pool))
+            if len(indices) and self.priorities is not None:
+                idx = ((np.asarray(indices, dtype=np.int64)[:, None]
+                        + np.arange(seq_len)[None, :]) % self.capacity)
+                pri = np.asarray(self.priorities[idx], dtype=np.float64)
+                self._ss_pri_sum += float(pri.max(axis=1).sum())
+                self._ss_pri_n += int(len(indices))
+        except Exception:
+            pass                      # telemetry never breaks sampling
+
+    def _sample_stats_raw(self) -> dict:
+        if not hasattr(self, "_ss_calls"):
+            self._reset_sample_stats()
+        with self._lock:
+            raw = {"calls": self._ss_calls, "sequences": self._ss_sequences,
+                   "rejected": self._ss_rejected,
+                   "candidates": self._ss_candidates,
+                   "pri_sum": self._ss_pri_sum, "pri_n": self._ss_pri_n}
+            self._reset_sample_stats()
+        return raw
+
+    @staticmethod
+    def _sample_stats_from_raw(raw: dict) -> dict:
+        return {
+            "sequences_sampled": int(raw["sequences"]),
+            # Summed over sample calls: candidate starts the boundary scan
+            # excluded (each call re-scans the whole buffer, so this is
+            # exposure-weighted; use rejected_boundary_frac for a rate).
+            "rejected_boundary": int(raw["rejected"]),
+            "rejected_boundary_frac": (
+                float(raw["rejected"]) / raw["candidates"]
+                if raw["candidates"] else None),
+            # Mean SEQUENCE priority (window max, as the PER sampler scores
+            # it) of what was drawn, uniform or not.
+            "mean_priority": (float(raw["pri_sum"]) / raw["pri_n"]
+                              if raw["pri_n"] else None),
+            "sample_calls": int(raw["calls"]),
+        }
+
+    def pop_sample_stats(self) -> dict:
+        """{sequences_sampled, rejected_boundary, rejected_boundary_frac,
+        mean_priority, sample_calls} since the last pop, then reset."""
+        return self._sample_stats_from_raw(self._sample_stats_raw())
 
     def add(
         self,
@@ -537,6 +607,10 @@ class ReplayBuffer:
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
             self._writes += 1
+            # Pure add() count — unlike `_writes`, load() never bumps it. save()
+            # diffs it across a lock-free write to learn how many of the
+            # oldest saved slots the acting thread overwrote mid-save.
+            self._n_added += 1
             self.lock_held_s += time.perf_counter() - _t_write
 
             # GROWTH IS FLAGGED HERE, NEVER PERFORMED HERE. This runs on the
@@ -803,6 +877,8 @@ class ReplayBuffer:
             # most a handful of writes at any realistic step rate. The choice
             # is copied so a later write cannot change it underneath us.
             indices = np.array(indices, dtype=np.int64, copy=True)
+            self._count_sample(indices, seq_len, n_valid,
+                               len(terminal_starts))
 
         obs_seqs, act_seqs, rew_seqs, cont_seqs, pp_seqs = self._gather(
             indices, seq_len)
@@ -1051,28 +1127,112 @@ class ReplayBuffer:
         return (np.arange(self.capacity, dtype=np.int64)
                 + int(self.position)) % self.capacity
 
+    # ---- BOUNDED-MEMORY SAVE (2026-10-07) --------------------------------
+    # THE INCIDENT. On the 16 GB host, memory near-full and swap climbing,
+    # the machine went unresponsive seconds after
+    #     replay buffer saved: 50000 transitions in 5.2s
+    # save() used to gather a FULL in-RAM copy of every column
+    # (`self.observations[order]`, ~1.2 GB per 25k-row stream of 3x128x128
+    # uint8) before np.save — a ~2.4 GB transient over two streams that the
+    # memory budget never saw, and it ran on EVERY periodic checkpoint, not
+    # only at stop. It also held the buffer lock across the whole gather, so
+    # the acting thread's add() stalled behind it.
+    #
+    # NOW: each column is streamed to its .npy in chunks of at most
+    # `_SAVE_CHUNK_BYTES` (and `_SAVE_CHUNK_ROWS`). The lock is held only for
+    # one chunk's gather, never across a column, so add() keeps running.
+    # That concurrency is what makes the save non-trivial: add() overwrites
+    # the OLDEST slot, so rows gathered late may be newer than the snapshot.
+    # Because the saved set is chronological and overwrites walk it from the
+    # oldest end, every possibly-overwritten saved row lies in a PREFIX; its
+    # length is bounded from the add counter after the last chunk and stored
+    # as `start`, which load() skips. Bytes on disk are what np.save would
+    # write (same header writer), so old readers read new files and vice
+    # versa (an absent `start` means 0).
+    _SAVE_CHUNK_BYTES = 8 << 20      # max bytes gathered per lock hold
+    _SAVE_CHUNK_ROWS = 1024          # max rows gathered per lock hold
+    _SAVE_SYNC_BYTES = 64 << 20      # flush + fdatasync cadence (dirty pages)
+
+    def _save_columns(self):
+        cols = [("observations", self.observations),
+                ("actions", self.actions),
+                ("rewards", self.rewards),
+                ("dones", self.dones),
+                ("priorities", self.priorities),
+                ("restarts", self.restarts)]
+        if self.proprio is not None:
+            cols.append(("proprio", self.proprio))
+        return cols
+
+    @staticmethod
+    def _col_layout(col):
+        # Plain ints: a numpy integer in the shape would be written into the
+        # .npy header as `np.int64(512)` under numpy 2 and break readers.
+        if isinstance(col, BlockArray):
+            return (np.dtype(col.dtype),
+                    tuple(int(x) for x in col.row_shape))
+        return col.dtype, tuple(int(x) for x in col.shape[1:])
+
+    def _stream_column(self, fpath: str, col, order: np.ndarray) -> None:
+        """Write `col[order]` to `fpath` as a .npy, one chunk at a time."""
+        dtype, row_shape = self._col_layout(col)
+        n = int(len(order))
+        row_bytes = max(1, int(dtype.itemsize * int(np.prod(row_shape))))
+        rows = int(max(1, min(self._SAVE_CHUNK_ROWS,
+                              self._SAVE_CHUNK_BYTES // row_bytes)))
+        header = {"descr": np.lib.format.dtype_to_descr(dtype),
+                  "fortran_order": False,
+                  "shape": (n,) + row_shape}
+        _sync = getattr(os, "fdatasync", os.fsync)
+        _fadv = getattr(os, "posix_fadvise", None)
+        with open(fpath, "wb") as fh:
+            # The same header writer np.save uses (format 1.0), so the file
+            # is byte-identical to np.save(fpath, col[order]).
+            np.lib.format.write_array_header_1_0(fh, header)
+            unsynced = 0
+            for i in range(0, n, rows):
+                idx = order[i:i + rows]
+                with self._lock:
+                    chunk = col[idx]
+                chunk = np.ascontiguousarray(chunk, dtype=dtype)
+                fh.write(chunk.reshape(-1).view(np.uint8).data)
+                unsynced += chunk.nbytes
+                del chunk
+                if unsynced >= self._SAVE_SYNC_BYTES:
+                    # Bound dirty pages: on a near-full host a 1.2 GB burst
+                    # of unwritten page cache is itself memory pressure.
+                    fh.flush()
+                    try:
+                        _sync(fh.fileno())
+                        if _fadv is not None:
+                            _fadv(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    except OSError:
+                        pass
+                    unsynced = 0
+
     def save(self, path: str, max_transitions: Optional[int] = None) -> int:
         """Write the most recent experience to directory `path`.
 
         The manifest is written LAST and is the commit record — a reader that
         finds no manifest treats the directory as absent rather than loading
         a half-written buffer.
+
+        Extra memory is bounded by one chunk (`_SAVE_CHUNK_BYTES`), not by
+        the buffer; the lock is held per chunk, not per column. See the
+        block comment above for how concurrent add()s are made safe.
         """
         with self._lock:
-            order = self._chronological()
-            if max_transitions is not None and len(order) > int(max_transitions):
-                order = order[-int(max_transitions):]      # keep the NEWEST
+            full = self._chronological()
+            n_full = int(len(full))
+            order = full
+            if max_transitions is not None and n_full > int(max_transitions):
+                order = full[-int(max_transitions):]       # keep the NEWEST
+            order = np.array(order, dtype=np.int64, copy=True)
             n = int(len(order))
-            cols = {
-                "observations": self.observations[order],
-                "actions": self.actions[order],
-                "rewards": self.rewards[order],
-                "dones": self.dones[order],
-                "priorities": self.priorities[order],
-                "restarts": self.restarts[order],
-            }
-            if self.proprio is not None:
-                cols["proprio"] = self.proprio[order]
+            cap0 = int(self.capacity)
+            size0 = int(self.size)
+            added0 = int(self._n_added)
+            cols = self._save_columns()
             meta = {
                 "n": n,
                 "obs_dim": int(self.obs_dim),
@@ -1086,14 +1246,37 @@ class ReplayBuffer:
         if os.path.isdir(tmp):
             shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp, exist_ok=True)
-        for k, v in cols.items():
-            np.save(os.path.join(tmp, k + ".npy"), v)
+        for k, col in cols:
+            self._stream_column(os.path.join(tmp, k + ".npy"), col, order)
+        with self._lock:
+            added = int(self._n_added) - added0
+        # add() fills the (cap0 - size0) free slots first, then overwrites the
+        # oldest slot onward, in chronological order. If capacity grew
+        # mid-save there were MORE free slots than this assumes, so the
+        # estimate only ever over-counts (drops a few good rows, never keeps
+        # a bad one).
+        overwritten = max(0, added - (cap0 - size0))
+        start = int(min(n, max(0, overwritten - (n_full - n))))
+        meta["start"] = start
+        if start:
+            logger.info("replay buffer save: %d of %d oldest rows were "
+                        "overwritten during the write and are marked "
+                        "skipped (start=%d)", start, n, start)
         with open(os.path.join(tmp, _BUF_MANIFEST), "w") as fh:
             json.dump(meta, fh)                       # COMMIT
         if os.path.isdir(path):
             shutil.rmtree(path, ignore_errors=True)
         os.replace(tmp, path)
-        return n
+        return n - start
+
+    @staticmethod
+    def _open_col(fpath: str):
+        """Memory-map a saved column read-only (no full in-RAM copy at boot);
+        fall back to a plain load where mmap is impossible (empty file)."""
+        try:
+            return np.load(fpath, mmap_mode="r")
+        except (ValueError, OSError):
+            return np.load(fpath)
 
     def load(self, path: str) -> int:
         """Restore from `path`. Returns the number of transitions loaded.
@@ -1102,6 +1285,11 @@ class ReplayBuffer:
         restore now uses: a payload whose shapes cannot fill this buffer is
         refused while the buffer is still pristine, rather than half-copied
         into a hybrid that reports success.
+
+        Columns are memory-mapped and copied in chunks, so boot no longer
+        holds the file contents AND the buffer in RAM at once. Rows before
+        the manifest's `start` (overwritten during a concurrent save) are
+        skipped; an absent `start` (every save before 2026-10-07) is 0.
         """
         mpath = os.path.join(path, _BUF_MANIFEST)
         if not os.path.isfile(mpath):
@@ -1128,7 +1316,9 @@ class ReplayBuffer:
         for k in _BUF_ARRAYS:
             if not os.path.isfile(os.path.join(path, k + ".npy")):
                 raise FileNotFoundError(f"{path} is missing {k}.npy")
-        cols = {k: np.load(os.path.join(path, k + ".npy")) for k in _BUF_ARRAYS}
+        cols = {k: self._open_col(os.path.join(path, k + ".npy"))
+                for k in _BUF_ARRAYS}
+        _n0 = int(cols["observations"].shape[0])
         # `restarts` is NOT in _BUF_ARRAYS: it arrived 2026-09-01 and the live
         # host's persisted buffer predates it. Absent means "nothing is known
         # to be a rebuild splice", which is precisely the pre-change
@@ -1136,9 +1326,8 @@ class ReplayBuffer:
         # refusing to load. Making a new column mandatory would have bricked
         # the only copy of the agent's experience.
         _rp = os.path.join(path, "restarts.npy")
-        cols["restarts"] = (np.load(_rp) if os.path.isfile(_rp)
-                            else np.zeros(int(cols["observations"].shape[0]),
-                                          dtype=bool))
+        cols["restarts"] = (self._open_col(_rp) if os.path.isfile(_rp)
+                            else None)                # None => all False
         # `proprio` gets the SAME treatment as `restarts`, for the same
         # reason: it arrived 2026-09-18 and the live host's persisted buffer
         # predates it. Absent means "this experience carries no body sense",
@@ -1147,7 +1336,6 @@ class ReplayBuffer:
         # agent's experience over a column worth 0.03% of a row.
         _pp = os.path.join(path, "proprio.npy")
         if self.proprio is not None:
-            _n0 = int(cols["observations"].shape[0])
             _saved_layout = str(meta.get("sensor_layout", ""))
             # An EMPTY layout on either side means "unknown", which is the
             # pre-bus case and must still load — the host's buffer is the only
@@ -1161,8 +1349,9 @@ class ReplayBuffer:
                     "do not, and reading one layout as another teaches the "
                     "model a body it does not have.",
                     _saved_layout, self.sensor_layout)
+            _loaded = None
             if os.path.isfile(_pp) and _layout_ok:
-                _loaded = np.load(_pp)
+                _loaded = self._open_col(_pp)
                 if int(_loaded.shape[1]) != self.proprio_dim:
                     # A WIDTH CHANGE IS NOT RESTORABLE. Field k means a
                     # different sense than it did, so carrying the values
@@ -1172,11 +1361,11 @@ class ReplayBuffer:
                         "NEUTRAL ZEROS for %d transitions rather than "
                         "misaligned senses",
                         int(_loaded.shape[1]), self.proprio_dim, _n0)
-                    _loaded = np.zeros((_n0, self.proprio_dim), np.float32)
-                cols["proprio"] = _loaded
-            else:
-                cols["proprio"] = np.zeros((_n0, self.proprio_dim), np.float32)
-        n = int(cols["observations"].shape[0])
+                    _loaded = None
+            cols["proprio"] = _loaded                 # None => neutral zeros
+        # Rows overwritten while the save was streaming (see save()).
+        start = int(min(_n0, max(0, int(meta.get("start", 0) or 0))))
+        n = _n0 - start
         # GROW TO FIT rather than discard (2026-09-01). Truncating to "newest"
         # is right for a shrunken fixed buffer, but with growth on it would
         # throw away experience the machine has room for — and the restored
@@ -1188,17 +1377,30 @@ class ReplayBuffer:
             if not self.maybe_grow():
                 break
         if n > self.capacity:                 # capacity shrank: keep newest
-            cols = {k: v[-self.capacity:] for k, v in cols.items()}
+            start = _n0 - self.capacity
             n = self.capacity
+        _dst = {"observations": self.observations, "actions": self.actions,
+                "rewards": self.rewards, "dones": self.dones,
+                "priorities": self.priorities, "restarts": self.restarts}
+        if self.proprio is not None:
+            _dst["proprio"] = self.proprio
         with self._lock:
-            self.observations[:n] = cols["observations"]
-            self.actions[:n] = cols["actions"]
-            self.rewards[:n] = cols["rewards"]
-            self.dones[:n] = cols["dones"]
-            self.priorities[:n] = cols["priorities"]
-            self.restarts[:n] = cols["restarts"].astype(bool)
-            if self.proprio is not None and "proprio" in cols:
-                self.proprio[:n] = cols["proprio"]
+            for k, dst in _dst.items():
+                src = cols.get(k)
+                dtype, row_shape = self._col_layout(dst)
+                row_bytes = max(1, int(dtype.itemsize
+                                       * int(np.prod(row_shape))))
+                rows = int(max(1, min(self._SAVE_CHUNK_ROWS,
+                                      self._SAVE_CHUNK_BYTES // row_bytes)))
+                for i in range(0, n, rows):
+                    j = min(n, i + rows)
+                    if src is None:
+                        dst[i:j] = (False if k == "restarts" else 0.0)
+                    elif k == "restarts":
+                        dst[i:j] = np.asarray(
+                            src[start + i:start + j]).astype(bool)
+                    else:
+                        dst[i:j] = np.asarray(src[start + i:start + j])
             self.size = n
             self.position = n % self.capacity
             # A RESTORED BUFFER IS A DIFFERENT BUFFER. size and position both
@@ -1213,6 +1415,7 @@ class ReplayBuffer:
             # Carrying stale indices would be worse than carrying none.
             self.episode_starts = []
             self._current_episode_start = self.position
+        del cols
         return n
 
     def __len__(self) -> int:
@@ -1330,6 +1533,17 @@ class MultiStreamReplayBuffer:
 
     def __len__(self) -> int:
         return sum(len(s) for s in self.streams)
+
+    def pop_sample_stats(self) -> dict:
+        """Aggregate of every stream's sampler counters since the last pop
+        (counts summed, mean_priority weighted by sequences), then reset."""
+        tot = {"calls": 0, "sequences": 0, "rejected": 0, "candidates": 0,
+               "pri_sum": 0.0, "pri_n": 0}
+        for st in self.streams:
+            raw = st._sample_stats_raw()
+            for k in tot:
+                tot[k] += raw[k]
+        return ReplayBuffer._sample_stats_from_raw(tot)
 
     @property
     def is_ready(self) -> bool:

@@ -20,7 +20,7 @@ launch cwd -- scripts/launch_skybot.sh does `cd /workspace/devai`)
         ./logs. NOT ATOMIC: torch.save / open("w") straight onto the final
         name, one file after another -- so a copy can catch a half-written
         file (truncated zip) or two generations side by side.
-    logs/checkpoints/curiosity_visits.pkl + progress_probes.pkl
+    logs/checkpoints/curiosity_visits.pkl + progress_probes.pkl + exploration_cells.pkl
         same writer, but tmp + fsync + os.replace (atomic). Missing on
         checkpoints older than 2026-10-05: recorded as brain_paths_missing,
         never fatal. Verified by pickle framing only (never unpickled here).
@@ -115,7 +115,10 @@ CHECKPOINT_FILES = (
     "options_state.json",
     # 2026-10-05 sidecars (LP visit histories/prototypes; paired-progress
     # probes). Absent on older checkpoints -> skipped like any missing path.
-    "curiosity_visits.pkl", "progress_probes.pkl")
+    "curiosity_visits.pkl", "progress_probes.pkl",
+    # telemetry: the unique-cell set behind cells_per_hour / time-since-new-
+    # cell (2026-10-07). Losing it resets "new cell" for every cell visited.
+    "exploration_cells.pkl")
 DEFAULT_BRAIN_PATHS = tuple(
     ["logs/checkpoints/" + f for f in CHECKPOINT_FILES]
     + ["runlogs/breaks_by_type.json",

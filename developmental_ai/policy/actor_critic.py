@@ -37,6 +37,30 @@ from developmental_ai.world_model.rssm import symlog, symexp
 
 logger = logging.getLogger(__name__)
 
+# ---- PPO UPDATE TELEMETRY (2026-10-07, measurement only) -------------------
+# When True, StandaloneActorCritic.train_step fills `last_update_stats` with
+# final-epoch means of the PPO diagnostics. Everything it computes is
+# detached, under no_grad, and draws NO random numbers, so parameters and RNG
+# state after an update are byte-identical with it on or off
+# (tests/_ml_stats_smoke.py flips this flag to prove exactly that). The
+# per-minibatch values stay on-device and are pulled back with ONE .tolist()
+# after the loop: one extra device sync per update, not per minibatch.
+COLLECT_STATS = True
+
+
+def explained_variance(pred, target) -> float:
+    """1 - Var(target - pred) / Var(target), the SB3/CleanRL definition.
+
+    1.0 = perfect value fit, 0.0 = no better than predicting the mean,
+    negative = worse than the mean. NaN when the target has zero variance
+    (undefined, not "perfect")."""
+    pred = np.asarray(pred, dtype=np.float64).ravel()
+    target = np.asarray(target, dtype=np.float64).ravel()
+    var_t = float(np.var(target))
+    if not np.isfinite(var_t) or var_t <= 0.0:
+        return float("nan")
+    return float(1.0 - np.var(target - pred) / var_t)
+
 # SB3 is optional — we provide a standalone actor-critic as fallback
 try:
     from stable_baselines3 import PPO, SAC, A2C
@@ -535,6 +559,9 @@ class StandaloneActorCritic:
         self.logit_range = float(logit_range or 0.0)
         self.last_approx_kl = 0.0
         self.last_epochs_run = 0
+        # PPO diagnostics of the most recent update (see COLLECT_STATS).
+        # None until the first update; L logs null for it.
+        self.last_update_stats: Optional[Dict[str, Any]] = None
         # PPO update-rate forensics (2026-08-23). Under options a stored ROW
         # spans tau env steps, so the row count — not the env-step count —
         # is what the collapse guard divides by. Kept on the object so the
@@ -1478,10 +1505,16 @@ class StandaloneActorCritic:
         # problem it existed to prevent.
         _actor_frozen = False
         _kl_stopped = False
+        _collect = bool(COLLECT_STATS)
+        _st_rows = []   # final-epoch per-minibatch stat tensors (on device)
+        _st_vals = []   # final-epoch (pred, target) pairs, value space
         for _ in range(n_epochs):
             if _stop:
                 break
             _epochs_run += 1
+            if _collect:
+                _st_rows = []
+                _st_vals = []
             if _use_mb:
                 _perm = torch.randperm(_n_rows, device=self.device)
                 _chunks = [_perm[i:i + _mb] for i in range(0, _n_rows, _mb)]
@@ -1586,9 +1619,33 @@ class StandaloneActorCritic:
                 # target above makes the spike small in the first place, and
                 # this makes it structurally unable to steal the actor's step
                 # even if it were not.
-                torch.nn.utils.clip_grad_norm_(self._clip_actor, max_norm=0.5)
-                torch.nn.utils.clip_grad_norm_(self._clip_critic, max_norm=0.5)
+                _gn_a = torch.nn.utils.clip_grad_norm_(self._clip_actor,
+                                                       max_norm=0.5)
+                _gn_c = torch.nn.utils.clip_grad_norm_(self._clip_critic,
+                                                       max_norm=0.5)
                 self.optimizer.step()
+                if _collect:
+                    try:
+                        with torch.no_grad():
+                            _cf = ((ratio.detach() - 1.0).abs()
+                                   > self.clip_range).float().mean()
+                            _st_rows.append(torch.stack([
+                                policy_loss.detach().float(),
+                                value_loss.detach().float(),
+                                entropy.detach().float(),
+                                ((ratio.detach() - 1.0)
+                                 - _logratio.detach()).mean().float(),
+                                _cf,
+                                _gn_a.detach().float().reshape(()),
+                                _gn_c.detach().float().reshape(()),
+                            ]))
+                            _st_vals.append((
+                                new_values.detach().reshape(-1),
+                                (symlog(_ret) if self.value_space == "symlog"
+                                 else _ret).detach().reshape(-1)))
+                    except Exception as _e:  # never into the update
+                        _collect = False
+                        logger.warning("PPO stats collection off: %s", _e)
 
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
@@ -1622,6 +1679,12 @@ class StandaloneActorCritic:
         self._clear_rollout()
 
         self.last_epochs_run = _epochs_run
+        if COLLECT_STATS:
+            # A failed collection publishes None (L logs null), never the
+            # previous update's numbers as if they were this one's.
+            self.last_update_stats = (self._final_epoch_stats(
+                _st_rows, _st_vals, advantages_np, returns_np,
+                int(_n_rows), int(_epochs_run)) if _collect else None)
         _vcf = (self._value_clamp_hits / self._value_clamp_n
                 if self._value_clamp_n else 0.0)
         self._value_clamp_hits = self._value_clamp_n = 0
@@ -1685,6 +1748,62 @@ class StandaloneActorCritic:
             # is the finding, not a nuisance to tune away.
             "value_clamped_frac": _vcf,
         }
+
+    def _final_epoch_stats(self, rows, vals, adv_np, ret_np,
+                           n_samples: int, epochs: int):
+        """Reduce the final epoch's per-minibatch stat tensors to plain
+        floats. ONE device sync (the .tolist()). Never raises."""
+        try:
+            lr = float(self.optimizer.param_groups[0].get("lr", float("nan")))
+        except Exception:
+            lr = float("nan")
+        out = {
+            "policy_loss": None, "value_loss": None, "entropy": None,
+            "approx_kl": None, "clip_frac": None, "explained_variance": None,
+            "grad_norm": None, "grad_norm_actor": None,
+            "grad_norm_critic": None, "grad_norm_clipped": None,
+            "lr": lr,
+            # Raw (pre-normalisation) advantages: the normalised ones are
+            # ~0/1 by construction and carry no information.
+            "adv_mean": float(np.mean(adv_np)) if len(adv_np) else None,
+            "adv_std": float(np.std(adv_np)) if len(adv_np) else None,
+            "ret_mean": float(np.mean(ret_np)) if len(ret_np) else None,
+            "n_samples": int(n_samples), "epochs": int(epochs),
+            "minibatches": int(len(rows)),
+        }
+        if not rows:
+            return out
+        try:
+            k = len(rows)
+            with torch.no_grad():
+                pred = torch.cat([v[0] for v in vals]).float()
+                targ = torch.cat([v[1] for v in vals]).float()
+                payload = torch.cat([torch.stack(rows).reshape(-1),
+                                     pred, targ]).cpu()
+            flat = payload.numpy()                         # the one sync
+            m = flat[:k * 7].reshape(k, 7).astype(np.float64)
+            n = pred.numel()
+            p_np = flat[k * 7:k * 7 + n]
+            t_np = flat[k * 7 + n:k * 7 + 2 * n]
+            gn = np.sqrt(m[:, 5] ** 2 + m[:, 6] ** 2)  # global norm
+            clipped = int(np.sum((m[:, 5] > 0.5) | (m[:, 6] > 0.5)))
+            out.update({
+                "policy_loss": float(m[:, 0].mean()),
+                "value_loss": float(m[:, 1].mean()),
+                "entropy": float(m[:, 2].mean()),
+                "approx_kl": float(m[:, 3].mean()),
+                "clip_frac": float(m[:, 4].mean()),
+                "explained_variance": explained_variance(p_np, t_np),
+                "grad_norm": float(gn.mean()),
+                "grad_norm_actor": float(m[:, 5].mean()),
+                "grad_norm_critic": float(m[:, 6].mean()),
+                # Minibatch steps in the final epoch whose pre-clip norm
+                # (actor or critic group) exceeded max_norm=0.5.
+                "grad_norm_clipped": clipped,
+            })
+        except Exception as e:
+            logger.warning("PPO stats reduction failed: %s", e)
+        return out
 
     def _compute_gae(
         self,

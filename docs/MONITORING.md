@@ -135,3 +135,48 @@ docker volume ls | grep skybot-monitor
 ```
 
 You want the existing volumes reattached, not new ones.
+
+## Learning, exploration and incident telemetry (2026-10-07)
+
+The collector's evidence mirror drops `learning.jsonl*`, `position_trace.jsonl*`,
+`memory_census.jsonl*` and `incidents/` flat into `/data`; `ingest.py` reads them
+beside `metrics.jsonl` (override with `DATA_DIR` or the per-feed `*_PATH` vars).
+
+| Table | From | Key (INSERT OR IGNORE) |
+|---|---|---|
+| `learning_kv(run_id, seq, wall_time, key, value)` | `learning.jsonl` (`skybot.learning` v1), every numeric leaf as a dotted key, e.g. `reward.stream-0.gui_dwell`, `exploration.stream-1.steps_since_new_cell`, `ppo.approx_kl` | run_id, seq, key |
+| `positions(run_id, stream, step, t_wall, x, y, z, yaw, pitch)` | `position_trace.jsonl` (`skybot.position` v1) — **evaluator-only** | run_id, stream, step, t_wall |
+| `incidents(dir, class, exit_code, signal, t_start, t_end, run_id, git_rev, config_hash)` | `incidents/<ts>-<class>/summary.json` + `index.jsonl` (keeps pruned bundles); times are **epoch s** | dir |
+| `memory_census(wall_time, key, value)` | `memory_census.jsonl`, numeric leaves except the unbounded `objects` / `deep_tensors` | wall_time, key |
+
+Same rule as `segments`: the JSONL is the record. `rm skybot.db` and one pass
+rebuilds identical rows; rotated `.N` siblings are read too. Booleans become
+0/1; lists, strings and `null` (a missing producer) produce **no row** — a gap,
+not a zero. A torn last line waits for its newline; a corrupt line or an
+unknown `(schema, v)` is skipped and counted in the ingest log line
+(`ingest telemetry skipped ...`). Key names are the producer's; there is no
+mapping layer to drift.
+
+**Dashboards** (`grafana/provisioning/dashboards/`): *SkyBot Learning*
+(scoreboard, signed reward by source, mix, behaviour), *SkyBot Exploration*
+(X/Z scatter, Y over time, steps/seconds since new cell, cells/hour, path,
+displacement, radius), *SkyBot ML Health* (PPO, WM, curiosity gate, replay,
+timing, health), *SkyBot Host* (memory, swap, PSI, GPU, census, incidents).
+
+**Alerts** (`grafana/provisioning/alerting/skybot_alerts.yml`, folder SkyBot):
+main down (`up == 0` 5 m), memory thrash (swap-in > 500 pages/s or PSI-full >
+10 %, 5 m), heartbeat stale (> 15 min), crash loop (≥ 3 `crash` incidents in
+30 min), collector blind (newest `learning_kv` row > 15 min old), stuck
+(`steps_since_new_cell` > 5000 for 1 h, per stream). All auto-resolve. A
+deliberate STOP fires *heartbeat stale* and *collector blind* until relaunch.
+Delivery goes to the default policy; `contact_points.yml` is a **placeholder**
+(`skybot-oncall`, a dead localhost webhook) — put the real receiver in a local,
+uncommitted copy on node1 and route the default policy to it.
+
+**Offline:** `PYTHONPATH=. python tools/learning_report.py --learning
+runlogs/learning.jsonl --positions runlogs/position_trace.jsonl --png` writes
+`runlogs/learning_report/report.md` (+ PNGs) from the raw JSONL alone.
+
+`tests/_telemetry_ingest_smoke.py` runs **every** dashboard and alert query
+against a synthetic producer-shaped ingest: a renamed key fails CI instead of
+showing an empty panel.

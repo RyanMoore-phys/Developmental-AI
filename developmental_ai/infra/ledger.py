@@ -122,12 +122,17 @@ class RewardLedger:
     def segment(self) -> dict:
         """Close the current segment and return its income statement.
 
-        Returns ``{"total", "shares", "hhi", "alarms"}`` and RESETS the
+        Returns ``{"total", "shares", "hhi", "alarms", "signed"}`` and RESETS the
         per-segment accumulators. ``total`` is the signed net; ``shares`` are
         fractions of the abs-sum gross; ``hhi`` is the Herfindahl index
         (sum of squared shares — 1.0 means a monopoly, 1/n means n equal
         sources), which gives a single scalar to plot even when no alarm has
         fired yet.
+
+        ``signed`` (added 2026-10-07, telemetry) is the per-source SIGNED
+        sum, so ``sum(signed.values()) == total``. It was computed and then
+        discarded here; the abs-based ``shares`` stay the alarm's input and
+        are unchanged. It is write-only telemetry: nothing may gate on it.
 
         Zero-total segments (nothing recorded, or only zero amounts) return
         empty shares AND clear every dominance streak: an idle stretch is
@@ -145,7 +150,7 @@ class RewardLedger:
             if abs_total <= _EPS:
                 self._streaks.clear()
                 out = {"total": total, "shares": {}, "hhi": 0.0,
-                       "alarms": alarms}
+                       "alarms": alarms, "signed": dict(signed)}
             else:
                 shares = {s: v / abs_total for s, v in abs_.items()}
                 hhi = float(sum(f * f for f in shares.values()))
@@ -162,7 +167,7 @@ class RewardLedger:
                                 f"segments={st}")
                 self._streaks = new_streaks
                 out = {"total": total, "shares": shares, "hhi": hhi,
-                       "alarms": alarms}
+                       "alarms": alarms, "signed": dict(signed)}
 
             if self._err_count:
                 out["alarms"].append(
@@ -173,7 +178,8 @@ class RewardLedger:
         except Exception as exc:  # noqa: BLE001
             # Even a broken close must hand the caller a well-shaped dict.
             return {"total": 0.0, "shares": {}, "hhi": 0.0,
-                    "alarms": [f"LEDGER-ERROR count=1 last={exc!r}"]}
+                    "alarms": [f"LEDGER-ERROR count=1 last={exc!r}"],
+                    "signed": {}}
 
     # -- internals ---------------------------------------------------------
 

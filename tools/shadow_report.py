@@ -867,10 +867,16 @@ def validation_split(rows):
     One-episode screening uses a chronological split with a transition gap;
     it remains exploratory and does not establish episode generalization.
     """
+    def _when(r, i):
+        # t_wall orders real shadow rows; synthetic/legacy rows without it
+        # fall back to seq, then to input order -- never a KeyError.
+        t = r.get("t_wall")
+        return (float(t) if t is not None else float("inf"),
+                int(r.get("seq", i)))
     start: Dict[Tuple[Any, Any, Any], Tuple[float, int]] = {}
-    for r in rows:
+    for i, r in enumerate(rows):
         k = (r["env"], r["stream"], r["episode"])
-        when = (float(r["t_wall"]), int(r["seq"]))
+        when = _when(r, i)
         if k not in start or when < start[k]:
             start[k] = when
     # ties on (t_wall, seq) fall back to the key (repr: env may be None)
@@ -881,7 +887,9 @@ def validation_split(rows):
         val = [r for r in rows if (r["env"], r["stream"], r["episode"]) in held]
         basis = "development-episode"
     else:
-        ordered = sorted(rows, key=lambda r: (int(r["seq"]), float(r["t_wall"])))
+        ordered = [r for _, r in sorted(
+            enumerate(rows), key=lambda ir: (_when(ir[1], ir[0])[1],
+                                             _when(ir[1], ir[0])[0]))]
         cut = int(len(ordered)*0.8)
         fit, val = ordered[:max(0, cut-1)], ordered[cut:]
         basis = "development-chronological-gap-exploratory"

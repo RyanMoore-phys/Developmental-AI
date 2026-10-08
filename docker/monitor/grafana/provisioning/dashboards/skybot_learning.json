@@ -1,0 +1,356 @@
+{
+ "uid": "skybot-learning",
+ "title": "SkyBot Learning",
+ "description": "learning.jsonl, one record per segment, flattened into learning_kv (dotted keys). Reward is SIGNED per source; read the scoreboard (logs), not the reward total (CLAUDE.md section 9).",
+ "tags": [
+  "skybot"
+ ],
+ "timezone": "browser",
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Scoreboard",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Logs this run (all streams, latest segment)",
+   "gridPos": {
+    "h": 5,
+    "w": 6,
+    "x": 0,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT SUM(value) AS logs_run FROM learning_kv WHERE key LIKE 'outcomes.%.logs_run' AND seq = (SELECT MAX(seq) FROM learning_kv)"
+    }
+   ],
+   "description": "outcomes.stream-N.logs_run summed. History: 35 logs in 13,305 breaks; chopping a tree has never been learned."
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Breaks this run (all streams, latest segment)",
+   "gridPos": {
+    "h": 5,
+    "w": 6,
+    "x": 6,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT SUM(value) AS breaks_run FROM learning_kv WHERE key LIKE 'outcomes.%.breaks_run' AND seq = (SELECT MAX(seq) FROM learning_kv)"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Logs + breaks per segment, by stream",
+   "gridPos": {
+    "h": 5,
+    "w": 12,
+    "x": 12,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'outcomes.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'outcomes.%.logs_segment' OR key LIKE 'outcomes.%.breaks_segment') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "row",
+   "title": "Reward",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 6
+   },
+   "panels": []
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Reward by source (SIGNED sum per segment)",
+   "gridPos": {
+    "h": 9,
+    "w": 24,
+    "x": 0,
+    "y": 7
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'reward.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'reward.%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "reward.stream-N.<source>. Signed: a cost shows below zero. A source that pays while the agent does nothing is the recurring failure (CLAUDE.md 4.3/4.4) -- compare with behaviour.still_frac below."
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Reward mix: intrinsic through damp -> GUI zero -> mix",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 16
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'reward_mix.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'reward_mix.%.intrinsic_%' OR key LIKE 'reward_mix.%.mixed_sum') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "intrinsic_raw_sum vs intrinsic_after_damp vs intrinsic_after_gui_zero: where intrinsic reward is removed."
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Mix weights + damping",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 16
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'reward_mix.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'reward_mix.%.w_%' OR key LIKE 'reward_mix.%.farm_damp_mean' OR key LIKE 'reward_mix.%.habituation_mean') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "row",
+   "title": "Behaviour",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 24
+   },
+   "panels": []
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Action entropy (bits)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 25
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'behaviour.', ''), '.action_entropy_bits', '') AS metric, value FROM learning_kv WHERE (key LIKE 'behaviour.%.action_entropy_bits') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "GUI / still fraction",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 25
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'behaviour.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'behaviour.%.gui_frac' OR key LIKE 'behaviour.%.still_frac') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "Time inside a GUI and time standing still. The villager trade-menu incident was 10,149 consecutive GUI steps.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Longest GUI run (steps)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 25
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'behaviour.', ''), '.gui_longest_run', '') AS metric, value FROM learning_kv WHERE (key LIKE 'behaviour.%.gui_longest_run') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Action source: policy vs option slots",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 33
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'behaviour.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'behaviour.%.source_hist.%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "table",
+   "title": "Action histogram (latest segment)",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 33
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT replace(key, 'behaviour.', '') AS action, value AS count FROM learning_kv WHERE key LIKE 'behaviour.%.action_hist.%' AND seq = (SELECT MAX(seq) FROM learning_kv) ORDER BY value DESC"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "table",
+   "title": "Breaks by type (latest segment)",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 33
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT replace(key, 'outcomes.', '') AS block, value AS breaks FROM learning_kv WHERE key LIKE 'outcomes.%.breaks_by_type.%' AND seq = (SELECT MAX(seq) FROM learning_kv) ORDER BY value DESC"
+    }
+   ]
+  }
+ ]
+}

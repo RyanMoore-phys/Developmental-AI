@@ -58,6 +58,20 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 # reward and is robust across reward magnitudes. Bins span symlog space; the
 # range [-5, 5] in symlog covers real rewards up to symexp(5) ~= 147 while
 # keeping fine resolution (~0.04) right where DoorKey rewards live (0..~1).
+# ---- WORLD-MODEL STEP TELEMETRY (2026-10-07, measurement only) ------------
+# When True, WorldModel.train_step fills `last_step_stats` (every loss head as
+# loss_<name>, the unclamped KL, the pre-clip grad norm and the prior /
+# posterior entropies). All of it is computed under no_grad from tensors the
+# step already produced and draws no random numbers, so parameters and RNG
+# are byte-identical on or off (tests/_ml_stats_smoke.py). Cost: ONE extra
+# device sync per gradient step (a single .tolist() of four scalars).
+COLLECT_STATS = True
+
+# Short, stable names for the telemetry keys (anything else -> loss_<key>).
+_STAT_LOSS_NAMES = {"total": "loss_total", "reconstruction": "loss_recon",
+                    "kl": "loss_kl", "reward": "loss_reward",
+                    "continue": "loss_continue", "flow": "loss_flow"}
+
 TWOHOT_BINS = 255
 TWOHOT_LOW = -5.0
 TWOHOT_HIGH = 5.0
@@ -1230,6 +1244,11 @@ class WorldModel(nn.Module):
     needing more real environment interaction.
     """
 
+    # Diagnostics of the most recent train_step (see COLLECT_STATS); None
+    # until the first step. Plain floats only.
+    last_step_stats = None
+    _stats_logits = None
+
     def __init__(
         self,
         obs_dim: int,
@@ -2186,6 +2205,13 @@ class WorldModel(nn.Module):
                 infos["posterior_logits"].reshape(
                     -1, self.rssm.stoch_dim).float(),
             )
+        if COLLECT_STATS and self.training:
+            # Detached references only (no copy, no sync); train_step consumes
+            # and clears them. Not part of `losses`, whose every value is
+            # .item()'d by train_step.
+            self._stats_logits = (
+                infos["prior_logits"].detach(),
+                infos["posterior_logits"].detach())
 
         # 3. Reward prediction loss — TWOHOT distributional, CLASS-BALANCED.
         # The goal reward fires on ~1% of steps. A scalar MSE head collapses to
@@ -2440,13 +2466,56 @@ class WorldModel(nn.Module):
         losses["total"].backward()
 
         # Gradient clipping for stability (DreamerV3 uses 100.0)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
+        _gn = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
         self.optimizer.step()
 
         metrics = {k: v.item() for k, v in losses.items()}
+        if COLLECT_STATS:
+            self.last_step_stats = self._step_stats(metrics, _gn)
+        self._stats_logits = None
         if return_per_sample:
             return metrics, per_sample.detach().cpu().numpy()
         return metrics
+
+    def _step_stats(self, metrics, grad_norm):
+        """Plain-float diagnostics of one gradient step. ONE device sync.
+        Never raises: a failure yields the losses with the extras as None."""
+        out = {}
+        for k, v in metrics.items():
+            out[_STAT_LOSS_NAMES.get(k, "loss_" + str(k))] = float(v)
+        out.update({"kl_raw": None, "grad_norm": None,
+                    "prior_entropy": None, "posterior_entropy": None})
+        try:
+            with torch.no_grad():
+                vals = [grad_norm.detach().float().reshape(())]
+                lg = self._stats_logits
+                if lg is not None:
+                    pri = lg[0].reshape(-1, self.rssm.stoch_dim).float()
+                    post = lg[1].reshape(-1, self.rssm.stoch_dim).float()
+                    S = self.rssm.stochastic_size
+                    C = self.rssm.stochastic_classes
+                    lp_pri = F.log_softmax(pri.view(-1, S, C), dim=-1)
+                    lp_post = F.log_softmax(post.view(-1, S, C), dim=-1)
+                    # Mean entropy PER categorical variable, nats; the
+                    # ceiling is log(C). A posterior falling toward 0 is
+                    # collapse; a prior stuck at log(C) has learned nothing.
+                    ent_pri = -(lp_pri.exp() * lp_pri).sum(-1).mean()
+                    ent_post = -(lp_post.exp() * lp_post).sum(-1).mean()
+                    # Unclamped KL(post || prior): the loss_kl head is
+                    # floored by free nats and cannot fall below 0.11.
+                    kl_raw = self.rssm.prior_divergence(pri, post)
+                    vals += [kl_raw.float(), ent_pri, ent_post]
+                flat = torch.stack(vals).tolist()          # the one sync
+            out["grad_norm"] = float(flat[0])
+            if len(flat) == 4:
+                out["kl_raw"] = float(flat[1])
+                out["prior_entropy"] = float(flat[2])
+                out["posterior_entropy"] = float(flat[3])
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "world-model step stats failed: %s", e)
+        return out
 
     def get_prediction_error(
         self,

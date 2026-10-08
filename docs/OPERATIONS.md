@@ -82,13 +82,49 @@ What each line is actually telling you:
 
 ## When it crashes
 
-The supervisor restarts on crash with backoff, and **stops itself** after the
-same fault three times in a row — that message is a diagnosis, not a failure:
+The supervisor restarts on crash with backoff, and **stops relaunching**
+after the same fault three times — that message is a diagnosis, not a failure:
 
 ```
-[supervisor] STOPPING: same fault 3x in a row — this is
-             deterministic and will not fix itself
+[supervisor] STOPPING RELAUNCHES: kind=crash sig=SIGABRT 3x within 1800s — this is
+[supervisor]   deterministic and will not fix itself; wrote runlogs/CRASHLOOP
 ```
+
+### Exit classes, incident bundles, the crash-loop latch (2026-10-07)
+
+The agent runs under a wrapper (`launch_skybot.sh`) that writes
+`runlogs/skybot_run.exit` (`exit_code`, `signal`, `t_end`); `skybot_run.pid`
+is still the agent's own pid. Every exit is classified:
+
+| STOP | rc / log tail | class |
+|---|---|---|
+| yes | 0, no `terminate called` / `Traceback` | `clean` |
+| yes | anything else, or no `.exit` | `abnormal_under_stop` (the 2026-10-06 class) |
+| no | any | `crash` |
+
+rc > 128 is a signal: 134 ABRT, 137 KILL (OOM / earlyoom), 139 SEGV, 143 TERM.
+Each exit writes `runlogs/incidents/<UTC>-<class>/` (`scripts/incident_bundle.sh`:
+`summary.json`, run-log tail, memory/PSI, top RSS, GPU, kernel journal,
+earlyoom, disk; `clean` gets a short one) and a line in
+`runlogs/incidents/index.jsonl`. Kept: newest 50 / 100 MB on `main`; node1's
+collector mirrors them every 60 s and keeps 180 d.
+
+**Crash-loop latch.** Same class + signal (or `rc=N`) 3x within 30 min, or the
+same Python exception 3x in a row, writes `runlogs/CRASHLOOP` and the
+supervisor stops relaunching (it stays alive, idle). **To re-open** — any one:
+
+- `rm runlogs/CRASHLOOP` — the idle supervisor resumes within 60 s;
+- run `bash scripts/launch_skybot.sh` by hand — it clears the latch and the
+  supervisor adopts that agent;
+- `host.yml` → `launch` (starting a supervisor clears it);
+- `touch runlogs/STOP` ends the idle supervisor cleanly.
+
+`runlogs/supervisor.log` is still truncated by every launcher (`>`); the
+supervisor keeps the last 5 sessions as `supervisor.log.1..5`.
+
+**Kernel log off-box.** `sudo bash scripts/host_hardening.sh --apply
+--netconsole node1` streams kernel messages as UDP to a LAN receiver; on node1
+run `nc -u -l 6666 >> netconsole.log`.
 
 Start here:
 

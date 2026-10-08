@@ -137,31 +137,73 @@ def main():
     # forever-mode passes None so the loop runs until stop-file/SIGTERM
     # (the LifelongController resolves the budget); otherwise the CLI budget.
     _budget = None if args.forever else args.timesteps
-    agent.run(total_timesteps=_budget, verbose=1, log_interval=1)
+    # close() on EVERY exit path (clean STOP, budget reached, exception):
+    # it stops the async WM trainer before CUDA/env teardown. See
+    # _close_bounded for the live incident.
+    try:
+        agent.run(total_timesteps=_budget, verbose=1, log_interval=1)
 
-    if hasattr(agent.env, "finalize"):
-        agent.env.finalize()
+        if hasattr(agent.env, "finalize"):
+            agent.env.finalize()
 
-    rewards = list(agent.training_metrics["episode_reward"]) or [0.0]
-    q = max(1, len(rewards) // 4)
-    quarters = [float(np.mean(rewards[i * q:(i + 1) * q])) for i in range(4)]
-    res = {
-        "total_logs_chopped": logs[0],
-        "episodes": agent.total_episodes,
-        "quarter_rewards": quarters,
-        "best_episode_reward": float(max(rewards)),
-        "skills_minted": agent.skill_bank.get_stats()["total_skills"],
-        "goal_stats": agent.broadcaster.stats,
-    }
-    print("\n===== MINECRAFT (Treechop) =====", flush=True)
-    print(f"  logs chopped total: {res['total_logs_chopped']:.0f}")
-    print(f"  episodes: {res['episodes']}  best episode: "
-          f"{res['best_episode_reward']:.0f} logs")
-    print(f"  reward quarters: {[round(x, 2) for x in quarters]}")
-    print(f"  skills minted: {res['skills_minted']}  "
-          f"goal slots: {res['goal_stats']['n_slots']}")
-    path = save_results(args.out, res, extra={"protocol": vars(args)})
-    print(f"results -> {path}", flush=True)
+        rewards = list(agent.training_metrics["episode_reward"]) or [0.0]
+        q = max(1, len(rewards) // 4)
+        quarters = [float(np.mean(rewards[i * q:(i + 1) * q])) for i in range(4)]
+        res = {
+            "total_logs_chopped": logs[0],
+            "episodes": agent.total_episodes,
+            "quarter_rewards": quarters,
+            "best_episode_reward": float(max(rewards)),
+            "skills_minted": agent.skill_bank.get_stats()["total_skills"],
+            "goal_stats": agent.broadcaster.stats,
+        }
+        print("\n===== MINECRAFT (Treechop) =====", flush=True)
+        print(f"  logs chopped total: {res['total_logs_chopped']:.0f}")
+        print(f"  episodes: {res['episodes']}  best episode: "
+              f"{res['best_episode_reward']:.0f} logs")
+        print(f"  reward quarters: {[round(x, 2) for x in quarters]}")
+        print(f"  skills minted: {res['skills_minted']}  "
+              f"goal slots: {res['goal_stats']['n_slots']}")
+        path = save_results(args.out, res, extra={"protocol": vars(args)})
+        print(f"results -> {path}", flush=True)
+    finally:
+        _close_bounded(agent)
+
+
+def _close_bounded(agent, timeout_s: float = 150.0) -> None:
+    """Call agent.close() on EVERY exit, bounded in time (2026-10-07).
+
+    LIVE INCIDENT: close() -- which stops and joins the async WM trainer
+    BEFORE env/CUDA teardown -- was never called by anything. Every exit
+    (including a clean runlogs/STOP) killed that daemon thread mid optimizer
+    step at interpreter shutdown, and both 2026-10-05 runs ended in
+    `terminate called without an active exception` (a C++ abort -> SIGABRT
+    -> a core dump of a ~8-10 GB CUDA process on a 16 GB box). The host
+    froze 22 s after the second one. close()'s own docstring names the
+    failure. Run it on a worker thread so a hung MineRL client inside
+    env.close() cannot keep the process from exiting: the trainer is
+    stopped FIRST inside close(), so that is the part that must finish.
+    """
+    import threading
+
+    err = []
+
+    def _c():
+        try:
+            agent.close()
+        except Exception as e:          # never mask the run's own outcome
+            err.append(e)
+    t = threading.Thread(target=_c, name="agent-close", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        print(f"agent.close() still running after {timeout_s:.0f}s "
+              f"(a client is probably hung); exiting anyway", flush=True)
+    elif err:
+        print(f"agent.close() raised {type(err[0]).__name__}: {err[0]}",
+              flush=True)
+    else:
+        print("agent closed cleanly (async WM trainer joined)", flush=True)
 
 
 if __name__ == "__main__":

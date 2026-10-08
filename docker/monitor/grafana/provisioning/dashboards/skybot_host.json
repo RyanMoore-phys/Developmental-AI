@@ -1,0 +1,373 @@
+{
+ "uid": "skybot-host",
+ "title": "SkyBot Host",
+ "description": "The training host `main` (node_exporter + nvidia_gpu_exporter via Prometheus), the agent's own memory census, and incident bundles.",
+ "tags": [
+  "skybot"
+ ],
+ "timezone": "browser",
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Memory",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "main: memory available / total",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 1
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "node_memory_MemAvailable_bytes{instance=\"main:9100\"}",
+     "legendFormat": "available",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "node_memory_MemTotal_bytes{instance=\"main:9100\"}",
+     "legendFormat": "total",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "main: swap used",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 1
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "node_memory_SwapTotal_bytes{instance=\"main:9100\"} - node_memory_SwapFree_bytes{instance=\"main:9100\"}",
+     "legendFormat": "swap used",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "main: swap in / out (pages/s)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 1
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "rate(node_vmstat_pswpin{instance=\"main:9100\"}[1m])",
+     "legendFormat": "swap in",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "rate(node_vmstat_pswpout{instance=\"main:9100\"}[1m])",
+     "legendFormat": "swap out",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "description": "Sustained swap-in is thrash; the 2026-10-06 freeze."
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "main: PSI (fraction of time stalled)",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 9
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "rate(node_pressure_memory_waiting_seconds_total{instance=\"main:9100\"}[1m])",
+     "legendFormat": "memory some",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "rate(node_pressure_memory_stalled_seconds_total{instance=\"main:9100\"}[1m])",
+     "legendFormat": "memory full",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    },
+    {
+     "refId": "C",
+     "expr": "rate(node_pressure_io_stalled_seconds_total{instance=\"main:9100\"}[1m])",
+     "legendFormat": "io full",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "description": "rate() of the PSI counters over 1 m ~ /proc/pressure avg60.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Agent memory census: RSS vs accounted",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 9
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM memory_census WHERE key IN ('summary.rss', 'summary.rss_anon', 'summary.swap', 'summary.cpu_accounted_total', 'summary.gpu_accounted_total') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "From memory_census.jsonl (in-process breakdown).",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 7,
+   "type": "row",
+   "title": "GPU + liveness",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 17
+   },
+   "panels": []
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "GPU utilisation",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 18
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nvidia_smi_utilization_gpu_ratio{job=\"gpu\"}",
+     "legendFormat": "util",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "GPU memory used / total",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 18
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "nvidia_smi_memory_used_bytes{job=\"gpu\"}",
+     "legendFormat": "used",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "nvidia_smi_memory_total_bytes{job=\"gpu\"}",
+     "legendFormat": "total",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Scrape up (main node + gpu)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 18
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rack-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "up{instance=~\"main:.*\"}",
+     "legendFormat": "{{job}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rack-prometheus"
+     }
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "row",
+   "title": "Incidents",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 26
+   },
+   "panels": []
+  },
+  {
+   "id": 12,
+   "type": "table",
+   "title": "Incident bundles (latest 50)",
+   "gridPos": {
+    "h": 9,
+    "w": 24,
+    "x": 0,
+    "y": 27
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT datetime(t_end, 'unixepoch') AS ended_utc, class, exit_code, signal, run_id, git_rev, config_hash, dir FROM incidents ORDER BY COALESCE(t_end, t_start) DESC LIMIT 50"
+    }
+   ],
+   "description": "runlogs/incidents/<UTC-ts>-<class>/summary.json, mirrored by the collector. Three crashes in 30 min fires the crash-loop alert."
+  }
+ ]
+}

@@ -1,0 +1,413 @@
+{
+ "uid": "skybot-exploration",
+ "title": "SkyBot Exploration",
+ "description": "ExplorationTracker segment summaries (learning_kv exploration.*) and the EVALUATOR-ONLY position trace (positions table). The trace is never read by the agent.",
+ "tags": [
+  "skybot"
+ ],
+ "timezone": "browser",
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Where it went",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "xychart",
+   "title": "Position, top-down (X vs Z), by stream",
+   "gridPos": {
+    "h": 14,
+    "w": 12,
+    "x": 0,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "table",
+     "rawQueryText": "SELECT x, z FROM positions WHERE stream = 0 AND t_wall BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY t_wall"
+    },
+    {
+     "refId": "B",
+     "queryType": "table",
+     "rawQueryText": "SELECT x, z FROM positions WHERE stream = 1 AND t_wall BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY t_wall"
+    },
+    {
+     "refId": "C",
+     "queryType": "table",
+     "rawQueryText": "SELECT x, z FROM positions WHERE stream >= 2 AND t_wall BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY t_wall"
+    }
+   ],
+   "description": "A = stream 0, B = stream 1, C = every further stream. One point per trace line (every trace_every_steps steps). Each episode is a fresh world (CLAUDE.md 7): coordinates from different episodes are not the same place.",
+   "options": {
+    "seriesMapping": "auto",
+    "dims": {
+     "x": "x"
+    },
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Y (height) over time, by stream",
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT t_wall AS time, 'stream-' || stream AS metric, y AS value FROM positions WHERE t_wall BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY t_wall"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Y range per segment (y_min / y_max)",
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 15
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'exploration.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.y_min' OR key LIKE 'exploration.%.y_max') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "row",
+   "title": "Novelty",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 22
+   },
+   "panels": []
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Steps since a new cell",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 23
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.steps_since_new_cell', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.steps_since_new_cell') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "The `stuck` alert fires when this stays > 5000 for 1 h.",
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 5000
+       }
+      ]
+     },
+     "custom": {
+      "thresholdsStyle": {
+       "mode": "line"
+      }
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Seconds since a new cell",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 23
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.seconds_since_new_cell', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.seconds_since_new_cell') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "New cells per hour",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 23
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.cells_per_hour', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.cells_per_hour') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Unique cells (run total)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 31
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.unique_cells_total', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.unique_cells_total') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "New cells this segment",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 31
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.new_cells_segment', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.new_cells_segment') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Stationary fraction",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 31
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.stationary_frac', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.stationary_frac') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 12,
+   "type": "row",
+   "title": "Movement",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 39
+   },
+   "panels": []
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Path length per segment (blocks)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 40
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.path_blocks', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.path_blocks') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Net displacement per segment (blocks)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 40
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.net_displacement', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.net_displacement') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "Small displacement with a long path = circling."
+  },
+  {
+   "id": 15,
+   "type": "timeseries",
+   "title": "Radius of gyration (blocks)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 40
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(replace(key, 'exploration.', ''), '.radius_of_gyration', '') AS metric, value FROM learning_kv WHERE (key LIKE 'exploration.%.radius_of_gyration') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  }
+ ]
+}

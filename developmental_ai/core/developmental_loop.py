@@ -730,6 +730,45 @@ class DevelopmentalAI:
                            "body (_run_episode) is not wired to it: nothing "
                            "will be recorded on this path")
 
+        # ---- LEARNING TELEMETRY + EXPLORATION (2026-10-07) ---------------
+        # MEASUREMENT ONLY: runlogs/learning.jsonl (one record per segment,
+        # written from _emit_metrics) and the evaluator-only position trace.
+        # Built from config `telemetry:`; a failure here leaves both None and
+        # the agent unchanged — a monitor must never stop the run starting.
+        self._ltel = None
+        self._explore_tracker = None
+        try:
+            _tcfg = dict(self.config.get("telemetry", {}) or {})
+            if _tcfg.get("enabled", False):
+                from developmental_ai.infra.learning_telemetry import \
+                    LearningTelemetry
+                from developmental_ai.foundation.runtime.shadow import \
+                    action_sources as _lt_as
+                self._lt_action_sources = _lt_as
+                self._ltel = LearningTelemetry(
+                    dict(_tcfg.get("learning", {}) or {}))
+                _xcfg = dict(_tcfg.get("exploration", {}) or {})
+                if _xcfg.get("enabled", True):
+                    from developmental_ai.infra.exploration import \
+                        ExplorationTracker
+                    self._explore_tracker = ExplorationTracker(
+                        cell_size=float(_xcfg.get("cell_size", 1.0)),
+                        trace_every_steps=int(
+                            _xcfg.get("trace_every_steps", 16)),
+                        trace_path=_xcfg.get(
+                            "trace_path", "runlogs/position_trace.jsonl"),
+                        stationary_eps=float(
+                            _xcfg.get("stationary_eps", 0.25)),
+                        max_cells=_xcfg.get("max_cells"),
+                        run_id=self._ltel.run_id)
+                logger.info("learning telemetry ON -> %s | exploration %s",
+                            getattr(self._ltel.sink, "path", None),
+                            "ON" if self._explore_tracker else "off")
+        except Exception as exc:
+            self._ltel = None
+            self._explore_tracker = None
+            logger.warning("learning telemetry unavailable: %r", exc)
+
         # Replay buffer for world model training
         per_cfg = self.config.get("prioritized_replay", {})
         # uint8 obs storage (step 8): pixel obs are [0,1] -> quantize x255 for
@@ -2895,6 +2934,8 @@ class DevelopmentalAI:
         """Clean up resources (Neo4j connections, LLM threads, etc.)."""
         if getattr(self, "_shadow", None) is not None:
             self._shadow.close()      # never raises; logs its summary
+        if getattr(self, "_explore_tracker", None) is not None:
+            self._explore_tracker.flush()   # position trace tail; never raises
         if hasattr(self.knowledge_graph, "close"):
             self.knowledge_graph.close()
         if hasattr(self, "llm") and self.llm is not None:
@@ -3629,6 +3670,9 @@ class DevelopmentalAI:
             )
 
             # ---- Logging ----
+            # Telemetry timing snapshot FIRST: _log_progress resets the phase
+            # accumulators it reads (measurement only, never raises).
+            self._lt_snapshot_timing()
             if verbose >= 1 and self.total_episodes % log_interval == 0:
                 self._log_progress()
 
@@ -4547,6 +4591,7 @@ class DevelopmentalAI:
                     ).to(self.device)
 
             _pt = self._phase_mark("act", _pt)
+            self._lt_pre_step(env_actions, n, use_dream_actor)
             # FOUNDATION SHADOW (off unless foundation.shadow.enabled): obs t
             # and the world model's prediction for the chosen action, logged
             # BEFORE env.step so the store can prove it preceded the outcome.
@@ -4804,6 +4849,7 @@ class DevelopmentalAI:
             # EVALUATION SINK. Reads info["oracle"] and nothing else writes
             # to the agent from here — see _oracle_observe.
             self._oracle_observe(step_infos, n)
+            self._lt_post_step(step_infos, dones, n)
             _fr = self._flow_residual_batch(
                 obs_t, next_obs_t, action_tensor, n,
                 ego=self._flow_ego_batch(step_infos, n))
@@ -4822,6 +4868,7 @@ class DevelopmentalAI:
             # damped term (plus the itemised novelty terms) IS the base drive
             # — nothing "leads" it any more. 1.0 = old behaviour.
             intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
+            self._lt_begin(intrinsic)
             icm_metrics = self._curiosity_train(
                 obs_t, action_tensor, next_obs_t
             )
@@ -4961,6 +5008,7 @@ class DevelopmentalAI:
             # WM reward head thus learns the true reward from 15 streams and
             # the shaped one from the primary — matching the single-env path.
             prim_extrinsic = rewards[0]
+            self._lt_mark("shaping", intrinsic, prim_extrinsic, "env")
             _frame = None
             if not use_dream_actor and self.symbolizer is not None:
                 try:
@@ -5021,6 +5069,7 @@ class DevelopmentalAI:
                 _hab = self._habituation_factor(prim_info)
                 if _hab < 1.0:
                     intrinsic[0] = intrinsic[0] * _hab
+                    self._lt_mark("damp_habituation", intrinsic, prim_extrinsic, None, "habituation", _hab)
             if not use_dream_actor and self.vision_scaffold is not None:
                 _sr = self._magnet_step_shaping(
                     env_actions[0], float(intrinsic[0].item()), latent[0:1])
@@ -5067,6 +5116,7 @@ class DevelopmentalAI:
                             self.infra, "last_loop_damp", 1.0) or 1.0)
                     _sr = _sr * _damp
                     prim_extrinsic = rewards[0] + _sr
+                    self._lt_mark("magnet", intrinsic, prim_extrinsic)
                 # ---- APPROACH A REMEMBERED PLACE (2026-09-04) -----------
                 # infra/episodic has recorded `sighting:tree_visible @(x,z)`
                 # for the whole project and driven NOTHING, so the agent
@@ -5084,6 +5134,7 @@ class DevelopmentalAI:
                         self.infra, "last_approach_reward", 0.0) or 0.0)
                     if _ar:
                         prim_extrinsic = prim_extrinsic + _ar
+                        self._lt_mark("approach", intrinsic, prim_extrinsic)
             # ---- GETTING OUT MUST PAY -----------------------------------
             # Zeroing income inside a menu removes the FARM but leaves
             # no gradient toward the exit — and it did something worse:
@@ -5112,6 +5163,7 @@ class DevelopmentalAI:
             # this runs exactly once per waking step, scaffold or not.
             if not use_dream_actor:
                 prim_extrinsic += self._gui_reward(0, step_infos[0])
+                self._lt_mark("gui_dwell", intrinsic, prim_extrinsic)
             # general infra: event monitors + empowerment (shared helper)
             if not use_dream_actor:
                 _ei = self._infra_step(
@@ -5120,6 +5172,7 @@ class DevelopmentalAI:
                     float(rewards[0]))
                 if _ei:
                     intrinsic[0] = intrinsic[0] + _ei
+                    self._lt_mark("empowerment", intrinsic, prim_extrinsic)
                 # ---- FARM DAMP ON THE CHANNEL THAT PAYS (2026-10-04) -----
                 # last_loop_damp used to multiply only the magnet's `_sr`,
                 # which is always 0 on the live config (llm.vision.enabled
@@ -5133,6 +5186,7 @@ class DevelopmentalAI:
                 _ldi = self._loop_damp_factor()
                 if _ldi < 1.0:
                     intrinsic[0] = intrinsic[0] * _ldi
+                    self._lt_mark("damp_farm", intrinsic, prim_extrinsic, None, "farm_damp", _ldi)
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -5304,8 +5358,10 @@ class DevelopmentalAI:
                 # extrinsic tier; only payment for the occlusion is removed.
                 if bool((step_infos[0] or {}).get("gui_open")):
                     intrinsic[0] = intrinsic[0] * 0.0
+                    self._lt_mark("gui_zero", intrinsic, prim_extrinsic, None, "gui_zero", 0.0)
                 mixed = self.reward_mixer.mix(
                     float(intrinsic[0].item()), prim_extrinsic)
+                self._lt_commit(mixed, intrinsic, prim_extrinsic)
                 # running "typical surprise" baseline — the denominator of
                 # mastery's WM-fidelity ratio. Updated EVERY primary step
                 # (not just during options), or the baseline would be biased
@@ -5743,6 +5799,7 @@ class DevelopmentalAI:
                     ).to(self.device)
 
             _pt = self._phase_mark("act", _pt)
+            self._lt_pre_step(env_actions, n, use_dream_actor)
             # FOUNDATION SHADOW (off unless foundation.shadow.enabled): obs t
             # and the world model's prediction for the chosen action, logged
             # BEFORE env.step so the store can prove it preceded the outcome.
@@ -5998,6 +6055,7 @@ class DevelopmentalAI:
             # EVALUATION SINK. Reads info["oracle"] and nothing else writes
             # to the agent from here — see _oracle_observe.
             self._oracle_observe(step_infos, n)
+            self._lt_post_step(step_infos, dones, n)
             _fr = self._flow_residual_batch(
                 obs_t, next_obs_t, action_tensor, n,
                 ego=self._flow_ego_batch(step_infos, n))
@@ -6016,6 +6074,7 @@ class DevelopmentalAI:
             # damped term (plus the itemised novelty terms) IS the base drive
             # — nothing "leads" it any more. 1.0 = old behaviour.
             intrinsic = intrinsic * float(getattr(self, "_icm_base_scale", 1.0))
+            self._lt_begin(intrinsic)
             # BORING-VIEW BASE DISCOUNT (2026-08-16). The sky discount only
             # ever covered the itemised novelty term; the BASE was left at
             # full pay. Measured live at the -90 clamp: ICM/LP base
@@ -6034,6 +6093,7 @@ class DevelopmentalAI:
             if _bvw > 0.0:
                 _bf = float(self._boring_view_factor())
                 intrinsic[0] = intrinsic[0] * (1.0 - _bvw * (1.0 - _bf))
+                self._lt_mark("damp_boring_view", intrinsic, 0.0, None, "boring_view", 1.0 - _bvw * (1.0 - _bf))
                 self._bv_sum = getattr(self, "_bv_sum", 0.0) + _bf
                 self._bv_n = getattr(self, "_bv_n", 0) + 1
 
@@ -6624,6 +6684,7 @@ class DevelopmentalAI:
             # WM reward head thus learns the true reward from 15 streams and
             # the shaped one from the primary — matching the single-env path.
             prim_extrinsic = rewards[0]
+            self._lt_mark("shaping", intrinsic, prim_extrinsic, "env")
             _frame = None
             if not use_dream_actor and self.symbolizer is not None:
                 try:
@@ -6637,6 +6698,7 @@ class DevelopmentalAI:
                 _hab = self._habituation_factor(prim_info)
                 if _hab < 1.0:
                     intrinsic[0] = intrinsic[0] * _hab
+                    self._lt_mark("damp_habituation", intrinsic, prim_extrinsic, None, "habituation", _hab)
             # Curiosity-ranked magnet: reads the grounding head's per-object
             # probs on the primary latent + this step's learning progress
             # (intrinsic[0]) and steers toward the most-curious in-view object.
@@ -6686,6 +6748,7 @@ class DevelopmentalAI:
                             self.infra, "last_loop_damp", 1.0) or 1.0)
                     _sr = _sr * _damp
                     prim_extrinsic = rewards[0] + _sr
+                    self._lt_mark("magnet", intrinsic, prim_extrinsic)
                 # ---- APPROACH A REMEMBERED PLACE (2026-09-04) -----------
                 # infra/episodic has recorded `sighting:tree_visible @(x,z)`
                 # for the whole project and driven NOTHING, so the agent
@@ -6703,6 +6766,7 @@ class DevelopmentalAI:
                         self.infra, "last_approach_reward", 0.0) or 0.0)
                     if _ar:
                         prim_extrinsic = prim_extrinsic + _ar
+                        self._lt_mark("approach", intrinsic, prim_extrinsic)
             # ---- GETTING OUT MUST PAY -----------------------------------
             # Zeroing income inside a menu removes the FARM but leaves
             # no gradient toward the exit — and it did something worse:
@@ -6731,6 +6795,7 @@ class DevelopmentalAI:
             # this runs exactly once per waking step, scaffold or not.
             if not use_dream_actor:
                 prim_extrinsic += self._gui_reward(0, step_infos[0])
+                self._lt_mark("gui_dwell", intrinsic, prim_extrinsic)
             # general infra: event monitors + empowerment shaping (shared
             # helper — see _infra_step)
             if not use_dream_actor:
@@ -6740,6 +6805,7 @@ class DevelopmentalAI:
                     float(rewards[0]))
                 if _ei:
                     intrinsic[0] = intrinsic[0] + _ei
+                    self._lt_mark("empowerment", intrinsic, prim_extrinsic)
                 # ---- FARM DAMP ON THE CHANNEL THAT PAYS (2026-10-04) -----
                 # last_loop_damp used to multiply only the magnet's `_sr`,
                 # which is always 0 on the live config (llm.vision.enabled
@@ -6753,6 +6819,7 @@ class DevelopmentalAI:
                 _ldi = self._loop_damp_factor()
                 if _ldi < 1.0:
                     intrinsic[0] = intrinsic[0] * _ldi
+                    self._lt_mark("damp_farm", intrinsic, prim_extrinsic, None, "farm_damp", _ldi)
 
             # ---- VLM SYMBOLIC GROUNDING (primary stream, waking only) ----
             # The VLM names what the agent is looking at; a head learns to
@@ -7003,8 +7070,10 @@ class DevelopmentalAI:
                 # extrinsic tier; only payment for the occlusion is removed.
                 if bool((step_infos[0] or {}).get("gui_open")):
                     intrinsic[0] = intrinsic[0] * 0.0
+                    self._lt_mark("gui_zero", intrinsic, prim_extrinsic, None, "gui_zero", 0.0)
                 mixed = self.reward_mixer.mix(
                     float(intrinsic[0].item()), prim_extrinsic)
+                self._lt_commit(mixed, intrinsic, prim_extrinsic)
                 # running "typical surprise" baseline — the denominator of
                 # mastery's WM-fidelity ratio. Updated EVERY primary step
                 # (not just during options), or the baseline would be biased
@@ -7646,14 +7715,17 @@ class DevelopmentalAI:
                     self.replay_buffer.update_priorities(
                         batch["start_indices"], seq_len, errs
                     )
+                    self._lt_wm_step(batch)     # telemetry: read-only
                     return m
-                return self.world_model.train_step(
+                m = self.world_model.train_step(
                     observations=batch["observations"],
                     actions=batch["actions"],
                     rewards=batch["rewards"],
                     continues=batch["continues"],
                     proprio=batch.get("proprio"),
                 )
+                self._lt_wm_step(batch)         # telemetry: read-only
+                return m
 
         try:
             metrics = {}
@@ -8754,6 +8826,35 @@ class DevelopmentalAI:
         run it monitors, so every read is a .get()/getattr() and the whole
         body is wrapped. A missing field is an absent key, never an exception.
         """
+        # ---- MEMORY CENSUS HOOK (2026-10-07): MEASUREMENT ONLY ------------
+        # Rides THIS site so there is still exactly one emission site (§4.2;
+        # tests/_metrics_sink_smoke.py). Placed BEFORE the sink check so it
+        # does not depend on metrics being enabled. Throttled by
+        # diagnostics.memory_census_every_s; `touch runlogs/MEMCENSUS` forces
+        # one at the next segment. Read-only (infra/memory_census.py) and
+        # can never raise into the loop: one warning, then silence.
+        try:
+            _mch = getattr(self, "_memory_census_hook", None)
+            if _mch is None:
+                from developmental_ai.infra.memory_census import \
+                    MemoryCensusHook
+                _mch = MemoryCensusHook(
+                    self.config.get("diagnostics", {}) or {})
+                self._memory_census_hook = _mch
+            _mch.tick(self)
+        except Exception as exc:                       # pragma: no cover
+            if not getattr(self, "_memory_census_warned", False):
+                self._memory_census_warned = True
+                logger.warning("memory census hook failed: %r", exc)
+        # ---- LEARNING TELEMETRY (2026-10-07): MEASUREMENT ONLY -----------
+        # learning.jsonl rides THIS site too (one emission site, §4.2), and
+        # before the sink check so it does not depend on metrics.enabled.
+        try:
+            self._lt_emit()
+        except Exception as exc:                       # pragma: no cover
+            if not getattr(self, "_ltel_warned", False):
+                self._ltel_warned = True
+                logger.warning("learning telemetry emit failed: %r", exc)
         sink = getattr(self, "_metrics_sink", None)
         if sink is None:
             return
@@ -9008,6 +9109,15 @@ class DevelopmentalAI:
                     self._progress.state_dict())
             except Exception as _e:
                 logger.warning("progress_probes.pkl save failed: %s", _e)
+        # exploration's career cell set (telemetry, evaluator-only): a
+        # restart must not re-count every visited cell as new.
+        if getattr(self, "_explore_tracker", None) is not None:
+            try:
+                atomic_pickle_dump(
+                    os.path.join(checkpoint_dir, "exploration_cells.pkl"),
+                    self._explore_tracker.state_dict())
+            except Exception as _e:
+                logger.warning("exploration_cells.pkl save failed: %s", _e)
 
         # Save policy
         torch.save(
@@ -9164,6 +9274,11 @@ class DevelopmentalAI:
             load_pickle_sidecar(
                 os.path.join(checkpoint_dir, "progress_probes.pkl"),
                 self._progress.load_state_dict, "paired progress probes",
+                log=logger)
+        if getattr(self, "_explore_tracker", None) is not None:
+            load_pickle_sidecar(
+                os.path.join(checkpoint_dir, "exploration_cells.pkl"),
+                self._explore_tracker.load_state_dict, "exploration cells",
                 log=logger)
 
         # Load policy
@@ -10682,6 +10797,110 @@ class DevelopmentalAI:
             logger.debug("flow senses failed: %s", _e)
         return out
 
+    # ---- LEARNING TELEMETRY (2026-10-07): MEASUREMENT ONLY ---------------
+    # Thin forwarders so each body carries ONE short line per stage (§4.2:
+    # identical text in _run_episode_parallel and _collect_segment, count
+    # 2). Off (self._ltel None) they cost one attribute test. Everything is
+    # read-only: values the body already computed, the executor's state via
+    # the shadow's read-only action_sources(), the producers' own pop_*
+    # counters. Nothing here can change reward, actions, replay or training
+    # (tests/_learning_telemetry_smoke.py proves it byte-for-byte), and the
+    # telemetry object swallows its own errors.
+    def _lt_begin(self, intrinsic) -> None:
+        if self._ltel is not None:
+            self._ltel.begin(intrinsic)
+
+    def _lt_mark(self, label, intrinsic, extrinsic, ext_label=None,
+                 mult_name=None, mult=None) -> None:
+        if self._ltel is not None:
+            self._ltel.mark(label, intrinsic, extrinsic, ext_label,
+                            mult_name, mult)
+
+    def _lt_commit(self, mixed, intrinsic, extrinsic) -> None:
+        if self._ltel is not None:
+            self._ltel.commit(0, mixed, intrinsic, extrinsic,
+                              self.reward_mixer)
+
+    def _lt_pre_step(self, env_actions, n, use_dream_actor) -> None:
+        if self._ltel is None:
+            return
+        try:
+            if use_dream_actor:
+                src = ["dream_actor"] * int(n)
+            else:
+                src = [d.get("source", "unknown") for d in
+                       self._lt_action_sources(self.option_executor, n)]
+        except Exception:
+            src = ["unknown"] * int(n)
+        self._ltel.pre_step(env_actions, src)
+
+    def _lt_post_step(self, step_infos, dones, n) -> None:
+        if self._ltel is not None:
+            self._ltel.post_step(step_infos, dones, n)
+
+    def _lt_wm_step(self, batch) -> None:
+        if self._ltel is not None:
+            self._ltel.wm_step(getattr(self.world_model, "last_step_stats",
+                                       None), batch)
+
+    def _lt_snapshot_timing(self) -> None:
+        """BEFORE _log_progress, which resets the phase accumulators."""
+        if self._ltel is not None:
+            self._ltel.snapshot_timing(
+                getattr(self, "_phase_acc", None),
+                getattr(self, "_env_wait_n", 0),
+                getattr(self, "_env_wait_sum", 0.0))
+
+    def _lt_emit(self) -> None:
+        """Gather the learner-side sections and write learning.jsonl. Called
+        ONLY from _emit_metrics (the single emission site). Every producer
+        is optional (getattr): a missing one logs null, never raises."""
+        lt = self._ltel
+        if lt is None:
+            return
+        sec: Dict[str, Any] = {}
+        try:
+            xt = getattr(self, "_explore_tracker", None)
+            if xt is not None:
+                xt.flush()
+                sec["exploration"] = xt.segment_summary(reset=True)
+        except Exception as exc:
+            lt._err("exploration", exc)
+        try:
+            ppo = getattr(self.policy, "last_update_stats", None)
+            # null unless a NEW update landed since the last record
+            if ppo is not None and id(ppo) != lt._last_ppo_id:
+                lt._last_ppo_id = id(ppo)
+                sec["ppo"] = dict(ppo)
+            else:
+                sec["ppo"] = None
+        except Exception as exc:
+            lt._err("ppo", exc)
+        try:
+            _pg = getattr(self.curiosity, "pop_gate_stats", None)
+            sec["curiosity"] = dict(_pg()) if callable(_pg) else None
+        except Exception as exc:
+            lt._err("curiosity", exc)
+        try:
+            rb = self.replay_buffer
+            _ps = getattr(rb, "pop_sample_stats", None)
+            rp = dict(_ps()) if callable(_ps) else {}
+            rp["size"] = int(len(rb))
+            rp["capacity"] = getattr(rb, "capacity", None)
+            sec["replay"] = rp
+        except Exception as exc:
+            lt._err("replay", exc)
+        try:
+            inf = getattr(self, "infra", None)
+            sec["ledger_signed"] = dict((getattr(
+                inf, "last_ledger_segment", {}) or {}).get("signed") or {}) \
+                if inf is not None else None
+        except Exception as exc:
+            lt._err("ledger", exc)
+        _ms = getattr(self, "_metrics_sink", None)
+        lt.record(int(getattr(self, "total_timesteps", 0)), sec,
+                  extra_dropped=int(getattr(_ms, "dropped", 0) or 0))
+
     def _oracle_observe(self, step_infos, n: int) -> None:
         """Consume the RED channel. EVALUATION ONLY — writes nothing the
         agent can read.
@@ -10700,11 +10919,40 @@ class DevelopmentalAI:
         the world model, and this method is deliberately the single place
         that touches one — so the isolation test has exactly one thing to
         check rather than a habit to audit.
+
+        EXPLORATION (2026-10-07, telemetry). The ExplorationTracker is fed
+        HERE and nowhere else, for EVERY stream (the drift readout below is
+        stream 0's only). It writes the evaluator-only position trace and
+        the learning.jsonl "exploration" section — files, never a path back
+        into the agent.
         """
+        # ONE read of the RED key per stream (the isolation test counts the
+        # literal): both the tracker and the drift readout use this list.
+        _orc = [((_s or {}).get("oracle") or {}) for _s in
+                (step_infos or [])[:max(0, int(n))]]
+        _xt = getattr(self, "_explore_tracker", None)
+        if _xt is not None and _orc:
+            try:
+                _tw = time.time()
+                for _e in range(len(_orc)):
+                    _sx = step_infos[_e] or {}
+                    _px = _orc[_e].get("true_position")
+                    if _px is None:
+                        continue
+                    _wx = _sx.get("world") or {}
+                    _xt.observe(
+                        _e, int(self.total_timesteps), _tw, _px,
+                        yaw=_wx.get("yaw"), pitch=_wx.get("pitch"),
+                        episode=(self._ltel.episode_id(_e)
+                                 if self._ltel is not None else None))
+            except Exception as exc:                   # pragma: no cover
+                if not getattr(self, "_explore_warned", False):
+                    self._explore_warned = True
+                    logger.warning("exploration tracker failed: %r", exc)
         if not self._oracle_enabled:
             return
         _si = (step_infos[0] or {}) if step_infos else {}
-        pos = (_si.get("oracle") or {}).get("true_position")
+        pos = (_orc[0] if _orc else {}).get("true_position")
         if pos is None:
             return
         pos = np.asarray(pos, dtype=np.float64)
@@ -11418,13 +11666,17 @@ class DevelopmentalAI:
         _g = float(self.config.get("policy", {}).get("gamma", 0.99))
         _ext = float(raw_ext)
         _int = float(intrinsic_e)
+        # telemetry parts (measurement only; same additions, same order)
+        _lpi = {"icm_base": _int}
 
         # PERSISTENCE (telescoping: progress, so gamma applies)
         _pw = float(self._persist_weight)
         if _pw > 0.0:
             _phi = min(1.0, float(info.get("attack_run", 0.0) or 0.0)
                        / max(1.0, float(self._persist_ticks)))
+            _i0 = _int
             _int += _pw * (_g * _phi - float(_st.get("persist", 0.0)))
+            _lpi["persistence"] = _int - _i0
             _st["persist"] = _phi
 
         # GAZE LEVEL (plain difference: a STATE COST must pay 0 while pinned
@@ -11434,21 +11686,32 @@ class DevelopmentalAI:
         if _plw > 0.0 and _pv is not None:
             _php = -((min(90.0, abs(float(_pv))) / 90.0) ** 4)
             if "pitch" in _st:
+                _i0 = _int
                 _int += _plw * (_php - float(_st["pitch"]))
+                _lpi["gaze_level"] = _int - _i0
             _st["pitch"] = _php
 
         # OCCLUSION: no world change, no world curiosity. Same category
         # argument as the primary — inside a GUI the observation changes a
         # great deal and the world does not change at all.
         _gui = bool(info.get("gui_open"))
+        _i_pre_gui = _int
         if _gui:
+            _lpi["gui_zero"] = -_int
             _int = 0.0
 
+        _e0 = _ext
         _ext += self._gui_reward(e_i, info)
 
         # update_stats=False: the return EMAs are a per-STEP clock tuned on
         # ONE stream; letting N bodies tick it would scale the anneal by N.
-        return self.reward_mixer.mix(_int, _ext, update_stats=False)
+        _mixed = self.reward_mixer.mix(_int, _ext, update_stats=False)
+        if self._ltel is not None:
+            self._ltel.book_parts(
+                e_i, _lpi, {"env": _e0, "gui_dwell": _ext - _e0}, _mixed,
+                self.reward_mixer, after_damp=_i_pre_gui,
+                mults={"gui_zero": 0.0} if _gui else None)
+        return _mixed
 
     def _magnet_step_shaping(self, action, lp_scalar, latent_row) -> float:
         """THE one magnet invocation, shared by all three loop bodies.

@@ -170,6 +170,19 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    # RETENTION (2026-10-07). The image default is 15 d, which drops the host
+    # history (memory, swap, PSI, GPU) of a slow-building incident before
+    # anyone compares it with the last one. 120 d, with a 20 GB size cap so
+    # the TSDB can never fill node1's disk -- whichever limit is hit first
+    # wins. Setting `command:` REPLACES the image's default arguments, so the
+    # first four lines are those defaults, restated, not new behaviour.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--storage.tsdb.retention.time=120d"
+      - "--storage.tsdb.retention.size=20GB"
     deploy:
       resources:
         limits: {cpus: "0.5", memory: 512M}

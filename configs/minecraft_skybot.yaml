@@ -3059,6 +3059,52 @@ metrics:
   # different durability.
   heartbeat_fsync: false
 
+# ---- LEARNING TELEMETRY (2026-10-07): MEASUREMENT ONLY ---------------------
+# What paid the agent and what it did for it, one record per segment in
+# runlogs/learning.jsonl (schema skybot.learning v1): reward SIGNED per source
+# per stream in mixed units (sums to the reward PPO actually stored), the
+# multipliers that shrank it, breaks/logs this segment and this run, action /
+# source histograms, menu and standing-still fractions, exploration, PPO / WM
+# / curiosity / replay stats, phase timing and health counters. Written at
+# the single metrics emission site with metrics_sink durability (fsync, seq
+# never rewinds, rotation). FILES ONLY: nothing here reaches reward, actions,
+# replay or training (tests/_learning_telemetry_smoke.py). Set enabled: false
+# to switch all of it off.
+telemetry:
+  enabled: true
+  learning:
+    path: runlogs/learning.jsonl
+    max_bytes: 67108864        # 64 MB per file, keep 5 -> bounded
+    keep: 5
+    fsync: true
+  # (2026-10-07) ExplorationTracker, fed ONLY from the RED oracle in
+  # _oracle_observe for EVERY stream (needs sensors.enabled to list
+  # true_position). Unbounded career cell set by default — the env's
+  # cells_seen 50k cap is the latch this replaces. Position trace is an
+  # EVALUATOR-ONLY file the agent never reads; career cells persist in the
+  # checkpoint sidecar exploration_cells.pkl.
+  exploration:
+    enabled: true
+    cell_size: 1.0
+    trace_every_steps: 16
+    trace_path: runlogs/position_trace.jsonl
+    stationary_eps: 0.25
+    max_cells: null
+
+# ---- MEMORY CENSUS (2026-10-07): MEASUREMENT ONLY -------------------------
+# Where the agent's RAM and VRAM actually go, to decide what to offload to the
+# CPU-only LAN nodes. One JSON line per census: process RSS/USS/PSS/swap,
+# replay bytes per column per stream WITH budget-vs-actual (the budget never
+# sees the initial block per stream), every nn.Module / optimizer by device,
+# torch.cuda allocator stats. Written at the metrics emission site (one per
+# segment at most), so the effective cadence is max(this, one segment).
+# On demand: `touch runlogs/MEMCENSUS` (write "deep" into it for the slow gc
+# tensor pass). Read with tools/memory_report.py or
+# scripts/host_memory_report.sh. Remove memory_census_path to switch it off.
+diagnostics:
+  memory_census_every_s: 1800
+  memory_census_path: runlogs/memory_census.jsonl
+
 # ---- Acting-while-learning: WM consolidation on a background thread ----
 # (the bot never freezes at wm_train_every; PPO stays synchronous)
 async_wm:

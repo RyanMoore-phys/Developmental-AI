@@ -43,6 +43,7 @@ UNIT = [
     "tests/unit/test_foundation_discovery_unit.py",
     "tests/unit/test_foundation_selection_unit.py",
     "tests/unit/test_foundation_planning_unit.py",
+    "tests/unit/test_exploration_unit.py",
 ]
 
 CONTRACT = [
@@ -95,6 +96,23 @@ CONTRACT = [
     # Public repo: no LAN/tailnet IPs or credentials in anything `git add -A`
     # would commit; local-only files stay ignored.
     "tests/_no_secrets_smoke.py",
+    # 2026-10-07: agent.close() was never called -> abort at every exit.
+    "tests/_clean_exit_smoke.py",
+    # Read-only RAM/VRAM census (infra/memory_census.py) + replay accounting.
+    "tests/_memory_census_smoke.py",
+    # 2026-10-07: replay save/load no longer double the buffer in RAM
+    # (the save at stop was the last thing before the host froze).
+    "tests/_replay_save_memory_smoke.py",
+    # Telemetry (2026-10-07): exploration / stuck metrics + 50k-cell latch.
+    "tests/_exploration_smoke.py",
+    # Ops (2026-10-07): exit capture, incident bundles, crash-loop guard.
+    "tests/_incident_bundle_smoke.py",
+    # Telemetry: PPO/WM/LP/replay stat producers, byte-identical training.
+    "tests/_ml_stats_smoke.py",
+    # node1 ingest tables + Grafana dashboards/alerts query drift check.
+    "tests/_telemetry_ingest_smoke.py",
+    # learning.jsonl: signed reward parts reconcile with the mixed reward.
+    "tests/_learning_telemetry_smoke.py",
 ]
 
 # These need the full stack (gymnasium / minerl) and so only run on the training host.

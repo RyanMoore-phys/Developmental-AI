@@ -215,6 +215,12 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         # tests/_capacity_wave_smoke.py rather than left to review.
         self._proto_arr: "np.ndarray | None" = None
         self._proto_ids: "list | None" = None
+        # ---- GATE TELEMETRY (2026-10-07, measurement only) ---------------
+        # Counts of what the LP gates did on LIVE (update_state=True) calls
+        # since the last pop_gate_stats(). Read-only calls (imagination) are
+        # not counted. Nothing reads these back into the reward.
+        self._reset_gate_stats()
+        self._lp_gate_stage = 0
 
     def _pooled_vec(self, obs_row: np.ndarray) -> "np.ndarray | None":
         c = int(getattr(self, "image_channels", 3))
@@ -381,6 +387,9 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
     def _lp_from_history(self, h: np.ndarray) -> float:
         """The error drop between the halves of `h`, or 0.0 unless it is
         SIGNIFICANT (relative gate) and MATERIAL (absolute floor)."""
+        # _lp_gate_stage (telemetry only): 0 = no material drop, 1 = passed
+        # the absolute floor, 2 = also passed the significance test.
+        self._lp_gate_stage = 0
         half = len(h) // 2
         a, b = h[:half], h[half:]
         older = float(a.mean())
@@ -394,12 +403,15 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         if not drop > (float(getattr(self, "lp_abs_frac", 0.0))
                        * max(recent, 1e-12)):
             return 0.0
+        self._lp_gate_stage = 1
         z = float(getattr(self, "lp_sig_z", 0.0))
         if z <= 0.0:
             # LEGACY relative gate (revert / regression witness only): valid
             # for independent samples, passes 22-39% of a frozen model's
             # autocorrelated history. See __init__.
             sig = drop > float(getattr(self, "lp_sig_k", 0.5)) * float(h.std())
+            if sig:
+                self._lp_gate_stage = 2
             return drop if sig else 0.0
         n = len(h)
         dof = n - 2
@@ -408,6 +420,7 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
             return 0.0
         var = ss / dof
         if var <= 0.0:
+            self._lp_gate_stage = 2
             return drop            # noiseless and strictly lower: real
         d = np.concatenate([np.diff(a), np.diff(b)])
         r = 1.0 - float((d * d).mean()) / (2.0 * var) if len(d) else 0.0
@@ -422,7 +435,44 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
         # Student-t quantile from the normal one (Cornish-Fisher, first
         # term): small or highly correlated histories need a larger t.
         t = z * (1.0 + (z * z + 1.0) / (4.0 * dof_eff))
+        if drop > t * se:
+            self._lp_gate_stage = 2
         return drop if drop > t * se else 0.0
+
+    def _reset_gate_stats(self) -> None:
+        self._gs_evaluated = 0
+        self._gs_passed_abs = 0
+        self._gs_passed_sig = 0
+        self._gs_paid = 0
+        self._gs_paid_sum = 0.0
+        self._gs_collapsed = 0
+
+    def pop_gate_stats(self) -> dict:
+        """What the LP gates did on live calls since the last pop, then reset.
+
+        evaluated        bucket ENTRIES scored (history >= lp_min_samples)
+        passed_abs       of those, positive drop clearing the absolute floor
+        passed_sig       of those, also clearing the significance test
+        paid             entries whose raw LP > 0 (== passed_sig)
+        collapsed_visits continuation steps folded into an open visit
+        buckets          bucket histories currently held (a level, not a count)
+        mean_paid        mean RAW (pre-normalisation) LP over paid entries,
+                         None when nothing was paid
+        Invariant: paid <= passed_sig <= passed_abs <= evaluated."""
+        if not hasattr(self, "_gs_evaluated"):
+            self._reset_gate_stats()
+        out = {
+            "evaluated": int(self._gs_evaluated),
+            "passed_sig": int(self._gs_passed_sig),
+            "passed_abs": int(self._gs_passed_abs),
+            "paid": int(self._gs_paid),
+            "collapsed_visits": int(self._gs_collapsed),
+            "buckets": int(len(self._bucket_err)),
+            "mean_paid": (float(self._gs_paid_sum / self._gs_paid)
+                          if self._gs_paid else None),
+        }
+        self._reset_gate_stats()
+        return out
 
     def compute_intrinsic_reward(self, obs, action, next_obs,
                                  update_state: bool = True,
@@ -517,6 +567,7 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                     run = self._lp_runs.get(streams[i])
                     if run is not None and run[0] == key:
                         entry = False
+                        self._gs_collapsed += 1
                         run[1] += float(errs[i])
                         run[2] += 1
                     else:
@@ -532,6 +583,14 @@ class LearningProgressCuriosity(IntrinsicCuriosityModule):
                 if entry and len(hist) >= self.lp_min_samples:
                     lp[i] = self._lp_from_history(
                         np.fromiter(hist, dtype=np.float64))
+                    if update_state:
+                        _st = self._lp_gate_stage
+                        self._gs_evaluated += 1
+                        self._gs_passed_abs += int(_st >= 1)
+                        self._gs_passed_sig += int(_st >= 2)
+                        if lp[i] > 0.0:
+                            self._gs_paid += 1
+                            self._gs_paid_sum += float(lp[i])
                 if update_state and not self.lp_visit_collapse:
                     hist.append(float(errs[i]))         # counts next time
             if update_state:

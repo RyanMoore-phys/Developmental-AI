@@ -1092,6 +1092,19 @@ class MineRLEnvAdapter(gym.Env):
             cell = (int(x // self.coverage_cell), int(z // self.coverage_cell))
             n = self._visits.get(cell, 0)
             self._visits[cell] = n + 1
+            # CELLS SEEN IS A COUNTER, NOT len(_visits) (2026-10-07). The
+            # visit table below is FIFO-capped at 50k, so its length froze
+            # at 50000 for good and the loop's per-segment cells_delta (the
+            # stuck monitor's "new territory" input) read 0 forever — a
+            # guard become a latch (CLAUDE.md §4.1). Counting first-time
+            # insertions is O(1) memory and identical to len(_visits) below
+            # the cap (seeded from the restored table on first use); past it
+            # an evicted cell that is re-entered counts as new again, which
+            # is exactly how `coverage` already treats it.
+            if not hasattr(self, "_cells_ever"):
+                self._cells_ever = len(self._visits) - (1 if n == 0 else 0)
+            if n == 0:
+                self._cells_ever += 1
             if len(self._visits) > 50000:            # bound the memory
                 self._visits.pop(next(iter(self._visits)))
             # territory changes EVERY step, so it needs a step-paced flush of
@@ -1102,7 +1115,7 @@ class MineRLEnvAdapter(gym.Env):
             self._save_break_memory(event=False)
             out["coverage"] = float(1.0 / np.sqrt(1.0 + n))
             out["cell"] = cell
-            out["cells_seen"] = len(self._visits)
+            out["cells_seen"] = int(self._cells_ever)
             # WHERE IS IT LOOKING. Minecraft clamps pitch to [-90, +90];
             # -90 is straight up, +90 straight down. A value pinned at a
             # clamp means the camera cannot travel further that way, which

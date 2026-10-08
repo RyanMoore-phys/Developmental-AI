@@ -1,0 +1,216 @@
+apiVersion: 1
+
+# SkyBot alert rules (2026-10-07). Grafana-managed, file-provisioned: edit
+# HERE, not in the UI (provisioned rules are read-only there).
+#
+# Two datasources, on purpose:
+#   * Prometheus (rack-prometheus) for the HOST -- it scrapes main directly,
+#     so it still sees the box when the agent, the collector or SQLite don't;
+#   * SQLite (skybot-sqlite) for the AGENT's own feeds, which only exist once
+#     the collector has mirrored them and ingest.py has written skybot.db.
+#
+# Guard check (CLAUDE.md 4.1): every rule here AUTO-RESOLVES when its
+# condition clears; none needs a human to reset it, and none feeds back into
+# the agent. An empty table is treated as a FIRING condition, not as "no
+# data" -- COALESCE(..., 0) makes "never seen a heartbeat" a huge age, because
+# silence is the failure this file exists to catch.
+#
+# Thresholds are starting points (docs/foundation/TELEMETRY_INVENTORY_OPS.md
+# 2.4); calibrate against a real thrash export before trusting them.
+# Routing: these go to the default notification policy. See contact_points.yml.
+# tests/_telemetry_ingest_smoke.py runs every SQL query here against a
+# synthetic ingest, so a renamed key or table goes red in CI, not silent.
+
+groups:
+  - orgId: 1
+    name: skybot-host
+    folder: SkyBot
+    interval: 1m
+    rules:
+      - uid: skybot-main-down
+        title: main down
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: rack-prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'up{job="node",instance="main:9100"}'
+          - refId: R
+            datasourceUid: __expr__
+            model: {refId: R, type: reduce, expression: A, reducer: last}
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: R
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+        # An absent series is silence too (the scrape target vanished).
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {severity: page, component: host}
+        annotations:
+          summary: "main has not answered a node_exporter scrape for 5 min"
+          description: "Box down, NIC dead, or userspace starved (the 2026-10-06 freeze). Check ping vs ssh to split kernel-alive from powered-off."
+
+      - uid: skybot-memory-thrash
+        title: main memory thrash
+        condition: T
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: rack-prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'rate(node_vmstat_pswpin{instance="main:9100"}[2m])'
+          - refId: P
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: rack-prometheus
+            model:
+              refId: P
+              instant: true
+              expr: 'rate(node_pressure_memory_stalled_seconds_total{instance="main:9100"}[1m])'
+          - refId: RA
+            datasourceUid: __expr__
+            model: {refId: RA, type: reduce, expression: A, reducer: last}
+          - refId: RP
+            datasourceUid: __expr__
+            model: {refId: RP, type: reduce, expression: P, reducer: last}
+          - refId: T
+            datasourceUid: __expr__
+            model:
+              refId: T
+              type: math
+              # swap-in > 500 pages/s, OR every task stalled on memory > 10%
+              # of the time (rate of the PSI "full" counter ~ avg60).
+              expression: '$RA > 500 || $RP > 0.10'
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: warn, component: host}
+        annotations:
+          summary: "main is thrashing (swap-in or memory PSI high for 5 min)"
+          description: "Precursor of the 2026-10-06 freeze. Stop the run gracefully (touch runlogs/STOP) before the box stops answering; check memory_census on the Host dashboard."
+
+  - orgId: 1
+    name: skybot-agent
+    folder: SkyBot
+    interval: 1m
+    rules:
+      - uid: skybot-heartbeat-stale
+        title: heartbeat stale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: skybot-sqlite
+            model:
+              refId: A
+              queryType: table
+              rawQueryText: "SELECT CAST(strftime('%s','now') AS REAL) - COALESCE(MAX(wall_time), 0) AS value FROM heartbeat"
+              queryText: "SELECT CAST(strftime('%s','now') AS REAL) - COALESCE(MAX(wall_time), 0) AS value FROM heartbeat"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [900]}
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        labels: {severity: page, component: agent}
+        annotations:
+          summary: "no heartbeat for > 15 min"
+          description: "900 s sits above a synchronous PPO update and the ~8.5 min replay save on stop. A deliberate STOP also fires this; it resolves on relaunch. Check main down / collector blind first: either explains it."
+
+      - uid: skybot-crash-loop
+        title: crash loop
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: skybot-sqlite
+            model:
+              refId: A
+              queryType: table
+              rawQueryText: "SELECT COUNT(*) AS value FROM incidents WHERE class = 'crash' AND COALESCE(t_end, t_start) >= CAST(strftime('%s','now') AS REAL) - 1800"
+              queryText: "SELECT COUNT(*) AS value FROM incidents WHERE class = 'crash' AND COALESCE(t_end, t_start) >= CAST(strftime('%s','now') AS REAL) - 1800"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [2]}
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {severity: page, component: agent}
+        annotations:
+          summary: ">= 3 crash incidents in the last 30 min"
+          description: "Restarting repeatedly. Read the newest bundles in the Host dashboard incidents table (runlogs/incidents/<ts>-crash/)."
+
+      - uid: skybot-collector-blind
+        title: collector blind
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: skybot-sqlite
+            model:
+              refId: A
+              queryType: table
+              rawQueryText: "SELECT CAST(strftime('%s','now') AS REAL) - COALESCE(MAX(wall_time), 0) AS value FROM learning_kv"
+              queryText: "SELECT CAST(strftime('%s','now') AS REAL) - COALESCE(MAX(wall_time), 0) AS value FROM learning_kv"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [900]}
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        labels: {severity: warn, component: monitor}
+        annotations:
+          summary: "no new learning.jsonl record ingested for > 15 min"
+          description: "Segments land every ~7 min. If main is up and the heartbeat is fresh, the evidence mirror or ingest.py is broken -- so silence on every other agent panel must NOT be read as health."
+
+      - uid: skybot-stuck
+        title: stuck (no new cell)
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: skybot-sqlite
+            model:
+              refId: A
+              queryType: table
+              rawQueryText: "SELECT replace(replace(key, 'exploration.', ''), '.steps_since_new_cell', '') AS stream, value FROM learning_kv WHERE key LIKE 'exploration.%.steps_since_new_cell' AND seq = (SELECT MAX(seq) FROM learning_kv)"
+              queryText: "SELECT replace(replace(key, 'exploration.', ''), '.steps_since_new_cell', '') AS stream, value FROM learning_kv WHERE key LIKE 'exploration.%.steps_since_new_cell' AND seq = (SELECT MAX(seq) FROM learning_kv)"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [5000]}
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {severity: info, component: behaviour}
+        annotations:
+          summary: "a stream has visited no new cell for > 5000 steps, for 1 h"
+          description: "Per stream (label `stream`). Measurement only -- nothing reads this back into the agent. Look at the Exploration dashboard: pinned in a GUI, held against a wall, or circling."

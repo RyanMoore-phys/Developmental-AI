@@ -197,8 +197,10 @@ def main():
         'model_version=self._world_model_version()')
     assert src.count('model_version=self._world_model_version()') == 1
     sv, ld = _body(src, '_save_checkpoint_locked'), _body(src, 'load_checkpoint')
-    assert sv.count('atomic_pickle_dump(') == 2 and 'pickle.dump(' not in sv
-    assert ld.count('load_pickle_sidecar(') == 2 and 'pickle.load(' not in ld
+    # 3 sidecars since 2026-10-07: curiosity_visits, progress_probes and the
+    # telemetry exploration_cells.pkl -- every one atomic out, guarded in.
+    assert sv.count('atomic_pickle_dump(') == 3 and 'pickle.dump(' not in sv
+    assert ld.count('load_pickle_sidecar(') == 3 and 'pickle.load(' not in ld
     assert '_gui_reward_components' not in src
     assert 'curiosity.gui_dwell_weight must be finite and >= 0' in _body(src, '__init__')
     ev = open(EVAL).read()

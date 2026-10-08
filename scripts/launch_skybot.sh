@@ -14,8 +14,20 @@
 # a run launched with a dead bridge would strand the primary in a
 # connect-fail rebuild loop.
 set -e
-cd /workspace/devai
+# SKYBOT_ROOT exists for tests/_incident_bundle_smoke.py, which runs this
+# script in a temp copy; on the host it is always /workspace/devai.
+cd "${SKYBOT_ROOT:-/workspace/devai}"
 TS=${1:-1000000}
+# A MANUAL LAUNCH CLEARS THE CRASH-LOOP LATCH (2026-10-07). The supervisor
+# writes runlogs/CRASHLOOP and stops relaunching after the same exit class +
+# signal 3x in 30 min (supervise_skybot.sh). It calls this script with
+# SKYBOT_SUPERVISED=1; anything else is a human (or host.yml) deciding to run
+# again, which is exactly the escape that guard needs (CLAUDE.md 4.1).
+if [ -z "${SKYBOT_SUPERVISED:-}" ] && [ -f runlogs/CRASHLOOP ]; then
+  echo "  manual launch: clearing runlogs/CRASHLOOP ($(head -1 runlogs/CRASHLOOP 2>/dev/null))"
+  rm -f runlogs/CRASHLOOP runlogs/crash_history
+fi
+# ---- PREFLIGHT BEGIN (tests/_incident_bundle_smoke.py strips to END) ------
 if pgrep -f "run_minecraft[.]py" >/dev/null; then echo "REFUSED: run alive"; exit 1; fi
 # ---- STALE JAVA: CLEAR BUILD RESIDUE, REFUSE ONLY ON A REAL CLIENT --------
 # This was a bare `pgrep -x java -> REFUSED: stale java` (2026-09-23), and it
@@ -92,6 +104,7 @@ pgrep -x ollama >/dev/null || { OLLAMA_DEBUG=0 nohup ollama serve >> runlogs/oll
 # (measured 2026-08-16) would eat the disk on a long lifelong run
 pgrep -f "cap_log[.]sh runlogs/ollama[.]log" >/dev/null || \
   { nohup bash scripts/cap_log.sh runlogs/ollama.log >> runlogs/cap_log.log 2>&1 < /dev/null & }
+# ---- PREFLIGHT END ---------------------------------------------------------
 rm -rf runlogs/brain
 # OMP_NUM_THREADS 16 -> 6 (2026-09-22): the training host had 128 cores, this box
 # has 6/12 and two of them are pinned to Minecraft clients by the
@@ -106,6 +119,14 @@ rm -rf runlogs/brain
 # contiguous block. This does NOT create memory: it is worth ~a few hundred MB
 # of headroom, and the real fix for this box is the VLM KV-cache cap in
 # configs (symbolic_grounding.num_ctx). Keep both.
+# NO CORE DUMPS FOR THE AGENT (2026-10-07). An abort or segfault of this
+# process dumps ~8-10 GB of RAM plus CUDA mappings to disk on a 16 GB host
+# with one NVMe. On 2026-10-06 the host froze 22 s after the agent aborted
+# at exit (`terminate called without an active exception`; fixed in
+# run_minecraft.py). A dump of this process has never been used to debug
+# anything; the run log and runlogs/crashes.log carry the traceback.
+ulimit -c 0
+
 # KEEP THE PREVIOUS RUNS' LOGS (2026-10-04). The `>` below truncates, so
 # every launch -- including each supervisor relaunch after a crash -- erased
 # the last run's log, and there was no earlier `Loop timing` to compare a
@@ -117,13 +138,74 @@ for i in 2 1; do
 done
 [ -f runlogs/minecraft_skybot_run.log ] && \
   mv -f runlogs/minecraft_skybot_run.log runlogs/minecraft_skybot_run.log.1
+# EXIT CAPTURE (2026-10-07). The agent's exit code used to die with it: the
+# supervisor only ever saw "pid gone", so a clean STOP, an abort at exit
+# (rc 134, the 2026-10-06 freeze) and an OOM kill (137) were indistinguishable
+# (docs/foundation/TELEMETRY_INVENTORY_OPS.md 2.1, gap G1). A tiny bash
+# wrapper now owns the python process and outlives it by microseconds:
+#   * `sh -c 'echo $$ > pid; exec python'` -- the pid it writes IS the
+#     agent's pid (exec keeps it), so runlogs/skybot_run.pid, the
+#     supervisor's kill -0, deploy_skybot.sh's `ps -p PID -o args= | grep
+#     minecraft` + SIGTERM, and host_stop_wait.sh all address the AGENT as
+#     before. ($BASHPID would do it in bash 4, not in the 3.2 the test runs.)
+#   * python runs in the FOREGROUND of the wrapper, so it keeps default
+#     SIGINT/SIGQUIT handling (a background job of a non-interactive shell
+#     would have them ignored).
+#   * the wrapper traps TERM/INT/HUP, so a signal to the whole process group
+#     still lets it write runlogs/skybot_run.exit after python dies.
+# skybot_run.exit is key=value lines: exit_code, signal (NAME or "none"),
+# pid, t_start_epoch, t_end_epoch, t_end (ISO UTC). rc>128 = signal rc-128
+# (134 ABRT, 137 KILL = OOM/earlyoom, 139 SEGV, 143 TERM). It is written
+# .tmp + mv, so a reader never sees half of it, and removed here first, so a
+# stale one is never read for a new run.
+# `pgrep -f "run_minecraft[.]py"` also matches the wrapper -- harmless: it
+# is alive exactly when the agent is.
+rm -f runlogs/skybot_run.exit runlogs/skybot_run.pid
+_WRAP=$(cat <<'WRAPEOF'
+pidf=$1; exitf=$2; shift 2
+trap 'GOT_SIG=1' TERM INT HUP
+t0=$(date +%s)
+sh -c 'echo $$ > "$0.tmp" && mv -f "$0.tmp" "$0"; exec "$@"' "$pidf" "$@"
+rc=$?
+pid=$(cat "$pidf" 2>/dev/null || echo unknown)
+sig=none
+if [ "$rc" -gt 128 ] && [ "$rc" -lt 160 ]; then
+  sig=$(kill -l $((rc - 128)) 2>/dev/null || echo "$((rc - 128))")
+  sig=SIG${sig#SIG}
+fi
+{
+  echo "exit_code=$rc"
+  echo "signal=$sig"
+  echo "pid=$pid"
+  echo "t_start_epoch=$t0"
+  echo "t_end_epoch=$(date +%s)"
+  echo "t_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$exitf.tmp" && mv -f "$exitf.tmp" "$exitf"
+exit "$rc"
+WRAPEOF
+)
+# setsid is always present on the host; the guard is for the test on macOS.
+_SETSID=$(command -v setsid || true)
 DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=6 MINERL_HEADLESS=1 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  setsid ./venv_mc/bin/python run_minecraft.py \
+  $_SETSID bash -c "$_WRAP" skybot-exit-wrapper \
+    runlogs/skybot_run.pid runlogs/skybot_run.exit \
+    ./venv_mc/bin/python run_minecraft.py \
     --config configs/minecraft_skybot.yaml \
     --timesteps "$TS" --seed 0 --out minecraft_skybot_results \
     > runlogs/minecraft_skybot_run.log 2>&1 < /dev/null &
-PY=$!
+WRAPPER=$!
 disown
-echo "$PY" > runlogs/skybot_run.pid
+# The wrapper writes the AGENT pid within milliseconds; wait (bounded) for it.
+# Fallback: the wrapper's own pid, which lives exactly as long as the agent.
+PY=""
+for _i in $(seq 1 50); do
+  PY=$(cat runlogs/skybot_run.pid 2>/dev/null || true)
+  [ -n "$PY" ] && break
+  sleep 0.2
+done
+if [ -z "$PY" ]; then
+  PY=$WRAPPER
+  echo "$PY" > runlogs/skybot_run.pid
+fi
 echo "LAUNCHED skybot pid=$PY"

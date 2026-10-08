@@ -76,7 +76,7 @@ you wipe the volumes.
 ```bash
 # 1. GitHub -> Settings -> Actions -> Runners shows it Idle
 # 2. the mounted key and the network path both work, from INSIDE the container:
-docker compose exec runner bash -c 'ssh -i "$MAIN_SSH_KEYFILE" -p "$MAIN_SSH_PORT" root@"$MAIN_HOST" hostname'
+docker compose exec runner bash -c 'ssh -i "$MAIN_SSH_KEYFILE" -p "$MAIN_SSH_PORT" "${MAIN_USER:-root}"@"$MAIN_HOST" hostname'
 # 3. resource caps are actually applied:
 docker stats --no-stream skybot-runner
 # 4. Actions -> host -> Run workflow -> action=status   (read-only)

@@ -11,7 +11,7 @@ Nothing is ever written to or deleted on the training host.
 | path | written by | atomic? |
 |---|---|---|
 | `logs/checkpoints/{world_model,curiosity,policy,dream_actor,symbolic_decoder,glue_layer,symbolizer,familiarity,magnet}.pt`, `knowledge_graph.json`, `options_state.json` | `_save_checkpoint_locked` (`loop.log_dir: ./logs`) | **no** (written in place) |
-| `logs/checkpoints/curiosity_visits.pkl`, `logs/checkpoints/progress_probes.pkl` (since 2026-10-05; absent on older checkpoints = skipped, not fatal) | `_save_checkpoint_locked` | yes (tmp + fsync + replace) |
+| `logs/checkpoints/curiosity_visits.pkl`, `logs/checkpoints/progress_probes.pkl`, `logs/checkpoints/exploration_cells.pkl` (since 2026-10-05 / 10-07; absent on older checkpoints = skipped, not fatal) | `_save_checkpoint_locked` | yes (tmp + fsync + replace) |
 | `runlogs/breaks_by_type.json` | `environment.break_memory_path` | yes |
 | `runlogs/consequence_state.json`, `runlogs/anticipation_state.json` | `infra.log_dir` | yes |
 | `skill_bank_mc_rssm/` (live `skill_bank.storage_dir`) | skill bank | registry yes; skill `.pt` no |

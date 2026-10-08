@@ -1,0 +1,28 @@
+apiVersion: 1
+
+# PLACEHOLDER contact point for the SkyBot alert rules (skybot_alerts.yml).
+#
+# NO SECRET LIVES IN THIS FILE, and none may (tests/_no_secrets_smoke.py).
+# The URL below is a deliberate dead end on localhost, so a fresh stack
+# provisions cleanly and the rules evaluate and show in Alerting -> Alert
+# rules, but nothing is delivered anywhere yet.
+#
+# To actually get paged (on node1, NOT committed):
+#   1. replace `url` with your receiver (ntfy topic, Slack/Discord webhook,
+#      ...) in a LOCAL copy of this file, or switch `type` (email, telegram,
+#      ...) -- https://grafana.com/docs/grafana/latest/alerting/set-up/provision-alerting-resources/file-provisioning/
+#   2. point the default notification policy at `skybot-oncall`
+#      (Alerting -> Notification policies). The policy tree is deliberately
+#      NOT provisioned here: provisioning it would overwrite any routing
+#      already configured in this Grafana's UI.
+#   3. docker compose restart grafana
+contactPoints:
+  - orgId: 1
+    name: skybot-oncall
+    receivers:
+      - uid: skybot-oncall-webhook
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: http://localhost:9/skybot-alert-placeholder
+          httpMethod: POST

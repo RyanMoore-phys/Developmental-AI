@@ -17,6 +17,7 @@
 #   OUT_DIR      where to write (default /data)
 #   REMOTE_PATH  host-side metrics file
 #   RSYNC_EVERY  seconds between backfills (default 300)
+#   PULL_EVERY   seconds between evidence-mirror pulls (default 60; see below)
 set -uo pipefail
 
 # ---- WHO WE LOG IN AS (added 2026-09-22) ----------------------------------
@@ -105,9 +106,68 @@ backfill_hb() {
   rm -f "$OUT_DIR/.hb.jsonl"
 }
 
-echo "collector: training host=${MAIN_HOST}:${MAIN_SSH_PORT} -> ${OUT} (+ heartbeat)"
+# ---- EVIDENCE MIRROR (2026-10-07) -----------------------------------------
+# The 2026-10-06 freeze left its evidence ON main: the run log, crashes.log,
+# the kernel log -- none of it reachable while the box was down, and some of
+# it rotated away by the next launch. Every PULL_EVERY s (default 60) this
+# mirrors the rest of the telemetry flat into $OUT_DIR, where ingest.py reads:
+#   learning.jsonl*  position_trace.jsonl*  memory_census.jsonl*
+#   crashes.log  supervisor.log*  incidents/   (bundles, index.jsonl)
+# metrics.jsonl and heartbeat.jsonl are NOT in this list: they keep their
+# seq-merged copies above, which a raw mirror would clobber.
+# WHY plain `rsync -a` and not --append: the feeds ROTATE on main (the
+# metrics sink's 64 MB rotation; supervisor.log is truncated by every
+# launcher). --append skips a file whose remote copy is now SHORTER than the
+# local one, so after the first rotation it would silently stop updating --
+# the same quiet failure as the podlogs rename above. Instead:
+#   * the rotated siblings (`*.jsonl.1` ...) are pulled under their own
+#     names, so a rotation loses nothing as long as main does not rotate the
+#     same feed twice inside one PULL_EVERY;
+#   * rsync writes to a temp file and renames, so ingest never reads half a
+#     file (`--partial-dir` keeps an interrupted big transfer resumable);
+#   * NO --delete: what main prunes (bundle retention, 3-deep logs) stays here.
+# BOUNDED: `timeout PULL_TIMEOUT` (50 s) per pull, --max-size, and node1-side
+# retention of incident bundles older than INCIDENT_KEEP_DAYS (180).
+PULL_EVERY="${PULL_EVERY:-60}"
+PULL_TIMEOUT="${PULL_TIMEOUT:-50}"
+REMOTE_RUNLOGS="${REMOTE_RUNLOGS:-/workspace/devai/runlogs}"
+INCIDENT_KEEP_DAYS="${INCIDENT_KEEP_DAYS:-180}"
+mirror_pull() {
+  timeout "$PULL_TIMEOUT" rsync -a --partial-dir=.rsync-partial --max-size=512M \
+      -e "ssh ${SSH_OPTS[*]}" \
+      --include='learning.jsonl*' --include='position_trace.jsonl*' \
+      --include='memory_census.jsonl*' --include='crashes.log' \
+      --include='supervisor.log*' --include='CRASHLOOP' \
+      --exclude='incidents/.partial-*' \
+      --include='incidents/' --include='incidents/**' --exclude='*' \
+      "${MAIN_USER}@${MAIN_HOST}:${REMOTE_RUNLOGS}/" "$OUT_DIR/" 2>/dev/null
+  _rc=$?
+  # rc 23/24 = some listed file does not exist yet (a fresh host) -- normal.
+  if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 23 ] && [ "$_rc" -ne 24 ]; then
+    _now=$(date +%s)
+    if [ $(( _now - ${_LAST_MWARN:-0} )) -ge 300 ]; then
+      echo "collector: evidence mirror FAILED rc=$_rc from ${MAIN_HOST}:${REMOTE_RUNLOGS}" \
+           "(124 = timed out after ${PULL_TIMEOUT}s)"
+      _LAST_MWARN=$_now
+    fi
+  fi
+  # CRASHLOOP is a flag, not a log: mirror its ABSENCE too, or a cleared latch
+  # would stay "on" here forever (rsync without --delete never removes it).
+  if [ "$_rc" -eq 0 ] || [ "$_rc" -eq 23 ] || [ "$_rc" -eq 24 ]; then
+    ssh "${SSH_OPTS[@]}" "${MAIN_USER}@${MAIN_HOST}" \
+        "test -f '${REMOTE_RUNLOGS}/CRASHLOOP'" 2>/dev/null
+    [ $? -eq 1 ] && rm -f "$OUT_DIR/CRASHLOOP"
+  fi
+  [ -d "$OUT_DIR/incidents" ] && find "$OUT_DIR/incidents" -mindepth 1 -maxdepth 1 \
+      -type d -name '20*' -mtime +"$INCIDENT_KEEP_DAYS" -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+echo "collector: training host=${MAIN_HOST}:${MAIN_SSH_PORT} -> ${OUT} (+ heartbeat, evidence mirror every ${PULL_EVERY}s)"
 backfill
 backfill_hb
+mirror_pull
+LAST_PULL=$(date +%s)
 LAST_RSYNC=$(date +%s)
 # SEPARATE clock from LAST_RSYNC. Sharing it made the heartbeat condition
 # true on every 10s pass for the whole 300s segment-backfill window, so it
@@ -135,12 +195,17 @@ while true; do
       backfill
       LAST_RSYNC=$NOW
     fi
+    if [ $((NOW - LAST_PULL)) -ge "$PULL_EVERY" ]; then
+      mirror_pull
+      LAST_PULL=$NOW
+    fi
   done
 
   wait "$TAIL_PID" 2>/dev/null
   echo "collector: tail exited, backfilling then reconnecting in 10s"
   backfill
   backfill_hb
-  LAST_RSYNC=$(date +%s); LAST_HB=$LAST_RSYNC
+  mirror_pull
+  LAST_RSYNC=$(date +%s); LAST_HB=$LAST_RSYNC; LAST_PULL=$LAST_RSYNC
   sleep 10
 done

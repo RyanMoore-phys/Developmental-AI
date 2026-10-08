@@ -1,0 +1,477 @@
+{
+ "uid": "skybot-ml-health",
+ "title": "SkyBot ML Health",
+ "description": "PPO, world model, curiosity gate, replay sampler, timing and numeric-health counters from learning.jsonl. A missing producer logs null -> no row -> a gap, never a zero.",
+ "tags": [
+  "skybot"
+ ],
+ "timezone": "browser",
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "PPO",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "PPO losses",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('ppo.policy_loss', 'ppo.value_loss')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "PPO approx KL / clip fraction",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('ppo.approx_kl', 'ppo.clip_frac')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "PPO entropy / explained variance",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 1
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('ppo.entropy', 'ppo.explained_variance')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "PPO grad norms (clipped flag = 1)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 9
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key LIKE 'ppo.grad_norm%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Advantage / return stats",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 9
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('ppo.adv_mean', 'ppo.adv_std', 'ppo.ret_mean')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "PPO lr / samples / epochs",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 9
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('ppo.lr', 'ppo.n_samples', 'ppo.epochs', 'ppo.minibatches')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type": "row",
+   "title": "World model",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 17
+   },
+   "panels": []
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "WM losses (block means)",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 18
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key LIKE 'wm.loss_%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "WM KL raw / grad norm",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 18
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('wm.kl_raw', 'wm.grad_norm')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "WM prior / posterior entropy",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 18
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('wm.prior_entropy', 'wm.posterior_entropy')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "WM steps / replay ratio",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 26
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('wm.steps', 'wm.replay_ratio')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "row",
+   "title": "Curiosity + replay",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 34
+   },
+   "panels": []
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Curiosity gate (evaluated -> passed -> paid)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 35
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('curiosity.evaluated', 'curiosity.passed_sig', 'curiosity.passed_abs', 'curiosity.paid', 'curiosity.collapsed_visits')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "timeseries",
+   "title": "Curiosity mean paid / buckets",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 35
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key IN ('curiosity.mean_paid', 'curiosity.buckets')) AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "Replay sampler",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 35
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key LIKE 'replay.%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "sequences_sampled, rejected_boundary, mean_priority + sizes."
+  },
+  {
+   "id": 17,
+   "type": "row",
+   "title": "Timing + health",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 43
+   },
+   "panels": []
+  },
+  {
+   "id": 18,
+   "type": "timeseries",
+   "title": "Steps per second",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 44
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key = 'timing.steps_per_s') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "Phase timings (ms)",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 44
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, replace(key, 'timing.', '') AS metric, value FROM learning_kv WHERE (key LIKE 'timing.%' AND key <> 'timing.steps_per_s') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "Health: NaN steps / grad spikes / sink dropped",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 44
+   },
+   "datasource": {
+    "type": "frser-sqlite-datasource",
+    "uid": "skybot-sqlite"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "queryType": "time series",
+     "timeColumns": [
+      "time"
+     ],
+     "rawQueryText": "SELECT wall_time AS time, key AS metric, value FROM learning_kv WHERE (key LIKE 'health.%') AND wall_time BETWEEN $__unixEpochFrom() AND $__unixEpochTo() ORDER BY wall_time"
+    }
+   ],
+   "description": "Should be flat zero. Any rise is a finding."
+  }
+ ]
+}
