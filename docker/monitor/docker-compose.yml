@@ -165,8 +165,12 @@ services:
     # gitignored ./.env (compose interpolation), so no LAN IP is committed.
     extra_hosts:
       - "main:${MAIN_HOST:?set MAIN_HOST in docker/monitor/.env}"
-      - "node2:${NODE2_HOST:?set NODE2_HOST in docker/monitor/.env}"
-      - "paper-server:${MC_HOST:?set MC_HOST in docker/monitor/.env}"
+      # OPTIONAL scrape targets: unset -> 192.0.2.1 (RFC 5737 documentation
+      # address, never routable), so the target shows DOWN in Prometheus
+      # instead of blocking the whole stack from starting or scraping the
+      # wrong box. Set them in docker/monitor/.env to monitor those hosts.
+      - "node2:${NODE2_HOST:-192.0.2.1}"
+      - "paper-server:${MC_HOST:-192.0.2.1}"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
