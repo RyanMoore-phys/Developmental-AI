@@ -376,6 +376,12 @@ if [ -f "$MJ" ] && grep -q "MineRLAgent" "$MJ"; then
     || echo "  WARN: agent-name patch did NOT apply (template changed upstream?)"
 fi
 
+echo "=== STAGE 4b3: drop MCP-Reborn stat-name debug spam from logs/mc_*.log ==="
+# A leftover println prints every stat NAME (no value) on every observation;
+# it filled 117 GB of a 232 GB disk on main. Lossless to drop — see the script.
+./venv_mc/bin/python scripts/patch_minerl_log_filter.py \
+  || echo "  WARN: log-filter patch did NOT apply — mc_*.log will grow ~GB/day"
+
 echo "=== STAGE 4c: GPU-GL launch wrap (VGL EGL + per-core pin) ==="
 # Two coupled fixes on the java client launch (proven on the A4000 / EPYC 7702):
 #  1. `vglrun -d egl` renders on the NVIDIA GPU (software llvmpipe hangs at boot).
