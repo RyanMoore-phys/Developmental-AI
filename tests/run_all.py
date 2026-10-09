@@ -69,6 +69,8 @@ CONTRACT = [
     "tests/_foundation_baseline_smoke.py",
     "tests/_collection_path_smoke.py",
     "tests/_foundation_experience_smoke.py",
+    # 2026-10-09: store recovery pinned 3.58 GB of pymalloc arenas on main.
+    "tests/_store_recovery_memory_smoke.py",
     "tests/_foundation_mechanisms_smoke.py",
     "tests/_foundation_inference_smoke.py",
     "tests/_foundation_perception_smoke.py",

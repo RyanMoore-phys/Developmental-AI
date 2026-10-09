@@ -101,6 +101,7 @@ import collections
 import hashlib
 import math
 import os
+import sys
 import threading
 import time
 import uuid
@@ -178,6 +179,31 @@ class _Entry:
     line_no: int
     meta: Dict[str, Any]
     hash: str
+
+
+_INTERN_MAX = 40   # ids/labels repeat per record; 64-char content hashes do not
+
+
+def _slim(d: Dict) -> Dict:
+    """Reduce a decoded line to what recovery ingests: seq, kind, meta, hash.
+
+    Born 2026-10-09: on main the trainer held a 3.58 GB block that was
+    entirely pymalloc pools at ~25% fill. Read out of the live process: ~8.7M
+    str objects, ~490k copies EACH of 'content_hash', 'env', 'episode',
+    'stream-1', 'MineRLTreechop-v0', the episode id... — this store's
+    reloaded meta. Recovery held every decoded line, BODY included, for the
+    whole history at once, then kept only the meta; the freed bodies left
+    arenas pinned by the scattered survivors (~2.7 GB never returned).
+    Dropping the body per line keeps the peak small; interning the short
+    strings makes the ~490k meta dicts share one copy of each key and label
+    instead of json.loads' fresh copy per line. Bodies are re-read from disk
+    on demand (_Partition.read), never from these tuples.
+    """
+    meta = {sys.intern(k): (sys.intern(v) if isinstance(v, str)
+                            and len(v) <= _INTERN_MAX else v)
+            for k, v in d["meta"].items()}
+    return {"seq": d["seq"], "kind": sys.intern(d["kind"]),
+            "meta": meta, "hash": d["hash"]}
 
 
 # ---------------------------------------------------------------- partition
@@ -879,7 +905,7 @@ class EvidenceStore:
                 if d is None or d["part"] != name:
                     bad_file = True
                     break
-                good.append((cid, i, d))
+                good.append((cid, i, _slim(d)))
             if not bad_file:
                 return good
         # corrupt sealed chunk: quarantine, salvage self-verifying lines
@@ -895,12 +921,12 @@ class EvidenceStore:
         if not salv:
             return []
         if self.readonly:
-            return [(cid, i, ck.decode_line(ln)[0]) for i, ln in enumerate(salv)]
+            return [(cid, i, _slim(ck.decode_line(ln)[0])) for i, ln in enumerate(salv)]
         ncid = self.manifest["next_cid"]
         self.manifest["next_cid"] = ncid + 1
         p = self._parts[name]
         self._write_sealed(p, ncid, salv)
-        return [(ncid, i, ck.decode_line(ln)[0]) for i, ln in enumerate(salv)]
+        return [(ncid, i, _slim(ck.decode_line(ln)[0])) for i, ln in enumerate(salv)]
 
     def _load_journal(self, name, cid, path):
         lines, tail = ck.read_journal(path)
@@ -924,7 +950,7 @@ class EvidenceStore:
                                       fsync=self.fsync)
         p.journal_lines = list(good)
         p.journal_bytes = sum(len(x.encode("utf-8")) for x in good)
-        return [(cid, i, ck.decode_line(ln)[0]) for i, ln in enumerate(good)]
+        return [(cid, i, _slim(ck.decode_line(ln)[0])) for i, ln in enumerate(good)]
 
     # ---------------------------------------------------------- ingest
     def _ingest(self, part: str, e: _Entry) -> None:
