@@ -109,6 +109,8 @@ CONTRACT = [
     "tests/_exploration_smoke.py",
     # Ops (2026-10-07): exit capture, incident bundles, crash-loop guard.
     "tests/_incident_bundle_smoke.py",
+    # 2026-10-09: no Java client outlives its env (2 orphans, ~2.4 GB, on main).
+    "tests/_client_leak_smoke.py",
     # Telemetry: PPO/WM/LP/replay stat producers, byte-identical training.
     "tests/_ml_stats_smoke.py",
     # node1 ingest tables + Grafana dashboards/alerts query drift check.

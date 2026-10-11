@@ -565,6 +565,9 @@ class MineRLEnvAdapter(gym.Env):
         # _prev_mainhand with the dead equipped_items path created a
         # per-step false tool_lost loop (~7000 bogus KG facts).
         self._prev_derived_hand: Optional[str] = None
+        # Set by close(); read by reset()/_rebuild() so a closed adapter can
+        # never boot another Java client (see _rebuild, 2026-10-09).
+        self._closed = False
         self._env = self._make_underlying()
         self._validate_macros()
 
@@ -1812,7 +1815,24 @@ class MineRLEnvAdapter(gym.Env):
         return obs
 
     def _rebuild(self) -> None:
-        """Replace a dead/hung Minecraft client with a fresh one (~90s)."""
+        """Replace a dead/hung Minecraft client with a fresh one (~90s).
+
+        NEVER AFTER close() (2026-10-09). _parallel_reset abandons a hung
+        reset() and close()s this adapter from another thread -- but the
+        abandoned reset() is still inside its 3-attempt loop on a pool
+        thread. close() breaks its socket, the loop catches that ("attempt
+        2/3: Bad file descriptor") and called this, booting a NEW client on
+        an adapter nothing references. Measured on `main`: 2 of 4 Java
+        clients were such orphans (0 bytes in 15 s, ~1.2 GB each with their
+        watcher) under a num_envs=2 run, alive until the trainer exits.
+
+        close() sets _closed BEFORE it closes self._env, and this checks it
+        AFTER assigning the new client, so every interleaving ends closed:
+        flag seen here -> we close the new client; flag set after our check
+        -> close() reads self._env, which is already the new client.
+        """
+        if self._closed:
+            raise RuntimeError("MineRL adapter closed — not rebuilding")
         try:
             self._env.close()
         except Exception as e:
@@ -1823,6 +1843,14 @@ class MineRLEnvAdapter(gym.Env):
         # whole scene change as "someone else did something" (2026-08-09)
         self._prev_small_pov = None
         self._env = self._make_underlying()
+        if self._closed:      # close() landed during the ~90 s boot
+            try:
+                self._env.close()
+            except Exception as e:
+                logger.warning("MineRL close() of a post-close rebuild "
+                               "failed: %s", e)
+            raise RuntimeError("MineRL adapter closed during rebuild — "
+                               "fresh client closed")
         self._validate_macros()
 
     # ---- gymnasium API ----------------------------------------------------
@@ -1855,6 +1883,9 @@ class MineRLEnvAdapter(gym.Env):
                 pass  # not all MineRL envs support seeding
         last_err: Optional[Exception] = None
         for attempt in range(3):
+            if self._closed:  # abandoned + reaped: stop, do not rebuild
+                raise RuntimeError(
+                    f"MineRL adapter closed during reset: {last_err}")
             try:
                 obs = self._env.reset()
                 # a fresh mission means a fresh boot: re-arm the grace period
@@ -2536,6 +2567,10 @@ class MineRLEnvAdapter(gym.Env):
         return self._last_pov
 
     def close(self):
+        # FIRST, before anything can block: a reset()/_rebuild() still running
+        # on an abandoned pool thread must see this and stop instead of
+        # booting a replacement client (see _rebuild).
+        self._closed = True
         # FINAL FLUSH (2026-08-11, review finding): nothing wrote the lifelong
         # memory on shutdown, so everything since the last throttled flush —
         # up to 2000 steps of territory — died with the process.

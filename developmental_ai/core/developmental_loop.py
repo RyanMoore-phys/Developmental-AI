@@ -4254,6 +4254,15 @@ class DevelopmentalAI:
             # earlier bug that re-stalled the 8-env run. Give up to 2 tries,
             # then zero-fill and carry on with a dead stream for this episode.
             for _try in range(2):
+                # TRY 1'S CLIENT MUST NOT BE OVERWRITTEN UNCLOSED (2026-10-09).
+                # `envs[i] = ...` below used to drop the previous try's env
+                # on the floor: "env 0 rebuild try 1 failed ()" on `main`
+                # left that try's Java client running (0 bytes in 15 s,
+                # ~1.2 GB with its watcher) until the trainer exited. Its
+                # reset is still hung on a pool thread, so reap it the same
+                # way as the original abandoned client.
+                if _try:
+                    _reap(envs[i], i)
                 try:
                     envs[i] = self._make_one_env(i)
                     rf = self._env_pool.submit(envs[i].reset)

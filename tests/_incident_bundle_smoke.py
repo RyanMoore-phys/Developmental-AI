@@ -38,6 +38,14 @@ Contracts:
     H. LOG ROTATION: supervisor.log.1..5 keep the last 5 sessions even though
        every caller truncates supervisor.log with `>`; the launcher's 3-deep
        run-log rotation and `ulimit -c 0` survive.
+    I. SINGLETON (2026-10-09): two supervisors started 114 s apart on `main`
+       both launched -- launch_skybot.sh's pgrep guard is blind for the ~2 min
+       before python is up. Two agents on one brain dir filled 4 GB of swap in
+       10 min; killing one took used RAM 14.9 -> 6.9 GB. A second supervisor
+       must REFUSE (rc 3) without launching or rotating logs. ESCAPE: the
+       lock dies with its holder even while that holder's agent lives on
+       (FALSIFICATION: if the agent inherited fd 9, a dead supervisor's
+       orphan would latch every future launch).
 
 Run: PYTHONPATH=. python tests/_incident_bundle_smoke.py
 """
@@ -68,6 +76,7 @@ case "$mode" in
   stopabort) touch "$SKYBOT_ROOT/runlogs/STOP"; echo "terminate called without an active exception"; kill -ABRT $$ ;;
   stopmark)  touch "$SKYBOT_ROOT/runlogs/STOP"; echo "terminate called without an active exception"; exit 0 ;;
   slowstop)  sleep 1.5; touch "$SKYBOT_ROOT/runlogs/STOP"; exit 0 ;;
+  hold)      while [ ! -f "$SKYBOT_ROOT/release" ]; do sleep 0.1; done; exit 0 ;;
   *)         exit 3 ;;
 esac
 """
@@ -350,6 +359,33 @@ def main():
         check("budget=7" in read(root, "runlogs/supervisor.log")
               and "budget=6" not in read(root, "runlogs/supervisor.log"), "live log still truncated by caller")
         print("  H. supervisor.log.1..5 = last 5 sessions despite the caller's '>'")
+
+        # ---- I: singleton supervisor -----------------------------------------
+        root = make_root(); roots.append(root)
+        queue(root, "hold")
+        p1 = start_sup(root, budget="1")
+        check(wait_for(lambda: n_launches(root) == 1), "first supervisor launched its agent")
+        log1 = read(root, "runlogs/supervisor.log.1")
+        p2 = subprocess.Popen(["bash", "scripts/supervise_skybot.sh", "2"], cwd=root,
+                              env=env_for(root), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        out2 = p2.communicate(timeout=20)[0].decode()
+        check(p2.returncode == 3 and "REFUSED" in out2, "second supervisor refused: rc=%s %r" % (p2.returncode, out2))
+        check(n_launches(root) == 1, "no duplicate agent launched")
+        check(read(root, "runlogs/supervisor.log.1") == log1
+              and not os.path.exists(os.path.join(root, "runlogs", "supervisor.log.2")),
+              "refused supervisor did not rotate the live one's logs")
+        p1.kill(); p1.wait(timeout=10)                  # holder dies; its agent lives on
+        check(subprocess.run(["bash", "-c", "kill -0 $(cat runlogs/skybot_run.pid)"], cwd=root).returncode == 0,
+              "agent still alive after its supervisor died")
+        open(os.path.join(root, "runlogs", "STOP"), "w").close()
+        p3 = start_sup(root, budget="3")
+        rc3 = p3.wait(timeout=20)
+        log3 = read(root, "runlogs/supervisor.log")
+        check(rc3 == 0 and "REFUSED" not in log3 and "STOP present" in log3,
+              "lock freed with its holder despite the orphan agent: rc=%s %r" % (rc3, log3))
+        open(os.path.join(root, "release"), "w").close()
+        print("  I. second supervisor refused (rc 3, no launch, no rotation); lock frees when holder dies")
     finally:
         for r in roots:
             shutil.rmtree(r, ignore_errors=True)

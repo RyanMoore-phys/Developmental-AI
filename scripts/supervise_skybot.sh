@@ -88,6 +88,38 @@ EXITF=runlogs/skybot_run.exit
 RUNLOG=runlogs/minecraft_skybot_run.log
 mkdir -p runlogs
 
+# SINGLETON (2026-10-09). Two supervisors were started 114 s apart (21:19:35,
+# 21:21:29) and BOTH launched: launch_skybot.sh's `pgrep run_minecraft` guard
+# only sees the agent once python is up, ~2 min after its supervisor starts,
+# so the second launch fell straight through that window. Two full agents ->
+# 4-6 Java clients + two ~5 GB trainers on a 16 GB box: swap 4.06/4.09 GB
+# within 10 min (a single run measures ~13 GB steady), both writing the SAME
+# brain dir and the same logs. Killing the duplicate took used RAM 14.9 -> 6.9 GB.
+# This must run BEFORE the log rotation and CRASHLOOP clearing below -- the
+# duplicate's rotation is what scrambled supervisor.log.1 that night.
+# ESCAPE PATH (CLAUDE.md 4.1): flock is a kernel lock on an open fd, not a
+# file's existence -- it is released the instant the holder dies, by any
+# means, so no stale lock can latch. The fd is closed (9>&-) for every child
+# so an orphaned agent or Java client can never keep holding it -- and that
+# includes every `sleep`: a killed supervisor does NOT kill its sleep child,
+# and an orphaned `sleep $BACKOFF` (up to 300 s) holding fd 9 would refuse
+# deploy_skybot.sh's relaunch right after its `pkill supervise_skybot`
+# (caught by tests/_incident_bundle_smoke.py contract I). Any new child
+# process added below needs 9>&- too. If flock is missing we warn and run
+# unguarded rather than refuse.
+LOCKF=runlogs/supervisor.lock
+if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$LOCKF"
+    if ! flock -n 9; then
+        echo "[supervisor] REFUSED: another supervisor holds $LOCKF (pid $(cat "$LOCKF.pid" 2>/dev/null || echo '?'))"
+        echo "[supervisor]   a second one would launch a duplicate agent. Stop the live one first."
+        exit 3
+    fi
+    echo $$ > "$LOCKF.pid"
+else
+    echo "[supervisor] WARNING: flock not found -- running WITHOUT the singleton guard"
+fi
+
 for i in 4 3 2 1; do
     [ -f "runlogs/supervisor.log.$i" ] && \
         mv -f "runlogs/supervisor.log.$i" "runlogs/supervisor.log.$((i + 1))"
@@ -120,7 +152,7 @@ while true; do
             say "[supervisor]   rm $CRASHLOOP   or a manual scripts/launch_skybot.sh"
             IDLE=1
         fi
-        sleep "$CL_POLL"
+        sleep "$CL_POLL" 9>&-
         continue
     fi
     if [ -n "$IDLE" ]; then
@@ -148,7 +180,7 @@ while true; do
     if [ -z "${AGENT_PID:-}" ] || ! kill -0 "$AGENT_PID" 2>/dev/null; then
         say "[supervisor] launching $(now_iso)"
         LAUNCH_EPOCH=$(date +%s)
-        OUT=$(SKYBOT_SUPERVISED=1 bash scripts/launch_skybot.sh "$TS" 2>&1)
+        OUT=$(exec 9>&-; SKYBOT_SUPERVISED=1 bash scripts/launch_skybot.sh "$TS" 2>&1)
         RC=$?
         say "$OUT"
         # launch_skybot.sh prints "LAUNCHED skybot pid=NNNN"; that PID is the
@@ -159,19 +191,19 @@ while true; do
             # and retry rather than hammering a server that is not there.
             say "[supervisor] launcher refused (rc=$RC) — retrying in ${REFUSE_WAIT}s"
             AGENT_PID=""
-            sleep "$REFUSE_WAIT"
+            sleep "$REFUSE_WAIT" 9>&-
             continue
         fi
 
         if [ -z "$AGENT_PID" ]; then
             say "[supervisor] could not read the launched PID — retrying in ${REFUSE_WAIT}s"
-            sleep "$REFUSE_WAIT"
+            sleep "$REFUSE_WAIT" 9>&-
             continue
         fi
     fi
     say "[supervisor] watching pid=$AGENT_PID"
     while kill -0 "$AGENT_PID" 2>/dev/null; do
-        sleep "$WATCH_POLL"
+        sleep "$WATCH_POLL" 9>&-
     done
 
     # ---- classify the exit ------------------------------------------------
@@ -179,7 +211,7 @@ while true; do
     # loaded box, bounded. Absent (wrapper killed too) -> rc unknown.
     _w=0
     while [ ! -f "$EXITF" ] && [ "$_w" -lt "$EXIT_WAIT" ]; do
-        sleep 1; _w=$((_w + 1))
+        sleep 1 9>&-; _w=$((_w + 1))
     done
     XRC=$(sed -n 's/^exit_code=//p' "$EXITF" 2>/dev/null | head -1)
     XSIG=$(sed -n 's/^signal=//p' "$EXITF" 2>/dev/null | head -1)
@@ -195,7 +227,7 @@ while true; do
         KIND=crash
     fi
     say "[supervisor] agent pid=$AGENT_PID exited $(now_iso) kind=$KIND rc=$XRC sig=$XSIG${FATAL:+ marker=\"$FATAL\"}"
-    BOUT=$($TO90 nice -n 10 bash scripts/incident_bundle.sh "$KIND" "${XT0:-${LAUNCH_EPOCH:-0}}" 2>&1 | tail -3)
+    BOUT=$(exec 9>&-; $TO90 nice -n 10 bash scripts/incident_bundle.sh "$KIND" "${XT0:-${LAUNCH_EPOCH:-0}}" 2>&1 | tail -3)
     say "[supervisor] $BOUT"
     BUNDLE=$(printf '%s' "$BOUT" | sed -n 's/^incident bundle: //p' | tail -1)
 
@@ -252,7 +284,7 @@ while true; do
         continue
     fi
     say "[supervisor] agent exited — see $CRASHLOG; restarting in ${BACKOFF}s"
-    sleep "$BACKOFF"
+    sleep "$BACKOFF" 9>&-
     BACKOFF=$(( BACKOFF * 2 ))
     [ "$BACKOFF" -gt "$MAX_BACKOFF" ] && BACKOFF=$MAX_BACKOFF
 done
