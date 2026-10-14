@@ -226,8 +226,8 @@ primary:                              # deep-merged into the run config when thi
   stays Minecraft's whenever Minecraft is enabled.
 * **Minecraft-only preflight** (socat bridge, server ping, Xvfb, java) runs
   only when Minecraft is enabled.
-* **Per-game GitHub actions**: `Game — Minecraft` and `Game — Doom`
-  (`.github/workflows/game-*.yml`), each `workflow_dispatch` with
+* **Per-game GitHub actions**: `Minecraft` and `Doom`
+  (`.github/workflows/{minecraft,doom}.yml`), each `workflow_dispatch` with
   `action: enable | disable | status` and a `restart` toggle. Enable/disable
   edits `games.enabled` and (optionally) restarts the one supervisor — there
   is still exactly one trainer and one brain. See `docs/OPERATIONS.md`.
@@ -344,7 +344,7 @@ grab rate (≥ 30 fps), key→pixel latency (≤ 50 ms), XTest relative mouse, a
 audio — and decides whether XTest is enough or a per-seat uinput backend is
 needed. `configs/games/doom_player.yaml` is the first game; its launch flags
 are Chocolate Doom 3.x and are part of what P0 checks. Install with the
-`game-doom_player` action (`action: install`) or provisioning STAGE 4e.
+**Doom** action (`engine: player`, `action: install`) or provisioning STAGE 4e.
 
 | Stage | State |
 |---|---|

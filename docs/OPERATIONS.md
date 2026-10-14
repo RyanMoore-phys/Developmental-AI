@@ -36,14 +36,15 @@ starts training. Starting is always a deliberate act.
 
 SkyBot is one brain that plays several games at once, each game as concurrent
 streams (design: [`UNIVERSAL_GAMES.md`](UNIVERSAL_GAMES.md)). Each game has its
-own action: **Actions → game-minecraft** and **Actions → game-doom**. There is
+own action: **Actions → Minecraft** and **Actions → Doom** (Doom has an
+`engine` input: `vizdoom` = game `doom`, `player` = game `doom_player`). There is
 still exactly **one** trainer and **one** brain. Enabling a game adds its
 streams to that brain; it never starts a second agent.
 
-| action | game-doom | game-minecraft | what it does |
+| action | Doom | Minecraft | what it does |
 |---|---|---|---|
 | `status` | ✓ | ✓ | read-only: mode (legacy/universal), enabled games, live pid and config, Doom's save-state rings and its last evaluator lines. |
-| `install` | ✓ | — | `libopenal1` + `vizdoom==1.3.1` into `venv_mc` + Freedoom into `roms/doom/` (sha256-verified). Idempotent; run once per host before enabling Doom. |
+| `install` | ✓ | — | `vizdoom`: `libopenal1` + `vizdoom==1.3.1` into `venv_mc` + Freedoom into `roms/doom/` (sha256-verified). `player`: pulseaudio + chocolate-doom + mss + python-xlib + Freedoom. Idempotent; run once per host per engine before enabling it. |
 | `enable` | ✓ | ✓ | adds the game to `runlogs/games.enabled`. |
 | `disable` | ✓ | ✓ | removes it. **Refused for the last enabled game.** Enable another one first, `stop`, or use `legacy`. |
 | `legacy` | — | ✓ | deletes `runlogs/games.enabled` (kept as `.bak`): the next launch runs the **old Minecraft-only brain**, untouched by the universal one. |

@@ -1,38 +1,52 @@
-# Game — Minecraft. One of the per-game actions for SkyBot's ONE universal
-# brain (docs/UNIVERSAL_GAMES.md §6, docs/OPERATIONS.md "Per-game actions").
+# Doom. One of the per-game actions for SkyBot's ONE universal brain
+# (docs/UNIVERSAL_GAMES.md §6, docs/OPERATIONS.md "Per-game actions").
 #
-#   status    what is enabled, what is running. Safe.
-#   enable    add Minecraft to runlogs/games.enabled (needs the Paper server
-#             bridge: the launcher REFUSES a Minecraft launch without it —
-#             run `host` -> connect first)
+# ONE WORKFLOW, TWO ENGINES (2026-10-14; was game-doom.yml + game-doom_player.yml,
+# two near-identical files that differed only in GAME). `engine` picks which:
+#
+#   vizdoom   game `doom`: the ViZDoom research API (docs/UNIVERSAL_GAMES.md §6).
+#   player    game `doom_player`: the real Chocolate Doom engine, played through
+#             a screen, speakers, keyboard and mouse like a person (§11).
+#             UNPROVEN ON THE HOST until tools/player_spike.py (stage P0)
+#             passes there.
+#
+# They are separate entries in runlogs/games.enabled and can both be enabled.
+#
+#   status    what is enabled, what is running, Doom's save-state rings. Safe.
+#   install   vizdoom: libopenal1 + vizdoom==1.3.1 into venv_mc + Freedoom
+#             (sha256-verified) into roms/doom.
+#             player:  pulseaudio + chocolate-doom + mss + python-xlib + Freedoom.
+#             Idempotent. Run once per host per engine.
+#   enable    add it to runlogs/games.enabled
 #   disable   remove it (refused if it is the last enabled game)
-#   legacy    delete runlogs/games.enabled: the next launch runs the OLD
-#             Minecraft-only brain (configs/minecraft_skybot.yaml), untouched
-#             by the universal brain. The way back, and the only one.
 #
-# `restart` (enable/disable/legacy): stop the live run GRACEFULLY, sync the
-# code, and relaunch so the change takes effect now.
-#
-# Minecraft cannot be rewound (MineRL cannot save a world and the server is
-# shared), so it has no save-state ring; Doom's action handles that for Doom.
+# `restart` (enable/disable only): stop the live run GRACEFULLY, sync the code,
+# and relaunch so the change takes effect now. Off = the change waits for the
+# next launch. There is still exactly one trainer and one brain: enabling Doom
+# ADDS Doom streams to it, it does not start a second agent.
 #
 # workflow_dispatch workflows only appear in the Actions tab once this file is
 # on the DEFAULT branch (same rule as deploy.yml's workflow_run, CLAUDE.md §6).
-name: game-minecraft
+name: Doom
 
 run-name: >-
-  game · minecraft · ${{ inputs.action }}${{ (inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy') && inputs.restart && ' · restart' || '' }} · by @${{ github.actor }}
+  Doom · ${{ inputs.engine }} · ${{ inputs.action }}${{ (inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && ' · restart' || '' }} · by @${{ github.actor }}
 
 on:
   workflow_dispatch:
     inputs:
+      engine:
+        description: "vizdoom (game: doom) or player (game: doom_player, real Chocolate Doom)"
+        type: choice
+        options: [vizdoom, player]
+        default: vizdoom
       action:
         description: "what to do"
         type: choice
-        options: [status, enable, disable, legacy]
+        options: [status, install, enable, disable]
         default: status
       restart:
-        description: "enable/disable/legacy: stop the live run, sync code, relaunch now"
+        description: "enable/disable: stop the live run, sync code, relaunch now"
         type: boolean
         default: true
       timesteps:
@@ -50,9 +64,9 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      GAME: minecraft
+      GAME: ${{ inputs.engine == 'player' && 'doom_player' || 'doom' }}
       ACTION: ${{ inputs.action }}
-      RESTART: ${{ (inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy') && inputs.restart && '1' || '0' }}
+      RESTART: ${{ (inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && '1' || '0' }}
       TS_STEPS: ${{ inputs.timesteps }}
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +81,7 @@ jobs:
 
       # The host needs this commit's game_ctl.sh, configs/games/ and composer.
       - name: sync code + host-side smoke tests
-        if: ${{ env.RESTART == '1' }}
+        if: ${{ env.RESTART == '1' || inputs.action == 'install' }}
         timeout-minutes: 12
         env:
           DEPLOY_LAUNCH: "0"
@@ -75,8 +89,14 @@ jobs:
           set -euo pipefail
           bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
 
+      - name: install ${{ env.GAME }}
+        if: ${{ inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} install"
+
       - name: ${{ inputs.action }} ${{ env.GAME }}
-        if: ${{ inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy' }}
+        if: ${{ inputs.action == 'enable' || inputs.action == 'disable' }}
         run: |
           set -euo pipefail
           bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} ${ACTION}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manage which games SkyBot's ONE universal brain plays. Runs ON THE HOST,
 # from the repo root (/workspace/devai). Called by the per-game workflows
-# (.github/workflows/game-*.yml) through scripts/host_exec.sh; safe by hand.
+# (.github/workflows/{doom,minecraft}.yml) through scripts/host_exec.sh; safe by hand.
 #
 #   bash scripts/game_ctl.sh <game> enable    add <game> to runlogs/games.enabled
 #   bash scripts/game_ctl.sh <game> disable   remove it (refuses to remove the LAST)

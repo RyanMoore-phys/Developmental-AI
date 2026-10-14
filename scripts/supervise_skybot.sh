@@ -55,7 +55,7 @@
 #
 # LOG ROTATION (2026-10-07)
 #   Every caller starts this as `... > runlogs/supervisor.log` (deploy_skybot.sh,
-#   .github/workflows/host.yml, pipeline.yml), and that `>` truncates the
+#   .github/workflows/host.yml, doom.yml, minecraft.yml), and that `>` truncates the
 #   previous supervisor's log BEFORE this script runs, so it cannot be rotated
 #   from in here. Instead every line is ALSO appended to supervisor.log.1, and
 #   at start .1..4 shift to .2..5: the live log keeps its old behaviour and

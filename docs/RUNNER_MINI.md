@@ -5,7 +5,7 @@ Moves the self-hosted runner off the dev Mac and onto a mini running Linux,
 storage, starting **automatically on boot**, on a machine that **powers itself
 back on after an outage**.
 
-No application code changes. `deploy.yml`, `host.yml` and `pipeline.yml` already
+No application code changes. `deploy.yml`, `host.yml`, `doom.yml` and `minecraft.yml` already
 say `runs-on: self-hosted`, which matches any self-hosted runner on any OS.
 `ci.yml` runs the test suite on GitHub-hosted `ubuntu-latest` and never touches
 this machine.
@@ -17,7 +17,7 @@ this machine.
 | | Where it runs |
 |---|---|
 | `ci.yml` — the 12-suite test gate | GitHub-hosted `ubuntu-latest` |
-| `deploy.yml`, `host.yml`, `pipeline.yml` | **this runner** |
+| `deploy.yml`, `host.yml`, `doom.yml`, `minecraft.yml` | **this runner** |
 
 So the container needs `openssh-client` and `rsync` (it ssh/rsyncs to the
 training host) and **not** a Python/ML stack. It is close to idle in steady

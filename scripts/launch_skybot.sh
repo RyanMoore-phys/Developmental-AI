@@ -35,7 +35,7 @@ fi
 #                                  config composed fresh at every launch so a
 #                                  game enabled by its GitHub action takes
 #                                  effect on the next (re)launch.
-# Written by the per-game workflows (.github/workflows/game-*.yml) or by hand.
+# Written by the per-game workflows (.github/workflows/{doom,minecraft}.yml) or by hand.
 GAMES_FILE=runlogs/games.enabled
 CONFIG=configs/minecraft_skybot.yaml
 MC_ON=1

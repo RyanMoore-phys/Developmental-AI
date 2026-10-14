@@ -7,7 +7,7 @@
 #
 # WHAT THIS RUNNER ACTUALLY DOES: it does NOT run the test suite. That is
 # ci.yml, which runs on GitHub-hosted ubuntu-latest. This runner serves
-# deploy.yml / host.yml / pipeline.yml, which ssh + rsync to the training host.
+# deploy.yml / host.yml / doom.yml / minecraft.yml, which ssh + rsync to the training host.
 # So openssh-client and rsync are LOAD-BEARING, not conveniences: without them
 # scripts/host_exec.sh and scripts/deploy_skybot.sh fail at the first step.
 FROM ubuntu:22.04
