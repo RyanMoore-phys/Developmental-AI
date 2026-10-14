@@ -1,0 +1,108 @@
+# Game — Minecraft. One of the per-game actions for SkyBot's ONE universal
+# brain (docs/UNIVERSAL_GAMES.md §6, docs/OPERATIONS.md "Per-game actions").
+#
+#   status    what is enabled, what is running. Safe.
+#   enable    add Minecraft to runlogs/games.enabled (needs the Paper server
+#             bridge: the launcher REFUSES a Minecraft launch without it —
+#             run `host` -> connect first)
+#   disable   remove it (refused if it is the last enabled game)
+#   legacy    delete runlogs/games.enabled: the next launch runs the OLD
+#             Minecraft-only brain (configs/minecraft_skybot.yaml), untouched
+#             by the universal brain. The way back, and the only one.
+#
+# `restart` (enable/disable/legacy): stop the live run GRACEFULLY, sync the
+# code, and relaunch so the change takes effect now.
+#
+# Minecraft cannot be rewound (MineRL cannot save a world and the server is
+# shared), so it has no save-state ring; Doom's action handles that for Doom.
+#
+# workflow_dispatch workflows only appear in the Actions tab once this file is
+# on the DEFAULT branch (same rule as deploy.yml's workflow_run, CLAUDE.md §6).
+name: game-minecraft
+
+run-name: >-
+  game · minecraft · ${{ inputs.action }}${{ (inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy') && inputs.restart && ' · restart' || '' }} · by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "what to do"
+        type: choice
+        options: [status, enable, disable, legacy]
+        default: status
+      restart:
+        description: "enable/disable/legacy: stop the live run, sync code, relaunch now"
+        type: boolean
+        default: true
+      timesteps:
+        description: "relaunch only: total timesteps"
+        default: "4000000"
+
+# Serialised with the other game actions: two of them restarting the one
+# supervisor at once would race the singleton lock and the games file.
+concurrency:
+  group: skybot-games
+  cancel-in-progress: false
+
+jobs:
+  game:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    env:
+      GAME: minecraft
+      ACTION: ${{ inputs.action }}
+      RESTART: ${{ (inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy') && inputs.restart && '1' || '0' }}
+      TS_STEPS: ${{ inputs.timesteps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stop BEFORE syncing: deploy_skybot.sh refuses to sync under a live run
+      # without DEPLOY_ALLOW_STOP_LIVE, and a graceful stop saves the brain.
+      - name: stop the live run (graceful)
+        if: ${{ env.RESTART == '1' }}
+        run: |
+          set -euo pipefail
+          bash scripts/host_stop_wait.sh 1200
+
+      # The host needs this commit's game_ctl.sh, configs/games/ and composer.
+      - name: sync code + host-side smoke tests
+        if: ${{ env.RESTART == '1' }}
+        timeout-minutes: 12
+        env:
+          DEPLOY_LAUNCH: "0"
+        run: |
+          set -euo pipefail
+          bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
+
+      - name: ${{ inputs.action }} ${{ env.GAME }}
+        if: ${{ inputs.action == 'enable' || inputs.action == 'disable' || inputs.action == 'legacy' }}
+        run: |
+          set -euo pipefail
+          bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} ${ACTION}"
+
+      # Same launch block as host.yml `launch`: green only for a LIVE agent.
+      - name: relaunch
+        if: ${{ env.RESTART == '1' }}
+        run: |
+          set -euo pipefail
+          bash scripts/host_exec.sh "
+            cd /workspace/devai
+            rm -f runlogs/STOP
+            setsid nohup bash scripts/supervise_skybot.sh ${TS_STEPS} \
+              > runlogs/supervisor.log 2>&1 < /dev/null &
+            sleep 25
+            tail -8 runlogs/supervisor.log
+            PID=\$(cat runlogs/skybot_run.pid 2>/dev/null || true)
+            if [ -n \"\$PID\" ] && ps -p \"\$PID\" >/dev/null 2>&1; then
+              echo \"run pid: \$PID (LIVE)\"
+            else
+              echo '::error::relaunch did not produce a live agent -- see REFUSED above'
+              grep -E 'REFUSED|refused' runlogs/supervisor.log 2>/dev/null | tail -5
+              exit 1
+            fi"
+
+      - name: status
+        if: ${{ always() }}
+        run: |
+          bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} status" || true

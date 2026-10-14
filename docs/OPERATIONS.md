@@ -32,6 +32,59 @@ spend an hour wondering why a fix had no effect.
 `deploy` runs with `DEPLOY_LAUNCH=0`: it syncs and smoke-tests, and never
 starts training. Starting is always a deliberate act.
 
+## Per-game actions (universal brain, 2026-10-11)
+
+SkyBot is one brain that plays several games at once, each game as concurrent
+streams (design: [`UNIVERSAL_GAMES.md`](UNIVERSAL_GAMES.md)). Each game has its
+own action: **Actions → game-minecraft** and **Actions → game-doom**. There is
+still exactly **one** trainer and **one** brain. Enabling a game adds its
+streams to that brain; it never starts a second agent.
+
+| action | game-doom | game-minecraft | what it does |
+|---|---|---|---|
+| `status` | ✓ | ✓ | read-only: mode (legacy/universal), enabled games, live pid and config, Doom's save-state rings and its last evaluator lines. |
+| `install` | ✓ | — | `libopenal1` + `vizdoom==1.3.1` into `venv_mc` + Freedoom into `roms/doom/` (sha256-verified). Idempotent; run once per host before enabling Doom. |
+| `enable` | ✓ | ✓ | adds the game to `runlogs/games.enabled`. |
+| `disable` | ✓ | ✓ | removes it. **Refused for the last enabled game.** Enable another one first, `stop`, or use `legacy`. |
+| `legacy` | — | ✓ | deletes `runlogs/games.enabled` (kept as `.bak`): the next launch runs the **old Minecraft-only brain**, untouched by the universal one. |
+
+`restart` (on by default) makes `enable`/`disable`/`legacy` take effect now:
+**stop (graceful) → deploy (sync + host smoke tests) → change the games file →
+launch**. That is the same order as above, done for you. With `restart` off,
+the change waits for the next launch.
+
+How the host decides what to run, at every launch (`launch_skybot.sh`):
+
+| `runlogs/games.enabled` | runs |
+|---|---|
+| absent | the legacy Minecraft-only brain: `configs/minecraft_skybot.yaml`, `logs/checkpoints`, `skill_bank_mc_rssm/`. Unchanged. |
+| present | the universal brain under `brain_universal/`, from `runlogs/run_config.yaml`, composed fresh from the listed games by `tools/compose_run_config.py`. |
+
+Things to know:
+
+* **The first `enable` switches the host to the universal brain**, which starts
+  fresh. The legacy brain is never read or written by it, and `legacy` returns
+  to it at any time.
+* **Doom alone needs no game server.** The bridge, server ping and X display
+  checks run only when Minecraft is enabled. A Doom-only run starts with the
+  Paper server down.
+* **Doom rewinds itself.** Every 5 minutes each Doom stream saves its game
+  state (ring of 3, under `brain_universal/snapshots/stream_<i>/`). When its
+  reward stagnates (window mean ≤ 25% of its own long-run baseline for 3
+  minutes, after a 10-minute warmup), the stream rewinds to the oldest save.
+  After 3 rewinds without a recovery, it starts a fresh episode instead, so
+  rewinding cannot become a loop. Only the game rewinds; the brain keeps
+  learning. The run log shows `doom stream N: stuck (...) — rewind`.
+* **Doom must be installed before it is enabled.** The launcher refuses a
+  Doom-enabled launch without `vizdoom` and prints which action to run.
+* **Doom audio needs `libopenal1`.** Without it the sound buffer is silent and
+  the run log warns after 5,000 steps: `SILENT audio — is OpenAL installed`.
+* **A mixed fleet runs at Minecraft's pace.** Streams step in lockstep, so Doom
+  streams wait for Minecraft's ~3–10 steps/s. A Doom-only run is limited by the
+  GPU instead.
+* **These actions appear in the Actions tab only once their files are on the
+  default branch** (`main`), the same rule as `deploy.yml` (CLAUDE.md §6).
+
 ## Stopping takes about 13 minutes
 
 A healthy graceful stop is ~5 minutes to finish the current segment plus ~8.5

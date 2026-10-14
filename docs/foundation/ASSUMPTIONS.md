@@ -34,9 +34,10 @@ The last column is for `configs/minecraft_skybot.yaml` (`sensors.enabled`).
 | `motion` | green | adapter-metadata | policy |
 | `light` | green | adapter-metadata | policy |
 | `sky` | green | adapter-metadata | policy |
-| `audio` | green | adapter-metadata | registered, not enabled |
+| `audio` | green | adapter-metadata | legacy: registered, not enabled; universal brain: policy (Doom fills it) |
 | `hud` | green | adapter-metadata | registered, not enabled |
 | `true_position` | red | evaluator-only | enabled, oracle only |
+| `tempo` | green | adapter-metadata | universal brain: policy — game time since the last decision (real-time games: measured; Minecraft: its fixed step, action_repeat/20 s) |
 
 Proprio fields, in wire order (`minerl_env.py PROPRIO_KEYS`; the smoke test
 checks this by AST): food, saturation, life, depth, has_tool, gui_open,

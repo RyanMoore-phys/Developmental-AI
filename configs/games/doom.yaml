@@ -1,0 +1,72 @@
+# Doom (ViZDoom + Freedoom) — one game on SkyBot's universal brain.
+# Schema and rationale: docs/UNIVERSAL_GAMES.md. Composed into the run config
+# by tools/compose_run_config.py; never run on its own.
+
+game:
+  name: doom
+  env_name: ViZDoom-Freedoom          # make_env dispatch (environments/wrappers.py)
+  backend: vizdoom
+  streams: 2                          # concurrent streams when Doom is enabled
+  # gitignored; `bash scripts/fetch_roms.sh` places and sha256-verifies it
+  rom: roms/doom/freedoom2.wad
+  maps: [MAP01, MAP02, MAP03, MAP04, MAP05, MAP06, MAP07, MAP08, MAP09, MAP10,
+         MAP11, MAP12, MAP13, MAP14, MAP15, MAP16, MAP17, MAP18, MAP19, MAP20,
+         MAP21, MAP22, MAP23, MAP24, MAP25, MAP26, MAP27, MAP28, MAP29, MAP30,
+         MAP31, MAP32]
+  render: RES_256X192                 # native frame; resized to universal image_size
+  # REAL TIME (user decision 2026-10-11): the game runs on its own 35 Hz
+  # clock and does NOT wait while SkyBot thinks. A decision holds its buttons
+  # until the next one; how much game time passed is the `tempo` sense.
+  # Cadence: as fast as SkyBot can (never twice on the same tic).
+  realtime: true
+  tic_hz: 35
+  # Synchronous mode only (realtime: false): tics per agent step.
+  action_repeat: 4
+  # Measured 2026-10-11: walking covers ~1.8 blocks per 4-tic step (~14.5
+  # units/tic). 16 puts a walk near the top of `moved` without pinning it.
+  move_units_per_tic: 16
+  audio: {enabled: true, sample_rate: 22050}
+
+  # SkyBot's controller for Doom. Slot k -> the inputs held for the whole
+  # step. Slot 0 MUST be {} (the no-op) in every game. Turns use the delta
+  # axis: the value is degrees PER TIC (measured: +10 x 4 tics = -40 deg),
+  # so 4 -> 16 deg per step, close to Minecraft's 15-degree camera macros.
+  # No vertical look: vanilla Doom has none, and an unearned pitch axis is
+  # where this agent once spent 96% of its drive staring at the sky.
+  # No menu buttons: nothing here opens a state it cannot close (CLAUDE.md
+  # 4.5) — ViZDoom PLAYER mode exposes no menus at all.
+  controller:
+    - {}                                        # 0  no-op
+    - {MOVE_FORWARD: 1}                         # 1  walk
+    - {MOVE_BACKWARD: 1}                        # 2  back
+    - {TURN_LEFT_RIGHT_DELTA: -4}               # 3  turn left
+    - {TURN_LEFT_RIGHT_DELTA: 4}                # 4  turn right
+    - {ATTACK: 1}                               # 5  fire
+    - {MOVE_FORWARD: 1, ATTACK: 1}              # 6  fire while walking
+    - {USE: 1}                                  # 7  use (doors, switches, lifts)
+    - {MOVE_LEFT: 1}                            # 8  strafe left
+    - {MOVE_RIGHT: 1}                           # 9  strafe right
+    - {MOVE_FORWARD: 1, TURN_LEFT_RIGHT_DELTA: -4}   # 10 walk + turn left
+    - {MOVE_FORWARD: 1, TURN_LEFT_RIGHT_DELTA: 4}    # 11 walk + turn right
+    - {MOVE_FORWARD: 1, SPEED: 1}               # 12 run
+    - {SELECT_NEXT_WEAPON: 1}                   # 13 next weapon
+    - {SELECT_PREV_WEAPON: 1}                   # 14 previous weapon
+    - {MOVE_FORWARD: 1, USE: 1}                 # 15 walk into + use
+
+  checkpoint: {enabled: true, interval_s: 300, keep: 3}
+  stuck:
+    enabled: true
+    window_s: 180                     # stagnant this long -> stuck
+    ratio: 0.25                       # "stagnant" = window mean <= ratio x baseline
+    warmup_s: 600                     # no verdicts in the first 10 min of a stream
+    baseline_halflife_s: 1800
+    max_rewinds_without_recovery: 3   # then a fresh episode instead (no latch)
+  log_every: 5000                     # evaluator line in the run log, per stream
+
+# Deep-merged into the run config only when Doom holds stream 0.
+primary:
+  # The VLM prompts and the vision scaffold are Minecraft-specific (trees,
+  # Steve/Alex, Treechop action indices). Off for a Doom primary.
+  llm:
+    vision: {enabled: false}
+  symbolic_grounding: {enabled: false}

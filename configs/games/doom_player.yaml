@@ -1,0 +1,67 @@
+# Doom through the PLAYER ADAPTER — the real Chocolate Doom engine, played
+# through a screen, speakers, keyboard and mouse like a person
+# (docs/UNIVERSAL_GAMES.md §11). Stage P1: the first game proven on the
+# universal adapter, with the ViZDoom stream (configs/games/doom.yaml) as the
+# known-good baseline to compare frame rate, latency and sound against.
+#
+# UNPROVEN ON THE HOST: tools/player_spike.py (stage P0) measures every
+# assumption this file makes (grab rate, key latency, relative mouse, audio)
+# before it is enabled. Launch flags below are Chocolate Doom 3.x.
+
+game:
+  name: doom_player
+  env_name: Player-doom
+  backend: player
+  streams: 2
+  display_base: 100                    # seat i uses Xvfb :100+i (never shared)
+  window: {width: 640, height: 480}
+  fps: 35                              # Doom's tic rate: capture every tic
+  gl: false                            # Chocolate Doom renders in software
+  boot_s: 4.0
+  # {stream} {display} {name} are filled per seat. -warp/-skill start a game
+  # directly (no menu navigation needed); -nomusic keeps sound effects only.
+  launch: [chocolate-doom, -iwad, roms/doom/freedoom2.wad, -window,
+           -geometry, 640x480, -warp, "1", -skill, "3", -nomusic]
+  audio: {enabled: true, sample_rate: 22050}
+
+  # Chocolate Doom's DEFAULT keys. Slot 0 releases everything. Use (space)
+  # also respawns after a death — the respawn "button" must be reachable.
+  # No Escape: it opens the menu, and nothing here should need it.
+  controller:
+    - {}                                       # 0  release everything
+    - {keys: [Up]}                             # 1  walk
+    - {keys: [Down]}                           # 2  back
+    - {keys: [Left]}                           # 3  turn left
+    - {keys: [Right]}                          # 4  turn right
+    - {keys: [Control_L]}                      # 5  fire
+    - {keys: [Up, Control_L]}                  # 6  walk + fire
+    - {keys: [space]}                          # 7  use (doors, switches, respawn)
+    - {keys: [comma]}                          # 8  strafe left
+    - {keys: [period]}                         # 9  strafe right
+    - {keys: [Up, Left]}                       # 10 walk + turn left
+    - {keys: [Up, Right]}                      # 11 walk + turn right
+    - {keys: [Up, Shift_L]}                    # 12 run
+    - {mouse: {dx_per_s: -400}}                # 13 mouse turn left
+    - {mouse: {dx_per_s: 400}}                 # 14 mouse turn right
+    - {keys: [Up, space]}                      # 15 walk into + use
+  # One-way doors: none offered (no Escape, no menu keys). Declared anyway so
+  # adding Escape to a slot later forces its closer to be reachable too.
+  doors:
+    - {opens: [Escape], closes: [Escape]}
+
+  health: {frozen_s: 60, max_restarts_per_hour: 6, frame_timeout_s: 10}
+  stuck:
+    enabled: true
+    window_s: 180
+    ratio: 0.25
+    warmup_s: 600
+    baseline_halflife_s: 1800
+    max_rewinds_without_recovery: 3
+  # No `save:` block: Chocolate Doom's quicksave asks for a slot through the
+  # menu the first time, which SkyBot cannot be driven through. Getting
+  # unstuck therefore restarts the game (the universal fallback).
+
+primary:
+  llm:
+    vision: {enabled: false}
+  symbolic_grounding: {enabled: false}

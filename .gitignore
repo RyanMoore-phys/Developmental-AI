@@ -93,6 +93,30 @@ outputs/
 !experiments/results/**/*.json
 !experiments/results/**/*.md
 
+# ---- game data: ROMs, WADs, emulator save states (2026-10-11) ----
+# The repo is PUBLIC. Game files never enter it. Everything lives under
+# roms/<game>/, populated by scripts/fetch_roms.sh (free games) or by hand
+# (your own dumps of commercial games); only roms/README.md is tracked.
+# Guarded by tests/_no_secrets_smoke.py (contract C), so a later edit that
+# re-includes a ROM fails CI instead of publishing it.
+/roms/*
+!/roms/README.md
+# A dump saved OUTSIDE roms/ is still never stageable. Bracketed because git
+# matches ignore patterns case-sensitively on Linux (the host and CI), where
+# `POKEMON.GB` would otherwise slip past `*.gb`. (ultrareview 2026-10-11)
+*.[wW][aA][dD]
+*.[gG][bB]
+*.[gG][bB][cC]
+*.[gG][bB][aA]
+*.[nN][eE][sS]
+*.[sS][fF][cC]
+*.[sS][mM][cC]
+# The universal brain (docs/UNIVERSAL_GAMES.md). Anchored: a slash-less
+# pattern matches at every depth (see the skill_bank note above). Holds the
+# emulator save-state ring too (brain_universal/snapshots/), so no generic
+# save-state extension needs ignoring repo-wide.
+/brain_universal/
+
 # ---- media (heavy, regenerable) ----
 *.mp4
 *.gif

@@ -337,6 +337,7 @@ system.
 | What's next | `NEXT_OBJECTIVES.md`, `ROADMAP.md` |
 | Host ops | `host_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
 | Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |
+| One brain, many games (Doom, …) | `docs/UNIVERSAL_GAMES.md`; `configs/universal.yaml` + `configs/games/*.yaml` |
 
 ---
 

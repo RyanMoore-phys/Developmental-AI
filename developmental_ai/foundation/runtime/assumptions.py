@@ -53,6 +53,8 @@ SENSOR_CLASSIFICATION: Dict[str, str] = {
     "audio": "green",
     "hud": "green",
     "true_position": "red",
+    # 2026-10-11: game time since the last decision (real-time games).
+    "tempo": "green",
 }
 
 # The 13 proprio fields, in wire order (environments/minerl_env.py

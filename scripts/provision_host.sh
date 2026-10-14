@@ -382,6 +382,33 @@ echo "=== STAGE 4b3: drop MCP-Reborn stat-name debug spam from logs/mc_*.log ===
 ./venv_mc/bin/python scripts/patch_minerl_log_filter.py \
   || echo "  WARN: log-filter patch did NOT apply — mc_*.log will grow ~GB/day"
 
+echo "=== STAGE 4d: universal games — Doom (ViZDoom + Freedoom, OpenAL for sound) ==="
+# docs/UNIVERSAL_GAMES.md. Non-fatal like 4b3: a box that cannot install Doom
+# must still run Minecraft, and the launcher REFUSES a Doom-enabled launch
+# with a message naming what is missing, so nothing trains half-installed.
+#  * libopenal1: ViZDoom's audio buffer is SILENT without it (measured on a
+#    Mac 2026-10-11: 0/120 non-zero frames, then 120/120 once OpenAL was
+#    present) -- SkyBot would train deaf without a single error.
+#  * vizdoom==1.3.1: pinned; scripts/fetch_roms.sh pins Freedoom's sha256 to
+#    the copies THIS wheel bundles.
+$SUDO apt-get install -y -q libopenal1 \
+  || echo "  WARN: libopenal1 did NOT install — Doom audio will be silent"
+./venv_mc/bin/pip install -q "vizdoom==1.3.1" \
+  || echo "  WARN: vizdoom did NOT install — Doom streams cannot start"
+bash scripts/fetch_roms.sh ./venv_mc/bin/python \
+  || echo "  WARN: roms/doom not fetched/verified — Doom streams cannot start"
+
+echo "=== STAGE 4e: Player Adapter (any game via screen/speakers/keys/mouse) ==="
+# docs/UNIVERSAL_GAMES.md §11. Non-fatal like 4d: the launcher refuses a
+# player-adapter game with the missing piece named. Xvfb/openbox are STAGE 1.
+#  * pulseaudio: each seat's own null sink = the game's speakers
+#  * chocolate-doom: the first game proven on the adapter (stage P1)
+#  * mss + python-xlib: screen capture (MIT-SHM) and XTest input
+$SUDO apt-get install -y -q pulseaudio chocolate-doom \
+  || echo "  WARN: pulseaudio/chocolate-doom did NOT install — player-adapter games cannot start"
+./venv_mc/bin/pip install -q mss python-xlib \
+  || echo "  WARN: mss/python-xlib did NOT install — player-adapter games cannot start"
+
 echo "=== STAGE 4c: GPU-GL launch wrap (VGL EGL + per-core pin) ==="
 # Two coupled fixes on the java client launch (proven on the A4000 / EPYC 7702):
 #  1. `vglrun -d egl` renders on the NVIDIA GPU (software llvmpipe hangs at boot).

@@ -112,6 +112,14 @@ jobs:
                         "pillow==12.3.0" "scipy==1.15.3" "matplotlib==3.10.9" \
                         "tqdm==4.70.0" "imageio==2.37.4" "psutil==7.2.2" \
                         scikit-learn
+          # UNIVERSAL BRAIN, DOOM (2026-10-11, docs/UNIVERSAL_GAMES.md).
+          # Same pin as provision_host.sh STAGE 4d. libopenal1 so the audio
+          # contract runs for real (ViZDoom's sound buffer is silent without
+          # it); fetch_roms.sh places Freedoom from the wheel and verifies its
+          # sha256 — roms/ is gitignored, so a checkout has none.
+          sudo apt-get install -y -q libopenal1
+          pip install -q "vizdoom==1.3.1"
+          bash scripts/fetch_roms.sh python
 
       - name: Environment report
         run: |

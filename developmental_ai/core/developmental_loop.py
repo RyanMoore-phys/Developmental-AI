@@ -321,42 +321,48 @@ class DevelopmentalAI:
         viewer_cfg = self.config.get("viewer", {})
         self._viewer_enabled = bool(viewer_cfg.get("enabled", False))
         _render_mode = "rgb_array" if self._viewer_enabled else env_cfg.get("render_mode")
-        self.env, self.curriculum = make_env(
-            env_name=self.env_name,
-            normalize=True,
-            curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
-            render_mode=_render_mode,
-            max_episode_steps=env_cfg.get("max_episode_steps"),
-            pixel_obs=self.pixel_obs,
-            image_size=self.image_size,
-            grayscale=env_cfg.get("grayscale", False),
-            agent_view_size=env_cfg.get("agent_view_size"),
-            action_repeat=env_cfg.get("action_repeat", 1),
-            render_size=env_cfg.get("render_size", 0),
-            # THE SENSOR BUS. Absent from config -> None -> the adapter
-            # emits info["proprio"] and nothing else, i.e. exactly the
-            # pre-bus behaviour for every other config in the tree.
-            sensors_cfg=(self.config.get("sensors") or None),
-            lifelong=self._lifelong,
-            remote_server=env_cfg.get("remote_server"),
-            # this site builds the PRIMARY env, so it keeps the bare prefix
-            # (see _agent_name_for: renaming slot 0 would orphan its player)
-            agent_name=self._agent_name_for(0),
-            remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
-            # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
-            # the swing that fells a log, so the PROCESS of chopping out-earns
-            # any other block per tick — not just the completion event.
-            # 0.0 = off = byte-identical for every other config. BOTH call
-            # sites get it: the scouts feed the same shared world model, so
-            # different reward rules per stream would teach it two economies.
-            log_tick_reward=env_cfg.get("log_tick_reward", 0.0),
-            log_tick_cap=env_cfg.get("log_tick_cap", 120),
-            log_break_reward=env_cfg.get("log_break_reward", 5.0),
-            break_decay_scale=env_cfg.get("break_decay_scale", 0.0),
-            # lifelong break-mastery memory (2026-08-08): survives restarts
-            break_memory_path=env_cfg.get("break_memory_path", None),
-            start_tool=env_cfg.get("start_tool", "__default__"),
-        )
+        if self._stream_spec(0) is not None:
+            # UNIVERSAL BRAIN: stream 0 is whatever game the composed
+            # config put first (docs/UNIVERSAL_GAMES.md §3).
+            self.env, self.curriculum = self._build_stream_env(
+                0, render_mode=_render_mode)
+        else:
+            self.env, self.curriculum = make_env(
+                env_name=self.env_name,
+                normalize=True,
+                curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
+                render_mode=_render_mode,
+                max_episode_steps=env_cfg.get("max_episode_steps"),
+                pixel_obs=self.pixel_obs,
+                image_size=self.image_size,
+                grayscale=env_cfg.get("grayscale", False),
+                agent_view_size=env_cfg.get("agent_view_size"),
+                action_repeat=env_cfg.get("action_repeat", 1),
+                render_size=env_cfg.get("render_size", 0),
+                # THE SENSOR BUS. Absent from config -> None -> the adapter
+                # emits info["proprio"] and nothing else, i.e. exactly the
+                # pre-bus behaviour for every other config in the tree.
+                sensors_cfg=(self.config.get("sensors") or None),
+                lifelong=self._lifelong,
+                remote_server=env_cfg.get("remote_server"),
+                # this site builds the PRIMARY env, so it keeps the bare prefix
+                # (see _agent_name_for: renaming slot 0 would orphan its player)
+                agent_name=self._agent_name_for(0),
+                remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
+                # LOG ECONOMICS (2026-08-03): pays per attack tick invested in
+                # the swing that fells a log, so the PROCESS of chopping out-earns
+                # any other block per tick — not just the completion event.
+                # 0.0 = off = byte-identical for every other config. BOTH call
+                # sites get it: the scouts feed the same shared world model, so
+                # different reward rules per stream would teach it two economies.
+                log_tick_reward=env_cfg.get("log_tick_reward", 0.0),
+                log_tick_cap=env_cfg.get("log_tick_cap", 120),
+                log_break_reward=env_cfg.get("log_break_reward", 5.0),
+                break_decay_scale=env_cfg.get("break_decay_scale", 0.0),
+                # lifelong break-mastery memory (2026-08-08): survives restarts
+                break_memory_path=env_cfg.get("break_memory_path", None),
+                start_tool=env_cfg.get("start_tool", "__default__"),
+            )
 
         # ---- Live viewer server (optional) ----
         self.viewer = None
@@ -844,6 +850,29 @@ class DevelopmentalAI:
         self._wm_busy = _threading.Event()
         self._wm_param_lock = _threading.RLock()
         self._wm_metrics_box = None  # trainer publishes by atomic ref-swap
+        # ---- INFERENCE COPY (2026-10-11, docs/UNIVERSAL_GAMES.md §10 R2) --
+        # Measured on Doom: the acting thread spent ~61% of its time WAITING
+        # on _wm_param_lock, which the trainer holds for every gradient step
+        # (seconds on a CPU), and Python locks are not fair -- the trainer
+        # re-takes it before the acting thread wakes. With inference_copy the
+        # trainer trains ITS OWN copy (`_wm_train`, with the optimizer) and
+        # publishes the weights into `self.world_model` -- the module every
+        # acting read uses -- every `publish_every` gradient steps, holding
+        # the lock only for that copy. Acting never waits for a gradient
+        # step again; it acts on weights at most publish_every steps old.
+        # Default OFF: legacy configs byte-identical.
+        _awc = self.config.get("async_wm", {}) or {}
+        self._wm_inference_copy = bool(_awc.get("inference_copy", False)) \
+            and bool(self._use_async_wm)
+        self._wm_publish_every = max(1, int(_awc.get("publish_every", 4)))
+        self._wm_train = None
+        self._wm_pub_n = 0
+        self.wm_publishes = 0
+        # ---- STANDBY ACTOR (2026-10-11, docs/UNIVERSAL_GAMES.md §10 R3) ---
+        # Plays the REAL-TIME streams while the loop learns between segments.
+        self._standby = None
+        self._rt_gap: Dict[int, bool] = {}
+        self.standby_decisions = 0
         self._wm_metrics_fresh = False  # consume-once gate for run()'s users
         # replay-ratio instrumentation (equal-learning verdict): count cadence
         # points reached vs training blocks actually EXECUTED. skip_ratio =
@@ -2932,6 +2961,15 @@ class DevelopmentalAI:
 
     def close(self) -> None:
         """Clean up resources (Neo4j connections, LLM threads, etc.)."""
+        # FIRST: the standby actor may be stepping the real-time envs that
+        # are closed below
+        _sb = getattr(self, "_standby", None)
+        if _sb is not None:
+            self._standby = None
+            try:
+                _sb.stop(timeout=5.0)
+            except Exception:
+                pass
         if getattr(self, "_shadow", None) is not None:
             self._shadow.close()      # never raises; logs its summary
         if getattr(self, "_explore_tracker", None) is not None:
@@ -4092,37 +4130,41 @@ class DevelopmentalAI:
         # each other. The rebuild path (_make_one_env) already knew its
         # slot; this one, which builds the ORIGINAL scouts, did not.
         for _sidx in range(1, self._num_envs):
-            e, c = make_env(
-                env_name=self.env_name,
-                normalize=True,
-                curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
-                render_mode=None,
-                max_episode_steps=env_cfg.get("max_episode_steps"),
-                pixel_obs=self.pixel_obs,
-                image_size=self.image_size,
-                grayscale=env_cfg.get("grayscale", False),
-                agent_view_size=env_cfg.get("agent_view_size"),
-                action_repeat=env_cfg.get("action_repeat", 1),
-                render_size=env_cfg.get("render_size", 0),
-                # THE SENSOR BUS. Absent from config -> None -> the
-                # adapter emits info["proprio"] and nothing else, i.e.
-                # exactly the pre-bus behaviour for every other config.
-                sensors_cfg=(self.config.get("sensors") or None),
-                lifelong=getattr(self, "_lifelong", False),
-                # remote_server_scope "primary" (default): only env 0 — the
-                # continuous lifelong stream — joins the external server; the
-                # scout envs explore local generated worlds. "all": every
-                # stream joins (N bots on the server).
-                remote_server=(env_cfg.get("remote_server")
-                               if env_cfg.get("remote_server_scope",
-                                              "primary") == "all" else None),
-                agent_name=self._agent_name_for(_sidx),
-            )
+            if self._stream_spec(_sidx) is not None:
+                e, c = self._build_stream_env(_sidx)
+            else:
+                e, c = make_env(
+                    env_name=self.env_name,
+                    normalize=True,
+                    curriculum=self.config.get("loop", {}).get("curriculum_enabled", True),
+                    render_mode=None,
+                    max_episode_steps=env_cfg.get("max_episode_steps"),
+                    pixel_obs=self.pixel_obs,
+                    image_size=self.image_size,
+                    grayscale=env_cfg.get("grayscale", False),
+                    agent_view_size=env_cfg.get("agent_view_size"),
+                    action_repeat=env_cfg.get("action_repeat", 1),
+                    render_size=env_cfg.get("render_size", 0),
+                    # THE SENSOR BUS. Absent from config -> None -> the
+                    # adapter emits info["proprio"] and nothing else, i.e.
+                    # exactly the pre-bus behaviour for every other config.
+                    sensors_cfg=(self.config.get("sensors") or None),
+                    lifelong=getattr(self, "_lifelong", False),
+                    # remote_server_scope "primary" (default): only env 0 — the
+                    # continuous lifelong stream — joins the external server; the
+                    # scout envs explore local generated worlds. "all": every
+                    # stream joins (N bots on the server).
+                    remote_server=(env_cfg.get("remote_server")
+                                   if env_cfg.get("remote_server_scope",
+                                                  "primary") == "all" else None),
+                    agent_name=self._agent_name_for(_sidx),
+                )
             self._parallel_envs.append(e)
             self._parallel_curricula.append(c)
         logger.info(
             f"Parallel collection active with {self._num_envs} environments"
         )
+        self._install_stream_masks()
 
     def _agent_name_for(self, idx: int) -> str:
         """Server-visible player name for parallel slot `idx`.
@@ -4139,6 +4181,236 @@ class DevelopmentalAI:
             "agent_name_prefix", "SkyBot"))
         return _pref if int(idx) <= 0 else f"{_pref}{int(idx)}"
 
+    # ---- UNIVERSAL BRAIN (2026-10-11, docs/UNIVERSAL_GAMES.md) ------------
+    def _stream_spec(self, idx: int) -> Optional[Dict[str, Any]]:
+        """parallel_envs.streams[idx], or None for every legacy config."""
+        streams = (self.config.get("parallel_envs") or {}).get("streams")
+        if not streams or idx < 0 or idx >= len(streams):
+            return None
+        return streams[idx]
+
+    def _build_stream_env(self, idx: int, render_mode=None):
+        """Build stream `idx` from its game spec. THE single builder for all
+        three build sites (primary, startup scouts, rebuilds) whenever the
+        config has `streams:` -- so a stream rebuilt after a crash is exactly
+        the stream that booted, which the legacy scout site never was (it
+        omitted the reward kwargs `_make_one_env` passes).
+        """
+        spec = self._stream_spec(idx)
+        env_cfg = self.config.get("environment", {})
+        is_mc = spec.get("backend") == "minerl"
+        kw = dict(
+            env_name=(env_cfg.get("name") if is_mc
+                      and str(env_cfg.get("name", "")).startswith("MineRL")
+                      else spec["env_name"]),
+            normalize=True,
+            curriculum=self.config.get("loop", {}).get(
+                "curriculum_enabled", True),
+            render_mode=render_mode,
+            max_episode_steps=env_cfg.get("max_episode_steps"),
+            pixel_obs=self.pixel_obs, image_size=self.image_size,
+            grayscale=env_cfg.get("grayscale", False),
+            agent_view_size=env_cfg.get("agent_view_size"),
+            sensors_cfg=(self.config.get("sensors") or None),
+            lifelong=getattr(self, "_lifelong", False),
+            universal=dict(self.config.get("universal") or {}),
+            game_cfg=spec.get("game_cfg"), stream_index=idx,
+            seed=int(self.seed or 0))
+        if is_mc:
+            _scope = env_cfg.get("remote_server_scope", "primary")
+            kw.update(
+                action_repeat=env_cfg.get("action_repeat", 1),
+                render_size=env_cfg.get("render_size", 0),
+                remote_server=(env_cfg.get("remote_server")
+                               if idx == 0 or _scope == "all" else None),
+                agent_name=self._agent_name_for(idx),
+                remote_step_delay_s=env_cfg.get("remote_step_delay_s", 0.0),
+                log_tick_reward=env_cfg.get("log_tick_reward", 0.0),
+                log_tick_cap=env_cfg.get("log_tick_cap", 120),
+                log_break_reward=env_cfg.get("log_break_reward", 5.0),
+                break_decay_scale=env_cfg.get("break_decay_scale", 0.0),
+                break_memory_path=(env_cfg.get("break_memory_path")
+                                   if idx == 0 else None),
+                start_tool=env_cfg.get("start_tool", "__default__"))
+        logger.info("stream %d: %s (%s)", idx, spec.get("game"),
+                    kw["env_name"])
+        return make_env(**kw)
+
+    def _install_stream_masks(self) -> None:
+        """Per-stream controller masks -> the option executor.
+
+        Each game marks which of SkyBot's controller slots it maps. The
+        executor ANDs that into every decision mask it builds, so a Doom
+        stream's policy never spends probability on Minecraft-only slots.
+        Not load-bearing for safety: an unmapped slot executes the game's
+        no-op at the adapter (UniversalControllerWrapper).
+        """
+        from developmental_ai.environments.universal import find_attr
+        masks = [find_attr(e, "action_mask") for e in self._parallel_envs]
+        self._stream_masks = (masks if any(m is not None for m in masks)
+                              else None)
+        if self._stream_masks is not None:
+            logger.info("stream action masks: %s", [
+                None if m is None else int(np.asarray(m).sum())
+                for m in self._stream_masks])
+        if getattr(self, "option_executor", None) is not None:
+            self.option_executor.stream_masks = self._stream_masks
+        if getattr(self, "viewer", None) is not None:
+            try:
+                self.viewer.set_streams([
+                    f"{e}: {(self._stream_spec(e) or {}).get('game', self.env_name)}"
+                    for e in range(len(self._parallel_envs))])
+            except Exception:
+                pass
+
+    def _feed_stream_rewards(self, envs, rewards, intrinsic, n: int) -> None:
+        """Each stream's earned reward -> its adapter's stuck watch.
+
+        Only adapters that can rewind expose `observe_reward` (Doom now);
+        for every other env this is a no-op. Called ONCE per step in BOTH
+        live bodies (CLAUDE.md 4.2; tests/_universal_loop_smoke.py counts 2).
+        """
+        if self._stream_spec(0) is None:
+            return
+        from developmental_ai.environments.universal import find_attr
+        for _e in range(n):
+            _fn = find_attr(envs[_e], "observe_reward")
+            if _fn is None:
+                continue
+            try:
+                _ri = float(intrinsic[_e]) if intrinsic is not None else 0.0
+                _fn(float(rewards[_e]) + _ri)
+            except Exception as _ex:            # never let ops stall training
+                logger.debug("stuck feed stream %d: %s", _e, _ex)
+
+    # ---- STANDBY ACTOR (R3) ------------------------------------------------
+    def _realtime_streams(self) -> List[int]:
+        """Stream indices whose game runs on its own clock (never waits)."""
+        if self._stream_spec(0) is None or not self._parallel_envs:
+            return []
+        from developmental_ai.environments.universal import find_attr
+        return [e for e, env in enumerate(self._parallel_envs)
+                if find_attr(env, "realtime")]
+
+    def _policy_snapshot(self):
+        """A frozen copy of the policy for acting: networks only. The rollout
+        buffer (up to GBs of observations) is detached during the copy."""
+        import copy as _copy
+        pol = self.policy
+        saved = {k: v for k, v in vars(pol).items() if k.startswith("rollout_")}
+        for k in saved:
+            setattr(pol, k, [])
+        try:
+            snap = _copy.deepcopy(pol)
+        finally:
+            for k, v in saved.items():
+                setattr(pol, k, v)
+        return snap
+
+    def _standby_begin(self, step_infos) -> None:
+        if self._standby is not None:
+            return
+        rt = self._realtime_streams()
+        if not rt or self._ll is None:
+            return
+        try:
+            from developmental_ai.core.standby_actor import StandbyActor
+            st = self._ll.rssm_state
+            P = int(self.action_dim)
+            width = int(self.policy.actor.action_head.out_features)
+            pm = None
+            if self.option_executor is not None:
+                _pmf = getattr(self.option_executor.bank, "primitive_mask", None)
+                pm = None if _pmf is None else np.asarray(_pmf(P), dtype=bool)
+            masks = {}
+            for e in rt:
+                m = np.zeros(width, dtype=bool)
+                m[:P] = True if pm is None else pm[:P]
+                sm = (self._stream_masks[e] if getattr(self, "_stream_masks", None)
+                      else None)
+                if sm is not None:
+                    m[:P] &= np.asarray(sm, dtype=bool)[:P]
+                m[0] = True                       # the no-op, every game
+                masks[e] = m
+            pp = getattr(self, "_proprio_per_env", None)
+            self._standby = StandbyActor(
+                envs={e: self._parallel_envs[e] for e in rt},
+                policy=self._policy_snapshot(),
+                world_model=self.world_model, wm_lock=self._wm_param_lock,
+                wm_proprio_fn=self._wm_proprio_batch, device=self.device,
+                action_dim=P,
+                beliefs={e: {"h": st["h"][e:e + 1], "z": st["z"][e:e + 1]}
+                         for e in rt},
+                obs={e: self._stream_obs[e] for e in rt},
+                infos={e: (step_infos[e] if e < len(step_infos) else {})
+                       for e in rt},
+                aug_proprio={e: (None if pp is None or e >= len(pp)
+                                 else pp[e]) for e in rt},
+                masks=masks,
+                knowledge=self._current_knowledge_feature(),
+                use_feats=(getattr(self.policy, "arch", "") == "rssm"))
+            self._standby.start()
+        except Exception as _ex:
+            # never let the standby take the run down: without it the game
+            # simply holds SkyBot's last buttons, as before R3
+            logger.warning("standby actor not started: %s", _ex)
+            self._standby = None
+
+    def _standby_refresh_policy(self) -> None:
+        if self._standby is not None:
+            try:
+                self._standby.set_policy(self._policy_snapshot())
+            except Exception as _ex:
+                logger.warning("standby policy refresh failed: %s", _ex)
+
+    def _standby_end(self) -> None:
+        sb = self._standby
+        if sb is None:
+            return
+        self._standby = None
+        out = sb.stop()
+        st = self._ll.rssm_state if self._ll is not None else None
+        pp = getattr(self, "_proprio_per_env", None)
+        for e, r in out.items():
+            self._stream_obs[e] = r["obs"]
+            if st is not None:
+                with torch.no_grad():
+                    st["h"][e] = r["h"][0]
+                    st["z"][e] = r["z"][0]
+            if pp is not None and e < len(pp) and r["aug"] is not None:
+                pp[e] = r["aug"]
+            # replay: the next stored row starts a new sequence
+            self._rt_gap[e] = True
+            self._reset_stream_potentials(e)
+            self.standby_decisions += int(r["decisions"])
+        self._enc_carry = None                 # carried features are stale
+        logger.info("standby actor: played %s decisions in %.1fs while the "
+                    "loop learned", {e: r["decisions"] for e, r in out.items()},
+                    (sb.t_stop or 0) - (sb.t_start or 0))
+
+    def _reset_stream_potentials(self, e_i: int) -> None:
+        """A potential must not cross a gap in time any more than a world
+        boundary: the same per-stream resets the ADVANCE block performs on a
+        death (that block is the reference; tests/_universal_loop_smoke.py
+        checks the two stay in step), minus the env reset itself."""
+        self._drop_curiosity_batch()
+        self._sc_phi.pop(e_i, None)
+        if e_i == 0:
+            self._persist_phi = 0.0
+            self._reach_phi = 0.0
+            self._pitch_level_phi = None
+            self._gui_run = 0
+            self._gui_dwell_phi = None
+            self._habit_prev.clear()
+        self._mine_by_env.pop(e_i, None)
+        self._new_break_by_env.pop(e_i, None)
+        if hasattr(self, "_loginv_by_env"):
+            self._loginv_by_env.pop(e_i, None)
+        if e_i == 0 and self.symbolizer is not None:
+            self._prev_mine.clear()
+        if self.option_executor is not None:
+            self.option_executor.clear(e_i, self.total_timesteps)
+
     def _make_one_env(self, idx: int = -1):
         """Build one fresh env (used to replace a hung/dead parallel env).
         See _agent_name_for for why slot 0's name is special.
@@ -4149,6 +4421,9 @@ class DevelopmentalAI:
         crash-rebuilds (else the visitor silently respawns into a local
         world). Scouts (idx != 0) follow remote_server_scope.
         """
+        if idx >= 0 and self._stream_spec(idx) is not None:
+            e, _c = self._build_stream_env(idx)
+            return e
         env_cfg = self.config.get("environment", {})
         _scope = env_cfg.get("remote_server_scope", "primary")
         _remote = env_cfg.get("remote_server") if (
@@ -4267,6 +4542,15 @@ class DevelopmentalAI:
                     envs[i] = self._make_one_env(i)
                     rf = self._env_pool.submit(envs[i].reset)
                     o = rf.result(timeout=timeout)[0]
+                    if i == 0:
+                        # SELF.ENV FOLLOWS SLOT 0 (2026-10-11). `envs` IS
+                        # self._parallel_envs, so a slot-0 rebuild replaced the
+                        # list entry but left self.env on the REAPED client:
+                        # the viewer, fact histories and the broadcaster read
+                        # a dead env, and shutdown closed the dead one twice
+                        # while the live replacement was never closed -- the
+                        # same orphaned-client class as bebd8db.
+                        self.env = envs[0]
                     return np.asarray(o, dtype=np.float32)
                 except Exception as ex:
                     logger.warning("env %d rebuild try %d failed (%s)",
@@ -5318,7 +5602,10 @@ class DevelopmentalAI:
                     # but the world model must not learn the splice as
                     # dynamics, and must certainly not OVERSAMPLE it.
                     restart=bool(restarted[e_i]) or bool(
-                        (step_infos[e_i] or {}).get("env_restarted")),
+                        (step_infos[e_i] or {}).get("env_restarted"))
+                    # time passed that this loop did not record (the standby
+                    # actor played on while it learned): never splice across
+                    or bool(self._rt_gap.pop(e_i, False)),
                     # THE BODY AS IT WAS WHEN obs_list[e_i] WAS SEEN, not as
                     # it is now. `step_infos` describes the state AFTER this
                     # step, so writing it here would pair o_t with proprio
@@ -5505,6 +5792,7 @@ class DevelopmentalAI:
             # done re-resets the WHOLE fleet at the next call, so every
             # stream's episode ends here.
             _sh_fleet_reset = bool(dones[0])
+            self._feed_stream_rewards(envs, rewards, intrinsic, n)
             if self._shadow is not None:
                 self._shadow.after_step(
                     step_infos, env_actions, rewards, dones, restarted,
@@ -5673,6 +5961,9 @@ class DevelopmentalAI:
         if not self._stream_started:
             self._stream_started = True
             self._start_stream()
+        # take the real-time streams back from the standby actor (if it was
+        # playing them while the loop learned) BEFORE reading the carry
+        self._standby_end()
         envs = self._parallel_envs
         rssm_state = self._ll.rssm_state          # carried; observe_step mutates
         obs_list = self._stream_obs               # carried between segments
@@ -6526,10 +6817,14 @@ class DevelopmentalAI:
             # and the entropy/magnet diagnostics. _viewer_push swallows every
             # exception, so this cannot interrupt the run.
             if self.viewer is not None and not use_dream_actor:
+                # the stream chosen in the viewer (2026-10-13), not always 0
+                _vs = int(getattr(self.viewer, "selected_stream", 0) or 0)
+                _vs = _vs if 0 <= _vs < n else 0
+                self._viewer_env = envs[_vs]
                 self._viewer_push(
-                    env_actions[0], float(rewards[0]),
-                    float(intrinsic[0].item()), rssm_state, latent[0:1],
-                    episode_length)
+                    env_actions[_vs], float(rewards[_vs]),
+                    float(intrinsic[_vs].item()), rssm_state,
+                    latent[_vs:_vs + 1], episode_length, stream=_vs)
                 if self.infra is not None:
                     self.infra.beat("viewer", self.total_timesteps)
 
@@ -7030,7 +7325,10 @@ class DevelopmentalAI:
                     # but the world model must not learn the splice as
                     # dynamics, and must certainly not OVERSAMPLE it.
                     restart=bool(restarted[e_i]) or bool(
-                        (step_infos[e_i] or {}).get("env_restarted")),
+                        (step_infos[e_i] or {}).get("env_restarted"))
+                    # time passed that this loop did not record (the standby
+                    # actor played on while it learned): never splice across
+                    or bool(self._rt_gap.pop(e_i, False)),
                     # THE BODY AS IT WAS WHEN obs_list[e_i] WAS SEEN, not as
                     # it is now. `step_infos` describes the state AFTER this
                     # step, so writing it here would pair o_t with proprio
@@ -7291,6 +7589,7 @@ class DevelopmentalAI:
             # FOUNDATION SHADOW (see the episodic body). Lifelong: a stream's
             # episode ends only on its OWN boundary; there is no fleet reset.
             _sh_fleet_reset = False
+            self._feed_stream_rewards(envs, rewards, intrinsic, n)
             if self._shadow is not None:
                 self._shadow.after_step(
                     step_infos, env_actions, rewards, dones, restarted,
@@ -7490,6 +7789,10 @@ class DevelopmentalAI:
 
         self._stream_obs = obs_list
         self._ll.decay()                          # per-segment soft leak
+        # From here until the next segment the loop LEARNS (PPO below, then
+        # run()'s dream / skills / reports / checkpoints). Real-time games do
+        # not wait for that: hand them to the standby actor now.
+        self._standby_begin(step_infos)
 
         # PPO update: bootstrap with V(s_last) because the segment ends
         # MID-trajectory (the rollout is not a terminated episode).
@@ -7525,6 +7828,8 @@ class DevelopmentalAI:
             pm = self.policy.train_step(
                 n_epochs=self.config.get("policy", {}).get("n_epochs", 10),
                 last_value=last_v)
+            # the standby actor plays on with the policy that just learned
+            self._standby_refresh_policy()
             policy_loss = pm.get("policy_loss", 0.0)
             self._last_ppo = dict(pm)      # for the entropy forensics line
             # COLLAPSE DETECTOR, in the path that actually runs (2026-08-02).
@@ -7676,6 +7981,12 @@ class DevelopmentalAI:
         # adaptation a no-op that still printed as if it worked.
         train_iters = self._wm_train_iters
         prioritized = self._use_per
+        # the module gradient steps land on: the trainer's own copy when the
+        # acting thread reads an inference copy, else the one shared module
+        _wm = self._wm_train if self._wm_train is not None else self.world_model
+        import contextlib as _ctx
+        _step_lock = (_ctx.nullcontext() if _wm is not self.world_model
+                      else self._wm_param_lock)
         # ---- TERMINAL OVERSAMPLING IS NOW A KNOB (2026-09-01) ------------
         # This call never passed `terminal_fraction`, so it silently used the
         # sampler's 0.25 default — tuned for EPISODIC runs where terminals are
@@ -7706,9 +8017,9 @@ class DevelopmentalAI:
             never see torn parameters mid-update. Uncontended (sync mode) the
             RLock costs ~1us per iteration.
             """
-            with self._wm_param_lock:
+            with _step_lock:
                 if prioritized:
-                    m, errs = self.world_model.train_step(
+                    m, errs = _wm.train_step(
                         observations=batch["observations"],
                         actions=batch["actions"],
                         rewards=batch["rewards"],
@@ -7726,7 +8037,7 @@ class DevelopmentalAI:
                     )
                     self._lt_wm_step(batch)     # telemetry: read-only
                     return m
-                m = self.world_model.train_step(
+                m = _wm.train_step(
                     observations=batch["observations"],
                     actions=batch["actions"],
                     rewards=batch["rewards"],
@@ -7756,10 +8067,20 @@ class DevelopmentalAI:
                 sampler = self._get_bg_sampler(batch_size, seq_len, prioritized)
                 sampler.request(train_iters)
                 for _ in range(train_iters):
+                    # STOP BETWEEN GRADIENT STEPS (2026-10-11): a block is
+                    # many steps (seconds each on a CPU) and the stop flag
+                    # was only read between BLOCKS, so close() waited out its
+                    # 90 s budget and the process could exit with this thread
+                    # still inside torch (measured: exit code 139).
+                    if self._wm_trainer_stop.is_set():
+                        break
                     batch = sampler.get()
                     metrics = _do_train(batch)
+                    self._maybe_publish_wm()
             else:
                 for _ in range(train_iters):
+                    if self._wm_trainer_stop.is_set():
+                        break
                     batch = self.replay_buffer.sample_sequences(
                         batch_size=batch_size,
                         seq_len=seq_len,
@@ -7770,7 +8091,9 @@ class DevelopmentalAI:
                         terminal_fraction=terminal_fraction,
                     )
                     metrics = _do_train(batch)
+                    self._maybe_publish_wm()
             self._wm_block_ms = 1000.0 * (time.perf_counter() - _t_wm)
+            self._publish_wm()          # the block's final weights, always
             self._wm_block_iters = int(train_iters)
             # HOW MANY GOAL WINDOWS THE STRATUM ACTUALLY HAD. This is the
             # measurement that says whether goal_replay_threshold changed
@@ -7784,7 +8107,7 @@ class DevelopmentalAI:
             # sd heads are read on the main thread every step via the glue)
             with self._wm_param_lock:
                 with torch.no_grad():
-                    states, _ = self.world_model.observe_sequence(
+                    states, _ = _wm.observe_sequence(
                         batch["observations"], batch["actions"],
                         batch.get("proprio"),
                     )
@@ -7873,12 +8196,53 @@ class DevelopmentalAI:
     # -----------------------------------------------------------------------
     # Async world-model trainer (retrospective consolidation off-thread)
     # -----------------------------------------------------------------------
+    def _maybe_publish_wm(self) -> None:
+        if self._wm_train is None:
+            return
+        self._wm_pub_n += 1
+        if self._wm_pub_n >= self._wm_publish_every:
+            self._publish_wm()
+
+    def _publish_wm(self) -> None:
+        """Trainer copy -> the acting world model, in place, under the lock.
+
+        The ONLY moment the acting thread can wait on world-model training:
+        one parameter copy (device-to-device on a GPU), never a gradient
+        step. In place, so every module that captured a reference to
+        self.world_model (prospection, grounding, viewer) sees the new
+        weights without being told. Buffers are copied too (running stats).
+        """
+        tr = self._wm_train
+        if tr is None:
+            return
+        self._wm_pub_n = 0
+        with self._wm_param_lock, torch.no_grad():
+            dst = self.world_model.state_dict(keep_vars=True)
+            for k, v in tr.state_dict(keep_vars=True).items():
+                d = dst.get(k)
+                if d is not None and d.shape == v.shape:
+                    d.copy_(v)
+        self.wm_publishes += 1
+
     def _ensure_wm_trainer(self) -> None:
         """Lazily start the background WM trainer (async_wm.enabled)."""
         if self._wm_trainer_thread is not None:
             return
         import queue
         import threading
+        if self._wm_inference_copy and self._wm_train is None:
+            import copy as _copy
+            with self._wm_param_lock:
+                self._wm_train = _copy.deepcopy(self.world_model)
+                # The acting copy never steps an optimizer: drop its Adam
+                # moments (2x the parameters) instead of carrying them.
+                try:
+                    self.world_model.optimizer.state.clear()
+                except Exception:
+                    pass
+            logger.warning("world model: acting on an inference copy; the "
+                           "trainer publishes every %d gradient steps",
+                           self._wm_publish_every)
 
         def _loop() -> None:
             while not self._wm_trainer_stop.is_set():
@@ -8697,17 +9061,58 @@ class DevelopmentalAI:
             return None
 
     def _viewer_push(self, action, ext_r, int_r, rssm_state, latent, ep_step,
-                     pred_obs=None, actual_obs=None):
+                     pred_obs=None, actual_obs=None, stream: int = 0):
         """Stream the live env frame + world-model state to the viewer.
 
         Best-effort and fully isolated: any failure is swallowed so the viewer
         can never interrupt training.
         """
         try:
+            # the env the viewer is watching (selected stream; else slot 0)
+            _venv = getattr(self, "_viewer_env", None) or self.env
             try:
-                env_rgb = self.env.render()
+                env_rgb = _venv.render()
             except Exception:
                 env_rgb = None
+            # THE GAME AT ITS OWN SPEED (2026-10-11, docs/UNIVERSAL_GAMES.md).
+            # Hand the viewer every game frame this step produced, each with
+            # the game time it covers; its playback thread plays them on its
+            # own clock. Adapters that can keep per-tic frames (Doom) are
+            # asked to — re-asked every push, so a rebuilt slot-0 env
+            # inherits it. Anything else (Minecraft) contributes its one step
+            # frame, covering action_repeat ticks at 20 ticks/s.
+            try:
+                from developmental_ai.environments.universal import find_attr
+                # one clock feeds the viewer at a time: when the watched
+                # stream changes, unhook the previous one's frame sink
+                _prev = getattr(self, "_viewer_sink_env", None)
+                if _prev is not None and _prev is not _venv:
+                    _ps = find_attr(_prev, "set_frame_sink")
+                    if _ps is not None:
+                        _ps(None)
+                    self._viewer_sink_env = None
+                _pop = find_attr(_venv, "pop_tic_frames")
+                if find_attr(_venv, "realtime"):
+                    # REAL-TIME GAME: the clock thread hands every frame to
+                    # the viewer itself, at 35 fps, whatever SkyBot is doing.
+                    # (Re)installed each push, so a rebuilt env inherits it.
+                    _sink = find_attr(_venv, "set_frame_sink")
+                    _vw = self.viewer
+                    _sink(lambda f, dt, _vw=_vw: _vw.push_game_frames([f], dt))
+                    self._viewer_sink_env = _venv
+                    _frames, _fdt = [], 0.0
+                elif _pop is not None:
+                    if not find_attr(_venv, "keep_tic_frames"):
+                        find_attr(_venv, "set_keep_tic_frames")(True)
+                    _frames = _pop()
+                    _fdt = float(find_attr(_venv, "tic_seconds") or 1 / 35)
+                else:
+                    _frames = [] if env_rgb is None else [env_rgb]
+                    _fdt = float(self.env_action_repeat) / 20.0
+                if _frames:
+                    self.viewer.push_game_frames(_frames, _fdt)
+            except Exception:
+                pass
             # World-model predicted reward for the current latent (a WM head).
             try:
                 with torch.no_grad():
@@ -8738,9 +9143,14 @@ class DevelopmentalAI:
                     recon = {"env_name": self.env_name, "real": a[:n].tolist(),
                              "pred": p[:n].tolist(), "err": err}
                     lines.append(("WM pred err", f"{err:.4f}"))
-            z = rssm_state["z"].detach().cpu().numpy().ravel()
+            _z = rssm_state["z"]
+            if _z.dim() > 1 and _z.shape[0] > stream:
+                _z = _z[stream]                      # the watched stream's belief
+            z = _z.detach().cpu().numpy().ravel()
+            _labels = getattr(self.viewer, "stream_labels", None) or []
             self.viewer.push(
-                env_rgb, f"{self.env_name}", lines, z=z,
+                env_rgb, (_labels[stream] if stream < len(_labels)
+                          else f"{self.env_name}"), lines, z=z,
                 ret_hist=list(self.episode_rewards), recon=recon,
                 income=self._income_now(),
             )
@@ -9255,9 +9665,13 @@ class DevelopmentalAI:
         # Load world model
         wm_path = os.path.join(checkpoint_dir, "world_model.pt")
         if os.path.exists(wm_path):
-            self.world_model.load_state_dict(
-                torch.load(wm_path, map_location=self.device)
-            )
+            _sd = torch.load(wm_path, map_location=self.device)
+            with self._wm_param_lock:
+                self.world_model.load_state_dict(_sd)
+                # an inference-copy trainer must continue from the loaded
+                # weights too, or its next publish would overwrite them
+                if getattr(self, "_wm_train", None) is not None:
+                    self._wm_train.load_state_dict(_sd)
 
         # Load curiosity module
         cur_path = os.path.join(checkpoint_dir, "curiosity.pt")
@@ -10072,7 +10486,10 @@ class DevelopmentalAI:
         return _now
 
     def _world_model_version(self):
-        steps = [int(v.get("step", 0)) for v in self.world_model.optimizer.state.values()]
+        # the optimizer that actually steps: the trainer's copy when there is
+        # one (the acting copy's optimizer never steps, so it would read 0)
+        _wm = self._wm_train if self._wm_train is not None else self.world_model
+        steps = [int(v.get("step", 0)) for v in _wm.optimizer.state.values()]
         return "adam_step=" + str(max(steps, default=0))
 
     def _curiosity_boundary(self, streams=None, valid=True):

@@ -513,6 +513,10 @@ def make_env(
     break_decay_scale: float = 0.0,
     break_memory_path: Optional[str] = None,
     agent_name: Optional[str] = None,
+    universal: Optional[Dict] = None,
+    game_cfg: Optional[Dict] = None,
+    stream_index: int = 0,
+    seed: int = 0,
 ) -> Tuple[DevelopmentalEnvWrapper, Optional[CurriculumWrapper]]:
     """
     Create a wrapped Gymnasium environment ready for the developmental AI framework.
@@ -550,6 +554,57 @@ def make_env(
         wrapped = DevelopmentalEnvWrapper(env, normalize_obs=False)
         return wrapped, curriculum_wrapper
 
+    # UNIVERSAL BRAIN (2026-10-11, docs/UNIVERSAL_GAMES.md). `universal` is
+    # the run's universal: block; when present, the stream's adapter is
+    # wrapped in SkyBot's fixed-width controller, which also refuses to start
+    # unless the observation is the brain's canonical shape. None = every
+    # legacy config, byte-identical.
+    def _universal_wrap(env, game: str):
+        if not universal or not universal.get("enabled"):
+            return env
+        from developmental_ai.environments.universal import (
+            UniversalControllerWrapper)
+        return UniversalControllerWrapper(
+            env, action_slots=int(universal["action_slots"]),
+            image_size=image_size, channels=1 if grayscale else 3, game=game)
+
+    # THE PLAYER ADAPTER (docs/UNIVERSAL_GAMES.md §11): ANY game, unmodified,
+    # through a screen, speakers, keyboard and mouse. Universal-brain only.
+    if env_name.startswith("Player") or (game_cfg or {}).get("backend") == "player":
+        if not (universal and universal.get("enabled")):
+            raise ValueError("player-adapter streams run only on the universal "
+                             "brain (compose the config with tools/compose_run_config.py)")
+        from developmental_ai.environments.player import PlayerAdapter
+        env = PlayerAdapter(game=game_cfg or {}, image_size=image_size,
+                            sensors_cfg=sensors_cfg, stream_index=stream_index,
+                            seed=seed, action_slots=int(universal["action_slots"]))
+        env = _universal_wrap(env, (game_cfg or {}).get("name", "player"))
+        curriculum_wrapper = None
+        if curriculum:
+            curriculum_wrapper = CurriculumWrapper(env)
+            env = curriculum_wrapper
+        wrapped = DevelopmentalEnvWrapper(env, normalize_obs=False)
+        return wrapped, curriculum_wrapper
+
+    # DOOM (ViZDoom + Freedoom): screen, stereo sound, controller from the
+    # game YAML. Universal-brain only — it has no meaning outside one.
+    if env_name.startswith("ViZDoom"):
+        if not (universal and universal.get("enabled")):
+            raise ValueError("ViZDoom streams run only on the universal brain "
+                             "(compose the config with tools/compose_run_config.py)")
+        from developmental_ai.environments.vizdoom_env import ViZDoomEnvAdapter
+        env = ViZDoomEnvAdapter(game=game_cfg or {}, image_size=image_size,
+                                sensors_cfg=sensors_cfg,
+                                snapshot_dir=universal.get("snapshot_dir"),
+                                stream_index=stream_index, seed=seed)
+        env = _universal_wrap(env, "doom")
+        curriculum_wrapper = None
+        if curriculum:
+            curriculum_wrapper = CurriculumWrapper(env)
+            env = curriculum_wrapper
+        wrapped = DevelopmentalEnvWrapper(env, normalize_obs=False)
+        return wrapped, curriculum_wrapper
+
     # MineRL (real Minecraft): legacy-gym dict-obs / dict-action env bridged
     # by the adapter, which emits the project's flat CHW float [0,1] pixel
     # contract and a Discrete macro-action space. Config sets pixel_obs=true
@@ -570,6 +625,7 @@ def make_env(
                                agent_name=agent_name,
                                **({} if start_tool == "__default__"
                                   else {"start_tool": start_tool}))
+        env = _universal_wrap(env, "minecraft")
         curriculum_wrapper = None
         if curriculum:
             curriculum_wrapper = CurriculumWrapper(env)

@@ -1042,15 +1042,25 @@ class SensorImageEncoder(nn.Module):
     are texture-scale facts a shallow stack resolves fine.
     """
 
-    def __init__(self, in_channels: int, size: int, out_dim: int = 64):
+    def __init__(self, in_channels: int, size: int, out_dim: int = 64,
+                 width: Optional[int] = None):
+        # NON-SQUARE SENSORS (fix 2026-10-11). This sized its Linear from
+        # `size` alone and the caller passed only H, so any sensor with
+        # H != W (audio is (2, 32, 16)) built a Linear for 4x4 features,
+        # received 4x2, and crashed on its FIRST forward pass. It hid because
+        # every sensor enabled until now was square. `width=None` keeps the
+        # square layer byte-identical, so existing checkpoints still load.
         super().__init__()
-        chans, c_in, layers, cur = [32, 64, 64], in_channels, [], size
+        chans, c_in, layers = [32, 64, 64], in_channels, []
+        cur_h, cur_w = int(size), int(size if width is None else width)
         for c_out in chans:
             layers += [nn.Conv2d(c_in, c_out, 3, stride=2, padding=1), nn.ELU()]
-            c_in, cur = c_out, (cur + 1) // 2
+            c_in = c_out
+            cur_h, cur_w = (cur_h + 1) // 2, (cur_w + 1) // 2
         self.conv = nn.Sequential(*layers)
         self.out_dim = int(out_dim)
-        self.fc = nn.Sequential(nn.Linear(c_in * cur * cur, out_dim), nn.ELU())
+        self.fc = nn.Sequential(nn.Linear(c_in * cur_h * cur_w, out_dim),
+                                nn.ELU())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv(x)
@@ -1328,8 +1338,8 @@ class WorldModel(nn.Module):
             min(spec[0] for spec in self.sensor_image_specs)
             if self.sensor_image_specs else self.proprio_dim)
         self.sensor_encoders = nn.ModuleList([
-            SensorImageEncoder(c, h, sensor_feature_dim)
-            for (_o, c, h, _w) in self.sensor_image_specs])
+            SensorImageEncoder(c, h, sensor_feature_dim, width=w)
+            for (_o, c, h, w) in self.sensor_image_specs])
         # What the RSSM actually receives from the sensor side: the vector
         # fields verbatim plus one feature block per image sensor.
         self.sensor_embed_dim = (

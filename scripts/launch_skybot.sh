@@ -27,8 +27,66 @@ if [ -z "${SKYBOT_SUPERVISED:-}" ] && [ -f runlogs/CRASHLOOP ]; then
   echo "  manual launch: clearing runlogs/CRASHLOOP ($(head -1 runlogs/CRASHLOOP 2>/dev/null))"
   rm -f runlogs/CRASHLOOP runlogs/crash_history
 fi
+# ---- WHICH GAMES (2026-10-11, docs/UNIVERSAL_GAMES.md §6) -----------------
+# runlogs/games.enabled ABSENT  -> the legacy Minecraft-only run, unchanged:
+#                                  configs/minecraft_skybot.yaml, legacy brain.
+# runlogs/games.enabled PRESENT -> SkyBot's ONE universal brain playing every
+#                                  game listed there (one name per line),
+#                                  config composed fresh at every launch so a
+#                                  game enabled by its GitHub action takes
+#                                  effect on the next (re)launch.
+# Written by the per-game workflows (.github/workflows/game-*.yml) or by hand.
+GAMES_FILE=runlogs/games.enabled
+CONFIG=configs/minecraft_skybot.yaml
+MC_ON=1
+DOOM_ON=0
+if [ -f "$GAMES_FILE" ]; then
+  _GAMES=$(sed 's/#.*//' "$GAMES_FILE" | tr 'A-Z' 'a-z' | tr -s ' \t\n' '\n' | grep -v '^$' || true)
+  [ -n "$_GAMES" ] || { echo "REFUSED: $GAMES_FILE lists no games (delete it for the legacy Minecraft run)"; exit 1; }
+  echo "$_GAMES" | grep -qx minecraft || MC_ON=0
+  echo "$_GAMES" | grep -qx doom && DOOM_ON=1
+  ./venv_mc/bin/python tools/compose_run_config.py --games-file "$GAMES_FILE" \
+      --out runlogs/run_config.yaml \
+    || { echo "REFUSED: could not compose a run config from $GAMES_FILE"; exit 1; }
+  CONFIG=runlogs/run_config.yaml
+  echo "  universal brain: games=$(echo $_GAMES | tr ' ' ',') config=$CONFIG"
+fi
 # ---- PREFLIGHT BEGIN (tests/_incident_bundle_smoke.py strips to END) ------
 if pgrep -f "run_minecraft[.]py" >/dev/null; then echo "REFUSED: run alive"; exit 1; fi
+# ---- PLAYER-ADAPTER GAMES: the game binary + capture tools exist ------------
+# (docs/UNIVERSAL_GAMES.md §11). Each enabled game whose YAML says
+# `backend: player` must have its launch command, Xvfb, pactl/parec, and the
+# mss + python-xlib modules — refuse with the missing piece named.
+if [ -f "$GAMES_FILE" ]; then
+  _PMISS=$(./venv_mc/bin/python - "$GAMES_FILE" <<'PYEOF' 2>/dev/null
+import sys, shutil, importlib.util, yaml, re
+games = [l.split('#')[0].strip().lower() for l in open(sys.argv[1]) if l.split('#')[0].strip()]
+miss = []
+for g in games:
+    try:
+        d = yaml.safe_load(open(f"configs/games/{g}.yaml"))["game"]
+    except Exception:
+        continue
+    if d.get("backend") != "player":
+        continue
+    for tool in [str((d.get("launch") or ["?"])[0]), "Xvfb", "pactl", "parec"]:
+        if shutil.which(tool) is None:
+            miss.append(f"{g}: {tool}")
+    for mod in ("mss", "Xlib"):
+        if importlib.util.find_spec(mod) is None:
+            miss.append(f"{g}: python module {mod}")
+print("; ".join(miss))
+PYEOF
+)
+  [ -z "$_PMISS" ] || { echo "REFUSED: player-adapter game(s) not installed: $_PMISS (run the game's action with action=install)"; exit 1; }
+fi
+# ---- DOOM: engine + game file present (universal brain only) --------------
+if [ "$DOOM_ON" = 1 ]; then
+  ./venv_mc/bin/python -c "import vizdoom" 2>/dev/null \
+    || { echo "REFUSED: doom enabled but vizdoom is not installed in venv_mc (run the Doom action with action=install, or provision)"; exit 1; }
+  bash scripts/fetch_roms.sh ./venv_mc/bin/python \
+    || { echo "REFUSED: doom enabled but roms/doom could not be fetched/verified"; exit 1; }
+fi
 # ---- STALE JAVA: CLEAR BUILD RESIDUE, REFUSE ONLY ON A REAL CLIENT --------
 # This was a bare `pgrep -x java -> REFUSED: stale java` (2026-09-23), and it
 # was a LATCH in the CLAUDE.md 4.1 sense: STAGE 3b of provisioning runs a
@@ -47,7 +105,7 @@ if pgrep -f "$_GD" >/dev/null 2>&1; then
   pkill -f "$_GD" 2>/dev/null || true
   sleep 3
 fi
-if pgrep -x java >/dev/null; then
+if [ "$MC_ON" = 1 ] && pgrep -x java >/dev/null; then
   echo "REFUSED: stale java — not gradle residue. Running java processes:"
   ps -eo pid,etime,args | grep "[j]ava" | head -5 | sed 's/^/    /'
   echo "  If these are dead MineRL clients, clear them with: pkill -9 -x java"
@@ -83,7 +141,7 @@ if command -v ollama >/dev/null 2>&1; then
   # On a 15.3 GB box that is 54% of RAM held for a sensor we deliberately
   # turned off. Read the CONFIG, not a flag here, so this can never disagree
   # with what the agent is actually doing.
-  _VLM_ON=$(./venv_mc/bin/python -c "import yaml,sys; c=yaml.safe_load(open('configs/minecraft_skybot.yaml')); print('1' if (c.get('symbolic_grounding') or {}).get('enabled') else '0')" 2>/dev/null || echo 1)
+  _VLM_ON=$(./venv_mc/bin/python -c "import yaml,sys; c=yaml.safe_load(open('$CONFIG')); print('1' if (c.get('symbolic_grounding') or {}).get('enabled') else '0')" 2>/dev/null || echo 1)
   if [ "$_VLM_ON" = "0" ]; then
     echo "  symbolic_grounding disabled -> stopping ollama entirely"
     sudo systemctl disable --now ollama 2>/dev/null || true
@@ -93,12 +151,18 @@ if command -v ollama >/dev/null 2>&1; then
     echo "  ollama procs left: $(pgrep -cx ollama 2>/dev/null || echo 0)"
   fi
 fi
+# MINECRAFT-ONLY PREFLIGHT (2026-10-11): the Paper server bridge and the X
+# display exist for MineRL's Java client. A Doom-only universal run needs
+# none of them, and refusing it because the game server is down would be a
+# latch on a game it is not playing.
+if [ "$MC_ON" = 1 ]; then
 pgrep -x tailscaled >/dev/null || { echo "REFUSED: tailscaled down"; exit 1; }
 ss -tln | grep -q "127.0.0.1:25565" || { echo "REFUSED: socat bridge down"; exit 1; }
 timeout 12 python3 scripts/mc_ping.py 127.0.0.1 25565 754 >/dev/null 2>&1 \
     || { echo "REFUSED: server unreachable through bridge"; exit 1; }
 pgrep -f "Xvfb [:]77" >/dev/null || { nohup Xvfb :77 -screen 0 800x600x24 >/dev/null 2>&1 < /dev/null & sleep 2; }
 DISPLAY=:77 sh -c "pgrep -x openbox >/dev/null" || { DISPLAY=:77 nohup openbox >/dev/null 2>&1 < /dev/null & sleep 1; }
+fi
 pgrep -x ollama >/dev/null || { OLLAMA_DEBUG=0 nohup ollama serve >> runlogs/ollama.log 2>&1 < /dev/null & sleep 5; }
 # append-mode above + capper below: 581 MB of VLM-server chatter in 5 days
 # (measured 2026-08-16) would eat the disk on a long lifelong run
@@ -191,7 +255,7 @@ DISPLAY=:77 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=6 MINERL_HEADLESS=1 \
   $_SETSID bash -c "$_WRAP" skybot-exit-wrapper \
     runlogs/skybot_run.pid runlogs/skybot_run.exit \
     ./venv_mc/bin/python run_minecraft.py \
-    --config configs/minecraft_skybot.yaml \
+    --config "$CONFIG" \
     --timesteps "$TS" --seed 0 --out minecraft_skybot_results \
     > runlogs/minecraft_skybot_run.log 2>&1 < /dev/null &
 WRAPPER=$!

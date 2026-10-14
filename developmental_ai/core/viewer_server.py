@@ -171,11 +171,21 @@ def compose(env_rgb, title, lines, paused, fps, z, ret_hist,
 _PAGE = b"""<!doctype html><html><head><meta charset=utf-8><title>AI Live Viewer</title>
 <style>body{background:#0b0b10;color:#ddd;font-family:system-ui;text-align:center;margin:0;padding:16px}
 img{border:1px solid #333;border-radius:8px;max-width:97vw}
+#game{width:min(97vw,960px);image-rendering:pixelated}
+.row{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;align-items:flex-start}
 button{background:#1d1d28;color:#ddd;border:1px solid #444;border-radius:6px;padding:8px 16px;margin:6px;cursor:pointer}
 button:hover{background:#2a2a3a}</style></head><body>
-<h2>AI Live Viewer &mdash; world model + environment</h2>
-<div><img src="/stream"></div>
+<h2>AI Live Viewer &mdash; the game at its own speed, and what the world model thinks</h2>
+<div class=row><div><img id=game src="/game"></div><div><img src="/stream"></div></div>
+<div id=streams></div>
 <div><button onclick="fetch('/cmd?c=toggle')">Pause / Resume</button></div>
+<script>
+async function refresh(){try{const d=await (await fetch('/data')).json();
+ const s=document.getElementById('streams');const L=d.streams||[];
+ s.innerHTML=L.length>1?'Watching: '+L.map((n,i)=>'<button style="'+(i==d.selected?'background:#2f4f2f':'')+'" onclick="fetch(\'/cmd?c=stream:'+i+'\')">'+n+'</button>').join(''):'';
+}catch(e){}}
+setInterval(refresh,1500);refresh();
+</script>
 </body></html>"""
 
 
@@ -193,6 +203,23 @@ def _make_handler(srv):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(d)))
                 self.end_headers(); self.wfile.write(d); return
+            if self.path == "/game":
+                # THE GAME AT ITS OWN SPEED (2026-10-11): one JPEG per game
+                # frame, paced by the playback thread, not by training steps.
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                seen = -1
+                try:
+                    while True:
+                        seq, j = srv.get_game_jpeg()
+                        if seq != seen:
+                            seen = seq
+                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                             + str(len(j)).encode() + b"\r\n\r\n" + j + b"\r\n")
+                        time.sleep(0.004)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
             if self.path == "/stream":
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -211,7 +238,7 @@ def _make_handler(srv):
 
 
 class ViewerServer:
-    def __init__(self, port=8000):
+    def __init__(self, port=8000, max_buffer_s=1.5):
         self.port = port
         self._lock = threading.Lock()
         self._jpeg = to_jpeg(Image.new("RGB", (690, 620), (12, 12, 16)))
@@ -219,14 +246,160 @@ class ViewerServer:
         self._errs = deque(maxlen=80)          # recent 1-step prediction errors
         self.paused = False
         self._n, self._last, self._fps = 0, time.time(), 0.0
+        # ---- GAME PLAYBACK (2026-10-11) -----------------------------------
+        # The training loop is synchronous: the game only advances when the
+        # agent steps, and it used to hand this server ONE frame per step,
+        # so the picture moved only as fast as SkyBot decided. Now the loop
+        # hands over EVERY game frame of the step with the game time each
+        # one covers, and this thread plays them back on its own clock at the
+        # game's real speed. Agent faster than real time -> oldest frames are
+        # dropped to stay near live (max_buffer_s). Agent slower -> the last
+        # frame is held and the overlay SAYS it is waiting for SkyBot; it
+        # never pretends a stalled game is live.
+        self.max_buffer_s = float(max_buffer_s)
+        self._game_lock = threading.Lock()
+        self._game_q = deque()                 # (HxWx3 uint8, seconds)
+        self._game_q_s = 0.0                   # game-seconds queued
+        self._game_jpeg = to_jpeg(Image.new("RGB", (320, 240), (12, 12, 16)))
+        self._game_seq = 0
+        self._game_last_frame = None
+        self._game_last_push = None
+        self.game_shown = 0                    # frames played (telemetry/tests)
+        self.game_dropped = 0                  # frames dropped to stay live
+        self._game_fps = 0.0
+        # SkyBot's DECISIONS, timed separately from the game's frames. On a
+        # real-time game the clock feeds frames every tic whatever SkyBot
+        # does, so frame arrival says nothing about whether SkyBot is alive;
+        # and `_fps` is only recomputed when a decision arrives, so a stalled
+        # loop kept showing its last rate (it misled a live check 2026-10-11).
+        self._decision_times = deque(maxlen=400)
+        # WHICH STREAM IS ON SCREEN (2026-10-13). One brain plays several
+        # games/streams at once; the viewer used to show stream 0 only, so in
+        # a mixed run the others played unseen. The loop reads this.
+        self.selected_stream = 0
+        self.stream_labels = []
 
     def start(self):
         self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), _make_handler(self))
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        self.start_playback()
+
+    def start_playback(self):
+        threading.Thread(target=self._playback, daemon=True,
+                         name="viewer-playback").start()
+
+    def push_game_frames(self, frames, frame_seconds):
+        """Hand over the game frames one agent step produced (oldest first),
+        each covering `frame_seconds` of game time. Called by the training
+        loop; cheap (a deque append), never blocks on encoding."""
+        if self.paused or not frames:
+            return
+        dt = max(1e-3, float(frame_seconds))
+        with self._game_lock:
+            for f in frames:
+                if f is None:
+                    continue
+                self._game_q.append((f, dt))
+                self._game_q_s += dt
+            while self._game_q and self._game_q_s > self.max_buffer_s:
+                _f, _dt = self._game_q.popleft()
+                self._game_q_s -= _dt
+                self.game_dropped += 1
+            self._game_last_push = time.time()
+
+    def get_game_jpeg(self):
+        with self._game_lock:
+            return self._game_seq, self._game_jpeg
+
+    def game_status(self):
+        with self._game_lock:
+            q_s = self._game_q_s
+            last = self._game_last_push
+        now = time.time()
+        waited = None if last is None else now - last
+        dts = list(self._decision_times)
+        recent = [t for t in dts if now - t <= 5.0]
+        return {"buffered_s": round(q_s, 3), "fps": round(self._game_fps, 1),
+                "shown": self.game_shown, "dropped": self.game_dropped,
+                "since_last_frame_s": None if waited is None else round(waited, 2),
+                # live, never stale: decisions in the last 5 s, and how long
+                # since SkyBot's last one
+                "decisions_per_s": round(len(recent) / 5.0, 2),
+                "since_last_decision_s": (None if not dts
+                                          else round(now - dts[-1], 2))}
+
+    def _label(self, frame, text, color):
+        img = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 8 + 6 * len(text), 14], fill=(0, 0, 0))
+        d.text((4, 2), text, fill=color)
+        return to_jpeg(img, 85)
+
+    def _playback(self):
+        n, t_fps = 0, time.time()
+        next_t = time.time()
+        idle_label_t = 0.0
+        while True:
+            item = None
+            with self._game_lock:
+                if self._game_q:
+                    item = self._game_q.popleft()
+                    self._game_q_s -= item[1]
+                    q_s = self._game_q_s
+            now = time.time()
+            if item is None:
+                # Nothing to play: the game is frozen until SkyBot's next
+                # decision. Say so (refreshed twice a second), hold the frame.
+                if self._game_last_frame is not None and now - idle_label_t > 0.5:
+                    idle_label_t = now
+                    waited = now - (self._game_last_push or now)
+                    j = self._label(self._game_last_frame,
+                                    f"WAITING FOR SKYBOT  {waited:4.1f}s  (game paused)",
+                                    (255, 190, 60))
+                    with self._game_lock:
+                        self._game_jpeg = j
+                        self._game_seq += 1
+                time.sleep(0.005)
+                next_t = time.time()
+                continue
+            frame, dt = item
+            self._game_last_frame = frame
+            j = self._label(frame, f"LIVE  game speed  buffer {q_s:3.1f}s",
+                            (120, 230, 120))
+            with self._game_lock:
+                self._game_jpeg = j
+                self._game_seq += 1
+            self.game_shown += 1
+            n += 1
+            if now - t_fps >= 1.0:
+                self._game_fps, n, t_fps = n / (now - t_fps), 0, now
+            next_t = max(next_t + dt, time.time() - dt)
+            delay = next_t - time.time()
+            if delay > 0:
+                time.sleep(delay)
 
     def command(self, c):
         if c == "toggle":
             self.paused = not self.paused
+        elif c.startswith("stream:"):
+            try:
+                k = int(c.split(":", 1)[1])
+            except ValueError:
+                return
+            n = len(self.stream_labels)
+            if 0 <= k and (n == 0 or k < n) and k != self.selected_stream:
+                self.selected_stream = k
+                self.clear_game_queue()        # never mix two streams' frames
+
+    def set_streams(self, labels):
+        self.stream_labels = [str(x) for x in labels]
+        if self.selected_stream >= len(self.stream_labels):
+            self.selected_stream = 0
+
+    def clear_game_queue(self):
+        with self._game_lock:
+            self._game_q.clear()
+            self._game_q_s = 0.0
 
     def get_jpeg(self):
         with self._lock:
@@ -243,6 +416,7 @@ class ViewerServer:
         if self.paused:
             return
         self._n += 1; now = time.time()
+        self._decision_times.append(now)
         if now - self._last >= 1.0:
             self._fps = self._n / (now - self._last); self._n = 0; self._last = now
         recon_img, err = None, None
@@ -258,7 +432,9 @@ class ViewerServer:
         # Raw state for the terminal client (/data): small env thumbnail +
         # metrics text + a 32x32 normalized latent grid + reconstruction.
         raw = {"title": str(title), "fps": round(self._fps, 1),
-               "lines": [[str(k), str(v)] for k, v in lines]}
+               "lines": [[str(k), str(v)] for k, v in lines],
+               "game": self.game_status(),
+               "streams": self.stream_labels, "selected": self.selected_stream}
         if income:
             raw["income"] = [[str(n), round(float(f), 3),
                               round(float(s), 4)] for n, f, s in income]

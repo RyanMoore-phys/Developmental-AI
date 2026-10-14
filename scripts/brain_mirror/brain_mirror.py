@@ -125,7 +125,18 @@ DEFAULT_BRAIN_PATHS = tuple(
        "runlogs/consequence_state.json",
        "runlogs/anticipation_state.json",
        "skill_bank_mc_rssm/",
-       "skill_bank_mc_curiosity/"])
+       "skill_bank_mc_curiosity/"]
+    # THE UNIVERSAL BRAIN (2026-10-11, docs/UNIVERSAL_GAMES.md): one brain
+    # for every game, under one root, set by configs/universal.yaml. On a
+    # host still running the legacy brain these are simply absent and
+    # skipped (logged, never an error). Its replay buffer is excluded for the
+    # same reason the legacy one is; its emulator save states
+    # (brain_universal/snapshots/) are a 15-minute ring a restart clears.
+    + ["brain_universal/logs/checkpoints/" + f for f in CHECKPOINT_FILES]
+    + ["brain_universal/breaks_by_type.json",
+       "brain_universal/infra/consequence_state.json",
+       "brain_universal/infra/anticipation_state.json",
+       "brain_universal/skill_bank/"])
 SHADOW_REL = "runlogs/foundation_shadow/"
 
 DEFAULTS = {

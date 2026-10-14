@@ -265,8 +265,34 @@ def build_default_bus(proprio_width: int, proprio_read,
         # RED. Registered so it can be MEASURED, never so it can be used.
         Sensor("true_position", 3, _read_true_position,
                classification=RED, version=1),
+        # TEMPO (2026-10-11): how much game time passed since the last
+        # decision. Appended last: registration order is the wire format.
+        Sensor("tempo", 2, _read_tempo, classification=GREEN, version=1),
     ]
     return SensorBus(sensors, enabled=enabled)
+
+
+# ---------------------------------------------------------------------------
+# TEMPO — the world does not wait (2026-10-11, docs/UNIVERSAL_GAMES.md §10)
+# ---------------------------------------------------------------------------
+# On a real-time game clock a decision covers however much game time passed
+# while SkyBot was thinking — one tic on a fast brain, hundreds on a slow
+# one. The same action held for 1 tic and for 2 seconds has very different
+# consequences, so a model that cannot tell them apart learns cause and
+# effect wrong. A player feels time passing; this is that feeling, and it
+# names nothing. world["decision_seconds"] is set by real-time adapters.
+#   [0] has a reading (1) or not (0) -- so "unknown" is not "no time passed"
+#   [1] log1p(seconds) / log1p(10): ~0.04 for one Doom tic, 1.0 at 10 s
+_TEMPO_FULL_S = 10.0
+
+
+def _read_tempo(ctx: Dict) -> Optional[np.ndarray]:
+    w = ctx.get("world") or {}
+    s = w.get("decision_seconds")
+    if s is None:
+        return None
+    v = float(np.log1p(max(0.0, float(s))) / np.log1p(_TEMPO_FULL_S))
+    return np.array([1.0, min(1.0, v)], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------

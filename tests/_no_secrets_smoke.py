@@ -39,7 +39,19 @@ CRED_RE = re.compile(
 LOCAL_ONLY = ("CLAUDE.local.md", "scripts/brain_mirror/brain_mirror.env",
               "docker/monitor/.env", "docker/runner/.env",
               "docker/runner/runner.env", ".claude/settings.local.json",
-              "runlogs/anything")
+              "runlogs/anything",
+              # GAME DATA (2026-10-11, docs/UNIVERSAL_GAMES.md): the repo is
+              # public, so no ROM/WAD may ever be stageable -- inside roms/ or
+              # anywhere else, in any letter case (the host and CI match
+              # ignore rules case-sensitively).
+              "roms/doom/freedoom2.wad", "roms/pokemon/red.gb",
+              "POKEMON.GB", "somewhere/SMB.NES", "x/game.Wad",
+              "brain_universal/snapshots/stream_1/snap_00000001.zds")
+# ...and the converse: these MUST stay committable. A game-data rule once
+# swallowed every root `*_results/` dir -- the experimental record
+# (ultrareview 2026-10-11).
+MUST_TRACK = ("roms/README.md", "minecraft_results/results.json",
+              "rung9_lawtransfer_results/results.json")
 
 
 def tracked():
@@ -102,6 +114,11 @@ def main():
                              "`git add -A` would publish them: "
                              f"{not_ignored}")
     print(f"  C. local-only files still ignored: {', '.join(LOCAL_ONLY)}")
+    swallowed = [f for f in MUST_TRACK if subprocess.run(
+        ["git", "check-ignore", "-q", f]).returncode == 0]
+    assert not swallowed, ("these paths must stay committable but are "
+                           f"gitignored: {swallowed}")
+    print(f"  D. still committable: {', '.join(MUST_TRACK)}")
     print(f"[{NAME}] ALL PASS")
 
 

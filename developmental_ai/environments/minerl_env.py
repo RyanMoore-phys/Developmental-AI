@@ -2442,6 +2442,13 @@ class MineRLEnvAdapter(gym.Env):
             # the swing streak lives on the adapter, not in `world` — fold it
             # in so the agent can FEEL sustained effort (see PROPRIO_KEYS)
             _w["attack_run"] = float(self._attack_run)
+            # TEMPO (2026-10-11, docs/UNIVERSAL_GAMES.md §10): the game time
+            # this decision covered. MineRL is synchronous, so it is always
+            # action_repeat client ticks at Minecraft's 20 ticks/s -- reported
+            # anyway so the one brain's `tempo` sense means the same thing in
+            # every game, instead of "unknown" here and real time in Doom.
+            # Read only by the `tempo` sensor; legacy configs do not enable it.
+            _w["decision_seconds"] = float(self.action_repeat) / 20.0
             _w["reach_evidence"] = float(self._reach_evidence)
             info["proprio"] = self._proprio(_w)
             # THE BUS READS THE SAME `world` THE PROPRIO VECTOR DOES, plus

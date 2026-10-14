@@ -1041,6 +1041,11 @@ class OptionExecutor:
         self.bank = bank
         self.num_envs = int(num_envs)
         self.gamma = float(gamma)
+        # UNIVERSAL BRAIN (2026-10-11): per-stream controller masks, one bool
+        # array of primitive width per stream (None = this stream's game maps
+        # every slot / not a universal run). Installed by the loop once the
+        # fleet exists; see _and_stream.
+        self.stream_masks: Optional[List[Optional[np.ndarray]]] = None
         self.max_option_steps = int(cfg.get("max_option_steps", 25))
         self.terminate_on_spike = bool(cfg.get("terminate_on_spike", True))
         self.spike_threshold = float(cfg.get("spike_threshold", 0.9))
@@ -1160,6 +1165,28 @@ class OptionExecutor:
             self.probation_offers += 1
         return out
 
+    def _and_stream(self, mask: np.ndarray, e_i: int) -> np.ndarray:
+        """AND stream e_i's game controller mask into a decision mask.
+
+        Only the PRIMITIVE columns narrow; option columns are untouched (a
+        skill learned in one game may be offered in another — whether that
+        transfers is the experiment, and its primitives fall back to the
+        no-op where the game has no such input). Never masks the agent mute:
+        slot 0, the no-op, is mapped in every game.
+        """
+        sm = (self.stream_masks[e_i]
+              if self.stream_masks is not None and e_i < len(self.stream_masks)
+              else None)
+        if sm is None:
+            return mask
+        sm = np.asarray(sm, dtype=bool)
+        k = min(len(sm), len(mask), int(self.bank.P))
+        out = mask.copy()
+        out[:k] &= sm[:k]
+        if not out[:int(self.bank.P)].any():
+            out[0] = True
+        return out
+
     def act(self, obs_list, primary_kv, policy, timestep: int,
             predicates_per_env: Optional[List[Dict[str, bool]]] = None,
             competence: Optional[Dict[str, float]] = None,
@@ -1244,8 +1271,8 @@ class OptionExecutor:
                     # construction here, which is what the branch means.
                     _pmask = getattr(self.bank, "primitive_mask", None)
                     if _pmask is not None:
-                        _pk["action_mask"] = _pmask(P + int(
-                            getattr(self.bank, "K", 0) or 0))
+                        _pk["action_mask"] = self._and_stream(_pmask(P + int(
+                            getattr(self.bank, "K", 0) or 0)), e_i)
                     a, _info = policy.select_action(
                         obs_list[e_i], feats=_feats(e_i),
                         verify_feats=verify_feats, **_pk)
@@ -1278,6 +1305,7 @@ class OptionExecutor:
                 else:
                     mask = base_mask
                 mask = self._apply_probation(mask, timestep)
+                mask = self._and_stream(mask, e_i)
                 # contact gate (see __init__): veto slots whose target is not
                 # engaged right now. Copy-on-veto — the mask may still BE the
                 # shared base_mask.

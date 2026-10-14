@@ -1,0 +1,72 @@
+# SkyBot's UNIVERSAL BRAIN contract — docs/UNIVERSAL_GAMES.md §3.1.
+#
+# Deep-merged over configs/minecraft_skybot.yaml (the tuned learner) by
+# tools/compose_run_config.py, then the enabled games are added as streams.
+# Lists REPLACE (they are not concatenated); maps merge key by key.
+#
+# EVERY value here fixes a shape or a location of the ONE brain all games
+# share. Changing action_slots, image_size or the sensor list after a run has
+# started makes the saved brain unloadable — decide those deliberately.
+
+universal:
+  enabled: true
+  # SkyBot's controller width. Minecraft uses 28, Doom 16, a Game Boy ~10,
+  # SNES/Genesis ~16. Set generously ONCE: growing it later changes the
+  # policy head, the RSSM action input, ICM and every replay row.
+  action_slots: 48
+  # Fixed stream order for slot 0: Minecraft first whenever enabled (slot 0
+  # keeps the bare `SkyBot` player name on the Paper server — CLAUDE.md §7),
+  # then the rest alphabetically.
+  primary_order: [minecraft]
+  # Where each game's save-state ring lives (environments/rewind.py).
+  snapshot_dir: brain_universal/snapshots
+
+environment:
+  pixel_obs: true
+  image_size: 128            # the canonical square every game is resized to
+  grayscale: false
+  # A FRESH brain (user decision 2026-10-11): none of the Minecraft brain's
+  # state is read or written. It stays exactly where it is, archived.
+  break_memory_path: brain_universal/breaks_by_type.json
+
+sensors:
+  enabled:
+    - proprio
+    - screen_fx
+    - fovea_native
+    - fovea_delta
+    - dead_reckon
+    - motion
+    - true_position          # RED: evaluation only, never reaches learning
+    - light
+    - sky
+    # SOUND. Doom fills it (stereo mel, 2x32x16); Minecraft emits nothing
+    # and it reads neutral there. Needs the non-square encoder fix in
+    # rssm.SensorImageEncoder (2026-10-11).
+    - audio
+    # TIME PASSING (2026-10-11). Real-time games do not wait while SkyBot
+    # thinks, so each decision covers a different amount of game time; this
+    # is how long it was. Minecraft (synchronous) reports its fixed step
+    # (action_repeat ticks at 20 ticks/s), so the sense means the same thing
+    # in every game.
+    - tempo
+
+loop:
+  log_dir: ./brain_universal/logs          # checkpoints/ lives under this
+skill_bank:
+  storage_dir: ./brain_universal/skill_bank
+infra:
+  # consequence/anticipation state is LEARNED and per-brain; decision traces
+  # and advisor files follow it here.
+  log_dir: brain_universal/infra
+foundation:
+  shadow:
+    root: brain_universal/foundation_shadow
+
+# ACTING NEVER WAITS FOR WORLD-MODEL TRAINING (docs/UNIVERSAL_GAMES.md §10 R2).
+# The trainer trains its own copy and publishes into the one SkyBot acts on
+# every `publish_every` gradient steps (and at the end of every block).
+async_wm:
+  enabled: true
+  inference_copy: true
+  publish_every: 4

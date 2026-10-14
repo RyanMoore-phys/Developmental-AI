@@ -59,6 +59,10 @@ OPTIONAL = {
     "seed": "absent means a random seed, which is what a lifelong run wants",
     "symbolic_decoder": "the pixel-gated decoder is off in this config; the "
                         "block is only read when it is on",
+    "universal": "the universal-brain block (docs/UNIVERSAL_GAMES.md) exists "
+                 "only in configs/universal.yaml and the run configs composed "
+                 "from it; absent = the legacy Minecraft-only brain, which is "
+                 "exactly what this config is",
 }
 # NOTE the five entries this list started with — async_replay, async_wm,
 # sensors, spatial, slots — were removed within a minute of writing it,

@@ -111,6 +111,17 @@ CONTRACT = [
     "tests/_incident_bundle_smoke.py",
     # 2026-10-09: no Java client outlives its env (2 orphans, ~2.4 GB, on main).
     "tests/_client_leak_smoke.py",
+    # 2026-10-11: one universal brain for every game (docs/UNIVERSAL_GAMES.md).
+    "tests/_universal_smoke.py",
+    "tests/_rewind_smoke.py",
+    "tests/_universal_loop_smoke.py",
+    "tests/_vizdoom_smoke.py",
+    # 2026-10-11: the viewer plays the game at its own speed (every tic).
+    "tests/_viewer_playback_smoke.py",
+    # 2026-10-11: real-time games keep being played while SkyBot learns (R3).
+    "tests/_standby_actor_smoke.py",
+    # 2026-10-13: the Player Adapter — any game via screen/speakers/keys/mouse.
+    "tests/_player_adapter_smoke.py",
     # Telemetry: PPO/WM/LP/replay stat producers, byte-identical training.
     "tests/_ml_stats_smoke.py",
     # node1 ingest tables + Grafana dashboards/alerts query drift check.
@@ -174,7 +185,8 @@ def run(path: str, timeout: int = 900):
         # Deliberately narrow: only a missing HEAVY dependency at import
         # counts. An AssertionError, or a missing dep the repo owns, is
         # still a failure.
-        for dep in ("gymnasium", "minerl", "minedojo", "crafter", "minigrid"):
+        for dep in ("gymnasium", "minerl", "minedojo", "crafter", "minigrid",
+                    "vizdoom"):
             if f"No module named '{dep}'" in out:
                 return (f"SKIP:{dep}", dt, out)
         return ("FAIL", dt, out)

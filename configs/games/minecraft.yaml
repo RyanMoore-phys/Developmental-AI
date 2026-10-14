@@ -1,0 +1,22 @@
+# Minecraft (MineRL on the Paper server) — one game on SkyBot's universal brain.
+# Schema and rationale: docs/UNIVERSAL_GAMES.md. Composed into the run config
+# by tools/compose_run_config.py.
+#
+# Minecraft's whole tuned `environment:` block (server, macros, log economics,
+# render size, ...) stays in configs/minecraft_skybot.yaml, which is the base
+# of every universal run config. This file only declares the stream count and
+# the brain-path override for break memory.
+
+game:
+  name: minecraft
+  env_name: MineRLTreechop-v0         # whatever minecraft_skybot.yaml's environment.name is
+  backend: minerl
+  # 2 is the proven client count for the Paper server (CLAUDE.md §6); 4 gave
+  # 0 segments in 17 minutes. The server, not the host, is the bottleneck.
+  streams: 2
+  # Not rewindable: MineRL cannot save a world and the server is shared.
+  checkpoint: {enabled: false}
+  stuck: {enabled: false}
+
+# Deep-merged into the run config only when Minecraft holds stream 0.
+primary: {}
