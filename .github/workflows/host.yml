@@ -211,7 +211,7 @@ jobs:
           : "${MAIN_SSH_PORT:?set MAIN_SSH_PORT in the runner .env}"
           KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
           [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY"; exit 1; }
-          SSH="ssh -p $MAIN_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          SSH="ssh -p $MAIN_SSH_PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20"
           # SUDO-AWARE: / is not writable by a non-root MAIN_USER, and on a
           # fresh host /workspace does not exist at all (a rented GPU host mounted it for
           # free; an owned box does not). Create it, then hand it to the login

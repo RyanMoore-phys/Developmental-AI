@@ -42,8 +42,12 @@ KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
 [ -f "$KEY" ] || { echo "host_exec: no SSH key at $KEY" >&2; exit 1; }
 # UserKnownHostsFile=/dev/null is REQUIRED: providers reuse IPs across hosts, so
 # the host key changes and plain ssh refuses with HOST KEY CHANGED.
+# LogLevel=ERROR (2026-10-14): with /dev/null every call prints "Permanently
+# added '<MAIN_HOST>' to the list of known hosts" — on a PUBLIC repo that put
+# the host's real address into every Actions log. Errors still print.
 exec ssh -p "$MAIN_SSH_PORT" -i "$KEY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
   -o ConnectTimeout=20 \
   -o BatchMode=yes \
   -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \

@@ -110,7 +110,7 @@ jobs:
             KEY="${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}"
             [ -f "$KEY" ] || { echo "::error::no SSH key at $KEY on the runner host"; exit 1; }
             ssh -p "$MAIN_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
+                -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 \
                 "${MAIN_USER:-root}@$MAIN_HOST" 'echo "training host: $(hostname)"' \
               || { echo "::error::ssh to $MAIN_HOST:$MAIN_SSH_PORT failed. The host's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
           fi
@@ -147,6 +147,6 @@ jobs:
             tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" "$CMD"
           else
             ssh -p "$MAIN_SSH_PORT" -i "${MAIN_SSH_KEYFILE:-$HOME/.ssh/skybot_ed25519}" \
-              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
               "${MAIN_USER:-root}@$MAIN_HOST" "$CMD"
           fi

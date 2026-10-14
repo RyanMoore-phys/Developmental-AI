@@ -20,9 +20,15 @@
 #   enable    add it to runlogs/games.enabled
 #   disable   remove it (refused if it is the last enabled game)
 #
-# `restart` (enable/disable only): stop the live run GRACEFULLY, sync the code,
-# and relaunch so the change takes effect now. Off = the change waits for the
-# next launch. There is still exactly one trainer and one brain: enabling Doom
+# `restart` (install/enable/disable): stop the live run GRACEFULLY, sync the
+# code, and relaunch so the change takes effect now. Off = the change waits for
+# the next launch.
+#
+# INSTALL STOPS A LIVE RUN TOO (2026-10-14). It used to sync without stopping,
+# and deploy_skybot.sh REFUSES to sync under a live run — so `install` failed
+# every time training was up, which is exactly when you would run it after
+# `host -> launch`. With restart off, install now fails fast with that reason
+# instead of inside the deploy script. There is still exactly one trainer and one brain: enabling Doom
 # ADDS Doom streams to it, it does not start a second agent.
 #
 # workflow_dispatch workflows only appear in the Actions tab once this file is
@@ -30,7 +36,7 @@
 name: Doom
 
 run-name: >-
-  Doom · ${{ inputs.engine }} · ${{ inputs.action }}${{ (inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && ' · restart' || '' }} · by @${{ github.actor }}
+  Doom · ${{ inputs.engine }} · ${{ inputs.action }}${{ (inputs.action == 'install' || inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && ' · restart' || '' }} · by @${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -46,7 +52,7 @@ on:
         options: [status, install, enable, disable]
         default: status
       restart:
-        description: "enable/disable: stop the live run, sync code, relaunch now"
+        description: "install/enable/disable: stop the live run, sync code, relaunch now"
         type: boolean
         default: true
       timesteps:
@@ -66,7 +72,7 @@ jobs:
     env:
       GAME: ${{ inputs.engine == 'player' && 'doom_player' || 'doom' }}
       ACTION: ${{ inputs.action }}
-      RESTART: ${{ (inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && '1' || '0' }}
+      RESTART: ${{ (inputs.action == 'install' || inputs.action == 'enable' || inputs.action == 'disable') && inputs.restart && '1' || '0' }}
       TS_STEPS: ${{ inputs.timesteps }}
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +84,15 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/host_stop_wait.sh 1200
+
+      - name: refuse to sync onto a live run
+        if: ${{ env.RESTART == '0' && inputs.action == 'install' }}
+        run: |
+          set -euo pipefail
+          if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null' 2>/dev/null; then
+            echo "::error::training is LIVE and install must sync code first. Re-run with restart=true (stops gracefully, installs, relaunches), or host -> stop first."
+            exit 1
+          fi
 
       # The host needs this commit's game_ctl.sh, configs/games/ and composer.
       - name: sync code + host-side smoke tests

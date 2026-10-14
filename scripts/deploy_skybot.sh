@@ -73,7 +73,7 @@ else
   # ServerAlive* covers the other half: the host-side smoke tests run for
   # minutes over one connection, and a silently dropped link would hang just
   # as long.
-  SSH_OPTS="-p $PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+  SSH_OPTS="-p $PORT -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
   SSH_CMD="ssh $SSH_OPTS"
   RSH="ssh $SSH_OPTS"
 fi
