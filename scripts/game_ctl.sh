@@ -89,14 +89,14 @@ case "$ACTION" in
     SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo -n"
     case "$GAME" in
       doom)
-        $SUDO apt-get install -y -q libopenal1 \
+        $SUDO apt-get install -y -q -o Acquire::Retries=5 libopenal1 \
           || echo "  WARN: libopenal1 not installed — Doom audio will be SILENT"
         "$PY" -m pip install -q "vizdoom==1.3.1"
         bash scripts/fetch_roms.sh "$PY"
         "$PY" -c "import vizdoom; print('  vizdoom', vizdoom.__version__)"
         ;;
       doom_player)
-        $SUDO apt-get install -y -q pulseaudio chocolate-doom \
+        $SUDO apt-get install -y -q -o Acquire::Retries=5 pulseaudio chocolate-doom \
           || { echo "GAME-CTL FAILED: apt install pulseaudio chocolate-doom"; exit 1; }
         "$PY" -m pip install -q mss python-xlib
         bash scripts/fetch_roms.sh "$PY"

@@ -80,6 +80,7 @@ jobs:
       # Stop BEFORE syncing: deploy_skybot.sh refuses to sync under a live run
       # without DEPLOY_ALLOW_STOP_LIVE, and a graceful stop saves the brain.
       - name: stop the live run (graceful)
+        id: stop
         if: ${{ env.RESTART == '1' }}
         run: |
           set -euo pipefail
@@ -96,6 +97,7 @@ jobs:
 
       # The host needs this commit's game_ctl.sh, configs/games/ and composer.
       - name: sync code + host-side smoke tests
+        id: sync
         if: ${{ env.RESTART == '1' || inputs.action == 'install' }}
         timeout-minutes: 12
         env:
@@ -117,8 +119,17 @@ jobs:
           bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} ${ACTION}"
 
       # Same launch block as host.yml `launch`: green only for a LIVE agent.
+      #
+      # RELAUNCHES EVEN IF THE ACTION FAILED (2026-10-14). This used to be
+      # skipped whenever any earlier step failed, so a failed install (an apt
+      # mirror timing out) left training STOPPED until a human noticed — a
+      # guard-becomes-latch (CLAUDE.md §4.1). Training was running before this
+      # workflow stopped it, so it is restarted whenever the stop and the sync
+      # both succeeded. The job still goes red for the failed step. It does NOT
+      # relaunch after a failed sync: that would start code whose host-side
+      # smoke tests just failed.
       - name: relaunch
-        if: ${{ env.RESTART == '1' }}
+        if: ${{ !cancelled() && env.RESTART == '1' && steps.stop.outcome == 'success' && steps.sync.outcome == 'success' }}
         run: |
           set -euo pipefail
           bash scripts/host_exec.sh "
