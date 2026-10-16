@@ -1,0 +1,46 @@
+# EXAMPLE — a browser game through the Player Adapter (docs/UNIVERSAL_GAMES.md
+# §11.1). Not enabled anywhere: copy to configs/games/<name>.yaml, set
+# game.name to <name>, then install + enable it like any other game.
+#
+# Chrome/Chromium (preferred) or Firefox opens the page as a kiosk app window
+# on the seat's own screen, with a private profile per seat. Browser shortcuts
+# (Ctrl/Alt chords, F-keys) leave the game and are refused in the controller
+# unless listed under launcher.allow_keys.
+
+game:
+  name: browser_2048
+  env_name: Player-browser_2048
+  backend: player
+  streams: 2
+  display_base: 110
+  window: {width: 640, height: 640}
+  fps: 30
+  gl: false                       # true = vglrun (GPU WebGL); false = SwiftShader
+  boot_s: 8.0
+  launcher:
+    type: browser
+    url: "https://play2048.co/"
+    browser: auto                 # auto | chrome | chromium | firefox
+  audio: {enabled: true, sample_rate: 22050}
+  controller:
+    - {}                          # 0 release everything
+    - {keys: [Up]}
+    - {keys: [Down]}
+    - {keys: [Left]}
+    - {keys: [Right]}
+  doors: []
+  health: {frozen_s: 120, max_restarts_per_hour: 6, frame_timeout_s: 10}
+  stuck: {enabled: true, window_s: 300, ratio: 0.25, warmup_s: 600,
+          baseline_halflife_s: 1800, max_rewinds_without_recovery: 3}
+  install:
+    apt: [pulseaudio]
+    pip: [mss, python-xlib]
+    # Ubuntu's chromium is a snap (works; its profile lives under ~/snap).
+    # For Google Chrome: download google-chrome-stable_current_amd64.deb once,
+    # put it in the depot's debs/ folder, and uncomment:
+    # debs: [google-chrome-stable_current_amd64.deb]
+
+primary:
+  llm:
+    vision: {enabled: false}
+  symbolic_grounding: {enabled: false}

@@ -391,12 +391,12 @@ echo "=== STAGE 4d: universal games — Doom (ViZDoom + Freedoom, OpenAL for sou
 #    present) -- SkyBot would train deaf without a single error.
 #  * vizdoom==1.3.1: pinned; scripts/fetch_roms.sh pins Freedoom's sha256 to
 #    the copies THIS wheel bundles.
-$SUDO apt-get install -y -q libopenal1 \
-  || echo "  WARN: libopenal1 did NOT install — Doom audio will be silent"
-./venv_mc/bin/pip install -q "vizdoom==1.3.1" \
-  || echo "  WARN: vizdoom did NOT install — Doom streams cannot start"
-bash scripts/fetch_roms.sh ./venv_mc/bin/python \
-  || echo "  WARN: roms/doom not fetched/verified — Doom streams cannot start"
+# ONE install path (2026-10-14): what Doom needs is declared in
+# configs/games/doom.yaml `install:` and installed by tools/game_install.py,
+# the same code as the Doom action — the game depot first, IPv4-forced apt
+# with retries (the esm.ubuntu.com/IPv6 failure), nothing fetched twice.
+./venv_mc/bin/python tools/game_install.py doom \
+  || echo "  WARN: Doom did NOT fully install — the launcher refuses Doom until the Doom action's install succeeds"
 
 echo "=== STAGE 4e: Player Adapter (any game via screen/speakers/keys/mouse) ==="
 # docs/UNIVERSAL_GAMES.md §11. Non-fatal like 4d: the launcher refuses a
@@ -404,10 +404,8 @@ echo "=== STAGE 4e: Player Adapter (any game via screen/speakers/keys/mouse) ===
 #  * pulseaudio: each seat's own null sink = the game's speakers
 #  * chocolate-doom: the first game proven on the adapter (stage P1)
 #  * mss + python-xlib: screen capture (MIT-SHM) and XTest input
-$SUDO apt-get install -y -q pulseaudio chocolate-doom \
-  || echo "  WARN: pulseaudio/chocolate-doom did NOT install — player-adapter games cannot start"
-./venv_mc/bin/pip install -q mss python-xlib \
-  || echo "  WARN: mss/python-xlib did NOT install — player-adapter games cannot start"
+./venv_mc/bin/python tools/game_install.py doom_player \
+  || echo "  WARN: doom_player did NOT fully install — player-adapter games cannot start until the Doom action (engine: player) install succeeds"
 
 echo "=== STAGE 4c: GPU-GL launch wrap (VGL EGL + per-core pin) ==="
 # Two coupled fixes on the java client launch (proven on the A4000 / EPYC 7702):

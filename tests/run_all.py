@@ -122,6 +122,11 @@ CONTRACT = [
     "tests/_standby_actor_smoke.py",
     # 2026-10-13: the Player Adapter — any game via screen/speakers/keys/mouse.
     "tests/_player_adapter_smoke.py",
+    # 2026-10-14: Steam + browser launchers; installs from the LAN game depot.
+    "tests/_launchers_smoke.py",
+    "tests/_game_install_smoke.py",
+    # 2026-10-14: dead Doom/Player streams are rebuilt; orphaned seats cleared.
+    "tests/_dead_stream_smoke.py",
     # Telemetry: PPO/WM/LP/replay stat producers, byte-identical training.
     "tests/_ml_stats_smoke.py",
     # node1 ingest tables + Grafana dashboards/alerts query drift check.

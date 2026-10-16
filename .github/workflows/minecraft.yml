@@ -32,7 +32,7 @@ on:
         options: [status, enable, disable, legacy]
         default: status
       restart:
-        description: "enable/disable/legacy: stop the live run, sync code, relaunch now"
+        description: "enable/disable/legacy: stop the live run, sync code, relaunch it (only if it was running)"
         type: boolean
         default: true
       timesteps:
@@ -59,6 +59,21 @@ jobs:
 
       # Stop BEFORE syncing: deploy_skybot.sh refuses to sync under a live run
       # without DEPLOY_ALLOW_STOP_LIVE, and a graceful stop saves the brain.
+      # A RUN STOPPED ON PURPOSE STAYS STOPPED (2026-10-14). The stop below
+      # succeeds instantly when nothing is running, and relaunch clears
+      # runlogs/STOP — so with restart on (the default), any game action used
+      # to START training on a host someone had deliberately stopped. Only a
+      # run that was live is relaunched; start one by hand with host -> launch.
+      - name: was training running?
+        id: live
+        if: ${{ env.RESTART == '1' }}
+        run: |
+          if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null'; then
+            echo "was_live=1" >> "$GITHUB_OUTPUT"; echo "training is running: it will be relaunched"
+          else
+            echo "was_live=0" >> "$GITHUB_OUTPUT"; echo "training is NOT running: it will not be started (host -> launch does that)"
+          fi
+
       - name: stop the live run (graceful)
         id: stop
         if: ${{ env.RESTART == '1' }}
@@ -88,13 +103,12 @@ jobs:
       # RELAUNCHES EVEN IF THE ACTION FAILED (2026-10-14). This used to be
       # skipped whenever any earlier step failed, so a failed install (an apt
       # mirror timing out) left training STOPPED until a human noticed — a
-      # guard-becomes-latch (CLAUDE.md §4.1). Training was running before this
-      # workflow stopped it, so it is restarted whenever the stop and the sync
-      # both succeeded. The job still goes red for the failed step. It does NOT
+      # guard-becomes-latch (CLAUDE.md §4.1). It is restarted whenever it WAS
+      # running (steps.live) and the stop and the sync both succeeded. The job still goes red for the failed step. It does NOT
       # relaunch after a failed sync: that would start code whose host-side
       # smoke tests just failed.
       - name: relaunch
-        if: ${{ !cancelled() && env.RESTART == '1' && steps.stop.outcome == 'success' && steps.sync.outcome == 'success' }}
+        if: ${{ !cancelled() && env.RESTART == '1' && steps.live.outputs.was_live == '1' && steps.stop.outcome == 'success' && steps.sync.outcome == 'success' }}
         run: |
           set -euo pipefail
           bash scripts/host_exec.sh "

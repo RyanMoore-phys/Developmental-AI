@@ -44,7 +44,7 @@ streams to that brain; it never starts a second agent.
 | action | Doom | Minecraft | what it does |
 |---|---|---|---|
 | `status` | ✓ | ✓ | read-only: mode (legacy/universal), enabled games, live pid and config, Doom's save-state rings and its last evaluator lines. |
-| `install` | ✓ | — | `vizdoom`: `libopenal1` + `vizdoom==1.3.1` into `venv_mc` + Freedoom into `roms/doom/` (sha256-verified). `player`: pulseaudio + chocolate-doom + mss + python-xlib + Freedoom. Idempotent; run once per host per engine before enabling it. |
+| `install` | ✓ | — | whatever the game's YAML `install:` lists, from the game depot first (see "Game depot"). `vizdoom`: `libopenal1` + `vizdoom==1.3.1` + Freedoom. `player`: pulseaudio + chocolate-doom + mss + python-xlib + Freedoom. Idempotent; nothing already installed is fetched again. |
 | `enable` | ✓ | ✓ | adds the game to `runlogs/games.enabled`. |
 | `disable` | ✓ | ✓ | removes it. **Refused for the last enabled game.** Enable another one first, `stop`, or use `legacy`. |
 | `legacy` | — | ✓ | deletes `runlogs/games.enabled` (kept as `.bak`): the next launch runs the **old Minecraft-only brain**, untouched by the universal one. |
@@ -85,6 +85,38 @@ Things to know:
   GPU instead.
 * **These actions appear in the Actions tab only once their files are on the
   default branch** (`main`), the same rule as `deploy.yml` (CLAUDE.md §6).
+
+
+## Game depot (2026-10-14)
+
+Game files, `.deb`s and pip wheels cross the internet **once**. After that
+they come from the **game depot** on the LAN (design:
+[`UNIVERSAL_GAMES.md`](UNIVERSAL_GAMES.md) §12).
+
+| where | what |
+|---|---|
+| host `main`: `/workspace/devai/depot/` | what installs read. Gitignored; deploys never touch it. |
+| runner `node1`: `/home/runner/_work/depot/` | the LAN copy. Inside the runner's existing volume — **no setup needed**. |
+
+Every `install` action runs **depot → host**, the install, then **host →
+depot** (`scripts/depot_sync.sh`), so whatever one install downloads, the next
+host gets over the LAN. Neither sync can fail the install.
+
+Layout (same on both sides): `apt/` (apt's download cache), `wheels/`,
+`debs/` (drop-in `.deb`s), `files/<anything>/` (game files).
+
+**Adding things by hand** (a Chrome or Steam `.deb`, a copied Steam library,
+your own game files): use a folder you can see instead of the volume. On
+node1, create it owned by uid 1000, uncomment the depot line in
+`docker/runner/docker-compose.yml`, set `GAME_DEPOT_HOST_PATH=<that folder>`
+and `GAME_DEPOT=/home/runner/depot` in `docker/runner/.env`, then
+`docker compose up -d`. Recreating the container re-registers the runner —
+automatic with a `GITHUB_PAT`, otherwise it needs a fresh token. The folder
+can be a mount of node2's disk. Then list the files in the game's YAML:
+`install.debs: [file.deb]` or `install.files: [{src: mygame/, dest: games/mygame/}]`.
+
+`bash scripts/depot_sync.sh status` (on the runner) prints both sides' sizes.
+The depot only grows; prune it by hand.
 
 ## Stopping takes about 13 minutes
 

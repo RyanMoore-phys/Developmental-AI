@@ -144,3 +144,11 @@ scripts/brain_mirror/brain_mirror.env
 # Claude Code per-machine settings (may hold local paths/permissions). Was only
 # ignored by a personal global gitignore, so CI saw it as publishable.
 .claude/settings.local.json
+
+# The LAN game depot on the host (tools/game_install.py) and the runner's
+# copy of it (scripts/depot_sync.sh): game files, .debs, wheels. Never public.
+/depot/
+docker/runner/depot/
+
+# ViZDoom writes this into the cwd every time a game starts (tests included).
+_vizdoom.ini

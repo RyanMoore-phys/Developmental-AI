@@ -86,29 +86,12 @@ case "$ACTION" in
     ;;
   install)
     known_game "$GAME"
-    SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo -n"
-    case "$GAME" in
-      doom)
-        $SUDO apt-get install -y -q -o Acquire::Retries=5 libopenal1 \
-          || echo "  WARN: libopenal1 not installed — Doom audio will be SILENT"
-        "$PY" -m pip install -q "vizdoom==1.3.1"
-        bash scripts/fetch_roms.sh "$PY"
-        "$PY" -c "import vizdoom; print('  vizdoom', vizdoom.__version__)"
-        ;;
-      doom_player)
-        $SUDO apt-get install -y -q -o Acquire::Retries=5 pulseaudio chocolate-doom \
-          || { echo "GAME-CTL FAILED: apt install pulseaudio chocolate-doom"; exit 1; }
-        "$PY" -m pip install -q mss python-xlib
-        bash scripts/fetch_roms.sh "$PY"
-        "$PY" -c "import mss, Xlib; print('  mss + python-xlib ok')"
-        command -v chocolate-doom >/dev/null && echo "  chocolate-doom: $(command -v chocolate-doom)"
-        ;;
-      minecraft)
-        echo "  Minecraft is installed by provisioning (MineRL build, STAGE 3-4)."
-        ;;
-      *)
-        echo "  no installer for $GAME yet — see docs/UNIVERSAL_GAMES.md §8"; exit 2 ;;
-    esac
+    # Everything a game needs is declared in configs/games/<game>.yaml
+    # `install:` and installed by tools/game_install.py: the LAN game depot
+    # (<repo>/depot, synced by the runner — scripts/depot_sync.sh) first,
+    # the internet second, nothing already present re-downloaded.
+    # docs/UNIVERSAL_GAMES.md §12.
+    "$PY" tools/game_install.py "$GAME" --depot "${SKYBOT_DEPOT:-$PWD/depot}"
     ;;
   status)
     if [ -f "$F" ]; then

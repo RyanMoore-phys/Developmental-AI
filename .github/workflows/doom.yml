@@ -13,10 +13,12 @@
 # They are separate entries in runlogs/games.enabled and can both be enabled.
 #
 #   status    what is enabled, what is running, Doom's save-state rings. Safe.
-#   install   vizdoom: libopenal1 + vizdoom==1.3.1 into venv_mc + Freedoom
-#             (sha256-verified) into roms/doom.
+#   install   whatever configs/games/<game>.yaml `install:` lists, via
+#             tools/game_install.py: the LAN game depot first (synced from the
+#             runner, scripts/depot_sync.sh), the internet second; nothing
+#             already installed is fetched again. Idempotent.
+#             vizdoom: libopenal1 + vizdoom==1.3.1 + Freedoom (sha256-verified).
 #             player:  pulseaudio + chocolate-doom + mss + python-xlib + Freedoom.
-#             Idempotent. Run once per host per engine.
 #   enable    add it to runlogs/games.enabled
 #   disable   remove it (refused if it is the last enabled game)
 #
@@ -52,7 +54,7 @@ on:
         options: [status, install, enable, disable]
         default: status
       restart:
-        description: "install/enable/disable: stop the live run, sync code, relaunch now"
+        description: "install/enable/disable: stop the live run, sync code, relaunch it (only if it was running)"
         type: boolean
         default: true
       timesteps:
@@ -79,6 +81,21 @@ jobs:
 
       # Stop BEFORE syncing: deploy_skybot.sh refuses to sync under a live run
       # without DEPLOY_ALLOW_STOP_LIVE, and a graceful stop saves the brain.
+      # A RUN STOPPED ON PURPOSE STAYS STOPPED (2026-10-14). The stop below
+      # succeeds instantly when nothing is running, and relaunch clears
+      # runlogs/STOP — so with restart on (the default), any game action used
+      # to START training on a host someone had deliberately stopped. Only a
+      # run that was live is relaunched; start one by hand with host -> launch.
+      - name: was training running?
+        id: live
+        if: ${{ env.RESTART == '1' }}
+        run: |
+          if bash scripts/host_exec.sh 'R="run_min""ecraft"; pgrep -f "$R[.]py" >/dev/null'; then
+            echo "was_live=1" >> "$GITHUB_OUTPUT"; echo "training is running: it will be relaunched"
+          else
+            echo "was_live=0" >> "$GITHUB_OUTPUT"; echo "training is NOT running: it will not be started (host -> launch does that)"
+          fi
+
       - name: stop the live run (graceful)
         id: stop
         if: ${{ env.RESTART == '1' }}
@@ -106,11 +123,27 @@ jobs:
           set -euo pipefail
           bash scripts/deploy_skybot.sh "${MAIN_SSH_PORT:-22}"
 
+      # THE LAN GAME DEPOT (2026-10-14): everything an earlier install fetched
+      # (.debs, wheels, WADs) goes to the host from node1 over the LAN first,
+      # so the install below only reaches the internet for what is new — and
+      # what it does fetch is copied back afterwards. Neither step can fail the
+      # job: without a depot, install still works from the internet.
+      - name: game depot -> host
+        if: ${{ inputs.action == 'install' }}
+        continue-on-error: true
+        run: bash scripts/depot_sync.sh to-host
+
       - name: install ${{ env.GAME }}
         if: ${{ inputs.action == 'install' }}
         run: |
           set -euo pipefail
           bash scripts/host_exec.sh "cd /workspace/devai && bash scripts/game_ctl.sh ${GAME} install"
+
+      # always(): a partly-failed install still keeps what it downloaded
+      - name: host -> game depot
+        if: ${{ always() && inputs.action == 'install' && steps.sync.outcome == 'success' }}
+        continue-on-error: true
+        run: bash scripts/depot_sync.sh from-host
 
       - name: ${{ inputs.action }} ${{ env.GAME }}
         if: ${{ inputs.action == 'enable' || inputs.action == 'disable' }}
@@ -123,13 +156,12 @@ jobs:
       # RELAUNCHES EVEN IF THE ACTION FAILED (2026-10-14). This used to be
       # skipped whenever any earlier step failed, so a failed install (an apt
       # mirror timing out) left training STOPPED until a human noticed — a
-      # guard-becomes-latch (CLAUDE.md §4.1). Training was running before this
-      # workflow stopped it, so it is restarted whenever the stop and the sync
-      # both succeeded. The job still goes red for the failed step. It does NOT
+      # guard-becomes-latch (CLAUDE.md §4.1). It is restarted whenever it WAS
+      # running (steps.live) and the stop and the sync both succeeded. The job still goes red for the failed step. It does NOT
       # relaunch after a failed sync: that would start code whose host-side
       # smoke tests just failed.
       - name: relaunch
-        if: ${{ !cancelled() && env.RESTART == '1' && steps.stop.outcome == 'success' && steps.sync.outcome == 'success' }}
+        if: ${{ !cancelled() && env.RESTART == '1' && steps.live.outputs.was_live == '1' && steps.stop.outcome == 'success' && steps.sync.outcome == 'success' }}
         run: |
           set -euo pipefail
           bash scripts/host_exec.sh "

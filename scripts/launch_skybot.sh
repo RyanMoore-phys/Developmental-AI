@@ -53,31 +53,35 @@ if [ -f "$GAMES_FILE" ]; then
 fi
 # ---- PREFLIGHT BEGIN (tests/_incident_bundle_smoke.py strips to END) ------
 if pgrep -f "run_minecraft[.]py" >/dev/null; then echo "REFUSED: run alive"; exit 1; fi
-# ---- PLAYER-ADAPTER GAMES: the game binary + capture tools exist ------------
+# ---- PLAYER-ADAPTER GAMES: the game + capture tools exist ------------------
 # (docs/UNIVERSAL_GAMES.md §11). Each enabled game whose YAML says
-# `backend: player` must have its launch command, Xvfb, pactl/parec, and the
-# mss + python-xlib modules — refuse with the missing piece named.
+# `backend: player` must be startable by its launcher (exec binary, Steam
+# client + installed app, or a browser — launchers.preflight), with Xvfb,
+# pactl/parec and the mss + python-xlib modules — refuse with the missing
+# piece named.
 if [ -f "$GAMES_FILE" ]; then
-  _PMISS=$(./venv_mc/bin/python - "$GAMES_FILE" <<'PYEOF' 2>/dev/null
-import sys, shutil, importlib.util, yaml, re
+  # stderr NOT silenced, and a crash here is a refusal: an empty answer from
+  # a preflight that could not even import would otherwise read as "ready".
+  _PMISS=$(PYTHONPATH=. ./venv_mc/bin/python - "$GAMES_FILE" <<'PYEOF'
+import sys, importlib.util, yaml
+from developmental_ai.environments.player.launchers import preflight
 games = [l.split('#')[0].strip().lower() for l in open(sys.argv[1]) if l.split('#')[0].strip()]
 miss = []
 for g in games:
     try:
         d = yaml.safe_load(open(f"configs/games/{g}.yaml"))["game"]
-    except Exception:
+    except Exception as e:
+        miss.append(f"{g}: config unreadable ({e})")   # fail closed, not open
         continue
     if d.get("backend") != "player":
         continue
-    for tool in [str((d.get("launch") or ["?"])[0]), "Xvfb", "pactl", "parec"]:
-        if shutil.which(tool) is None:
-            miss.append(f"{g}: {tool}")
+    miss += [f"{g}: {m}" for m in preflight(d)]
     for mod in ("mss", "Xlib"):
         if importlib.util.find_spec(mod) is None:
             miss.append(f"{g}: python module {mod}")
 print("; ".join(miss))
 PYEOF
-)
+) || _PMISS="the player-adapter preflight itself failed (traceback above)"
   [ -z "$_PMISS" ] || { echo "REFUSED: player-adapter game(s) not installed: $_PMISS (run the game's action with action=install)"; exit 1; }
 fi
 # ---- DOOM: engine + game file present (universal brain only) --------------

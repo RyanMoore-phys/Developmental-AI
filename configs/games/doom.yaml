@@ -64,6 +64,13 @@ game:
   log_every: 5000                     # evaluator line in the run log, per stream
 
 # Deep-merged into the run config only when Doom holds stream 0.
+  # tools/game_install.py (Doom action -> install). The game depot first,
+  # the internet second; nothing already installed is fetched again.
+  install:
+    apt_optional: [libopenal1]         # ViZDoom's audio is SILENT without it (§3.5)
+    pip: ["vizdoom==1.3.1"]            # pinned: fetch_roms.sh pins its Freedoom shas
+    roms: doom
+
 primary:
   # The VLM prompts and the vision scaffold are Minecraft-specific (trees,
   # Steve/Alex, Treechop action indices). Off for a Doom primary.

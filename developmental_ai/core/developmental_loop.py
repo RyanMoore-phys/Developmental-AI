@@ -4472,6 +4472,67 @@ class DevelopmentalAI:
                else {"start_tool": env_cfg.get("start_tool")}))
         return e
 
+    def _maybe_heal_stream(self, envs, i: int, force: bool = False):
+        """Rebuild stream i when its env can no longer step; bounded + budgeted.
+
+        WHY (2026-10-14, the universal-games sweep): the lifelong body assumed
+        every env "rebuilds its own world" after a failed step — true of the
+        MineRL wrapper only. When ViZDoom's clock thread or the Player
+        Adapter's screen capture dies, EVERY later step()/reset() raises
+        ("doom clock died", "screen capture died"), and the body carried the
+        last obs with a restart flag on every step for the rest of the run: a
+        frozen frame, a warning per step, a stream silently gone.
+
+        Fires after `heal_after_failures` consecutive raised steps (default 3)
+        or at once when a reset raises (force). The old env is closed on a
+        daemon thread, exactly like _parallel_reset's _reap, because close()
+        is what may hang. A SLIDING budget of `heal_max_per_hour` (default 6)
+        per stream bounds a crash loop; a refused heal is retried once the
+        hour moves on, so a stream is never written off for good (§4.1).
+        Returns the new first obs, or None (caller carries the last obs).
+        """
+        import threading      # function-local, as in _reap (not module scope here)
+        pcfg = self.config.get("parallel_envs", {}) or {}
+        fails = self.__dict__.setdefault("_stream_fails", {})
+        if not force and fails.get(i, 0) < int(pcfg.get("heal_after_failures", 3)):
+            return None
+        hist = self.__dict__.setdefault("_stream_heals", {}).setdefault(i, deque())
+        now = time.time()
+        while hist and now - hist[0] > 3600.0:
+            hist.popleft()
+        if len(hist) >= int(pcfg.get("heal_max_per_hour", 6)):
+            last = self.__dict__.setdefault("_stream_heal_refused_log", {})
+            if now - last.get(i, 0.0) > 60.0:
+                last[i] = now
+                logger.error("env %d: dead stream, heal budget spent (%d in the "
+                             "last hour) — retried as the hour slides", i, len(hist))
+            return None
+        hist.append(now)
+        old = envs[i]
+
+        def _close(env=old):
+            try:
+                env.close()
+            except Exception as ex:
+                logger.warning("env %d: dead env would not close (%s)", i, ex)
+        threading.Thread(target=_close, daemon=True, name=f"heal-reap{i}").start()
+        timeout = float(pcfg.get("reset_timeout_s", 300))
+        try:
+            envs[i] = self._make_one_env(i)
+            o = self._env_pool.submit(envs[i].reset).result(timeout=timeout)[0]
+        except Exception as ex:
+            logger.error("env %d: heal failed (%s) — next try after %d more "
+                         "failed steps", i, ex, int(pcfg.get("heal_after_failures", 3)))
+            fails[i] = 0
+            return None
+        fails.pop(i, None)
+        if i == 0:
+            self.env = envs[0]           # same rule as _bounded_rebuild
+        if getattr(self, "_viewer_env", None) is old:
+            self._viewer_env = envs[i]
+        logger.warning("env %d: dead stream REBUILT (%d heal(s) this hour)", i, len(hist))
+        return np.asarray(o, dtype=np.float32)
+
     def _parallel_reset(self, envs):
         """Reset all N envs concurrently with a PER-ENV TIMEOUT. A MineRL
         client that hangs its reset (no exception, just a stuck socket) would
@@ -6144,6 +6205,7 @@ class DevelopmentalAI:
                 _rst = False
                 try:
                     nobs, rew, term, trunc, _inf = f.result(timeout=_step_to)
+                    self.__dict__.setdefault("_stream_fails", {}).pop(e_i, None)
                     if isinstance(_inf, dict):
                         step_infos[e_i] = _inf
                         if (self._proprio_per_env is not None
@@ -6163,6 +6225,14 @@ class DevelopmentalAI:
                     # truncation. Carry last obs, zero reward.
                     logger.warning("env %d step hung/failed (%s) — restart",
                                    e_i, ex)
+                    # ...but only MineRL's wrapper rebuilds itself. A Doom or
+                    # Player stream whose engine/capture died raises on EVERY
+                    # step forever; count it so the advance loop below can
+                    # rebuild it (_maybe_heal_stream). Timeouts are not
+                    # counted: that future may still be in flight.
+                    if not isinstance(ex, _FTimeout):
+                        _sf = self.__dict__.setdefault("_stream_fails", {})
+                        _sf[e_i] = _sf.get(e_i, 0) + 1
                     nobs = (obs_list[e_i]
                             if obs_list[e_i] is not None
                             else np.zeros(self.obs_dim, dtype=np.float32))
@@ -7654,7 +7724,12 @@ class DevelopmentalAI:
                         # in flight, so a reset here could race it on the same
                         # client — carry the last obs (rare; the adapter-caught
                         # crash below is the near-certain path).
-                        obs_list[e_i] = next_obs_list[e_i]
+                        # A step that RAISED several times in a row is not
+                        # that: its engine is dead, so rebuild it (bounded,
+                        # budgeted — _maybe_heal_stream).
+                        _h = self._maybe_heal_stream(envs, e_i)
+                        obs_list[e_i] = (_h if _h is not None
+                                         else next_obs_list[e_i])
                     else:
                         # 64-log SUCCESS or adapter-caught CRASH-REBUILD: the
                         # client needs a fresh mission (launched in reset()).
@@ -7667,7 +7742,12 @@ class DevelopmentalAI:
                             logger.warning(
                                 "env %d bounded reset failed (%s) — carrying "
                                 "obs; stream may lag one segment", e_i, _re)
-                            obs_list[e_i] = next_obs_list[e_i]
+                            # a reset that RAISES (e.g. "doom clock died")
+                            # will raise again next time: rebuild now
+                            _h = (None if isinstance(_re, _FTimeout) else
+                                  self._maybe_heal_stream(envs, e_i, force=True))
+                            obs_list[e_i] = (_h if _h is not None
+                                             else next_obs_list[e_i])
                 else:
                     obs_list[e_i] = next_obs_list[e_i]  # (no truncation in LL)
 

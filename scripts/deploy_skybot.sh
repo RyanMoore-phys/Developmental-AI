@@ -78,7 +78,8 @@ else
   RSH="ssh $SSH_OPTS"
 fi
 
-echo "==> target ${MAIN_USER}@$HOST:$PORT via $TRANSPORT (launch=$LAUNCH)"
+# The NAME, not the value: Actions logs are public and do not mask .env values.
+echo "==> target ${MAIN_USER}@\$MAIN_HOST:$PORT via $TRANSPORT (launch=$LAUNCH)"
 $SSH_CMD "${MAIN_USER}@$HOST" 'echo "    host reachable: $(hostname)"'
 
 # NO-LAUNCH MUST ALSO MEAN NO-STOP (2026-09-02). The stop below runs
@@ -94,7 +95,7 @@ if [ "$LAUNCH" != "1" ]; then
     if [ "${DEPLOY_ALLOW_STOP_LIVE:-0}" = "1" ]; then
       echo "==> WARNING: training is LIVE and DEPLOY_ALLOW_STOP_LIVE=1 — stopping it and NOT restarting"
     else
-      echo "REFUSED: training is LIVE on $HOST and DEPLOY_LAUNCH=0."
+      echo "REFUSED: training is LIVE on the training host and DEPLOY_LAUNCH=0."
       echo "  Syncing now would stop the run and leave it stopped."
       echo "  Stop it deliberately first (host.yml action=stop, or touch runlogs/STOP),"
       echo "  or re-run with DEPLOY_ALLOW_STOP_LIVE=1 if that is really what you want."
@@ -204,7 +205,9 @@ if [ "$LAUNCH" != "1" ]; then
   # the training host sits idle until someone launches on purpose.
   echo "==> DEPLOY_LAUNCH=0 — synced and smoke-tested, NOT launching."
   echo "    runlogs/STOP is still set; the supervisor will not come back by itself."
-  echo "    launch with: DEPLOY_LAUNCH=1 bash scripts/deploy_skybot.sh $PORT $HOST $TS"
+  # \$MAIN_HOST, NOT $HOST (2026-10-15): this line printed the host's real
+  # address into every public Actions log.
+  echo "    launch with: DEPLOY_LAUNCH=1 bash scripts/deploy_skybot.sh $PORT \$MAIN_HOST $TS"
   exit 0
 fi
 
@@ -219,4 +222,4 @@ $SSH_CMD "${MAIN_USER}@$HOST" "
   echo \"    run pid: \$(cat runlogs/skybot_run.pid 2>/dev/null || echo none)\""
 
 echo "==> done. Watch it with:"
-echo "    $SSH_CMD ${MAIN_USER}@$HOST 'tail -f /workspace/devai/runlogs/minecraft_skybot_run.log'"
+echo "    ssh ${MAIN_USER}@\$MAIN_HOST 'tail -f /workspace/devai/runlogs/minecraft_skybot_run.log'"

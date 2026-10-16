@@ -22,6 +22,9 @@ game:
   # directly (no menu navigation needed); -nomusic keeps sound effects only.
   launch: [chocolate-doom, -iwad, roms/doom/freedoom2.wad, -window,
            -geometry, 640x480, -warp, "1", -skill, "3", -nomusic]
+  # checked by the launch preflight (launchers.preflight): without its WAD the
+  # engine exits at boot and SkyBot would train on a black screen
+  requires: [roms/doom/freedoom2.wad]
   audio: {enabled: true, sample_rate: 22050}
 
   # Chocolate Doom's DEFAULT keys. Slot 0 releases everything. Use (space)
@@ -60,6 +63,14 @@ game:
   # No `save:` block: Chocolate Doom's quicksave asks for a slot through the
   # menu the first time, which SkyBot cannot be driven through. Getting
   # unstuck therefore restarts the game (the universal fallback).
+
+  # tools/game_install.py (Doom action, engine: player -> install).
+  # apt's chocolate-doom also pulls in the `freedoom` package, which
+  # fetch_roms.sh uses as a local source before any download.
+  install:
+    apt: [pulseaudio, chocolate-doom]
+    pip: [mss, python-xlib]
+    roms: doom
 
 primary:
   llm:

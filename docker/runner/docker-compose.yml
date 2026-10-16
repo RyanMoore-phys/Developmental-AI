@@ -69,6 +69,14 @@ services:
       # this path as `runner` so the volume inherits that ownership — see the
       # Dockerfile note; without it every job dies on _work/_tool permissions.
       - runner_work:/home/runner/_work
+      # OPTIONAL — the LAN game depot as a folder you can see and fill by hand
+      # (scripts/depot_sync.sh). Without this the depot lives inside
+      # runner_work at /home/runner/_work/depot and works with no setup. To
+      # use a folder instead (or a disk from node2 mounted on node1), create
+      # it owned by uid 1000, uncomment, set GAME_DEPOT=/home/runner/depot in
+      # .env, and `docker compose up -d` (recreates the container: with a
+      # GITHUB_PAT it re-registers itself; without one it needs a new token).
+      # - ${GAME_DEPOT_HOST_PATH:-./depot}:/home/runner/depot
       # NO runner_cfg VOLUME. There was one here mounted at
       # /home/runner/.runner.d — a path the runner never uses. Registration
       # lives in /home/runner/.runner, a FILE directly in the home dir, so the

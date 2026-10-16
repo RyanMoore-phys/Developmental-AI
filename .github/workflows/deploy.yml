@@ -103,7 +103,7 @@ jobs:
             # If this HANGS rather than fails, the tailnet ACL ssh rule is
             # action "check" (interactive re-auth) instead of "accept".
             tailscale ssh "${MAIN_USER:-root}@${MAIN_HOST}" 'echo "training host: $(hostname)"' \
-              || { echo "::error::Tailscale SSH to ${MAIN_HOST} failed — see docs/CI_SETUP.md"; exit 1; }
+              || { echo "::error::Tailscale SSH to the training host (MAIN_HOST) failed — see docs/CI_SETUP.md"; exit 1; }
           else
             : "${MAIN_HOST:?MAIN_HOST not set in the runner .env (training-host IP for ssh transport)}"
             : "${MAIN_SSH_PORT:?MAIN_SSH_PORT not set in the runner .env}"
@@ -112,7 +112,7 @@ jobs:
             ssh -p "$MAIN_SSH_PORT" -i "$KEY" -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 \
                 "${MAIN_USER:-root}@$MAIN_HOST" 'echo "training host: $(hostname)"' \
-              || { echo "::error::ssh to $MAIN_HOST:$MAIN_SSH_PORT failed. The host's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
+              || { echo "::error::ssh to the training host (MAIN_HOST, port $MAIN_SSH_PORT) failed. The host's SSH port rotates on every restart — update MAIN_SSH_PORT in the runner .env."; exit 1; }
           fi
 
       # STEP-LEVEL TIMEOUT (added 2026-09-02). A hang here used to run until

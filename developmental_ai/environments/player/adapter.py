@@ -62,17 +62,21 @@ class RealBackends:
         from developmental_ai.environments.player.seat import Seat
         g = self.game
         w = g.get("window") or {}
+        from developmental_ai.environments.player.launchers import (
+            prepare_profile, resolve_launch)
         disp = int(g.get("display_base", 100)) + self.i
-        launch = [str(x).format(stream=self.i, display=disp, name=self._name())
-                  for x in (g.get("launch") or [])]
-        return Seat(launch, display=disp, width=int(w.get("width", 640)),
+        # exec / steam / browser (launchers.py); the old `launch:` list is exec
+        spec = resolve_launch(g, self.i, disp, self._name())
+        prepare_profile(spec, g)
+        return Seat(spec.argv, display=disp, width=int(w.get("width", 640)),
                     height=int(w.get("height", 480)),
                     audio_sink=(f"skybot_seat_{disp}"
                                 if (g.get("audio") or {}).get("enabled", True) else None),
                     gl=bool(g.get("gl", False)),
                     cpu=(None if g.get("cpu_base") is None
                          else int(g["cpu_base"]) + self.i),
-                    cwd=g.get("cwd"), boot_s=float(g.get("boot_s", 4.0)))
+                    cwd=spec.cwd, env=spec.env, pre_start=spec.pre_start,
+                    boot_s=float(g.get("boot_s", 4.0)))
 
     def _name(self) -> str:
         # same rule as the loop's _agent_name_for: slot 0 keeps the bare name

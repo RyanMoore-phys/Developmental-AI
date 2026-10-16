@@ -1,0 +1,57 @@
+# EXAMPLE — a Steam game through the Player Adapter (docs/UNIVERSAL_GAMES.md
+# §11.1). Not enabled anywhere: copy to configs/games/<name>.yaml, set
+# game.name and launcher.appid, then install + enable it like any other game.
+#
+# CLIENT mode (no `exe`): the Steam client launches the game, so DRM, Proton
+# (Windows games) and cloud saves work — but Steam is one client per Linux
+# user, so streams must be 1, and the universal brain needs >= 2 streams in
+# total: pair it with another enabled game.
+# DIRECT mode (`exe:` relative to steamapps/common/): runs the binary with
+# SteamAppId set and no client — any number of streams, DRM-free games only.
+#
+# ONE-TIME HUMAN STEP on the host: Steam must be logged in once with
+# "remember me", and the game installed (steamcmd or the client). Nothing
+# here can type a password or a Steam Guard code. Or copy an installed Steam
+# library into the depot's files/ and list it under install.files.
+
+game:
+  name: steam_game
+  env_name: Player-steam_game
+  backend: player
+  streams: 1
+  display_base: 120
+  window: {width: 1280, height: 720}
+  fps: 30
+  gl: true                        # 3D games need the GPU: vglrun -d egl
+  boot_s: 60.0                    # Steam's own start-up comes first
+  launcher:
+    type: steam
+    appid: 70                     # <- the game's Steam app id (70 = Half-Life)
+    # exe: Half-Life/hl_linux     # DIRECT mode instead of the client
+    args: [-windowed, -w, "1280", -h, "720"]
+  audio: {enabled: true, sample_rate: 22050}
+  controller:
+    - {}                                       # 0 release everything
+    - {keys: [w]}
+    - {keys: [s]}
+    - {keys: [a]}
+    - {keys: [d]}
+    - {buttons: [1]}                           # fire
+    - {keys: [space]}                          # jump
+    - {keys: [e]}                              # use
+    - {mouse: {dx_per_s: -400}}
+    - {mouse: {dx_per_s: 400}}
+  doors:
+    - {opens: [Escape], closes: [Escape]}
+  health: {frozen_s: 120, max_restarts_per_hour: 4, frame_timeout_s: 15}
+  stuck: {enabled: true, window_s: 300, ratio: 0.25, warmup_s: 900,
+          baseline_halflife_s: 1800, max_rewinds_without_recovery: 3}
+  install:
+    apt: [pulseaudio]
+    pip: [mss, python-xlib]
+    # debs: [steam_latest.deb]   # Valve's installer, dropped into the depot's debs/
+
+primary:
+  llm:
+    vision: {enabled: false}
+  symbolic_grounding: {enabled: false}

@@ -354,6 +354,54 @@ are Chocolate Doom 3.x and are part of what P0 checks. Install with the
 | P3 stock Minecraft (portablemc offline, RCON scoreboard) | — |
 | P4 replace MineRL | — (consequences listed in the plan: MineRL-only signals go inert) |
 
+### 11.1 Launchers — executables, Steam games, browser games (2026-10-14)
+
+User decision: the Player Adapter launches Steam games and browser games as
+well as plain executables. A game YAML says how with a `launcher:` block
+(`environments/player/launchers.py`); the old top-level `launch:` list is
+still the `exec` launcher, unchanged. Worked examples:
+`configs/games/examples/{steam_game,browser_2048}.yaml` (not enabled; copy one
+to `configs/games/<name>.yaml` to use it).
+
+| `type` | starts | streams | the catch |
+|---|---|---|---|
+| `exec` | `argv` (or `launch:`) | any | — |
+| `steam` (client) | `steam -silent -applaunch <appid>` | **1** | Steam is one client per Linux user; a second launch is forwarded to the running client and opens on *its* screen. Refused at compose time for streams > 1; a seat refuses (without crashing — re-checked every restart) while a Steam client it did not start is running. Steam must be logged in once on the host ("remember me"): nothing here can type a password or Guard code. DRM and Proton work. |
+| `steam` + `exe` (direct) | the binary under `steamapps/common/`, `SteamAppId` set | any | DRM-free games only; one that needs the client shows up as a dead game. |
+| `browser` | Chrome/Chromium (preferred) or Firefox, kiosk app window on `url` | any | A private profile per seat. Ctrl/Alt chords and F-keys are browser shortcuts that leave the game (close, new window, devtools, back) — one-way doors, refused unless listed in `launcher.allow_keys`. `gl: false` = SwiftShader WebGL. Ubuntu's chromium is a snap (works; profile under `~/snap/chromium/common/skybot/`). |
+
+Every game process carries `SKYBOT_SEAT=<display>`; teardown kills every
+process with that marker, because Steam and browsers re-parent their children
+out of the process group the seat started. Contracts:
+`tests/_launchers_smoke.py`.
+
+## 12. Installing games — the LAN game depot (2026-10-14)
+
+What a game needs is declared in its YAML (`game.install`: `apt`,
+`apt_optional`, `debs`, `pip`, `roms`, `files`, `note`) and installed by
+`tools/game_install.py` (`game_ctl.sh <game> install`, i.e. the game's
+`install` action):
+
+* **Nothing twice**: installed apt packages are skipped before apt runs; pip
+  tries `--no-index` from the depot first.
+* **The depot first, the internet second**: `<repo>/depot/` on the host holds
+  apt's download cache, pip wheels, hand-dropped `.deb`s and game files. The
+  runner keeps a copy (`scripts/depot_sync.sh`) and syncs it to the host before
+  an install and back afterwards, so a rebuilt host installs over the LAN.
+* **The apt failure on main** (esm.ubuntu.com over IPv6, `Could not wait for
+  server fd` — identical on a second run, so deterministic): IPv4 forced
+  (`SKYBOT_APT_IPV4=0` to disable), retries, short timeouts, one `apt-get
+  update` + `--fix-missing` retry, then one install without the Ubuntu Pro
+  (ESM) sources, which the archive's own copies satisfy
+  (`SKYBOT_APT_ESM_FALLBACK=0` to disable), naming the packages if it still
+  fails.
+* `fetch_roms.sh` takes the first source whose sha256 matches — depot,
+  vizdoom package, apt's `freedoom` package, then the GitHub release (Python
+  `zipfile`, no `unzip`) — and saves the verified copy to the depot.
+
+Operating it: `docs/OPERATIONS.md`, "Game depot". Contracts:
+`tests/_game_install_smoke.py`.
+
 ## 9. Known limits and open questions
 
 * **Shared slots are deliberately meaningless across games.** Transfer between

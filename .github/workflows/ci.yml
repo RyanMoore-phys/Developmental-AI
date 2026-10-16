@@ -203,6 +203,20 @@ jobs:
               # ledger.segment() consumer, seq never rewinds) must be enforced
               # on every push, not checked once.
               tests/_metrics_sink_smoke.py
+              # THE UNIVERSAL BRAIN (ADDED 2026-10-14). The step above installs
+              # vizdoom + libopenal1 + Freedoom "for the universal brain", yet
+              # not one universal suite was in this list — so none had ever
+              # run on Linux (found by the universal-games sweep). These are
+              # the contracts for Doom, the Player Adapter, its launchers and
+              # game installs; all need only this job's dependency set.
+              tests/_universal_smoke.py
+              tests/_universal_loop_smoke.py
+              tests/_vizdoom_smoke.py
+              tests/_rewind_smoke.py
+              tests/_player_adapter_smoke.py
+              tests/_launchers_smoke.py
+              tests/_game_install_smoke.py
+              tests/_dead_stream_smoke.py
             )
             # DELIBERATELY EXCLUDED, each for a reason:
             #   _options_smoke     builds a Crafter env — wrong environment

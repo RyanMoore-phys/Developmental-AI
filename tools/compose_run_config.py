@@ -102,9 +102,14 @@ def compose(games: List[str], base_path: str, universal_path: str,
             sys.path.insert(0, ROOT)
             from developmental_ai.environments.player.controller import (
                 ControllerError, validate)
+            from developmental_ai.environments.player.launchers import (
+                LauncherError, validate_launcher)
             try:
-                validate(g, slots)
-            except ControllerError as e:
+                parsed = validate(g, slots)
+                # exec / steam / browser: steam client mode = 1 stream, browser
+                # shortcuts are one-way doors (launchers.py)
+                validate_launcher(g, parsed)
+            except (ControllerError, LauncherError) as e:
                 raise ComposeError(f"{name}: {e}")
         ctrl = g.get("controller")
         if ctrl is not None and g.get("backend") != "player":

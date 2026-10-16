@@ -17,6 +17,8 @@ game:
   # Not rewindable: MineRL cannot save a world and the server is shared.
   checkpoint: {enabled: false}
   stuck: {enabled: false}
+  install:
+    note: "Minecraft is installed by provisioning (MineRL build, STAGE 3-4) — nothing to do here."
 
 # Deep-merged into the run config only when Minecraft holds stream 0.
 primary: {}

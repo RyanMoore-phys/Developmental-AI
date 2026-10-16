@@ -37,8 +37,14 @@ macro — you don't; see §4.1.
 
 ```bash
 cd "/Users/rimac/Desktop/Developmental AI"
-./venv/bin/python tests/_gui_farm_smoke.py        # Python 3.9.6
+./venv/bin/python tests/_gui_farm_smoke.py        # Python 3.10 (was 3.9.6; measured 3.10.22 on 2026-10-14)
 ```
+
+**Known Mac-only red:** `_incident_bundle_smoke` contract I (singleton
+supervisor) times out on macOS because there is no `flock`; it fails the same
+way on an untouched HEAD. It is meant to pass on Linux. A crashed run of it can
+leave an orphaned `supervise_skybot.sh` behind — `pgrep -fl supervise_skybot`
+after it fails.
 
 Tests are **standalone `__main__` scripts**, not pytest. Each prints numbered
 contract lines and ends with `[name] ALL PASS`. Since 2026-09-19 there IS a
@@ -103,6 +109,23 @@ can ever satisfy it again.
 - The degenerate-signal gate counted *labels* instead of *positives* and
   disabled the magnet live.
 
+- **(2026-10-14, four more, all in the universal-games / Actions work):**
+  - A SIGKILLed trainer left its seats' Xvfb running; `seat.py` refused any
+    locked display, so after one hard crash **both doom_player seats refused
+    on every relaunch**. Fixed: each Xvfb carries `SKYBOT_SEAT_OWNER=<trainer
+    pid>` and `Seat.clear_stale_display()` clears dead/orphaned/own locks,
+    refusing only another live trainer's or a non-SkyBot X server.
+  - A Doom/Player engine or screen capture that died left its stream **dead
+    for the whole run** (frozen frame + restart flag every step): the
+    lifelong body assumed every env "rebuilds its own world" — MineRL only.
+    Fixed: `_maybe_heal_stream` (see §4.2).
+  - A failed game `install` with `restart` on stopped training and then
+    skipped the relaunch: **training stayed off until a human noticed.**
+    Fixed: relaunch runs when stop + sync succeeded, whatever the action did.
+  - The opposite edge: the stop step succeeds instantly when nothing runs, so
+    any game action with `restart` on **started training on a host someone
+    had stopped on purpose.** Fixed: only a run that was live is relaunched.
+
 **Rule:** every guard needs an escape path that the agent can actually reach,
 and you must state what re-opens it. If the answer is "a human notices," it's a
 latch.
@@ -118,6 +141,16 @@ Reward logic is duplicated between them. An edit that lands in one and not the
 other is silent — it just doesn't apply live. Use `replace_all: true`, then
 **grep to confirm the count is 2**. Several tests assert exactly this, e.g.
 `assert src.count("_gui_now2 = bool(") == 2`.
+
+**A body can also share a wrong ASSUMPTION (2026-10-14).** The lifelong body
+treated every raised step as "the wrapper rebuilt its own world" — true for
+MineRL only. A ViZDoom or Player stream whose engine died raised forever and
+was never reset. Now `_collect_segment` counts raised steps per stream
+(`_stream_fails`) and calls `_maybe_heal_stream` (bounded rebuild, sliding
+`parallel_envs.heal_max_per_hour`, default 6) after
+`heal_after_failures` (default 3) or at once when a reset raises. The
+episodic body already heals at its boundary via `_parallel_reset`.
+`tests/_dead_stream_smoke.py` asserts the wiring.
 
 **There is a THIRD body, and it is unwired** (found 2026-09-22): `_run_episode`
 (~line 3645), the single-env path. It has **none** of Waves 1–2 or Phases 1–7 —
@@ -338,6 +371,9 @@ system.
 | Host ops | `host_repository/docs/{RUNNING,PROVISIONING,TRANSFER,RECREATE}.md` |
 | Live config | `configs/minecraft_skybot.yaml` (the only one that matters) |
 | One brain, many games (Doom, …) | `docs/UNIVERSAL_GAMES.md`; `configs/universal.yaml` + `configs/games/*.yaml` |
+| Steam / browser / exec launchers | `docs/UNIVERSAL_GAMES.md` §11.1; `developmental_ai/environments/player/launchers.py`; examples in `configs/games/examples/` |
+| Installing a game, the game depot | `docs/UNIVERSAL_GAMES.md` §12, `docs/OPERATIONS.md` "Game depot"; `tools/game_install.py`, `scripts/depot_sync.sh` |
+| Which Actions workflow does what | §10 below |
 
 ---
 
@@ -354,3 +390,117 @@ Keep this in view; it's the point of the project.
 
 When you evaluate a change, ask what it does to *that* scoreboard — not to the
 reward number. The reward number has been wrong every single time.
+
+---
+
+## 10. GitHub Actions, games and installs (2026-10-14)
+
+### The five workflows
+
+| Workflow | Trigger | Runs on | What it does |
+|---|---|---|---|
+| `ci` | every push / PR | GitHub-hosted | the test gate. Since 2026-10-14 it also runs the universal suites (`_universal*`, `_vizdoom`, `_rewind`, `_player_adapter`, `_launchers`, `_game_install`, `_dead_stream`) — before that NONE ran on Linux, though CI installed vizdoom "for" them. |
+| `deploy` | after `ci` passes, or by hand | node1 runner | sync code + 4 host-side smokes. **Refuses while training is live** (a red `deploy` after a push during a run is that guard working). |
+| `host` | by hand | node1 runner | `status` / `connect` / `launch` / `stop` / `provision`. |
+| `Doom` | by hand | node1 runner | `engine`: `vizdoom` (game `doom`) or `player` (game `doom_player`, real Chocolate Doom). `status` / `install` / `enable` / `disable`. |
+| `Minecraft` | by hand | node1 runner | `status` / `enable` / `disable` / `legacy`. |
+
+Removed on 2026-10-14: `pipeline` (stop→deploy→connect→launch + a daily
+cron health check — it duplicated `host` + `deploy`), and `game-doom` +
+`game-doom_player` (merged into `Doom`); `game-minecraft` became
+`Minecraft`. The "Dependency graph" run by `dependabot[bot]` is **not a file
+in this repo** — it is GitHub's *Automatic dependency submission* setting
+(Settings → Code security), and can only be turned off there.
+
+**Order:** once per bare box `host → provision`; once per game `Doom →
+install`; per code change `host → stop` (if live) → push (`ci` → `deploy`) →
+`host → connect` (if Minecraft is enabled) → `host → launch`. A game action
+with `restart` on does stop → sync → change → relaunch itself, and relaunches
+**only if training was running**. Before enabling Minecraft, `host → connect`.
+
+### Legacy vs universal brain
+
+`runlogs/games.enabled` decides at every launch. **Absent** = the legacy
+Minecraft-only brain (`configs/minecraft_skybot.yaml`, its accumulated state).
+**Present** = the universal brain under `brain_universal/`, which **starts
+fresh**. The first `enable` of any game creates the file; `Minecraft →
+legacy` deletes it (kept as `.bak`) and is the only way back. Enabling Doom
+from a legacy host gives a Doom-only universal brain — Minecraft is not added
+for you. `host → launch` always starts ONE trainer; which games it plays is
+that file.
+
+### Installing games: `tools/game_install.py` and the depot
+
+- What a game needs lives in its YAML `game.install` (`apt`, `apt_optional`,
+  `debs`, `pip`, `roms`, `files`, `note`); `game_ctl.sh <game> install` and
+  provisioning STAGE 4d/4e both call the installer — **one install path**.
+- **The failure that started this:** `Doom → player → install` on `main`
+  fetched 79/83 packages at ~127 kB/s, then four from `esm.ubuntu.com`
+  (Ubuntu Pro) timed out **over IPv6** (`Could not wait for server fd`).
+  Commit 11277c6 "IPv6 fix" only added retries — and its run on 2026-10-15
+  failed **identically** (same four packages, same IPv6 address, 12 min with
+  5 retries): the failure is DETERMINISTIC, `main` cannot reach esm.ubuntu.com
+  over IPv6. Now: `Acquire::ForceIPv4` (`SKYBOT_APT_IPV4=0` disables), short
+  timeouts, 3 retries, one `apt-get update` + `--fix-missing` retry, then a
+  last install **without the Ubuntu Pro (ESM) sources** — those four are ESM
+  security rebuilds of archive packages, so the archive versions satisfy it
+  (loud WARN; ESM builds return on the next `apt upgrade` that reaches ESM;
+  `SKYBOT_APT_ESM_FALLBACK=0` disables). Already-installed packages are
+  skipped before apt runs. Host-level fix worth doing once on `main`:
+  `curl -6 -sI https://esm.ubuntu.com` vs `curl -4 ...` — if only -6 fails,
+  `echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4`.
+- **HOST-PROVEN (2026-10-15):** that same failed run relaunched training
+  afterwards (`run pid: 347953 (LIVE)`) — relaunch-after-a-failed-action works
+  on `main`.
+- **Deploys never re-download games.** `deploy_skybot.sh` rsyncs named
+  folders without `--delete`; apt packages and `roms/` survive every deploy.
+- **The game depot:** `<repo>/depot/` on the host (gitignored, never synced
+  by deploy) = apt's download cache, pip wheels, hand-dropped `.deb`s, game
+  files. The runner keeps the LAN copy at `/home/runner/_work/depot` (zero
+  setup) and `scripts/depot_sync.sh` syncs it to the host before an install
+  and back after, so a rebuilt host installs over the LAN. Neither sync can
+  fail an install. Optional visible folder: `docs/OPERATIONS.md` "Game depot".
+- `fetch_roms.sh` takes the first source whose sha256 matches (depot →
+  vizdoom wheel → apt `freedoom` → GitHub zip via Python `zipfile`). It used to
+  need `unzip`, which nothing installs.
+
+### Launchers: exec, Steam, browser
+
+`game.launcher` (`launchers.py`; old `launch:` = exec, unchanged).
+- **Steam client mode** (`steam -applaunch`): ONE per Linux user — a second
+  launch is forwarded to the running client and opens on ITS screen. So
+  streams must be 1 (compose refuses more), and a seat refuses — without
+  crashing, re-checked every restart — while a Steam client it did not start
+  runs. Needs a one-time human login on the host. **Direct mode** (`exe:`):
+  any streams, DRM-free only.
+- **Browser** (Chrome/Chromium/Firefox, kiosk app, private profile per seat):
+  Ctrl/Alt chords and F-keys are browser shortcuts that leave the game — a
+  one-way door (§4.5), refused unless in `launcher.allow_keys`.
+- Every game process carries `SKYBOT_SEAT=<display>`; teardown kills by that
+  marker because Steam and browsers re-parent children out of the seat's
+  process group.
+- `game.requires:` lists files the game cannot start without; the launch
+  preflight refuses if one is missing (doom_player without its WAD otherwise
+  trained on a black screen). The preflight now fails CLOSED.
+
+### Still unproven on `main` (do these before trusting the player path)
+
+`tools/player_spike.py` (P0: grab ≥ 30 fps, key latency, XTest relative
+mouse, audio); openbox decorations cropping the 640×480 grab; PulseAudio for
+a non-root `skybot` after ssh exits (`loginctl show-user skybot -p Linger`);
+`/usr/games` on the supervisor's PATH; RAM/VRAM for 2 MC + 2 Doom streams on
+16 GB / 8 GB; the dead-stream heal against a real engine death; Steam and
+browser launchers have only been tested against fakes.
+
+### Other operational facts from this work
+
+- **Actions logs are public and `.env` values are NOT masked** (only GitHub
+  secrets are). Two leaks fixed: (1) `host_exec.sh`, `deploy_skybot.sh`,
+  `deploy.yml`, `host.yml` pass `-o LogLevel=ERROR`, because with
+  `UserKnownHostsFile=/dev/null` every call printed `Permanently added
+  '<address>'`; (2) `deploy_skybot.sh` / `deploy.yml` echoed `$HOST` /
+  `$MAIN_HOST` in five messages (`launch with: ... <address> ...`) — they now
+  print the variable's NAME. Never `echo` a host value in anything a workflow
+  runs. Old run logs that show it can be deleted from the Actions tab.
+- A failed Actions run cannot be read from the Mac (no `gh` CLI, and `main`
+  is not reachable from it): ask for the step log.
